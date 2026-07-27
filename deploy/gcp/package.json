@@ -1,0 +1,17 @@
+{
+	"name": "vibevmm-orch-gcp",
+	"private": true,
+	"main": "index.ts",
+	"dependencies": {
+		"@pulumi/gcp": "^8",
+		"@pulumi/pulumi": "^3.150.0",
+		"@pulumi/random": "^4.16.0"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"typescript": "^5.6.0"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	}
+}

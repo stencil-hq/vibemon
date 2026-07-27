@@ -1,0 +1,6 @@
+name: vibevmm-orch-gcp
+description: vibevmm sandbox orchestration layer on GCP — scheduler fleet, nested-virt worker MIG, and one small state VM running Redis + Postgres
+runtime:
+  name: nodejs
+  options:
+    packagemanager: bun

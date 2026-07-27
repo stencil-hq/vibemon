@@ -49,6 +49,7 @@ vmon-agent (guest agent, Linux guest only)
 - `ui/` — React + Vite + TypeScript web panel; **builds into `vmond/web/`** for Rust embedding.
 - `demo/` — runnable demo and asset-fetch scripts (Ubuntu/arm64 boots, OCI→ext4, Lima bridge for macOS).
 - `deploy/aws/` — Pulumi (TypeScript/bun) stack: scheduler EC2 + bare-metal worker ASG (EC2 exposes `/dev/kvm` only on `*.metal`) + one state VM running Redis and Postgres; the vmon autoscaler drives the ASG through `scale-up.sh`/`scale-down.sh` hooks (worker ids are EC2 instance ids).
+- `deploy/gcp/` — Pulumi (TypeScript/bun) stack mirroring `deploy/aws`: scheduler VMs + worker MIG (GCE grants `/dev/kvm` via the nested-virtualization flag on Intel series; Arm needs `-metal`) + one state VM running Redis and Postgres; the vmon autoscaler drives the MIG through `resize`/`delete-instances` hooks (worker ids are instance names).
 
 ## Development Commands
 
