@@ -8,7 +8,7 @@ use std::{
 	collections::{HashMap, HashSet},
 	fs,
 	io::ErrorKind,
-	path::{Path, PathBuf},
+	path::PathBuf,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
@@ -23,6 +23,7 @@ use crate::Result;
 /// process that crashed between extraction and metadata publication.
 pub const CACHE_GC_GRACE: Duration = Duration::from_mins(2);
 
+/// Owns generation-scoped replica roots and pins active consumers against GC.
 #[derive(Clone, Debug)]
 pub struct ReplicaCache {
 	objects: PathBuf,
@@ -30,36 +31,28 @@ pub struct ReplicaCache {
 }
 
 impl ReplicaCache {
+	/// Open the controlled replica objects directory.
 	pub fn new(objects: PathBuf) -> Self {
 		Self { objects, in_use: Arc::new(Mutex::new(HashMap::new())) }
 	}
 
-	pub fn root_for(&self, sid: &str, object_key: &str) -> PathBuf {
-		self.objects.join(cache_root_name(sid, object_key))
+	/// Resolve a record to its immutable object-key or local-digest cache root.
+	pub fn root_for(&self, sid: &str, object_key: &str, digest: &str) -> PathBuf {
+		self.objects.join(cache_root_name(sid, object_key, digest))
 	}
 
 	/// Retain this exact immutable object root until the returned guard drops.
-	pub fn acquire(&self, sid: &str, object_key: &str) -> ReplicaCacheUse {
-		self.acquire_root(self.root_for(sid, object_key))
-	}
-
-	/// Retain a cache root inferred from a materialized snapshot path.  Paths
-	/// outside the controlled objects directory are not tracked.
-	pub fn acquire_snapshot(&self, snapshot: &Path) -> Option<ReplicaCacheUse> {
-		let root = snapshot.parent()?;
-		if root.parent()? != self.objects || !is_cache_root_name(root.file_name()?.to_str()?) {
-			return None;
-		}
-		Some(self.acquire_root(root.to_owned()))
+	pub fn acquire(&self, sid: &str, object_key: &str, digest: &str) -> ReplicaCacheUse {
+		self.acquire_root(self.root_for(sid, object_key, digest))
 	}
 
 	/// Whether an exact cache root is currently protected by a restore or
 	/// materialization guard.
-	pub fn is_in_use(&self, sid: &str, object_key: &str) -> bool {
+	pub fn is_in_use(&self, sid: &str, object_key: &str, digest: &str) -> bool {
 		self
 			.in_use
 			.lock()
-			.contains_key(&self.root_for(sid, object_key))
+			.contains_key(&self.root_for(sid, object_key, digest))
 	}
 
 	fn acquire_root(&self, root: PathBuf) -> ReplicaCacheUse {
@@ -69,6 +62,7 @@ impl ReplicaCache {
 		ReplicaCacheUse { root, in_use: self.in_use.clone() }
 	}
 
+	/// Remove unreferenced, unpinned cache roots after the crash grace period.
 	pub fn sweep(&self, records: &[ReplicaRecord]) -> Result<()> {
 		self.sweep_with_grace(records, CACHE_GC_GRACE)
 	}
@@ -76,8 +70,7 @@ impl ReplicaCache {
 	fn sweep_with_grace(&self, records: &[ReplicaRecord], grace: Duration) -> Result<()> {
 		let roots = records
 			.iter()
-			.filter(|record| !record.object_key.is_empty())
-			.map(|record| self.root_for(&record.sid, &record.object_key))
+			.map(|record| self.root_for(&record.sid, &record.object_key, &record.digest))
 			.collect::<HashSet<_>>();
 		// Keep this lock through deletion: a guard either registers before its
 		// root is considered stale, or starts after this sweep finishes.
@@ -155,8 +148,15 @@ impl Drop for ReplicaCacheUse {
 	}
 }
 
-fn cache_root_name(sid: &str, object_key: &str) -> String {
-	hex::encode(Sha256::digest(format!("{sid}\0{object_key}").as_bytes()))
+/// Hash the sandbox and canonical object identity into one controlled root
+/// name.
+pub(crate) fn cache_root_name(sid: &str, object_key: &str, digest: &str) -> String {
+	let identity = if object_key.is_empty() {
+		digest
+	} else {
+		object_key
+	};
+	hex::encode(Sha256::digest(format!("{sid}\0{identity}").as_bytes()))
 }
 
 fn is_cache_root_name(name: &str) -> bool {
@@ -211,8 +211,8 @@ mod tests {
 	#[test]
 	fn key_rotation_retires_old_scoped_root_after_grace() {
 		let (_temp, cache) = cache();
-		let old = cache.root_for("sid", "old-object");
-		let current = cache.root_for("sid", "new-object");
+		let old = cache.root_for("sid", "old-object", "digest");
+		let current = cache.root_for("sid", "new-object", "digest");
 		fs::create_dir(&old).unwrap();
 		fs::create_dir(&current).unwrap();
 		cache
@@ -225,9 +225,9 @@ mod tests {
 	#[test]
 	fn in_use_root_survives_until_guard_drops() {
 		let (_temp, cache) = cache();
-		let root = cache.root_for("sid", "old-object");
+		let root = cache.root_for("sid", "old-object", "digest");
 		fs::create_dir(&root).unwrap();
-		let guard = cache.acquire("sid", "old-object");
+		let guard = cache.acquire("sid", "old-object", "digest");
 		cache.sweep_with_grace(&[], Duration::ZERO).unwrap();
 		assert!(root.is_dir());
 		drop(guard);
@@ -238,12 +238,12 @@ mod tests {
 	#[test]
 	fn blocked_publication_keeps_uncommitted_root_until_metadata_commit() {
 		let (_temp, cache) = cache();
-		let root = cache.root_for("target", "new-scoped-object");
+		let root = cache.root_for("target", "new-scoped-object", "digest");
 		fs::create_dir(&root).unwrap();
 
 		// This is the guard held by MeshReplicaStore::put while upload and
 		// verification are deliberately blocked before PostgreSQL commit.
-		let publication = cache.acquire("target", "new-scoped-object");
+		let publication = cache.acquire("target", "new-scoped-object", "digest");
 		cache.sweep_with_grace(&[], Duration::ZERO).unwrap();
 		assert!(root.is_dir());
 
@@ -263,8 +263,8 @@ mod tests {
 	#[test]
 	fn shared_object_identity_remains_per_sid() {
 		let (_temp, cache) = cache();
-		let first = cache.root_for("first", "shared-object");
-		let second = cache.root_for("second", "shared-object");
+		let first = cache.root_for("first", "shared-object", "digest");
+		let second = cache.root_for("second", "shared-object", "digest");
 		fs::create_dir(&first).unwrap();
 		fs::create_dir(&second).unwrap();
 		cache
@@ -283,7 +283,7 @@ mod tests {
 		let outside = temp.path().join("outside");
 		fs::create_dir(&outside).unwrap();
 		fs::write(outside.join("keep"), "keep").unwrap();
-		let link = cache.root_for("sid", "object");
+		let link = cache.root_for("sid", "object", "digest");
 		symlink(&outside, &link).unwrap();
 		let malformed = cache.objects.join("not-a-cache-root");
 		fs::create_dir(&malformed).unwrap();
@@ -296,13 +296,13 @@ mod tests {
 	#[test]
 	fn restart_sweep_keeps_authoritative_root_and_removes_deleted_metadata_root() {
 		let (_temp, cache) = cache();
-		let live = cache.root_for("sid", "current-scoped-object");
-		let deleted = cache.root_for("deleted-sid", "deleted-scoped-object");
+		let live = cache.root_for("sid", "current-scoped-object", "digest");
+		let deleted = cache.root_for("deleted-sid", "deleted-scoped-object", "digest");
 		fs::create_dir(&live).unwrap();
 		fs::create_dir(&deleted).unwrap();
 		let partial = cache.objects.join(format!(
 			"{}.{}.partial",
-			cache_root_name("stale", "object"),
+			cache_root_name("stale", "object", "digest"),
 			uuid::Uuid::new_v4()
 		));
 		fs::create_dir(&partial).unwrap();
@@ -312,5 +312,32 @@ mod tests {
 		assert!(live.is_dir());
 		assert!(!deleted.exists());
 		assert!(!partial.exists());
+	}
+
+	#[test]
+	fn local_digest_identity_survives_sweep_and_is_pinnable() {
+		let (_temp, cache) = cache();
+		let record = ReplicaRecord::new_fenced(
+			"sid",
+			"local-digest",
+			"source",
+			1,
+			1,
+			"snapshot",
+			Default::default(),
+			false,
+		)
+		.unwrap();
+		let root = cache.root_for(&record.sid, &record.object_key, &record.digest);
+		fs::create_dir(&root).unwrap();
+		let guard = cache.acquire(&record.sid, &record.object_key, &record.digest);
+		assert!(cache.is_in_use(&record.sid, &record.object_key, &record.digest));
+		cache
+			.sweep_with_grace(std::slice::from_ref(&record), Duration::ZERO)
+			.unwrap();
+		assert!(root.is_dir());
+		drop(guard);
+		cache.sweep_with_grace(&[], Duration::ZERO).unwrap();
+		assert!(!root.exists());
 	}
 }

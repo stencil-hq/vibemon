@@ -26,6 +26,11 @@ use crate::{EngineError, Result, home::Home};
 pub const ALLOWED_HA: &[&str] = &["off", "async", "rerun", "async+rerun"];
 
 const RECORD_DIR_MODE: u32 = 0o700;
+pub(crate) const HANDOFF_TARGET_FIELD: &str = "_mesh_migration_handoff_target";
+pub(crate) const HANDOFF_TOKEN_FIELD: &str = "_mesh_migration_handoff_token";
+pub(crate) const HANDOFF_STATE_FIELD: &str = "_mesh_migration_handoff_state";
+pub(crate) const HANDOFF_SOURCE_FIELD: &str = "_mesh_migration_handoff_source";
+pub(crate) const HANDOFF_CLAIMED_FIELD: &str = "_mesh_migration_handoff_claimed";
 
 pub type Params = JsonMap<String, JsonValue>;
 
@@ -270,14 +275,35 @@ impl RecordStore {
 
 	/// Apply the `/v1/mesh/record/put` acceptance rule: accept iff no local
 	/// record exists or the incoming epoch is at least the existing epoch.
-	pub fn put_if_newer(&self, record: CreateRecord) -> Result<bool> {
-		let accept = self
-			.get(&record.sid)
-			.is_none_or(|existing| record.epoch >= existing.epoch);
-		if accept {
-			self.put(record)?;
+	pub fn put_if_newer(&self, mut record: CreateRecord) -> Result<bool> {
+		let mut inner = self.inner.write();
+		let existing = inner.meta.get(&record.sid).cloned();
+		if existing
+			.as_ref()
+			.is_some_and(|existing| record.epoch < existing.epoch)
+		{
+			return Ok(false);
 		}
-		Ok(accept)
+		let same_lineage = existing
+			.as_ref()
+			.is_some_and(|existing| record.owner == existing.owner && record.epoch == existing.epoch);
+		clear_handoff(&mut record.params);
+		if same_lineage && let Some(existing) = &existing {
+			for key in handoff_fields() {
+				if let Some(value) = existing.params.get(key) {
+					record.params.insert(key.to_owned(), value.clone());
+				}
+			}
+		}
+		let (params, secrets) = split_secrets(&record.params);
+		record.params = params;
+		if let Some(secrets) = secrets {
+			inner.secrets.insert(record.sid.clone(), secrets);
+		} else if !same_lineage {
+			inner.secrets.remove(&record.sid);
+		}
+		self.persist_meta(&mut inner, &record)?;
+		Ok(true)
 	}
 
 	/// Return a create record, reattaching in-memory secrets if still present.
@@ -324,6 +350,215 @@ impl RecordStore {
 		Ok(Some(record))
 	}
 
+	/// Persist one exact source-to-target migration authorization.
+	pub(crate) fn begin_migration_handoff(
+		&self,
+		sid: &str,
+		source: &str,
+		epoch: i64,
+		target: &str,
+		token: &str,
+	) -> Result<()> {
+		validate_handoff(sid, source, epoch, target, token)?;
+		let mut inner = self.inner.write();
+		let mut record =
+			inner.meta.get(sid).cloned().ok_or_else(|| {
+				EngineError::not_found(format!("sandbox {sid} has no ownership record"))
+			})?;
+		let target_epoch = epoch
+			.checked_add(1)
+			.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+		if record.owner == target
+			&& record.epoch == target_epoch
+			&& handoff_matches(&record.params, source, target, token)
+			&& handoff_state(&record.params) == Some("active")
+			&& handoff_claimed(&record.params)
+		{
+			return Ok(());
+		}
+		if record.owner != source || record.epoch != epoch {
+			return Err(EngineError::invalid(format!(
+				"migration handoff for {sid} lost source lease"
+			)));
+		}
+		if handoff_present(&record.params) {
+			if handoff_matches(&record.params, source, target, token)
+				&& handoff_state(&record.params) == Some("active")
+			{
+				return Ok(());
+			}
+			return Err(EngineError::busy(format!("migration handoff for {sid} already exists")));
+		}
+		set_handoff(&mut record.params, source, target, token, "active", false);
+		self.persist_meta(&mut inner, &record)
+	}
+
+	/// Mark the exact source authorization consumed before the target can run.
+	#[allow(clippy::too_many_arguments, reason = "the exact handoff lineage is the fencing key")]
+	pub(crate) fn confirm_migration_handoff(
+		&self,
+		sid: &str,
+		source: &str,
+		source_epoch: i64,
+		target: &str,
+		target_epoch: i64,
+		token: &str,
+	) -> Result<()> {
+		validate_handoff(sid, source, source_epoch, target, token)?;
+		if source_epoch.checked_add(1) != Some(target_epoch) {
+			return Err(EngineError::invalid("migration target epoch is not the source successor"));
+		}
+		let mut inner = self.inner.write();
+		let mut record =
+			inner.meta.get(sid).cloned().ok_or_else(|| {
+				EngineError::not_found(format!("sandbox {sid} has no ownership record"))
+			})?;
+		if record.owner == target
+			&& record.epoch == target_epoch
+			&& handoff_matches(&record.params, source, target, token)
+			&& handoff_claimed(&record.params)
+		{
+			return Ok(());
+		}
+		if record.owner != source
+			|| record.epoch != source_epoch
+			|| !handoff_matches(&record.params, source, target, token)
+			|| handoff_state(&record.params) != Some("active")
+		{
+			return Err(EngineError::invalid(format!("migration handoff for {sid} was fenced")));
+		}
+		record
+			.params
+			.insert(HANDOFF_CLAIMED_FIELD.to_owned(), JsonValue::Bool(true));
+		target.clone_into(&mut record.owner);
+		record.epoch = target_epoch;
+		self.persist_meta(&mut inner, &record)
+	}
+
+	/// Install a target intent only for the observed source generation.
+	pub(crate) fn claim_migration_handoff(
+		&self,
+		source: &str,
+		source_epoch: i64,
+		target: &str,
+		token: &str,
+		mut intent: CreateRecord,
+	) -> Result<CreateRecord> {
+		validate_handoff(&intent.sid, source, source_epoch, target, token)?;
+		let target_epoch = source_epoch
+			.checked_add(1)
+			.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+		if intent.owner != target || intent.epoch != target_epoch {
+			return Err(EngineError::invalid("migration intent is not the source successor"));
+		}
+		let mut inner = self.inner.write();
+		let current = inner.meta.get(&intent.sid).cloned().ok_or_else(|| {
+			EngineError::not_found(format!("sandbox {} has no ownership record", intent.sid))
+		})?;
+		if current.owner == target
+			&& current.epoch == target_epoch
+			&& handoff_matches(&current.params, source, target, token)
+			&& handoff_claimed(&current.params)
+		{
+			return Ok(with_secrets(&inner, current));
+		}
+		if current.owner != source || current.epoch != source_epoch {
+			return Err(EngineError::invalid(format!(
+				"migration handoff for {} was fenced",
+				intent.sid
+			)));
+		}
+		if handoff_present(&current.params)
+			&& (!handoff_matches(&current.params, source, target, token)
+				|| handoff_state(&current.params) != Some("active"))
+		{
+			return Err(EngineError::invalid(format!(
+				"migration handoff for {} was fenced",
+				intent.sid
+			)));
+		}
+		set_handoff(&mut intent.params, source, target, token, "active", true);
+		let (params, secrets) = split_secrets(&intent.params);
+		intent.params = params;
+		store_secrets(&mut inner, &intent.sid, secrets);
+		self.persist_meta(&mut inner, &intent)?;
+		Ok(with_secrets(&inner, intent))
+	}
+
+	/// Revoke only an exact, unclaimed authorization and advance the source
+	/// epoch.
+	pub(crate) fn abort_migration_handoff(
+		&self,
+		sid: &str,
+		source: &str,
+		source_epoch: i64,
+		target: &str,
+		token: &str,
+	) -> Result<Option<CreateRecord>> {
+		validate_handoff(sid, source, source_epoch, target, token)?;
+		let fresh_epoch = source_epoch
+			.checked_add(1)
+			.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+		let mut inner = self.inner.write();
+		let Some(mut record) = inner.meta.get(sid).cloned() else {
+			return Ok(None);
+		};
+		if record.owner == source
+			&& record.epoch == fresh_epoch
+			&& handoff_matches(&record.params, source, target, token)
+			&& handoff_state(&record.params) == Some("aborted")
+		{
+			return Ok(Some(with_secrets(&inner, record)));
+		}
+		if record.owner != source
+			|| record.epoch != source_epoch
+			|| !handoff_matches(&record.params, source, target, token)
+			|| handoff_state(&record.params) != Some("active")
+			|| handoff_claimed(&record.params)
+		{
+			return Ok(None);
+		}
+		record.epoch = fresh_epoch;
+		record
+			.params
+			.insert(HANDOFF_STATE_FIELD.to_owned(), JsonValue::String("aborted".to_owned()));
+		self.persist_meta(&mut inner, &record)?;
+		Ok(Some(with_secrets(&inner, record)))
+	}
+
+	/// Clear an aborted handoff only for its exact token and fresh source epoch.
+	pub(crate) fn complete_migration_abort(
+		&self,
+		sid: &str,
+		token: &str,
+		owner: &str,
+		fresh_epoch: i64,
+	) -> Result<CreateRecord> {
+		let mut inner = self.inner.write();
+		let mut record = inner.meta.get(sid).cloned().ok_or_else(|| {
+			EngineError::busy(format!("migration abort completion for {sid} fenced"))
+		})?;
+		if record.owner != owner
+			|| record.epoch != fresh_epoch
+			|| handoff_state(&record.params) != Some("aborted")
+			|| record
+				.params
+				.get(HANDOFF_TOKEN_FIELD)
+				.and_then(JsonValue::as_str)
+				!= Some(token)
+		{
+			return Err(EngineError::busy(format!("migration abort completion for {sid} fenced")));
+		}
+		clear_handoff(&mut record.params);
+		self.persist_meta(&mut inner, &record)?;
+		Ok(with_secrets(&inner, record))
+	}
+
+	fn persist_meta(&self, inner: &mut RecordInner, record: &CreateRecord) -> Result<()> {
+		inner.meta.insert(record.sid.clone(), record.clone());
+		write_record(&self.root, &record.sid, &record.to_wire())
+	}
+
 	/// Return all valid records in stable sandbox-id order.
 	#[allow(
 		clippy::needless_collect,
@@ -356,6 +591,75 @@ impl RecordStore {
 	pub fn contains(&self, sid: &str) -> bool {
 		self.inner.read().meta.contains_key(sid)
 	}
+}
+
+fn validate_handoff(sid: &str, source: &str, epoch: i64, target: &str, token: &str) -> Result<()> {
+	if sid.is_empty() || source.is_empty() || target.is_empty() || token.is_empty() || epoch < 0 {
+		Err(EngineError::invalid("invalid migration handoff"))
+	} else {
+		Ok(())
+	}
+}
+
+const fn handoff_fields() -> [&'static str; 5] {
+	[
+		HANDOFF_TARGET_FIELD,
+		HANDOFF_TOKEN_FIELD,
+		HANDOFF_STATE_FIELD,
+		HANDOFF_SOURCE_FIELD,
+		HANDOFF_CLAIMED_FIELD,
+	]
+}
+
+fn handoff_present(params: &Params) -> bool {
+	handoff_fields()
+		.into_iter()
+		.any(|key| params.contains_key(key))
+}
+
+fn handoff_matches(params: &Params, source: &str, target: &str, token: &str) -> bool {
+	params.get(HANDOFF_SOURCE_FIELD).and_then(JsonValue::as_str) == Some(source)
+		&& params.get(HANDOFF_TARGET_FIELD).and_then(JsonValue::as_str) == Some(target)
+		&& params.get(HANDOFF_TOKEN_FIELD).and_then(JsonValue::as_str) == Some(token)
+}
+
+fn handoff_state(params: &Params) -> Option<&str> {
+	params.get(HANDOFF_STATE_FIELD).and_then(JsonValue::as_str)
+}
+
+fn handoff_claimed(params: &Params) -> bool {
+	params
+		.get(HANDOFF_CLAIMED_FIELD)
+		.and_then(JsonValue::as_bool)
+		== Some(true)
+}
+
+fn set_handoff(
+	params: &mut Params,
+	source: &str,
+	target: &str,
+	token: &str,
+	state: &str,
+	claimed: bool,
+) {
+	params.insert(HANDOFF_SOURCE_FIELD.to_owned(), JsonValue::String(source.to_owned()));
+	params.insert(HANDOFF_TARGET_FIELD.to_owned(), JsonValue::String(target.to_owned()));
+	params.insert(HANDOFF_TOKEN_FIELD.to_owned(), JsonValue::String(token.to_owned()));
+	params.insert(HANDOFF_STATE_FIELD.to_owned(), JsonValue::String(state.to_owned()));
+	params.insert(HANDOFF_CLAIMED_FIELD.to_owned(), JsonValue::Bool(claimed));
+}
+
+fn clear_handoff(params: &mut Params) {
+	for key in handoff_fields() {
+		params.remove(key);
+	}
+}
+
+fn with_secrets(inner: &RecordInner, mut record: CreateRecord) -> CreateRecord {
+	if let Some(secrets) = inner.secrets.get(&record.sid) {
+		record.params.insert("secrets".to_owned(), secrets.clone());
+	}
+	record
 }
 
 fn store_secrets(inner: &mut RecordInner, sid: &str, secrets: Option<JsonValue>) {
@@ -443,4 +747,112 @@ fn temp_path_for(path: &Path) -> PathBuf {
 		.and_then(|name| name.to_str())
 		.unwrap_or("record.json");
 	path.with_file_name(format!(".{file_name}.{}.tmp", process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const SID: &str = "sandbox-1";
+	const SOURCE: &str = "source";
+	const TARGET: &str = "target";
+	const TOKEN: &str = "migration-token";
+	const SOURCE_EPOCH: i64 = 7;
+	const TARGET_EPOCH: i64 = 8;
+
+	fn source_record() -> CreateRecord {
+		make_create_record(SID, SOURCE, SOURCE_EPOCH, "create-token", Params::new(), "sandbox")
+			.unwrap()
+	}
+
+	fn target_intent() -> CreateRecord {
+		let mut record = source_record();
+		record.owner = TARGET.to_owned();
+		record.epoch = TARGET_EPOCH;
+		record
+			.params
+			.insert("_mesh_migration_token".to_owned(), JsonValue::String(TOKEN.to_owned()));
+		record
+	}
+
+	#[test]
+	fn confirmed_handoff_survives_restart_and_fences_source_abort() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		store.put(source_record()).unwrap();
+		store
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+		drop(store);
+
+		let restarted = RecordStore::new(temp.path());
+		restarted.load();
+		restarted
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+		restarted
+			.confirm_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TARGET_EPOCH, TOKEN)
+			.unwrap();
+		drop(restarted);
+
+		let recovered = RecordStore::new(temp.path());
+		recovered.load();
+		let record = recovered.get(SID).unwrap();
+		assert_eq!((record.owner.as_str(), record.epoch), (TARGET, TARGET_EPOCH));
+		assert!(handoff_claimed(&record.params));
+		assert!(
+			recovered
+				.abort_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn target_claim_survives_restart_and_is_idempotent() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		store.put(source_record()).unwrap();
+		store
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+		store
+			.claim_migration_handoff(SOURCE, SOURCE_EPOCH, TARGET, TOKEN, target_intent())
+			.unwrap();
+		drop(store);
+
+		let recovered = RecordStore::new(temp.path());
+		recovered.load();
+		recovered
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+		let record = recovered
+			.claim_migration_handoff(SOURCE, SOURCE_EPOCH, TARGET, TOKEN, target_intent())
+			.unwrap();
+		assert_eq!((record.owner.as_str(), record.epoch), (TARGET, TARGET_EPOCH));
+		assert!(handoff_claimed(&record.params));
+	}
+
+	#[test]
+	fn equal_epoch_replication_preserves_only_local_handoff_authority() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		let source = source_record();
+		store.put(source.clone()).unwrap();
+
+		let mut replicated = source.clone();
+		set_handoff(&mut replicated.params, "attacker", "other", "forged", "active", true);
+		assert!(store.put_if_newer(replicated).unwrap());
+		assert!(!handoff_present(&store.get(SID).unwrap().params));
+
+		store
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+		let mut replicated = source;
+		set_handoff(&mut replicated.params, "attacker", "other", "forged", "active", true);
+		assert!(store.put_if_newer(replicated).unwrap());
+		let record = store.get(SID).unwrap();
+		assert!(handoff_matches(&record.params, SOURCE, TARGET, TOKEN));
+		assert!(!handoff_claimed(&record.params));
+	}
 }

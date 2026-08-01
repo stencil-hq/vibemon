@@ -5949,6 +5949,15 @@ impl Engine {
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
 		let capture_lock = self.capture_lock(sid);
 		let _capture_guard = capture_lock.acquire();
+		self.mesh_checkpoint_while_capture_held(sid, kind, track)
+	}
+
+	fn mesh_checkpoint_while_capture_held(
+		&self,
+		sid: &str,
+		kind: &str,
+		track: bool,
+	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
 		let lifecycle = self.get_record(sid, false)?;
 		if lifecycle.status != "running" || !lifecycle.lifecycle.is_converged() {
 			return Err(EngineError::busy("sandbox lifecycle is not steady for mesh checkpoint"));
@@ -6024,11 +6033,13 @@ impl Engine {
 	/// Live-migration phase 1 (pre-copy): checkpoint the running sandbox for
 	/// a peer pull; the source keeps running. Follow with
 	/// [`Self::mesh_migrate_finalize`] once the target holds the bulk image.
+	/// The caller must retain the guard from
+	/// [`Self::try_acquire_running_capture`] across both migration phases.
 	pub(crate) fn mesh_migrate_precopy(
 		&self,
 		sid: &str,
 	) -> Result<crate::mesh::reconciler::ReplicatePreparation> {
-		self.mesh_checkpoint_for(sid, "migrate", true)
+		self.mesh_checkpoint_while_capture_held(sid, "migrate", true)
 	}
 
 	/// Atomically persist the source-side migration recovery journal.  The
@@ -6085,14 +6096,13 @@ impl Engine {
 	/// checkpoint is the sole authority. Follow with
 	/// [`Self::mesh_migrate_commit`] once the target confirms, or
 	/// [`Self::mesh_migrate_abort`] to restore the source locally.
+	/// The caller must still hold the capture guard acquired before pre-copy.
 	pub(crate) fn mesh_migrate_finalize(
 		&self,
 		sid: &str,
 		base_dir: &Path,
 		mut cleanup: MigrationCleanupWire,
 	) -> Result<(crate::mesh::reconciler::ReplicatePreparation, MigrationCleanupWire)> {
-		let capture_lock = self.capture_lock(sid);
-		let _capture_guard = capture_lock.acquire();
 		let lifecycle = self.get_record(sid, false)?;
 		if lifecycle.status != "running" || !lifecycle.lifecycle.is_converged() {
 			return Err(EngineError::busy("sandbox lifecycle is not steady for migration checkpoint"));
@@ -12685,7 +12695,7 @@ mod tests {
 		let temp = TempDir::new().expect("temp");
 		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
 		let engine = Arc::new(engine);
-		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "running"));
+		engine.insert_test_record(VmRecord::new("sandbox", "sandbox", "stopped"));
 		fs::create_dir_all(engine.sandbox("sandbox").dir()).expect("runtime directory");
 		let lock = engine.capture_lock("sandbox");
 		let held = lock.acquire();

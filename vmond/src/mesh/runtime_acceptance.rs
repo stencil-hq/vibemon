@@ -29,7 +29,8 @@ use super::{
 	},
 	runtime::{
 		DeleteTombstoneEngine, DeleteTombstoneStore, MeshRuntime, begin_target_migration,
-		converge_delete_tombstones, install_replica_cache, refresh_replica_metadata,
+		converge_delete_tombstones, copy_verify_or_rollback, install_replica_cache,
+		refresh_replica_metadata,
 	},
 };
 use crate::{EngineError, Result, mesh::lease::LeaseRecord};
@@ -94,6 +95,16 @@ impl MeshTemplateTransfer for TransferFake {
 		_token: String,
 	) -> BoxFuture<'a, MeshResult<String>> {
 		Box::pin(async { Err(MeshError::invalid("unexpected template pull")) })
+	}
+
+	fn pull_checkpoint<'a>(
+		&'a self,
+		_client: &'a reqwest::Client,
+		_peer_url: String,
+		_digest: String,
+		_token: String,
+	) -> BoxFuture<'a, MeshResult<String>> {
+		Box::pin(async { Err(MeshError::invalid("unexpected checkpoint pull")) })
 	}
 
 	fn pull_snapshot<'a>(
@@ -400,6 +411,13 @@ impl MeshRecordStore for RecordFake {
 	fn list(&self) -> MeshResult<Vec<CreateRecordWire>> {
 		Ok(self.0.lock().clone())
 	}
+
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		_record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
+	}
 }
 
 struct AbortRecordFake {
@@ -459,11 +477,19 @@ impl MeshRecordStore for AbortRecordFake {
 		self.complete_calls.fetch_add(1, Ordering::SeqCst);
 		Ok(self.fresh.clone())
 	}
+
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		_record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>> {
+		Box::pin(async { unsupported() })
+	}
 }
 
 struct ExactRecordFake {
 	record:      Mutex<Option<CreateRecordWire>>,
 	fail_update: bool,
+	fail_notify: bool,
 	events:      Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -504,6 +530,21 @@ impl MeshRecordStore for ExactRecordFake {
 		self.events.lock().push("intent");
 		*self.record.lock() = Some(record.clone());
 		Ok(record)
+	}
+
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		_record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>> {
+		self.events.lock().push("confirm_source");
+		let fail = self.fail_notify;
+		Box::pin(async move {
+			if fail {
+				Err(MeshError::unreachable("source unavailable"))
+			} else {
+				Ok(())
+			}
+		})
 	}
 }
 
@@ -602,6 +643,7 @@ async fn migration_target_activates_only_after_leases_and_durable_commit() {
 	let records = ExactRecordFake {
 		record:      Mutex::new(Some(pending_record(delta.path()))),
 		fail_update: false,
+		fail_notify: false,
 		events:      engine.events.clone(),
 	};
 	let leases = LeaseFake {
@@ -625,11 +667,48 @@ async fn migration_target_activates_only_after_leases_and_durable_commit() {
 	.unwrap();
 
 	assert_eq!(*engine.events.lock(), vec![
+		"confirm_source",
 		"adopt_paused",
 		"persist_leases",
 		"durable_commit",
 		"activate"
 	]);
+}
+
+#[tokio::test]
+async fn source_confirmation_failure_keeps_target_inactive() {
+	let delta = tempfile::tempdir().unwrap();
+	let engine = EngineFake::new(false, false);
+	let records = ExactRecordFake {
+		record:      Mutex::new(Some(pending_record(delta.path()))),
+		fail_update: false,
+		fail_notify: true,
+		events:      engine.events.clone(),
+	};
+	let leases = LeaseFake {
+		acquired: Vec::new(),
+		released: Mutex::new(Vec::new()),
+		events:   Some(engine.events.clone()),
+	};
+	let transfer = TransferFake;
+	let client = reqwest::Client::new();
+
+	assert!(
+		MeshRuntime::converge_migration_intent(
+			&engine,
+			&leases,
+			&records,
+			&transfer,
+			&client,
+			"token",
+			pending_record(delta.path()),
+		)
+		.await
+		.is_err()
+	);
+	assert_eq!(*engine.events.lock(), vec!["confirm_source"]);
+	assert_eq!(engine.adopts.load(Ordering::SeqCst), 0);
+	assert_eq!(engine.activations.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -639,6 +718,7 @@ async fn migration_target_commit_failure_never_activates_and_releases_paused_can
 	let records = ExactRecordFake {
 		record:      Mutex::new(Some(pending_record(delta.path()))),
 		fail_update: true,
+		fail_notify: false,
 		events:      engine.events.clone(),
 	};
 	let exact = vec![json!({"volume": "data", "epoch": 7, "token": "exact"})];
@@ -666,6 +746,7 @@ async fn migration_target_commit_failure_never_activates_and_releases_paused_can
 
 	assert_eq!(*leases.released.lock(), vec![exact]);
 	assert_eq!(*engine.events.lock(), vec![
+		"confirm_source",
 		"adopt_paused",
 		"persist_leases",
 		"durable_commit",
@@ -682,6 +763,7 @@ async fn committed_migration_retries_activation_without_rolling_back_ownership()
 	let records = ExactRecordFake {
 		record:      Mutex::new(Some(pending_record(delta.path()))),
 		fail_update: false,
+		fail_notify: false,
 		events:      engine.events.clone(),
 	};
 	let leases = LeaseFake {
@@ -714,10 +796,12 @@ async fn committed_migration_retries_activation_without_rolling_back_ownership()
 
 	assert_eq!(engine.activations.load(Ordering::SeqCst), 2);
 	assert_eq!(*engine.events.lock(), vec![
+		"confirm_source",
 		"adopt_paused",
 		"persist_leases",
 		"durable_commit",
 		"activate",
+		"confirm_source",
 		"activate"
 	]);
 }
@@ -752,6 +836,36 @@ async fn source_migration_intent_exists_before_receive_or_status_resolution() {
 	.await
 	.unwrap();
 	assert_eq!(resolved, json!({"committed": true}));
+}
+
+#[tokio::test]
+async fn failed_final_replica_verification_rolls_back_copied_object() {
+	let copied = Arc::new(AtomicBool::new(false));
+	let rolled_back = Arc::new(AtomicBool::new(false));
+	let copy_state = Arc::clone(&copied);
+	let verify_state = Arc::clone(&copied);
+	let rollback_state = Arc::clone(&rolled_back);
+
+	let error = copy_verify_or_rollback(
+		"replicas/final",
+		async move {
+			copy_state.store(true, Ordering::SeqCst);
+			Ok(())
+		},
+		async move {
+			assert!(verify_state.load(Ordering::SeqCst));
+			Err(EngineError::invalid("final digest mismatch"))
+		},
+		async move {
+			rollback_state.store(true, Ordering::SeqCst);
+			Ok(())
+		},
+	)
+	.await
+	.unwrap_err();
+
+	assert_eq!(error.message, "final digest mismatch");
+	assert!(rolled_back.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -1145,6 +1259,7 @@ async fn target_migration_persists_intent_then_exact_commit_marker_before_ack() 
 	let records = ExactRecordFake {
 		record:      Mutex::new(None),
 		fail_update: false,
+		fail_notify: false,
 		events:      events.clone(),
 	};
 	let leases = LeaseFake {
@@ -1193,6 +1308,7 @@ async fn marker_cas_failure_tears_target_down_before_releasing_leases_without_fa
 	let records = ExactRecordFake {
 		record:      Mutex::new(None),
 		fail_update: true,
+		fail_notify: false,
 		events:      engine.events.clone(),
 	};
 	let exact = vec![json!({"volume": "data", "token": "exact"})];

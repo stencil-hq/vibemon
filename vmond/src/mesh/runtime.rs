@@ -8,6 +8,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs::{self, OpenOptions},
+	future::Future,
 	io::Write,
 	os::unix::fs::OpenOptionsExt,
 	path::{Path, PathBuf},
@@ -743,6 +744,7 @@ impl MeshRuntime {
 			.and_then(Value::as_str)
 			.ok_or_else(|| MeshError::invalid("migration intent has no token"))?;
 		let _target_guard = records.try_begin_target_migration(&record.sid, migration_id)?;
+		records.notify_source_migration_claim(&record).await?;
 		if record
 			.params
 			.get("_mesh_migration_committed")
@@ -786,7 +788,7 @@ impl MeshRuntime {
 				Some(path) => path,
 				None => PathBuf::from(
 					transfer
-						.pull_template(
+						.pull_checkpoint(
 							client,
 							source_url.to_owned(),
 							base_digest.to_owned(),
@@ -796,7 +798,7 @@ impl MeshRuntime {
 				),
 			};
 			let installed = transfer
-				.pull_template(client, source_url.to_owned(), digest.to_owned(), token.to_owned())
+				.pull_checkpoint(client, source_url.to_owned(), digest.to_owned(), token.to_owned())
 				.await?;
 			let staged = engine
 				.stage_migration_delta(
@@ -1470,7 +1472,9 @@ impl MeshRuntime {
 		&self,
 		mut shared: replica::ReplicaRecord,
 	) -> Result<replica::ReplicaRecord> {
-		let _cache_use = self.replica_cache.acquire(&shared.sid, &shared.object_key);
+		let _cache_use = self
+			.replica_cache
+			.acquire(&shared.sid, &shared.object_key, &shared.digest);
 		let local = self
 			.replicas
 			.get(&shared.sid)
@@ -1508,7 +1512,10 @@ impl MeshRuntime {
 			.ok_or_else(|| {
 				EngineError::invalid("replica snapshot path has no valid final component")
 			})?;
-		let extract_root = self.replica_cache.root_for(&shared.sid, &shared.object_key);
+		let extract_root =
+			self
+				.replica_cache
+				.root_for(&shared.sid, &shared.object_key, &shared.digest);
 		let snapshot_dir = extract_root.join(snapshot_name);
 		if snapshot_dir.is_dir() && verify_replica_digest(&snapshot_dir, &shared.digest).is_err() {
 			let metadata = fs::symlink_metadata(&extract_root)?;
@@ -1597,7 +1604,9 @@ impl MeshRuntime {
 				.iter()
 				.any(|shared| shared.sid == local.sid && shared.object_key == local.object_key);
 			if !current
-				&& !self.replica_cache.is_in_use(&local.sid, &local.object_key)
+				&& !self
+					.replica_cache
+					.is_in_use(&local.sid, &local.object_key, &local.digest)
 				&& let Err(error) = self
 					.replicas
 					.remove_if_object_key(&local.sid, &local.object_key)
@@ -2738,15 +2747,51 @@ impl MeshRecordStore for MeshRuntime {
 		target_owner: &str,
 		token: &str,
 	) -> MeshResult<()> {
-		let store = self.cluster_store.as_ref().ok_or_else(|| {
-			MeshError::with_code(
-				"live migration handoff requires the fenced cluster record store",
-				"busy",
-			)
-		})?;
-		store
-			.begin_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
-			.map_err(engine_to_mesh)
+		if let Some(store) = &self.cluster_store {
+			store
+				.begin_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
+				.map_err(engine_to_mesh)
+		} else {
+			self
+				.records
+				.begin_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
+				.map_err(engine_to_mesh)
+		}
+	}
+
+	fn confirm_migration_handoff(
+		&self,
+		sid: &str,
+		source_owner: &str,
+		source_epoch: i64,
+		target_owner: &str,
+		target_epoch: i64,
+		token: &str,
+	) -> MeshResult<()> {
+		if let Some(store) = &self.cluster_store {
+			store
+				.confirm_migration_handoff(
+					sid,
+					source_owner,
+					source_epoch,
+					target_owner,
+					target_epoch,
+					token,
+				)
+				.map_err(engine_to_mesh)
+		} else {
+			self
+				.records
+				.confirm_migration_handoff(
+					sid,
+					source_owner,
+					source_epoch,
+					target_owner,
+					target_epoch,
+					token,
+				)
+				.map_err(engine_to_mesh)
+		}
 	}
 
 	fn abort_migration_handoff(
@@ -2757,16 +2802,18 @@ impl MeshRecordStore for MeshRuntime {
 		target_owner: &str,
 		token: &str,
 	) -> MeshResult<Option<CreateRecordWire>> {
-		let store = self.cluster_store.as_ref().ok_or_else(|| {
-			MeshError::with_code(
-				"live migration handoff requires the fenced cluster record store",
-				"busy",
-			)
-		})?;
-		store
-			.abort_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
-			.map(|record| record.map(record_wire))
-			.map_err(engine_to_mesh)
+		if let Some(store) = &self.cluster_store {
+			store
+				.abort_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
+				.map(|record| record.map(record_wire))
+				.map_err(engine_to_mesh)
+		} else {
+			self
+				.records
+				.abort_migration_handoff(sid, source_owner, source_epoch, target_owner, token)
+				.map(|record| record.map(record_wire))
+				.map_err(engine_to_mesh)
+		}
 	}
 
 	fn complete_migration_abort(
@@ -2776,13 +2823,18 @@ impl MeshRecordStore for MeshRuntime {
 		owner: &str,
 		fresh_epoch: i64,
 	) -> MeshResult<CreateRecordWire> {
-		let store = self.cluster_store.as_ref().ok_or_else(|| {
-			MeshError::with_code("migration handoff requires the fenced cluster record store", "busy")
-		})?;
-		store
-			.complete_migration_abort(sid, token, owner, fresh_epoch)
-			.map(record_wire)
-			.map_err(engine_to_mesh)
+		if let Some(store) = &self.cluster_store {
+			store
+				.complete_migration_abort(sid, token, owner, fresh_epoch)
+				.map(record_wire)
+				.map_err(engine_to_mesh)
+		} else {
+			self
+				.records
+				.complete_migration_abort(sid, token, owner, fresh_epoch)
+				.map(record_wire)
+				.map_err(engine_to_mesh)
+		}
 	}
 
 	fn claim_migration_handoff(
@@ -2792,27 +2844,89 @@ impl MeshRecordStore for MeshRuntime {
 		token: String,
 		record: CreateRecordWire,
 	) -> MeshResult<CreateRecordWire> {
-		let store = self.cluster_store.as_ref().ok_or_else(|| {
-			MeshError::with_code(
-				"live migration handoff requires the fenced cluster record store",
-				"busy",
-			)
-		})?;
 		let mut intent = create_record(record)?;
-		let (params, secrets) = record::split_secrets(&intent.params);
-		intent.params = params;
-		let claimed = store
-			.claim_migration_handoff(
-				&intent.sid,
-				&source_owner,
-				source_epoch,
-				&intent.owner,
-				&token,
-				&intent,
-			)
-			.map_err(engine_to_mesh)?;
-		self.records.remember_secrets(&claimed.sid, secrets);
-		Ok(record_wire(claimed))
+		let target_owner = intent.owner.clone();
+		if intent
+			.params
+			.get("_mesh_migration_token")
+			.and_then(Value::as_str)
+			!= Some(token.as_str())
+		{
+			return Err(MeshError::invalid("migration token does not match target intent"));
+		}
+		if let Some(store) = &self.cluster_store {
+			let (params, secrets) = record::split_secrets(&intent.params);
+			intent.params = params;
+			let claimed = store
+				.claim_migration_handoff(
+					&intent.sid,
+					&source_owner,
+					source_epoch,
+					&target_owner,
+					&token,
+					&intent,
+				)
+				.map_err(engine_to_mesh)?;
+			self.records.remember_secrets(&claimed.sid, secrets);
+			Ok(record_wire(claimed))
+		} else {
+			self
+				.records
+				.claim_migration_handoff(&source_owner, source_epoch, &target_owner, &token, intent)
+				.map(record_wire)
+				.map_err(engine_to_mesh)
+		}
+	}
+
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>> {
+		async move {
+			let source_url = record
+				.params
+				.get("_mesh_migration_source_url")
+				.and_then(Value::as_str)
+				.filter(|value| !value.is_empty())
+				.ok_or_else(|| MeshError::invalid("migration intent has no source URL"))?;
+			let source_owner = record
+				.params
+				.get("_mesh_migration_source_owner")
+				.and_then(Value::as_str)
+				.filter(|value| !value.is_empty())
+				.ok_or_else(|| MeshError::invalid("migration intent has no source owner"))?;
+			let source_epoch = record
+				.params
+				.get("_mesh_migration_source_epoch")
+				.and_then(Value::as_i64)
+				.filter(|epoch| *epoch >= 0)
+				.ok_or_else(|| MeshError::invalid("migration intent has no source epoch"))?;
+			let migration_id = record
+				.params
+				.get("_mesh_migration_id")
+				.and_then(Value::as_str)
+				.filter(|value| !value.is_empty())
+				.ok_or_else(|| MeshError::invalid("migration intent has no token"))?;
+			let claim = json!({
+				"sid": record.sid,
+				"source_owner": source_owner,
+				"source_epoch": source_epoch,
+				"target_owner": record.owner,
+				"target_epoch": record.epoch,
+				"migration_id": migration_id,
+			});
+			self
+				.transport
+				.post(
+					source_url,
+					"/v1/mesh/migrate/claim",
+					&claim,
+					Some(secs(self.config.mesh_create_timeout_sec)),
+				)
+				.await?;
+			Ok(())
+		}
+		.boxed()
 	}
 
 	fn commit_delete(&self, sid: &str, owner: &str, epoch: i64) -> MeshResult<()> {
@@ -2875,8 +2989,7 @@ impl MeshReplicaStore for MeshRuntime {
 			// cache root that is not authoritative until `publication.commit`.
 			// Keep that exact root alive through upload, verification, commit,
 			// local metadata persistence, and the immediately following sweep.
-			let _cache_use =
-				(!object_key.is_empty()).then(|| self.replica_cache.acquire(&sid, &object_key));
+			let _cache_use = self.replica_cache.acquire(&sid, &object_key, &digest);
 			if let Some(store) = &self.cluster_store {
 				let (clean, secrets) = record::split_secrets(&params);
 				let key_id = clean
@@ -3537,13 +3650,11 @@ impl reconciler::ReplicaStore for MeshRuntime {
 	}
 
 	fn acquire_cache_root(&self, record: &reconciler::ReplicaRecord) -> Option<Box<dyn Send>> {
-		if !record.object_key.is_empty() {
-			return Some(Box::new(self.replica_cache.acquire(&record.sid, &record.object_key)));
-		}
-		self
-			.replica_cache
-			.acquire_snapshot(&record.snapshot_dir)
-			.map(|guard| Box::new(guard) as Box<dyn Send>)
+		Some(Box::new(
+			self
+				.replica_cache
+				.acquire(&record.sid, &record.object_key, &record.digest),
+		))
 	}
 
 	fn publication_key(&self, sid: &str, prep: &reconciler::ReplicatePreparation) -> Result<String> {
@@ -4299,29 +4410,45 @@ async fn publish_verified_s3_replica(
 		)
 		.await?;
 
-		s3.copy_object(&staging_key, &final_key, staging_stat.size)
-			.await
-			.map_err(|error| {
-				EngineError::engine(format!("publishing shared replica object: {error}"))
-			})?;
-		let final_stat = s3.head_object(&final_key).await.map_err(|error| {
-			EngineError::engine(format!("verifying published replica object: {error}"))
-		})?;
-		if final_stat.size == 0 {
-			return Err(EngineError::engine("published shared replica object is empty"));
-		}
-		let final_verify = snapshot_dir
-			.parent()
-			.ok_or_else(|| EngineError::invalid("replica snapshot has no parent"))?
-			.join(format!(".replica-final-verify-{}", uuid::Uuid::new_v4()));
-		verify_uploaded_s3_bundle(
-			s3,
+		copy_verify_or_rollback(
 			&final_key,
-			&final_stat,
-			&final_verify,
-			digest,
-			REPLICA_ARCHIVE_ROOT,
-			snapshot,
+			async {
+				s3.copy_object(&staging_key, &final_key, staging_stat.size)
+					.await
+					.map_err(|error| {
+						EngineError::engine(format!("publishing shared replica object: {error}"))
+					})
+			},
+			async {
+				let final_stat = s3.head_object(&final_key).await.map_err(|error| {
+					EngineError::engine(format!("verifying published replica object: {error}"))
+				})?;
+				if final_stat.size == 0 {
+					return Err(EngineError::engine("published shared replica object is empty"));
+				}
+				let final_verify = snapshot_dir
+					.parent()
+					.ok_or_else(|| EngineError::invalid("replica snapshot has no parent"))?
+					.join(format!(".replica-final-verify-{}", uuid::Uuid::new_v4()));
+				verify_uploaded_s3_bundle(
+					s3,
+					&final_key,
+					&final_stat,
+					&final_verify,
+					digest,
+					REPLICA_ARCHIVE_ROOT,
+					snapshot,
+				)
+				.await
+			},
+			async {
+				match s3.remove(&final_key).await {
+					Ok(()) | Err(crate::s3::S3Error::NotFound) => Ok(()),
+					Err(error) => Err(EngineError::engine(format!(
+						"removing unverified shared replica object: {error}"
+					))),
+				}
+			},
 		)
 		.await
 	}
@@ -4334,6 +4461,33 @@ async fn publish_verified_s3_replica(
 	};
 	published?;
 	cleanup
+}
+
+/// Copy a staged object, verify the final key, and remove any ambiguous or
+/// invalid final object before returning the publication error.
+pub(crate) async fn copy_verify_or_rollback<C, V, D>(
+	key: &str,
+	copy: C,
+	verify: V,
+	rollback: D,
+) -> Result<()>
+where
+	C: Future<Output = Result<()>>,
+	V: Future<Output = Result<()>>,
+	D: Future<Output = Result<()>>,
+{
+	let result = async {
+		copy.await?;
+		verify.await
+	}
+	.await;
+	if let Err(primary) = result {
+		if let Err(cleanup) = rollback.await {
+			tracing::warn!(%cleanup, object_key = key, "failed to remove unverified replica object");
+		}
+		return Err(primary);
+	}
+	Ok(())
 }
 
 async fn upload_s3_bundle(
@@ -4479,6 +4633,22 @@ impl MeshTemplateTransfer for TemplateTransfer {
 	) -> BoxFuture<'a, MeshResult<String>> {
 		async move {
 			let path = transfer::pull_template(client, &peer_url, &digest, &token)
+				.await
+				.map_err(engine_to_mesh)?;
+			Ok(path.to_string_lossy().into_owned())
+		}
+		.boxed()
+	}
+
+	fn pull_checkpoint<'a>(
+		&'a self,
+		client: &'a reqwest::Client,
+		peer_url: String,
+		digest: String,
+		token: String,
+	) -> BoxFuture<'a, MeshResult<String>> {
+		async move {
+			let path = transfer::pull_checkpoint(client, &peer_url, &digest, &token)
 				.await
 				.map_err(engine_to_mesh)?;
 			Ok(path.to_string_lossy().into_owned())

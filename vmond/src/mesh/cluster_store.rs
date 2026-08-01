@@ -1089,10 +1089,28 @@ impl ProductionStore {
 					 EXTRACT(EPOCH FROM clock_timestamp()) FOR UPDATE",
 					&[&sid, &source, &epoch],
 				)
-				.map_err(database_error)?
-				.ok_or_else(|| {
-					EngineError::invalid(format!("migration handoff for {sid} lost source lease"))
-				})?;
+				.map_err(database_error)?;
+			let Some(row) = row else {
+				let target_epoch = epoch
+					.checked_add(1)
+					.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+				let claimed = transaction
+					.query_opt(
+						"SELECT 1 FROM sandbox_ownership WHERE sid = $1 AND owner = $3 AND epoch = $5 \
+						 AND deleting = FALSE AND migration_target = $3 AND migration_token = $4 AND \
+						 migration_source = $2 AND migration_state = 'active' AND migration_claimed = \
+						 TRUE",
+						&[&sid as &(dyn ToSql + Sync), &source, &target, &token, &target_epoch],
+					)
+					.map_err(database_error)?;
+				if claimed.is_some() {
+					transaction.commit().map_err(database_error)?;
+					return Ok(());
+				}
+				return Err(EngineError::invalid(format!(
+					"migration handoff for {sid} lost source lease"
+				)));
+			};
 			let existing_target = row
 				.try_get::<_, Option<String>>(2)
 				.map_err(database_error)?;
@@ -1118,6 +1136,63 @@ impl ProductionStore {
 				)
 				.map_err(database_error)?;
 			transaction.commit().map_err(database_error)
+		})
+	}
+
+	/// Verify that the shared store durably consumed one exact migration token.
+	#[allow(clippy::too_many_arguments, reason = "the full migration lineage is the fencing key")]
+	pub(crate) fn confirm_migration_handoff(
+		&self,
+		sid: &str,
+		source: &str,
+		source_epoch: i64,
+		target: &str,
+		target_epoch: i64,
+		token: &str,
+	) -> Result<()> {
+		if source.is_empty()
+			|| target.is_empty()
+			|| token.is_empty()
+			|| source_epoch < 0
+			|| source_epoch.checked_add(1) != Some(target_epoch)
+		{
+			return Err(EngineError::invalid("invalid migration handoff confirmation"));
+		}
+		self.with_client(|client| {
+			let row = client
+				.query_opt(
+					"SELECT owner, epoch, migration_target, migration_token, migration_claimed, \
+					 migration_source FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE",
+					&[&sid],
+				)
+				.map_err(database_error)?
+				.ok_or_else(|| {
+					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
+				})?;
+			let owner = row.try_get::<_, String>(0).map_err(database_error)?;
+			let epoch = row.try_get::<_, i64>(1).map_err(database_error)?;
+			let marker_target = row
+				.try_get::<_, Option<String>>(2)
+				.map_err(database_error)?;
+			let marker_token = row
+				.try_get::<_, Option<String>>(3)
+				.map_err(database_error)?;
+			let claimed = row.try_get::<_, bool>(4).map_err(database_error)?;
+			let marker_source = row
+				.try_get::<_, Option<String>>(5)
+				.map_err(database_error)?;
+			if owner != target
+				|| epoch != target_epoch
+				|| marker_target.as_deref() != Some(target)
+				|| marker_token.as_deref() != Some(token)
+				|| marker_source.as_deref() != Some(source)
+				|| !claimed
+			{
+				return Err(EngineError::busy(format!(
+					"migration handoff confirmation for {sid} was fenced"
+				)));
+			}
+			Ok(())
 		})
 	}
 
@@ -3652,7 +3727,15 @@ mod tests {
 				let replay = retry.expect("the winning abort remains idempotently replayable");
 				assert_eq!((replay.owner.as_str(), replay.epoch), ("node-a", 2));
 			},
-			"node-b" => assert!(retry.is_none(), "an abort retry cannot undo the claimed handoff"),
+			"node-b" => {
+				assert!(retry.is_none(), "an abort retry cannot undo the claimed handoff");
+				store
+					.confirm_migration_handoff("handoff-race", "node-a", 1, "node-b", 2, "handoff-token")
+					.expect("confirm claimed handoff");
+				store
+					.begin_migration_handoff("handoff-race", "node-a", 1, "node-b", "handoff-token")
+					.expect("claimed handoff begin is idempotent");
+			},
 			owner => panic!("unexpected handoff owner {owner}"),
 		}
 	}

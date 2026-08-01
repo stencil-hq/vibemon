@@ -33,6 +33,8 @@ const MIGRATION_ID_FIELD: &str = "_mesh_migration_id";
 const MIGRATION_BASE_DIGEST_FIELD: &str = "_mesh_migration_base_digest";
 const MIGRATION_DELTA_DIGEST_FIELD: &str = "_mesh_migration_delta_digest";
 const MIGRATION_SOURCE_URL_FIELD: &str = "_mesh_migration_source_url";
+const MIGRATION_SOURCE_OWNER_FIELD: &str = "_mesh_migration_source_owner";
+const MIGRATION_SOURCE_EPOCH_FIELD: &str = "_mesh_migration_source_epoch";
 const MIGRATION_DELTA_DIR_FIELD: &str = "_mesh_migration_delta_dir";
 const MIGRATION_COMMITTED_FIELD: &str = "_mesh_migration_committed";
 
@@ -513,6 +515,23 @@ pub trait MeshRecordStore: Send + Sync {
 		))
 	}
 
+	/// Confirm that the target durably consumed one exact source authorization.
+	#[allow(clippy::too_many_arguments, reason = "the full migration lineage is the fencing key")]
+	fn confirm_migration_handoff(
+		&self,
+		_sid: &str,
+		_source_owner: &str,
+		_source_epoch: i64,
+		_target_owner: &str,
+		_target_epoch: i64,
+		_token: &str,
+	) -> MeshResult<()> {
+		Err(MeshError::with_code(
+			"migration handoff confirmation is unsupported by this record store",
+			"busy",
+		))
+	}
+
 	/// Revoke an unclaimed source authorization and install a fresh source
 	/// epoch. `None` is fenced: a target may already have consumed the token.
 	fn abort_migration_handoff(
@@ -558,6 +577,12 @@ pub trait MeshRecordStore: Send + Sync {
 			"busy",
 		))
 	}
+
+	/// Notify the source that this durable target intent consumed its token.
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>>;
 
 	fn try_begin_target_migration(
 		&self,
@@ -617,6 +642,15 @@ pub trait MeshReplicaStore: Send + Sync {
 
 pub trait MeshTemplateTransfer: Send + Sync {
 	fn pull_template<'a>(
+		&'a self,
+		client: &'a reqwest::Client,
+		peer_url: String,
+		digest: String,
+		token: String,
+	) -> BoxFuture<'a, MeshResult<String>>;
+
+	/// Pull and CAS-index one migration checkpoint by its complete-tree digest.
+	fn pull_checkpoint<'a>(
 		&'a self,
 		client: &'a reqwest::Client,
 		peer_url: String,
@@ -713,6 +747,7 @@ pub fn router(state: MeshRouteState) -> Router {
 		.route("/v1/mesh/lease/release", post(mesh_lease_release))
 		.route("/v1/mesh/migrate/precopy", post(mesh_migrate_precopy))
 		.route("/v1/mesh/migrate/receive", post(mesh_migrate_receive))
+		.route("/v1/mesh/migrate/claim", post(mesh_migrate_claim))
 		.route("/v1/mesh/migrate/status", post(mesh_migrate_status))
 		.route("/v1/mesh/replica/receive", post(mesh_replica_receive))
 		.route("/v1/mesh/replica/list", get(mesh_replica_list))
@@ -966,7 +1001,7 @@ async fn mesh_migrate_precopy(
 	}
 	state
 		.transfer
-		.pull_template(
+		.pull_checkpoint(
 			state.transport.bulk_client(),
 			source_url,
 			digest,
@@ -1069,6 +1104,12 @@ async fn mesh_migrate_receive(
 			 params.name are required",
 		));
 	}
+	record
+		.params
+		.insert(MIGRATION_SOURCE_OWNER_FIELD.to_owned(), Value::String(source_owner.clone()));
+	record
+		.params
+		.insert(MIGRATION_SOURCE_EPOCH_FIELD.to_owned(), json!(source_epoch));
 	if record
 		.params
 		.get("_mesh_migration_token")
@@ -1085,12 +1126,33 @@ async fn mesh_migrate_receive(
 			.records
 			.try_begin_target_migration(&name, &migration_id),
 	)?;
-	record = map_mesh(state.records.claim_migration_handoff(
-		source_owner,
+	map_mesh(state.records.begin_migration_handoff(
+		&name,
+		&source_owner,
 		source_epoch,
-		migration_id,
+		&record.owner,
+		&migration_id,
+	))?;
+	record = map_mesh(state.records.claim_migration_handoff(
+		source_owner.clone(),
+		source_epoch,
+		migration_id.clone(),
 		record,
 	))?;
+	state
+		.records
+		.notify_source_migration_claim(&record)
+		.await
+		.map_err(|error| {
+			MeshRouteError::coded(
+				StatusCode::BAD_GATEWAY,
+				"ambiguous",
+				format!(
+					"target intent persisted but source handoff confirmation failed: {}",
+					error.message
+				),
+			)
+		})?;
 	if state.engine.has_sandbox(&name)
 		&& record
 			.params
@@ -1126,7 +1188,7 @@ async fn mesh_migrate_receive(
 	} else {
 		let installed = state
 			.transfer
-			.pull_template(
+			.pull_checkpoint(
 				state.transport.bulk_client(),
 				source_url,
 				digest.clone(),
@@ -1172,18 +1234,15 @@ async fn mesh_migrate_receive(
 			.acquire_writable_volume_leases(adopt_params.clone(), record.epoch)
 			.await,
 	)?;
-	let restored = match state
+	if let Err(err) = state
 		.engine
 		.migrate_adopt_target(sid.clone(), delta_dir.to_string_lossy().into_owned(), adopt_params)
 		.await
 	{
-		Ok(view) => view,
-		Err(err) => {
-			let _ = state.engine.teardown_candidate(sid, record.epoch).await;
-			let _ = state.leases.release_leases(lease_records).await;
-			return Err(MeshRouteError::from(err));
-		},
-	};
+		let _ = state.engine.teardown_candidate(sid, record.epoch).await;
+		let _ = state.leases.release_leases(lease_records).await;
+		return Err(MeshRouteError::from(err));
+	}
 	persist_target_migration_leases(
 		&*state.engine,
 		&*state.leases,
@@ -1207,10 +1266,35 @@ async fn mesh_migrate_receive(
 	)?;
 	state
 		.engine
-		.migrate_activate_target(sid, record.epoch)
+		.migrate_activate_target(sid.clone(), record.epoch)
 		.await
 		.map_err(MeshRouteError::from)?;
-	Ok(Json(apply_view_detail(restored, &record)))
+	let activated = map_mesh(state.engine.get_view(&sid))?;
+	Ok(Json(apply_view_detail(activated, &record)))
+}
+
+async fn mesh_migrate_claim(
+	State(state): State<MeshRouteState>,
+	request: Request<Body>,
+) -> RouteResult<Json<Value>> {
+	let headers = request.headers().clone();
+	require_mesh_auth(&state, &headers, true)?;
+	let mut body = json_object(request).await?;
+	let sid = take_string(&mut body, "sid");
+	let source_owner = take_string(&mut body, "source_owner");
+	let source_epoch = to_i64(body.remove("source_epoch")).unwrap_or(-1);
+	let target_owner = take_string(&mut body, "target_owner");
+	let target_epoch = to_i64(body.remove("target_epoch")).unwrap_or(-1);
+	let migration_id = take_string(&mut body, "migration_id");
+	map_mesh(state.records.confirm_migration_handoff(
+		&sid,
+		&source_owner,
+		source_epoch,
+		&target_owner,
+		target_epoch,
+		&migration_id,
+	))?;
+	Ok(Json(json!({"ok": true})))
 }
 
 /// Return whether this exact migration token committed on the target.  The
@@ -2172,6 +2256,12 @@ pub(crate) async fn migrate_sandbox_to(
 	record
 		.params
 		.insert("_mesh_migration_token".to_owned(), Value::String(migration_id.clone()));
+	record
+		.params
+		.insert(MIGRATION_SOURCE_OWNER_FIELD.to_owned(), Value::String(source_owner.clone()));
+	record
+		.params
+		.insert(MIGRATION_SOURCE_EPOCH_FIELD.to_owned(), json!(source_epoch));
 	record.owner.clone_from(&target);
 	record.epoch = epoch;
 	if let Err(error) = state.records.begin_migration_handoff(

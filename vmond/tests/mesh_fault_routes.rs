@@ -574,6 +574,13 @@ impl MeshRecordStore for FakeRecords {
 		self.records.lock().remove(sid);
 		Ok(())
 	}
+
+	fn notify_source_migration_claim<'a>(
+		&'a self,
+		_record: &'a CreateRecordWire,
+	) -> BoxFuture<'a, MeshResult<()>> {
+		Box::pin(async { Ok(()) })
+	}
 }
 
 #[derive(Default)]
@@ -619,6 +626,16 @@ impl MeshTemplateTransfer for FakeTransfer {
 		_token: String,
 	) -> BoxFuture<'a, MeshResult<String>> {
 		Box::pin(async { Err(MeshError::unreachable("template pull not configured")) })
+	}
+
+	fn pull_checkpoint<'a>(
+		&'a self,
+		_client: &'a reqwest::Client,
+		_peer_url: String,
+		_digest: String,
+		_token: String,
+	) -> BoxFuture<'a, MeshResult<String>> {
+		Box::pin(async { Err(MeshError::unreachable("checkpoint pull not configured")) })
 	}
 
 	fn pull_snapshot<'a>(

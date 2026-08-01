@@ -19,9 +19,8 @@ use std::{
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
-use super::bundle;
+use super::{bundle, replica_cache::cache_root_name};
 use crate::{EngineError, Result, home::state_dir, image::cas};
 
 const MARKER_NAME: &str = "agent-ready.json";
@@ -123,6 +122,26 @@ pub async fn pull_template(
 	digest: &str,
 	token: &str,
 ) -> Result<PathBuf> {
+	pull_indexed_bundle(client, peer_url, digest, token, IndexedDigest::Template).await
+}
+
+/// Fetch and CAS-index a migration checkpoint using its complete-tree digest.
+pub async fn pull_checkpoint(
+	client: &Client,
+	peer_url: &str,
+	digest: &str,
+	token: &str,
+) -> Result<PathBuf> {
+	pull_indexed_bundle(client, peer_url, digest, token, IndexedDigest::Checkpoint).await
+}
+
+async fn pull_indexed_bundle(
+	client: &Client,
+	peer_url: &str,
+	digest: &str,
+	token: &str,
+	digest_kind: IndexedDigest,
+) -> Result<PathBuf> {
 	let url = format!("{}/v1/templates/{digest}", peer_url.trim_end_matches('/'));
 	let templates = state_dir().join("templates");
 	fs::create_dir_all(&templates)?;
@@ -134,7 +153,7 @@ pub async fn pull_template(
 		Ok(()) => {
 			let digest = digest.to_owned();
 			let root = extract_root.clone();
-			tokio::task::spawn_blocking(move || install_pulled_template(&root, &digest))
+			tokio::task::spawn_blocking(move || install_pulled_indexed(&root, &digest, digest_kind))
 				.await
 				.map_err(|err| {
 					EngineError::engine(format!("mesh template install task failed: {err}"))
@@ -214,13 +233,10 @@ pub fn install_pulled_snapshot(
 		.and_then(|name| name.to_str())
 		.filter(|name| !name.is_empty() && *name != "." && *name != "..")
 		.ok_or_else(|| EngineError::invalid("replica snapshot has no valid root name"))?;
-	let cache_identity = if object_key.is_empty() {
-		digest
-	} else {
-		object_key
-	};
-	let cache_id = hex::encode(Sha256::digest(format!("{sid}\0{cache_identity}").as_bytes()));
-	let cache_root = state_dir().join("replicas").join("objects").join(cache_id);
+	let cache_root = state_dir()
+		.join("replicas")
+		.join("objects")
+		.join(cache_root_name(sid, object_key, digest));
 	fs::create_dir_all(&cache_root)?;
 	let target = cache_root.join(name);
 	if target.exists() {
@@ -233,22 +249,51 @@ pub fn install_pulled_snapshot(
 	Ok(target)
 }
 
-/// Verify and install an extracted template tree, checking that its stable
-/// CAS digest equals `digest` before replacing any local target.
+#[derive(Clone, Copy)]
+enum IndexedDigest {
+	Template,
+	Checkpoint,
+}
+
+impl IndexedDigest {
+	fn calculate(self, root: &Path) -> Result<String> {
+		match self {
+			Self::Template => cas::template_digest(root),
+			Self::Checkpoint => cas::snapshot_digest(root),
+		}
+	}
+
+	const fn mismatch(self) -> &'static str {
+		match self {
+			Self::Template => "pulled template digest mismatch",
+			Self::Checkpoint => "pulled migration checkpoint digest mismatch",
+		}
+	}
+}
+
+/// Verify, install, and CAS-index an extracted template tree.
 pub fn install_pulled_template(extract_root: &Path, digest: &str) -> Result<PathBuf> {
+	install_pulled_indexed(extract_root, digest, IndexedDigest::Template)
+}
+
+fn install_pulled_indexed(
+	extract_root: &Path,
+	digest: &str,
+	digest_kind: IndexedDigest,
+) -> Result<PathBuf> {
 	validate_digest(digest)?;
 	let templates = state_dir().join("templates");
 	fs::create_dir_all(&templates)?;
 
 	(|| {
 		let source = extracted_template_root(extract_root)?;
-		let actual = cas::template_digest(&source)?;
+		let actual = digest_kind.calculate(&source)?;
 		if actual != digest {
-			return Err(EngineError::invalid("pulled template digest mismatch"));
+			return Err(EngineError::invalid(digest_kind.mismatch()));
 		}
 		let target = templates.join(template_name_from_marker(&source, digest));
 		if target.exists() {
-			if target.is_dir() && cas::template_digest(&target).ok().as_deref() == Some(digest) {
+			if target.is_dir() && digest_kind.calculate(&target).ok().as_deref() == Some(digest) {
 				cas::index_template(&target, Some(digest))?;
 				return Ok(target);
 			}
