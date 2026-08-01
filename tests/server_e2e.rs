@@ -593,20 +593,20 @@ fn short_idle_override_wakes_long_default_scheduler() {
 		});
 
 	let deadline = Instant::now() + Duration::from_secs(8);
-	let suspended = loop {
+	let suspend_requested = loop {
 		let current = sandbox_view(&server, &id);
-		if current["status"] == "suspended" {
+		if current["desired_state"] == "suspended" {
 			break current;
 		}
 		assert!(
 			Instant::now() < deadline,
-			"1s VM idle override was not sampled under a 300s daemon default; view={current}; log \
-			 tail:\n{}",
+			"1s VM idle override did not request suspension under a 300s daemon default; \
+			 view={current}; log tail:\n{}",
 			server.log_tail()
 		);
 		thread::sleep(Duration::from_millis(100));
 	};
-	assert_eq!(suspended["idle_timeout_secs"], 1.0);
+	assert_eq!(suspend_requested["idle_timeout_secs"], 1.0);
 	remove_sandbox(&server, &id);
 }
 
