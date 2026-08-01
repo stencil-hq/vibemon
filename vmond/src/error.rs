@@ -10,7 +10,7 @@ use std::fmt;
 ///
 /// HTTP mapping (see the API layer): `not_found→404`, `not_running→409`,
 /// `busy→409`, `invalid→400`, `unsupported→501`, `unauthorized→401`,
-/// everything else `→503`.
+/// `forbidden→403`, and everything else `→503`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
 	NotFound,
@@ -19,6 +19,7 @@ pub enum ErrorCode {
 	Invalid,
 	Unsupported,
 	Unauthorized,
+	Forbidden,
 	/// Unclassified engine failure (maps to 503 like Python's bare
 	/// `EngineError`).
 	Engine,
@@ -34,6 +35,7 @@ impl ErrorCode {
 			Self::Invalid => "invalid",
 			Self::Unsupported => "unsupported",
 			Self::Unauthorized => "unauthorized",
+			Self::Forbidden => "forbidden",
 			Self::Engine => "engine_error",
 		}
 	}
@@ -73,6 +75,10 @@ impl EngineError {
 
 	pub fn unauthorized(message: impl Into<String>) -> Self {
 		Self::new(ErrorCode::Unauthorized, message)
+	}
+
+	pub fn forbidden(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::Forbidden, message)
 	}
 
 	pub fn engine(message: impl Into<String>) -> Self {

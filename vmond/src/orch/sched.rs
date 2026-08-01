@@ -76,9 +76,9 @@ const WORKER_CHANNELS: usize = 8;
 const ROUTE_WRITE_QUEUE_MAX: usize = 4_096;
 /// Maximum Redis `SET PX` commands written in one pipeline.
 const ROUTE_WRITE_BATCH_MAX: usize = 128;
-/// Maximum concurrently-executing BatchCreate items per stream.
+/// Maximum concurrently-executing `BatchCreate` items per stream.
 const BATCH_CONCURRENCY: usize = 4096;
-/// Buffered per-stream BatchCreate results awaiting the client.
+/// Buffered per-stream `BatchCreate` results awaiting the client.
 const BATCH_RESULT_QUEUE: usize = 256;
 /// Poll cadence while a `Watch(until_ready)` waits for an async route write.
 const WATCH_ROUTE_POLL: Duration = Duration::from_millis(100);
@@ -674,6 +674,8 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
+	type PtyAttachStream = BoxStream<pb::ExecOutput>;
+	type PtyOpenStream = BoxStream<pb::ExecOutput>;
 	type ShellStream = BoxStream<pb::ExecOutput>;
 	type WatchStream = BoxStream<pb::JsonView>;
 
@@ -853,6 +855,56 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 		client.extend(self.core.request(message)).await
 	}
 
+	async fn set_idle_timeout(
+		&self,
+		request: Request<pb::SetIdleTimeoutRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let message = request.into_inner();
+		let (_wid, url) = self.core.resolve_sandbox(&message.id).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		client.set_idle_timeout(self.core.request(message)).await
+	}
+
+	async fn resize(
+		&self,
+		request: Request<pb::ResizeSandboxRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let message = request.into_inner();
+		let (_wid, url) = self.core.resolve_sandbox(&message.id).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		client.resize(self.core.request(message)).await
+	}
+
+	async fn pty_list(
+		&self,
+		request: Request<pb::SandboxRef>,
+	) -> Result<Response<pb::PtySessionList>, Status> {
+		let message = request.into_inner();
+		let (_wid, url) = self.core.resolve_sandbox(&message.id).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		client.pty_list(self.core.request(message)).await
+	}
+
+	async fn pty_close(
+		&self,
+		request: Request<pb::PtyCloseRequest>,
+	) -> Result<Response<pb::PtySessionCloseResponse>, Status> {
+		let message = request.into_inner();
+		let (_wid, url) = self.core.resolve_sandbox(&message.id).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		client.pty_close(self.core.request(message)).await
+	}
+
+	async fn pty_exec(
+		&self,
+		request: Request<pb::PtyExecRequest>,
+	) -> Result<Response<pb::PtyExecResponse>, Status> {
+		let message = request.into_inner();
+		let (_wid, url) = self.core.resolve_sandbox(&message.id).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		client.pty_exec(self.core.request(message)).await
+	}
+
 	async fn metrics(
 		&self,
 		request: Request<pb::SandboxRef>,
@@ -910,6 +962,69 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 		let outbound = tokio_stream::once(first)
 			.chain(tokio_stream::StreamExt::filter_map(inbound, |frame| frame.ok()));
 		client.exec(self.core.request(outbound)).await.map(relay)
+	}
+
+	async fn pty_open(
+		&self,
+		request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyOpenStream>, Status> {
+		let mut inbound = request.into_inner();
+		let first = inbound
+			.message()
+			.await?
+			.ok_or_else(|| coded(Code::InvalidArgument, "invalid", false, "empty pty-open stream"))?;
+		let sid = match &first.input {
+			Some(pb::exec_input::Input::PtyOpen(open)) if !open.sandbox_id.is_empty() => {
+				open.sandbox_id.clone()
+			},
+			_ => {
+				return Err(coded(
+					Code::InvalidArgument,
+					"invalid",
+					false,
+					"first pty-open frame must be a pty_open payload naming a sandbox",
+				));
+			},
+		};
+		let (_wid, url) = self.core.resolve_sandbox(&sid).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		let outbound = tokio_stream::once(first)
+			.chain(tokio_stream::StreamExt::filter_map(inbound, |frame| frame.ok()));
+		client
+			.pty_open(self.core.request(outbound))
+			.await
+			.map(relay)
+	}
+
+	async fn pty_attach(
+		&self,
+		request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyAttachStream>, Status> {
+		let mut inbound = request.into_inner();
+		let first = inbound.message().await?.ok_or_else(|| {
+			coded(Code::InvalidArgument, "invalid", false, "empty pty-attach stream")
+		})?;
+		let sid = match &first.input {
+			Some(pb::exec_input::Input::PtyAttach(attach)) if !attach.sandbox_id.is_empty() => {
+				attach.sandbox_id.clone()
+			},
+			_ => {
+				return Err(coded(
+					Code::InvalidArgument,
+					"invalid",
+					false,
+					"first pty-attach frame must be a pty_attach payload naming a sandbox",
+				));
+			},
+		};
+		let (_wid, url) = self.core.resolve_sandbox(&sid).await?;
+		let mut client = self.core.sandbox_client(&url)?;
+		let outbound = tokio_stream::once(first)
+			.chain(tokio_stream::StreamExt::filter_map(inbound, |frame| frame.ok()));
+		client
+			.pty_attach(self.core.request(outbound))
+			.await
+			.map(relay)
 	}
 
 	async fn shell(

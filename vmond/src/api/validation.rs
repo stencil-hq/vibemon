@@ -1,4 +1,7 @@
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+	collections::HashMap,
+	net::{IpAddr, Ipv4Addr},
+};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -7,6 +10,7 @@ use super::error::{ApiError, ApiResult};
 use crate::{
 	engine::ExecRequest,
 	models::{ExecBody, ExtendBody, ForkBody, MAX_FORK_CLONES, NetworkBody, SandboxCreate},
+	registry::PersistencePolicy,
 };
 
 const ALLOWED_HA: &[&str] = &["async", "async+rerun", "off", "rerun"];
@@ -23,6 +27,10 @@ pub fn validate_create_value(value: &Value) -> ApiResult<()> {
 	non_negative_int(value, "pool_size")?;
 	non_negative_float(value, "timeout")?;
 	non_negative_int(value, "timeout_secs")?;
+	non_negative_float(value, "idle_timeout_secs")?;
+	non_negative_int(value, "activity_threshold_bytes")?;
+	validate_persistence_value(value.get("persistence"))?;
+	validate_nics_value(value.get("nics"))?;
 	if field_truthy(value, "remote_page_url")
 		|| field_truthy(value, "remote_page_token")
 		|| field_truthy(value, "remote_page_digest")
@@ -58,6 +66,16 @@ pub fn validate_create(body: &SandboxCreate) -> ApiResult<()> {
 	{
 		return Err(ApiError::invalid("timeout must be non-negative"));
 	}
+	if let Some(timeout) = body.idle_timeout_secs
+		&& (!timeout.is_finite() || timeout < 0.0)
+	{
+		return Err(ApiError::invalid("idle_timeout_secs must be non-negative"));
+	}
+	if let Some(PersistencePolicy::Sticky { priority }) = &body.persistence
+		&& *priority > 10
+	{
+		return Err(ApiError::invalid("sticky persistence priority must be between 0 and 10"));
+	}
 	if body.block_network && body.ports.as_ref().is_some_and(|ports| !ports.is_empty()) {
 		return Err(ApiError::invalid("ports cannot be exposed when block_network=True"));
 	}
@@ -69,9 +87,85 @@ pub fn validate_create(body: &SandboxCreate) -> ApiResult<()> {
 	validate_cidr_strings("egress_allow", body.egress_allow.as_deref())?;
 	validate_cidr_strings("inbound_cidr_allowlist", body.inbound_cidr_allowlist.as_deref())?;
 	validate_domain_strings("egress_allow_domains", body.egress_allow_domains.as_deref())?;
+	validate_nics(body.nics.as_deref())?;
 	validate_ha_str(body.ha.as_deref())?;
 	validate_arch_str(body.arch.as_deref())?;
 	Ok(())
+}
+
+fn validate_persistence_value(value: Option<&Value>) -> ApiResult<()> {
+	let Some(value) = value else {
+		return Ok(());
+	};
+	let policy = serde_json::from_value::<PersistencePolicy>(value.clone())
+		.map_err(|_| ApiError::invalid("invalid persistence policy"))?;
+	if policy
+		.sticky_priority()
+		.is_some_and(|priority| priority > 10)
+	{
+		return Err(ApiError::invalid("sticky persistence priority must be between 0 and 10"));
+	}
+	Ok(())
+}
+
+fn validate_nics_value(value: Option<&Value>) -> ApiResult<()> {
+	let Some(value) = value.filter(|value| !value.is_null()) else {
+		return Ok(());
+	};
+	let Some(items) = value.as_array() else {
+		return Err(ApiError::invalid("invalid request"));
+	};
+	if items.len() > 1 {
+		return Err(ApiError::invalid("vmon VMs have a single NIC"));
+	}
+	for item in items {
+		let Some(item) = item.as_object() else {
+			return Err(ApiError::invalid("invalid VPC NIC"));
+		};
+		let vpc = item.get("vpc").and_then(Value::as_str).unwrap_or_default();
+		if !valid_vpc_id(vpc) {
+			return Err(ApiError::invalid("VPC NIC vpc must be a vpc-<8hex> identifier"));
+		}
+		if item.get("default").and_then(Value::as_bool) != Some(true) {
+			return Err(ApiError::invalid("vmon VMs have a single NIC"));
+		}
+		match item.get("ipv4") {
+			Some(Value::Bool(true)) => {},
+			Some(Value::String(address)) if address.parse::<Ipv4Addr>().is_ok() => {},
+			_ => {
+				return Err(ApiError::invalid("VPC NIC ipv4 must be a valid IPv4 address or true"));
+			},
+		}
+	}
+	Ok(())
+}
+
+fn validate_nics(nics: Option<&[crate::models::NicSpec]>) -> ApiResult<()> {
+	if nics.is_some_and(|nics| nics.len() > 1) {
+		return Err(ApiError::invalid("vmon VMs have a single NIC"));
+	}
+	for nic in nics.unwrap_or_default() {
+		if !nic.default {
+			return Err(ApiError::invalid("vmon VMs have a single NIC"));
+		}
+		if !valid_vpc_id(&nic.vpc) {
+			return Err(ApiError::invalid("VPC NIC vpc must be a vpc-<8hex> identifier"));
+		}
+		match &nic.ipv4 {
+			Value::Bool(true) => {},
+			Value::String(address) if address.parse::<Ipv4Addr>().is_ok() => {},
+			_ => {
+				return Err(ApiError::invalid("VPC NIC ipv4 must be a valid IPv4 address or true"));
+			},
+		}
+	}
+	Ok(())
+}
+
+fn valid_vpc_id(value: &str) -> bool {
+	value.len() == 12
+		&& value.starts_with("vpc-")
+		&& value[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn validate_exec(body: &ExecBody) -> ApiResult<ExecRequest> {

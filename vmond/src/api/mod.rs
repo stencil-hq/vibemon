@@ -71,6 +71,7 @@ mod tests {
 		suspends:           Vec<String>,
 		histories:          Vec<String>,
 		rollbacks:          Vec<(String, String)>,
+		idle_timeouts:      Vec<(String, f64)>,
 		snapshot_deletes:   Vec<String>,
 		credential_lists:   Vec<String>,
 		credential_puts:    Vec<(String, String, String)>,
@@ -132,6 +133,7 @@ mod tests {
 				histories:          self.histories.clone(),
 				rollbacks:          self.rollbacks.clone(),
 				snapshot_deletes:   self.snapshot_deletes.clone(),
+				idle_timeouts:      self.idle_timeouts.clone(),
 				credential_lists:   self.credential_lists.clone(),
 				credential_puts:    self.credential_puts.clone(),
 				credential_deletes: self.credential_deletes.clone(),
@@ -233,6 +235,16 @@ mod tests {
 
 		fn extend(&self, _id: &str, _secs: u64) -> Result<Value> {
 			Self::unexpected("extend")
+		}
+
+		fn set_idle_timeout(&self, id: &str, secs: f64) -> Result<Value> {
+			self
+				.captured
+				.lock()
+				.expect("captured inputs")
+				.idle_timeouts
+				.push((id.to_owned(), secs));
+			Ok(json!({"id": id, "idle_timeout_secs": secs}))
 		}
 
 		fn metrics(&self, _id: &str) -> Result<Value> {
@@ -688,6 +700,40 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn api_idle_timeout_requires_presence_and_forwards_zero() {
+		let engine = Arc::new(ScriptedEngine::new());
+		let api = ApiHarness::start(engine.clone()).await;
+		let mut sandboxes = pb::sandbox_service_client::SandboxServiceClient::new(api.channel());
+
+		let response = sandboxes
+			.set_idle_timeout(authed(
+				pb::SetIdleTimeoutRequest {
+					id:                "sb".to_owned(),
+					idle_timeout_secs: Some(0.0),
+				},
+				"client-token",
+			))
+			.await
+			.expect("zero disables idle timeout")
+			.into_inner();
+		let view: Value = serde_json::from_str(&response.json).expect("idle timeout view JSON");
+		assert_eq!(view, json!({"id": "sb", "idle_timeout_secs": 0.0}));
+
+		let status = sandboxes
+			.set_idle_timeout(authed(
+				pb::SetIdleTimeoutRequest {
+					id:                "sb".to_owned(),
+					idle_timeout_secs: None,
+				},
+				"client-token",
+			))
+			.await
+			.expect_err("missing timeout rejected");
+		assert_eq!(status.code(), Code::InvalidArgument);
+		assert_eq!(engine.captures().idle_timeouts, vec![("sb".to_owned(), 0.0)]);
+	}
+
+	#[tokio::test]
 	async fn api_tenant_create_scopes_identity_and_rejects_host_resources() {
 		let engine = Arc::new(ScriptedEngine::new());
 		engine.set_create_response(json!({"id": "tenant-sandbox", "status": "running"}));
@@ -782,6 +828,7 @@ mod tests {
 			(ErrorCode::Invalid, Code::InvalidArgument),
 			(ErrorCode::Unsupported, Code::Unimplemented),
 			(ErrorCode::Unauthorized, Code::Unauthenticated),
+			(ErrorCode::Forbidden, Code::PermissionDenied),
 			(ErrorCode::Engine, Code::Unavailable),
 		];
 

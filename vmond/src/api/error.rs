@@ -150,6 +150,7 @@ impl From<EngineError> for ApiError {
 			ErrorCode::Invalid => StatusCode::BAD_REQUEST,
 			ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
 			ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+			ErrorCode::Forbidden => StatusCode::FORBIDDEN,
 			ErrorCode::Engine => StatusCode::SERVICE_UNAVAILABLE,
 		};
 		let mut err = Self::new(status, value.code.as_str(), value.message);

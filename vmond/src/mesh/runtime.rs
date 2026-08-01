@@ -1795,6 +1795,9 @@ mod tests {
 				("s3_mounts".to_owned(), json!({"/mnt/data": "s3://bucket/prefix"})),
 				("owner_tenant".to_owned(), json!("tenant-a")),
 				("encryption_key_id".to_owned(), json!("key-a")),
+				("idle_timeout_secs".to_owned(), json!(0.0)),
+				("activity_threshold_bytes".to_owned(), json!(512)),
+				("persistence".to_owned(), json!({"type": "ephemeral"})),
 				("secrets".to_owned(), json!({"token": "must-not-persist"})),
 				("status".to_owned(), json!("running")),
 			]),
@@ -1806,6 +1809,9 @@ mod tests {
 		assert_eq!(params.get("s3_mounts"), Some(&json!({"/mnt/data": "s3://bucket/prefix"})));
 		assert_eq!(params.get("owner_tenant"), Some(&json!("tenant-a")));
 		assert_eq!(params.get("encryption_key_id"), Some(&json!("key-a")));
+		assert_eq!(params.get("idle_timeout_secs"), Some(&json!(0.0)));
+		assert_eq!(params.get("activity_threshold_bytes"), Some(&json!(512)));
+		assert_eq!(params.get("persistence"), Some(&json!({"type": "ephemeral"})));
 		assert!(!params.contains_key("secrets"));
 		assert!(!params.contains_key("status"));
 		assert_eq!(ha, "active");
@@ -5028,6 +5034,7 @@ fn mesh_to_engine(error: MeshError) -> EngineError {
 		"busy" | "conflict" => ErrorCode::Busy,
 		"unsupported" => ErrorCode::Unsupported,
 		"unauthorized" => ErrorCode::Unauthorized,
+		"forbidden" => ErrorCode::Forbidden,
 		"invalid" | "arch_required" => ErrorCode::Invalid,
 		_ => ErrorCode::Engine,
 	};
@@ -5068,6 +5075,9 @@ fn sanitize_sandbox_params(mut params: Map<String, Value>) -> Map<String, Value>
 		"disk_mb",
 		"timeout",
 		"timeout_secs",
+		"idle_timeout_secs",
+		"activity_threshold_bytes",
+		"persistence",
 		"workdir",
 		"env",
 		"credentials",

@@ -1,4 +1,7 @@
-use std::io::{self, Read, Write};
+use std::{
+	collections::VecDeque,
+	io::{self, Read, Write},
+};
 
 pub const MAX_PAYLOAD_LEN: usize = 1 << 20;
 pub const HEADER_LEN: usize = 9;
@@ -18,6 +21,54 @@ pub const FRAME_STDERR: u8 = 4;
 pub const FRAME_EXIT: u8 = 5;
 pub const FRAME_RESP: u8 = 6;
 pub const FRAME_KILL: u8 = 7;
+
+pub const OP_HELLO: &str = "hello";
+pub const PTY_SCROLLBACK_LIMIT: usize = 1 << 20;
+
+/// Identifies a stream within one host connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtyBinding {
+	pub epoch:    u64,
+	pub frame_id: u32,
+}
+
+/// Byte-bounded PTY history. Oldest bytes are discarded first.
+#[derive(Debug)]
+pub struct Scrollback {
+	bytes: VecDeque<u8>,
+	limit: usize,
+}
+
+impl Scrollback {
+	pub const fn new(limit: usize) -> Self {
+		Self { bytes: VecDeque::new(), limit }
+	}
+
+	pub fn push(&mut self, chunk: &[u8]) {
+		if self.limit == 0 {
+			self.bytes.clear();
+			return;
+		}
+		if chunk.len() >= self.limit {
+			self.bytes.clear();
+			self
+				.bytes
+				.extend(chunk[chunk.len() - self.limit..].iter().copied());
+			return;
+		}
+		let overflow = self
+			.bytes
+			.len()
+			.saturating_add(chunk.len())
+			.saturating_sub(self.limit);
+		self.bytes.drain(..overflow);
+		self.bytes.extend(chunk.iter().copied());
+	}
+
+	pub fn snapshot(&self) -> Vec<u8> {
+		self.bytes.iter().copied().collect()
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -190,6 +241,7 @@ mod tests {
 		// the reader scans to the next SYNC marker and returns the following frame.
 		let mut bytes = Vec::new();
 		bytes.extend_from_slice(&((MAX_PAYLOAD_LEN as u32) + 1).to_le_bytes());
+
 		bytes.push(FRAME_REQ);
 		bytes.extend_from_slice(&7u32.to_le_bytes());
 		bytes.extend_from_slice(&SYNC);
@@ -197,6 +249,23 @@ mod tests {
 
 		let frame = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
 		assert_eq!(frame, Frame::new(FRAME_STDOUT, 9, b"ok".to_vec()));
+	}
+	#[test]
+	fn scrollback_discards_oldest_bytes_at_bound() {
+		let mut ring = Scrollback::new(5);
+		ring.push(b"abc");
+		ring.push(b"defg");
+		assert_eq!(ring.snapshot(), b"cdefg");
+		ring.push(b"012345");
+		assert_eq!(ring.snapshot(), b"12345");
+	}
+
+	#[test]
+	fn pty_binding_includes_connection_epoch() {
+		let stale = PtyBinding { epoch: 7, frame_id: 1 };
+		let current = PtyBinding { epoch: 8, frame_id: 1 };
+		assert_ne!(stale, current);
+		assert_eq!(current, PtyBinding { epoch: 8, frame_id: 1 });
 	}
 
 	#[test]

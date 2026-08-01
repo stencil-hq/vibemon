@@ -10,9 +10,11 @@ pub mod agent;
 pub mod control;
 pub(crate) mod diskdelta;
 mod facade;
+pub mod pty;
 pub mod s3proxy;
 pub mod spawn;
 pub(crate) mod staging_gc;
+pub mod vpc;
 
 use std::collections::HashMap;
 
@@ -188,6 +190,16 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value>;
 	fn pause(&self, id: &str) -> Result<Value>;
 	fn resume(&self, id: &str) -> Result<Value>;
+	fn resize(
+		&self,
+		id: &str,
+		cpus: Option<u32>,
+		memory_mib: Option<u32>,
+		disk_mb: Option<u64>,
+	) -> Result<Value> {
+		let _ = (id, cpus, memory_mib, disk_mb);
+		Err(EngineError::unsupported("sandbox resizing is unavailable"))
+	}
 	/// Atomically claim an expired durable suspended marker and install only its
 	/// non-serving local projection. Callers must invoke this solely after
 	/// owner routing proves the recorded owner unavailable, then call `resume`
@@ -203,6 +215,11 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn rollback(&self, id: &str, recovery_point: &str) -> Result<Value>;
 	/// Returns `{"deadline_unix": …}`.
 	fn extend(&self, id: &str, secs: u64) -> Result<Value>;
+	/// Replace and rearm one sandbox's network-idle suspension policy.
+	fn set_idle_timeout(&self, id: &str, secs: f64) -> Result<Value> {
+		let _ = (id, secs);
+		Err(EngineError::unsupported("runtime idle-timeout updates are unavailable"))
+	}
 	fn metrics(&self, id: &str) -> Result<Value>;
 
 	// -- console / logs ---------------------------------------------------
@@ -217,6 +234,29 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn exec_capture(&self, id: &str, req: ExecRequest) -> Result<ExecCapture>;
 	/// Streaming exec for the WS protocol (§2.4).
 	fn exec_stream(&self, id: &str, req: ExecRequest) -> Result<ExecStream>;
+	/// Open and attach to a persistent guest PTY session.
+	fn pty_open(&self, _id: &str, _params: Value) -> Result<pty::PtyStream> {
+		Err(EngineError::unsupported("persistent PTYs are unavailable"))
+	}
+	/// Reattach to a persistent guest PTY session.
+	fn pty_attach(&self, _id: &str, _params: Value) -> Result<pty::PtyStream> {
+		Err(EngineError::unsupported("persistent PTYs are unavailable"))
+	}
+	fn pty_list(&self, _id: &str) -> Result<Vec<Value>> {
+		Err(EngineError::unsupported("persistent PTYs are unavailable"))
+	}
+	fn pty_close(&self, _id: &str, _session_id: &str) -> Result<Value> {
+		Err(EngineError::unsupported("persistent PTYs are unavailable"))
+	}
+	fn pty_exec(
+		&self,
+		_id: &str,
+		_session_id: &str,
+		_command: &str,
+		_timeout: f64,
+	) -> Result<ExecCapture> {
+		Err(EngineError::unsupported("persistent PTYs are unavailable"))
+	}
 	/// Boot-or-attach an interactive shell (`WS /v1/shell` semantics; params
 	/// are the loose query/first-frame shell parameters).
 	fn shell_start(&self, params: Value) -> Result<ShellSession>;
@@ -237,6 +277,20 @@ pub trait EngineApi: Send + Sync + 'static {
 	fn tunnels(&self, id: &str) -> Result<Value>;
 	/// Host target `(ip, port)` for the tunnel HTTP/WS proxy.
 	fn tunnel_target(&self, id: &str, port: u16) -> Result<(String, u16)>;
+	fn vpc_create(
+		&self,
+		_tenant: &str,
+		_name: Option<&str>,
+		_cidr: Option<&str>,
+	) -> Result<vpc::Vpc> {
+		Err(EngineError::unsupported("VPCs are unavailable"))
+	}
+	fn vpc_list(&self, _tenant: &str) -> Result<Vec<vpc::Vpc>> {
+		Err(EngineError::unsupported("VPCs are unavailable"))
+	}
+	fn vpc_delete(&self, _tenant: &str, _id: &str) -> Result<()> {
+		Err(EngineError::unsupported("VPCs are unavailable"))
+	}
 
 	// -- snapshots --------------------------------------------------------
 	/// Machine snapshot -> `{"snapshot": name, "dir": path}`.

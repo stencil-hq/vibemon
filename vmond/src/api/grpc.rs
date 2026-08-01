@@ -1,6 +1,6 @@
 //! gRPC surface of the v1 API (proto/vmon/v1/api.proto).
 //!
-//! Ten tonic services implemented against [`EngineApi`] or their dedicated
+//! Eleven tonic services implemented against [`EngineApi`] or their dedicated
 //! domains, mounted into the axum router next to the kept HTTP routes (healthz,
 //! metrics, SSE, WS, ports proxy, static web). Every RPC failure is a gRPC
 //! status carrying the stable vmond error code in `vmon-code` response
@@ -36,7 +36,9 @@ use crate::{
 		state::{ApiState, PRINCIPAL_KEY_HEADER, PRINCIPAL_ROLE_HEADER, PRINCIPAL_TENANT_HEADER},
 		validation,
 	},
-	engine::{EngineApi, ExecExit, ExecStream as EngineExecStream},
+	engine::{
+		EngineApi, ExecExit, ExecStream as EngineExecStream, pty::PtyStream as EnginePtyStream,
+	},
 	image::{self, normalize_oci_arch},
 	mesh::{
 		proxy::{self, MeshError, MeshPeer, OwnerProxyDecision, OwnerRecord},
@@ -154,6 +156,7 @@ pub fn status_from(err: &ApiError) -> Status {
 	let code = match err.code() {
 		"not_found" => Code::NotFound,
 		"invalid" => Code::InvalidArgument,
+		"forbidden" => Code::PermissionDenied,
 		"unauthorized" if err.status() == axum::http::StatusCode::FORBIDDEN => Code::PermissionDenied,
 		"unauthorized" => Code::Unauthenticated,
 		"not_running" | "actor_lost" | "unavailable_secret" | "ha_unavailable" => {
@@ -213,6 +216,11 @@ pub(super) fn service(state: ApiState) -> Routes {
 		)
 		.add_service(
 			pb::pool_service_server::PoolServiceServer::new(api.clone())
+				.max_decoding_message_size(MAX_MESSAGE_SIZE)
+				.max_encoding_message_size(MAX_MESSAGE_SIZE),
+		)
+		.add_service(
+			pb::vpc_service_server::VpcServiceServer::new(api.clone())
 				.max_decoding_message_size(MAX_MESSAGE_SIZE)
 				.max_encoding_message_size(MAX_MESSAGE_SIZE),
 		)
@@ -1235,7 +1243,10 @@ fn pump_exec(
 						.and_then(|(rows, cols)| control.resize(rows, cols).map_err(ApiError::from)),
 					// Mid-stream request payloads are ignored, like the WS pump.
 					Some(
-						pb::exec_input::Input::Start(_) | pb::exec_input::Input::ShellParamsJson(_),
+						pb::exec_input::Input::Start(_)
+						| pb::exec_input::Input::ShellParamsJson(_)
+						| pb::exec_input::Input::PtyOpen(_)
+						| pb::exec_input::Input::PtyAttach(_),
 					)
 					| None => Ok(()),
 				};
@@ -1252,6 +1263,90 @@ fn pump_exec(
 		shell_cleanup(&engine, cleanup).await;
 	});
 	Box::pin(ReceiverStream::new(out_rx))
+}
+
+fn pty_session(value: &Value) -> Result<pb::PtySession, Status> {
+	let field = |name| value.get(name);
+	Ok(pb::PtySession {
+		session_id:             field("session_id")
+			.and_then(Value::as_str)
+			.ok_or_else(|| Status::internal("agent omitted PTY session_id"))?
+			.to_owned(),
+		running:                field("running").and_then(Value::as_bool).unwrap_or(true),
+		exit_code:              field("exit_code").and_then(Value::as_i64),
+		cols:                   field("cols").and_then(Value::as_u64).unwrap_or(80) as u32,
+		rows:                   field("rows").and_then(Value::as_u64).unwrap_or(24) as u32,
+		exec:                   field("exec").and_then(Value::as_str).map(str::to_owned),
+		created_at_unix_millis: field("created_at_unix_millis")
+			.and_then(Value::as_u64)
+			.unwrap_or_default() as i64,
+		attached_count:         field("attached_count")
+			.and_then(Value::as_u64)
+			.unwrap_or_default() as u32,
+		suspended:              field("suspended").and_then(Value::as_bool).unwrap_or(false),
+	})
+}
+
+fn pump_pty(
+	stream: EnginePtyStream,
+	mut inbound: Streaming<pb::ExecInput>,
+) -> Result<BoxStream<pb::ExecOutput>, Status> {
+	let EnginePtyStream { session, mut control, stdout, exit } = stream;
+	let metadata = pty_session(&session)?;
+	let (out_tx, out_rx) = mpsc::channel::<Result<pb::ExecOutput, Status>>(32);
+	tokio::spawn(async move {
+		if out_tx
+			.send(Ok(pb::ExecOutput { output: Some(pb::exec_output::Output::Pty(metadata)) }))
+			.await
+			.is_err()
+		{
+			let _ = control.detach();
+			return;
+		}
+		let (events_tx, mut events_rx) = mpsc::channel::<pb::ExecOutput>(32);
+		let stdout_forward = spawn_chunk_forward(stdout, pb::Stream::Console, events_tx.clone());
+		thread::spawn(move || {
+			if let Ok(exit) = exit.recv() {
+				let _ = stdout_forward.join();
+				let _ = events_tx.blocking_send(exit_output(exit));
+			}
+		});
+		let output_tx = out_tx.clone();
+		let output = async move {
+			while let Some(event) = events_rx.recv().await {
+				let exited = matches!(event.output, Some(pb::exec_output::Output::Exit(_)));
+				if output_tx.send(Ok(event)).await.is_err() || exited {
+					break;
+				}
+			}
+		};
+		let input = async move {
+			loop {
+				let Ok(Some(frame)) = inbound.message().await else {
+					break;
+				};
+				let result: ApiResult<()> = match frame.input {
+					Some(pb::exec_input::Input::Stdin(data)) => {
+						control.write(&data).map_err(ApiError::from)
+					},
+					Some(pb::exec_input::Input::Resize(resize)) => resize_dims(resize)
+						.and_then(|(rows, cols)| control.resize(rows, cols).map_err(ApiError::from)),
+					Some(pb::exec_input::Input::Eof(_)) => break,
+					_ => Ok(()),
+				};
+				if let Err(error) = result {
+					let _ = out_tx.send(Err(status_from(&error))).await;
+					break;
+				}
+			}
+			let _ = control.detach();
+		};
+		tokio::select! {
+			() = output => {},
+			() = input => {},
+		}
+	});
+	Ok(Box::pin(ReceiverStream::new(out_rx)))
 }
 
 #[tonic::async_trait]
@@ -2156,10 +2251,12 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
+	type PtyAttachStream = BoxStream<pb::ExecOutput>;
+	type PtyOpenStream = BoxStream<pb::ExecOutput>;
 	type ShellStream = BoxStream<pb::ExecOutput>;
 	type WatchStream = BoxStream<pb::JsonView>;
 
-	/// BatchCreate: run each streamed item through the unary create pipeline
+	/// `BatchCreate`: run each streamed item through the unary create pipeline
 	/// concurrently, reporting per-item outcomes as they finish (out of
 	/// order). The stream itself only fails on transport or auth errors.
 	async fn batch_create(
@@ -2224,7 +2321,7 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		Ok(Response::new(Box::pin(ReceiverStream::new(out))))
 	}
 
-	/// Watch one sandbox's lifecycle as JsonView frames.
+	/// Watch one sandbox's lifecycle as `JsonView` frames.
 	///
 	/// The bus is subscribed before the initial `get`, so no transition is
 	/// lost between the snapshot frame and the event stream. Unknown sids
@@ -2358,6 +2455,19 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		Ok(Response::new(json_view(&view)))
 	}
 
+	async fn resize(
+		&self,
+		request: Request<pb::ResizeSandboxRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let (metadata, _, message) = request.into_parts();
+		forward_to_owner!(self, metadata, &message.id, message, resize);
+		let pb::ResizeSandboxRequest { id, cpus, memory_mib, disk_mb } = message;
+		let view = self
+			.engine_call(move |engine| engine.resize(&id, cpus, memory_mib, disk_mb))
+			.await?;
+		Ok(Response::new(json_view(&view)))
+	}
+
 	async fn remove(
 		&self,
 		request: Request<pb::SandboxRef>,
@@ -2472,6 +2582,21 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 		Ok(Response::new(json_view(&view)))
 	}
 
+	async fn set_idle_timeout(
+		&self,
+		request: Request<pb::SetIdleTimeoutRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let (metadata, _, message) = request.into_parts();
+		forward_to_owner!(self, metadata, &message.id, message, set_idle_timeout);
+		let pb::SetIdleTimeoutRequest { id, idle_timeout_secs } = message;
+		let secs = idle_timeout_secs
+			.ok_or_else(|| Status::from(ApiError::invalid("idle_timeout_secs is required")))?;
+		let view = self
+			.engine_call(move |engine| engine.set_idle_timeout(&id, secs))
+			.await?;
+		Ok(Response::new(json_view(&view)))
+	}
+
 	async fn metrics(
 		&self,
 		request: Request<pb::SandboxRef>,
@@ -2569,6 +2694,145 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 			.engine_call(move |engine| engine.exec_stream(&id, exec_request))
 			.await?;
 		Ok(Response::new(pump_exec(self.state.engine.clone(), stream, inbound, None, None)))
+	}
+
+	async fn pty_open(
+		&self,
+		request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyOpenStream>, Status> {
+		let principal = request_principal(&request)?;
+		let (metadata, _, mut inbound) = request.into_parts();
+		let Some(pb::exec_input::Input::PtyOpen(start)) =
+			inbound.message().await?.and_then(|frame| frame.input)
+		else {
+			return Err(Status::invalid_argument("PTY open requires pty_open first frame"));
+		};
+		if start.sandbox_id.is_empty() {
+			return Err(Status::invalid_argument("PTY open requires sandbox_id"));
+		}
+		self
+			.authorize_sandbox(&principal, &start.sandbox_id)
+			.await?;
+		if let Some(target) = self.forward_target(&metadata, &start.sandbox_id).await? {
+			let first = pb::ExecInput { input: Some(pb::exec_input::Input::PtyOpen(start)) };
+			let outbound = tokio_stream::once(first).chain(inbound.filter_map(|frame| frame.ok()));
+			return target
+				.sandbox_client()
+				.pty_open(target.request(outbound))
+				.await
+				.map(relay_stream);
+		}
+		let id = start.sandbox_id;
+		let params = json!({
+			"session_id": start.session_id,
+			"cols": start.cols,
+			"rows": start.rows,
+			"exec": start.exec,
+			"env": start.env,
+			"workdir": start.workdir,
+		});
+		let stream = self
+			.engine_call(move |engine| engine.pty_open(&id, params))
+			.await?;
+		Ok(Response::new(pump_pty(stream, inbound)?))
+	}
+
+	async fn pty_attach(
+		&self,
+		request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyAttachStream>, Status> {
+		let principal = request_principal(&request)?;
+		let (metadata, _, mut inbound) = request.into_parts();
+		let Some(pb::exec_input::Input::PtyAttach(start)) =
+			inbound.message().await?.and_then(|frame| frame.input)
+		else {
+			return Err(Status::invalid_argument("PTY attach requires pty_attach first frame"));
+		};
+		if start.sandbox_id.is_empty() || start.session_id.is_empty() {
+			return Err(Status::invalid_argument("PTY attach requires sandbox_id and session_id"));
+		}
+		self
+			.authorize_sandbox(&principal, &start.sandbox_id)
+			.await?;
+		if let Some(target) = self.forward_target(&metadata, &start.sandbox_id).await? {
+			let first = pb::ExecInput { input: Some(pb::exec_input::Input::PtyAttach(start)) };
+			let outbound = tokio_stream::once(first).chain(inbound.filter_map(|frame| frame.ok()));
+			return target
+				.sandbox_client()
+				.pty_attach(target.request(outbound))
+				.await
+				.map(relay_stream);
+		}
+		let id = start.sandbox_id;
+		let params = json!({
+			"session_id": start.session_id,
+			"cols": start.cols,
+			"rows": start.rows,
+		});
+		let stream = self
+			.engine_call(move |engine| engine.pty_attach(&id, params))
+			.await?;
+		Ok(Response::new(pump_pty(stream, inbound)?))
+	}
+
+	async fn pty_list(
+		&self,
+		request: Request<pb::SandboxRef>,
+	) -> Result<Response<pb::PtySessionList>, Status> {
+		let principal = request_principal(&request)?;
+		let (metadata, _, message) = request.into_parts();
+		self.authorize_sandbox(&principal, &message.id).await?;
+		forward_to_owner!(self, metadata, &message.id, message, pty_list);
+		let id = message.id;
+		let sessions = self.engine_call(move |engine| engine.pty_list(&id)).await?;
+		Ok(Response::new(pb::PtySessionList {
+			sessions: sessions.iter().map(pty_session).collect::<Result<_, _>>()?,
+		}))
+	}
+
+	async fn pty_close(
+		&self,
+		request: Request<pb::PtyCloseRequest>,
+	) -> Result<Response<pb::PtySessionCloseResponse>, Status> {
+		let principal = request_principal(&request)?;
+		let (metadata, _, message) = request.into_parts();
+		self.authorize_sandbox(&principal, &message.id).await?;
+		forward_to_owner!(self, metadata, &message.id, message, pty_close);
+		let id = message.id;
+		let session_id = message.session_id;
+		let response = self
+			.engine_call(move |engine| engine.pty_close(&id, &session_id))
+			.await?;
+		Ok(Response::new(pb::PtySessionCloseResponse {
+			session_id: response
+				.get("session_id")
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_owned(),
+			exit_code:  response.get("exit_code").and_then(Value::as_i64),
+		}))
+	}
+
+	async fn pty_exec(
+		&self,
+		request: Request<pb::PtyExecRequest>,
+	) -> Result<Response<pb::PtyExecResponse>, Status> {
+		let principal = request_principal(&request)?;
+		let (metadata, _, message) = request.into_parts();
+		self.authorize_sandbox(&principal, &message.id).await?;
+		forward_to_owner!(self, metadata, &message.id, message, pty_exec);
+		let id = message.id;
+		let session_id = message.session_id;
+		let command = message.command;
+		let timeout = message.timeout.unwrap_or(60.0);
+		let capture = self
+			.engine_call(move |engine| engine.pty_exec(&id, &session_id, &command, timeout))
+			.await?;
+		Ok(Response::new(pb::PtyExecResponse {
+			code:   capture.exit,
+			stdout: capture.stdout,
+			stderr: capture.stderr,
+		}))
 	}
 
 	async fn shell(
@@ -2995,6 +3259,64 @@ impl pb::volume_service_server::VolumeService for GrpcApi {
 	}
 }
 
+fn vpc_tenant(principal: &Principal) -> String {
+	if principal.is_admin() {
+		"default".to_owned()
+	} else {
+		principal.tenant.clone()
+	}
+}
+
+fn vpc_message(vpc: crate::engine::vpc::Vpc) -> pb::Vpc {
+	pb::Vpc {
+		id:                     vpc.id,
+		name:                   vpc.name,
+		cidr:                   vpc.cidr,
+		created_at_unix_millis: i64::try_from(vpc.created_at_unix_millis).unwrap_or(i64::MAX),
+	}
+}
+
+#[tonic::async_trait]
+impl pb::vpc_service_server::VpcService for GrpcApi {
+	async fn create(
+		&self,
+		request: Request<pb::VpcCreateRequest>,
+	) -> Result<Response<pb::Vpc>, Status> {
+		let tenant = vpc_tenant(&request_principal(&request)?);
+		let pb::VpcCreateRequest { name, cidr } = request.into_inner();
+		let vpc = self
+			.engine_call(move |engine| {
+				engine.vpc_create(
+					&tenant,
+					(!name.is_empty()).then_some(name.as_str()),
+					(!cidr.is_empty()).then_some(cidr.as_str()),
+				)
+			})
+			.await?;
+		Ok(Response::new(vpc_message(vpc)))
+	}
+
+	async fn list(
+		&self,
+		request: Request<pb::ListVpcsRequest>,
+	) -> Result<Response<pb::VpcList>, Status> {
+		let tenant = vpc_tenant(&request_principal(&request)?);
+		let vpcs = self
+			.engine_call(move |engine| engine.vpc_list(&tenant))
+			.await?;
+		Ok(Response::new(pb::VpcList { vpcs: vpcs.into_iter().map(vpc_message).collect() }))
+	}
+
+	async fn delete(&self, request: Request<pb::VpcRef>) -> Result<Response<pb::Ok>, Status> {
+		let tenant = vpc_tenant(&request_principal(&request)?);
+		let id = request.into_inner().id;
+		self
+			.engine_call(move |engine| engine.vpc_delete(&tenant, &id))
+			.await?;
+		Ok(Response::new(pb::Ok {}))
+	}
+}
+
 #[tonic::async_trait]
 impl pb::pool_service_server::PoolService for GrpcApi {
 	async fn list(
@@ -3086,6 +3408,7 @@ mod tests {
 			(ErrorCode::NotFound, Code::NotFound),
 			(ErrorCode::Invalid, Code::InvalidArgument),
 			(ErrorCode::Unauthorized, Code::Unauthenticated),
+			(ErrorCode::Forbidden, Code::PermissionDenied),
 			(ErrorCode::NotRunning, Code::FailedPrecondition),
 			(ErrorCode::Busy, Code::Aborted),
 			(ErrorCode::Unsupported, Code::Unimplemented),

@@ -93,9 +93,11 @@ pub struct Resources {
 }
 
 /// Periodic worker state snapshot: counters and capacity only, fixed size at
-/// any fleet scale. Serialized as compact JSON both into the worker's
-/// self-expiring key and onto the workers stream. Per-sandbox state travels
-/// separately as [`SandboxRoute`] writes.
+/// any fleet scale.
+///
+/// Serialized as compact JSON both into the worker's self-expiring key and onto
+/// the workers stream. Per-sandbox state travels separately as [`SandboxRoute`]
+/// writes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerHeartbeat {
 	/// Wire version ([`WIRE_VERSION`]); unknown versions are skipped.

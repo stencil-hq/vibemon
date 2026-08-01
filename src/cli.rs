@@ -2655,6 +2655,8 @@ fn pump_exec(
 						eprintln!("ready: {}", ready.sandbox_id);
 					}
 				},
+				// Session metadata only flows on the PTY RPCs; ignore it defensively.
+				Some(pb::exec_output::Output::Pty(_)) => {},
 				None => return err("invalid exec output frame"),
 			},
 			Ok(None) => break,

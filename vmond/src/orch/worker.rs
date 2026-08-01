@@ -632,6 +632,10 @@ mod tests {
 			.expect("bind hole");
 		let hole_addr = hole.local_addr().expect("hole addr");
 		let hole_task = tokio::spawn(async move {
+			#[allow(
+				clippy::collection_is_never_read,
+				reason = "retains TCP streams to keep connections open in black-hole server"
+			)]
 			let mut sockets = Vec::new();
 			loop {
 				let Ok((socket, _peer)) = hole.accept().await else {

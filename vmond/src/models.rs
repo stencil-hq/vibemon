@@ -9,106 +9,129 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::registry::PersistencePolicy;
+
 /// `POST /v1/sandboxes` body: today's `SandboxCreate` field set plus
 /// `command` (foreground entrypoint override composed by the CLI).
 /// External `remote_page_*` fields are rejected by validation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxCreate {
-	pub image:                  Option<String>,
-	pub template:               Option<String>,
-	pub dockerfile:             Option<String>,
+	pub image: Option<String>,
+	pub template: Option<String>,
+	pub dockerfile: Option<String>,
 	#[serde(default = "default_context")]
-	pub context:                String,
-	pub name:                   Option<String>,
+	pub context: String,
+	pub name: Option<String>,
 	#[serde(default = "default_cpus")]
-	pub cpus:                   u32,
+	pub cpus: u32,
 	#[serde(default = "default_memory")]
-	pub memory:                 u32,
+	pub memory: u32,
 	#[serde(default = "default_disk_mb")]
-	pub disk_mb:                u32,
+	pub disk_mb: u32,
 	#[serde(default = "default_timeout")]
-	pub timeout:                Option<f64>,
-	pub timeout_secs:           Option<u64>,
-	pub workdir:                Option<String>,
-	pub env:                    Option<HashMap<String, String>>,
+	pub timeout: Option<f64>,
+	pub timeout_secs: Option<u64>,
+	/// Per-sandbox network-idle timeout; zero disables.
+	pub idle_timeout_secs: Option<f64>,
+	/// Minimum raw NIC byte delta that qualifies an interval as active.
+	pub activity_threshold_bytes: Option<u64>,
+	/// Stored-state retention behavior.
+	pub persistence: Option<PersistencePolicy>,
+	pub workdir: Option<String>,
+	pub env: Option<HashMap<String, String>>,
 	/// Request-scoped secrets: `[{name, values}]`; never persisted.
-	pub secrets:                Option<Vec<Value>>,
+	pub secrets: Option<Vec<Value>>,
 	/// Host-brokered credential names; secret values never enter this document.
-	pub credentials:            Option<Vec<String>>,
+	pub credentials: Option<Vec<String>>,
 	/// Mountpoint -> volume name or `{name, read_only}`.
-	pub volumes:                Option<HashMap<String, Value>>,
+	pub volumes: Option<HashMap<String, Value>>,
 	/// Mountpoint -> lazy S3 mount specification.
-	pub s3_mounts:              Option<HashMap<String, S3MountSpec>>,
-	pub tags:                   Option<HashMap<String, String>>,
-	pub fs_dir:                 Option<String>,
+	pub s3_mounts: Option<HashMap<String, S3MountSpec>>,
+	pub tags: Option<HashMap<String, String>>,
+	pub fs_dir: Option<String>,
 	#[serde(default = "default_block_network")]
-	pub block_network:          bool,
-	pub ports:                  Option<Vec<u16>>,
-	pub egress_allow:           Option<Vec<String>>,
-	pub egress_allow_domains:   Option<Vec<String>>,
+	pub block_network: bool,
+	pub ports: Option<Vec<u16>>,
+	pub egress_allow: Option<Vec<String>>,
+	pub egress_allow_domains: Option<Vec<String>>,
 	pub inbound_cidr_allowlist: Option<Vec<String>>,
-	pub readiness_probe:        Option<Value>,
+	/// Single routed NIC attachment to a VPC.
+	pub nics: Option<Vec<NicSpec>>,
+	pub readiness_probe: Option<Value>,
 	#[serde(default)]
-	pub pool_size:              u32,
+	pub pool_size: u32,
 	/// Rejected for external callers (mesh-internal restore plumbing).
-	pub remote_page_url:        Option<String>,
-	pub remote_page_token:      Option<String>,
-	pub remote_page_digest:     Option<String>,
-	pub ha:                     Option<String>,
-	pub arch:                   Option<String>,
-	pub idempotency_key:        Option<String>,
+	pub remote_page_url: Option<String>,
+	pub remote_page_token: Option<String>,
+	pub remote_page_digest: Option<String>,
+	pub ha: Option<String>,
+	pub arch: Option<String>,
+	pub idempotency_key: Option<String>,
 	/// Foreground entrypoint override (`command?: [str]`, new in v1).
-	pub command:                Option<Vec<String>>,
+	pub command: Option<Vec<String>>,
 	/// Mesh-only tag preservation for restored remote virtio-fs snapshots.
 	#[serde(skip)]
 	pub(crate) s3_restore_tags: Option<HashMap<String, String>>,
 	/// Owning tenant injected by the authenticated API boundary.
 	#[serde(default = "default_tenant")]
-	pub owner_tenant:           String,
+	pub owner_tenant: String,
 	/// Customer-managed encryption key injected by the API boundary.
 	#[serde(default = "default_encryption_key")]
-	pub encryption_key_id:      String,
+	pub encryption_key_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NicSpec {
+	pub vpc:     String,
+	pub ipv4:    Value,
+	#[serde(default)]
+	pub default: bool,
 }
 
 impl Default for SandboxCreate {
 	fn default() -> Self {
 		Self {
-			image:                  None,
-			template:               None,
-			dockerfile:             None,
-			context:                default_context(),
-			name:                   None,
-			cpus:                   default_cpus(),
-			memory:                 default_memory(),
-			disk_mb:                default_disk_mb(),
-			timeout:                default_timeout(),
-			timeout_secs:           None,
-			workdir:                None,
-			env:                    None,
-			secrets:                None,
-			credentials:            None,
-			volumes:                None,
-			s3_mounts:              None,
-			tags:                   None,
-			fs_dir:                 None,
-			block_network:          default_block_network(),
-			ports:                  None,
-			egress_allow:           None,
-			egress_allow_domains:   None,
+			image: None,
+			template: None,
+			dockerfile: None,
+			context: default_context(),
+			name: None,
+			cpus: default_cpus(),
+			memory: default_memory(),
+			disk_mb: default_disk_mb(),
+			timeout: default_timeout(),
+			timeout_secs: None,
+			idle_timeout_secs: None,
+			activity_threshold_bytes: None,
+			persistence: None,
+			workdir: None,
+			env: None,
+			secrets: None,
+			credentials: None,
+			volumes: None,
+			s3_mounts: None,
+			tags: None,
+			fs_dir: None,
+			block_network: default_block_network(),
+			ports: None,
+			egress_allow: None,
+			egress_allow_domains: None,
 			inbound_cidr_allowlist: None,
-			readiness_probe:        None,
-			pool_size:              0,
-			remote_page_url:        None,
-			remote_page_token:      None,
-			remote_page_digest:     None,
-			ha:                     None,
-			arch:                   None,
-			idempotency_key:        None,
-			command:                None,
-			s3_restore_tags:        None,
-			owner_tenant:           default_tenant(),
-			encryption_key_id:      default_encryption_key(),
+			nics: None,
+			readiness_probe: None,
+			pool_size: 0,
+			remote_page_url: None,
+			remote_page_token: None,
+			remote_page_digest: None,
+			ha: None,
+			arch: None,
+			idempotency_key: None,
+			command: None,
+			s3_restore_tags: None,
+			owner_tenant: default_tenant(),
+			encryption_key_id: default_encryption_key(),
 		}
 	}
 }

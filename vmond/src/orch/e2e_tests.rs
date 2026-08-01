@@ -1,5 +1,5 @@
 //! Hermetic end-to-end test of the orchestration layer: a real scheduler
-//! (embedded MiniRedis, controller, autoscaler) driving two in-process stub
+//! (embedded `MiniRedis`, controller, autoscaler) driving two in-process stub
 //! gRPC workers whose state is published by the real [`OrchWorker`].
 //!
 //! No hypervisor and no external Redis are involved; the stubs implement just
@@ -123,6 +123,8 @@ impl pb::sandbox_service_server::SandboxService for StubWorker {
 	type BatchCreateStream = BoxStream<pb::BatchCreateResponse>;
 	type ExecStream = BoxStream<pb::ExecOutput>;
 	type LogsStream = BoxStream<pb::LogChunk>;
+	type PtyAttachStream = BoxStream<pb::ExecOutput>;
+	type PtyOpenStream = BoxStream<pb::ExecOutput>;
 	type ShellStream = BoxStream<pb::ExecOutput>;
 	type WatchStream = BoxStream<pb::JsonView>;
 
@@ -308,6 +310,13 @@ impl pb::sandbox_service_server::SandboxService for StubWorker {
 		stub_unimplemented()
 	}
 
+	async fn set_idle_timeout(
+		&self,
+		_request: Request<pb::SetIdleTimeoutRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		stub_unimplemented()
+	}
+
 	async fn metrics(
 		&self,
 		_request: Request<pb::SandboxRef>,
@@ -433,6 +442,48 @@ impl pb::sandbox_service_server::SandboxService for StubWorker {
 	) -> Result<Response<Self::BatchCreateStream>, Status> {
 		// The scheduler fans batch items out as unary creates; the worker-side
 		// batch surface is exercised by the real worker, not this stub.
+		stub_unimplemented()
+	}
+
+	async fn resize(
+		&self,
+		_request: Request<pb::ResizeSandboxRequest>,
+	) -> Result<Response<pb::JsonView>, Status> {
+		stub_unimplemented()
+	}
+
+	async fn pty_open(
+		&self,
+		_request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyOpenStream>, Status> {
+		stub_unimplemented()
+	}
+
+	async fn pty_attach(
+		&self,
+		_request: Request<Streaming<pb::ExecInput>>,
+	) -> Result<Response<Self::PtyAttachStream>, Status> {
+		stub_unimplemented()
+	}
+
+	async fn pty_list(
+		&self,
+		_request: Request<pb::SandboxRef>,
+	) -> Result<Response<pb::PtySessionList>, Status> {
+		stub_unimplemented()
+	}
+
+	async fn pty_close(
+		&self,
+		_request: Request<pb::PtyCloseRequest>,
+	) -> Result<Response<pb::PtySessionCloseResponse>, Status> {
+		stub_unimplemented()
+	}
+
+	async fn pty_exec(
+		&self,
+		_request: Request<pb::PtyExecRequest>,
+	) -> Result<Response<pb::PtyExecResponse>, Status> {
 		stub_unimplemented()
 	}
 
@@ -871,7 +922,7 @@ async fn orchestration_end_to_end() {
 /// Admission/readiness split through the scheduler: a `no_wait` create comes
 /// back `starting` yet fully annotated, `Watch` routes to the owner and relays
 /// its stream until ready, and `BatchCreate` streams one seq-tagged result per
-/// item. Hermetic: embedded MiniRedis, one stub worker, no hypervisor.
+/// item. Hermetic: embedded `MiniRedis`, one stub worker, no hypervisor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_wait_watch_and_batch_create() {
 	let handle = spawn_scheduler(SchedulerOptions {

@@ -9,6 +9,7 @@ use std::{
 	ops::Deref,
 	os::unix::fs::{OpenOptionsExt, PermissionsExt},
 	path::{Path, PathBuf},
+	process::Command,
 	sync::{
 		Arc, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -21,7 +22,11 @@ use flume::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::{runtime::Runtime, sync::broadcast, task::JoinHandle};
+use tokio::{
+	runtime::Runtime,
+	sync::{Notify, broadcast},
+	task::JoinHandle,
+};
 use vmm::snapshot::is_safe_snapshot_name;
 
 use crate::{
@@ -29,11 +34,16 @@ use crate::{
 	engine::{
 		EngineApi, ExecCapture, ExecExit, ExecRequest, ExecStream, OwnershipHandoff, RecoveryPoint,
 		ShellSession,
-		agent::{AgentConn, ExecHandle, GuestActivity},
+		agent::{AgentConn, ExecHandle, GuestActivity, PtyAgentHandle},
 		control::ControlClient,
 		diskdelta,
+		pty::{PtyCache, PtyControl, PtyStream},
 		s3proxy::S3Proxy,
-		spawn::{LaunchSpec, RemoteFsShare, SandboxRuntime, SandboxVm, VmonRuntime, VolumeMount},
+		spawn::{
+			LaunchSpec, MAX_CPUS, MAX_MEM_MIB, RemoteFsShare, SandboxRuntime, SandboxVm, VmonRuntime,
+			VolumeMount,
+		},
+		vpc::{Vpc, VpcRegistry},
 	},
 	error::{EngineError, Result},
 	home::Home,
@@ -53,8 +63,8 @@ use crate::{
 		RetentionPolicy,
 	},
 	registry::{
-		LifecycleOperation, LifecyclePhase, LifecycleState, Registry, SafeRuntimeIdentity,
-		StateGeneration, TransitionBegin, TransitionDisposition, VmRecord,
+		LifecycleOperation, LifecyclePhase, LifecycleState, PersistencePolicy, Registry,
+		SafeRuntimeIdentity, StateGeneration, TransitionBegin, TransitionDisposition, VmRecord,
 	},
 	s3::{S3Auth, S3Client, S3Credentials, S3MountConfig, parse_s3_uri},
 	security::{
@@ -170,12 +180,26 @@ struct LifecycleOwnership {
 	epoch:   i64,
 }
 
+struct MaintenancePermit {
+	inner: Arc<EngineInner>,
+	id:    String,
+}
+
+impl Drop for MaintenancePermit {
+	fn drop(&mut self) {
+		self.inner.release_maintenance(&self.id);
+	}
+}
+
 struct EngineInner {
 	config: ServeConfig,
 	home: Home,
 	registry: Registry,
+	vpcs: VpcRegistry,
 	runtimes: Mutex<HashMap<String, RuntimeState>>,
 	launch_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+	relaunch_recipes: Mutex<HashMap<String, RelaunchRecipe>>,
+	pty_cache: PtyCache,
 	restore_handoff: Mutex<Option<Weak<dyn OwnershipHandoff>>>,
 	capture_locks: Mutex<HashMap<String, Arc<CaptureLock>>>,
 	pools: PoolRegistry,
@@ -191,6 +215,8 @@ struct EngineInner {
 	portable_history: Option<Arc<PortableHistory>>,
 	portable_ownership: Mutex<Option<PortableOwnership>>,
 	maintenance_busy: Mutex<HashSet<String>>,
+	maintenance_changed: Condvar,
+	maintenance_wake: Notify,
 	pending_migration_staging: Mutex<HashMap<String, Arc<TransientDir>>>,
 	snapshot_sources: Mutex<HashMap<String, SnapshotSource>>,
 	pending_replica_exports: Mutex<HashMap<String, Arc<ReplicaExport>>>,
@@ -201,7 +227,18 @@ struct EngineInner {
 	capture_executor: Mutex<Option<Arc<TestCaptureExecutor>>>,
 	#[cfg(test)]
 	rollback_resume_executor: Mutex<Option<Arc<TestRollbackResumeExecutor>>>,
+	#[cfg(test)]
+	disk_resize_executor: Mutex<Option<Arc<TestDiskResizeExecutor>>>,
 	audit: AuditLog,
+}
+
+impl EngineInner {
+	fn release_maintenance(&self, id: &str) {
+		let removed = self.maintenance_busy.lock().remove(id);
+		if removed {
+			self.maintenance_changed.notify_all();
+		}
+	}
 }
 
 #[derive(Default)]
@@ -508,6 +545,18 @@ struct EngineExecControl {
 	handle: ExecHandle,
 }
 
+struct EnginePtyControl {
+	handle: PtyAgentHandle,
+}
+
+#[derive(Clone)]
+struct RelaunchRecipe {
+	params:       SandboxCreate,
+	template_dir: PathBuf,
+	image_spec:   Option<image::ImageConfig>,
+	image_ref:    Option<String>,
+}
+
 struct CreatePlan {
 	params:               SandboxCreate,
 	sid:                  String,
@@ -527,6 +576,8 @@ struct CreatePlan {
 	host_slot:            bool,
 	networked_warm:       bool,
 	networked_warm_linux: bool,
+	relaunch_params:      SandboxCreate,
+	retained_rootfs:      bool,
 }
 
 /// Identity of a memoized image-template resolution. The boot-verify timeout
@@ -552,48 +603,56 @@ type TestCaptureExecutor =
 	dyn Fn(&Engine, &str, &str, bool, bool) -> Result<RecoveryPoint> + Send + Sync;
 #[cfg(test)]
 type TestRollbackResumeExecutor = dyn Fn(&SandboxVm) + Send + Sync;
+#[cfg(test)]
+type TestDiskResizeExecutor = dyn Fn(&Path, &Path, u64) -> Result<()> + Send + Sync;
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SnapshotOptions {
-	agent:                  Option<bool>,
-	block_network:          Option<bool>,
-	env:                    Option<HashMap<String, String>>,
-	workdir:                Option<String>,
-	tags:                   Option<HashMap<String, String>>,
-	timeout:                Option<f64>,
-	timeout_secs:           Option<u64>,
-	readiness_probe:        Option<Value>,
-	secrets:                Option<Vec<Value>>,
-	s3_mounts:              Option<HashMap<String, S3MountSpec>>,
-	command:                Option<Vec<String>>,
-	credentials:            Option<Vec<String>>,
-	owner_tenant:           Option<String>,
-	encryption_key_id:      Option<String>,
-	ports:                  Option<Vec<u16>>,
-	egress_allow:           Option<Vec<String>>,
-	egress_allow_domains:   Option<Vec<String>>,
+	agent: Option<bool>,
+	block_network: Option<bool>,
+	env: Option<HashMap<String, String>>,
+	workdir: Option<String>,
+	tags: Option<HashMap<String, String>>,
+	timeout: Option<f64>,
+	timeout_secs: Option<u64>,
+	idle_timeout_secs: Option<f64>,
+	activity_threshold_bytes: Option<u64>,
+	persistence: Option<PersistencePolicy>,
+	readiness_probe: Option<Value>,
+	secrets: Option<Vec<Value>>,
+	s3_mounts: Option<HashMap<String, S3MountSpec>>,
+	command: Option<Vec<String>>,
+	credentials: Option<Vec<String>>,
+	owner_tenant: Option<String>,
+	encryption_key_id: Option<String>,
+	ports: Option<Vec<u16>>,
+	egress_allow: Option<Vec<String>>,
+	egress_allow_domains: Option<Vec<String>>,
 	inbound_cidr_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
 struct ResolvedSnapshotOptions {
-	agent:                  bool,
-	block_network:          Option<bool>,
-	env:                    BTreeMap<String, String>,
-	secret_env:             BTreeMap<String, String>,
-	secret_names:           Vec<String>,
-	workdir:                Option<String>,
-	tags:                   HashMap<String, String>,
-	timeout_secs:           Option<u64>,
-	readiness_probe:        Option<Value>,
-	s3_mounts:              Option<HashMap<String, S3MountSpec>>,
-	command:                Option<Vec<String>>,
-	credentials:            Vec<String>,
-	owner_tenant:           String,
-	encryption_key_id:      String,
-	ports:                  Option<Vec<u16>>,
-	egress_allow:           Option<Vec<String>>,
-	egress_allow_domains:   Option<Vec<String>>,
+	agent: bool,
+	block_network: Option<bool>,
+	env: BTreeMap<String, String>,
+	secret_env: BTreeMap<String, String>,
+	secret_names: Vec<String>,
+	workdir: Option<String>,
+	tags: HashMap<String, String>,
+	timeout_secs: Option<u64>,
+	idle_timeout_secs: Option<f64>,
+	activity_threshold_bytes: Option<u64>,
+	persistence: PersistencePolicy,
+	readiness_probe: Option<Value>,
+	s3_mounts: Option<HashMap<String, S3MountSpec>>,
+	command: Option<Vec<String>>,
+	credentials: Vec<String>,
+	owner_tenant: String,
+	encryption_key_id: String,
+	ports: Option<Vec<u16>>,
+	egress_allow: Option<Vec<String>>,
+	egress_allow_domains: Option<Vec<String>>,
 	inbound_cidr_allowlist: Option<Vec<String>>,
 }
 
@@ -716,6 +775,7 @@ impl Engine {
 		let registry = Registry::new();
 		let lock_requests = registry.rehydrate(&home)?;
 		registry.rebuild_idempotency_index();
+		let vpcs = VpcRegistry::open(home.root())?;
 		let net_runtime = Runtime::new()
 			.map_err(|err| EngineError::engine(format!("starting network runtime: {err}")))?;
 		let engine = Self {
@@ -723,7 +783,10 @@ impl Engine {
 				config,
 				home,
 				registry,
+				vpcs,
 				runtimes: Mutex::new(HashMap::new()),
+				relaunch_recipes: Mutex::new(HashMap::new()),
+				pty_cache: PtyCache::default(),
 				launch_cancellations: Mutex::new(HashMap::new()),
 				capture_locks: Mutex::new(HashMap::new()),
 				restore_handoff: Mutex::new(None),
@@ -733,6 +796,8 @@ impl Engine {
 				capture_executor: Mutex::new(None),
 				#[cfg(test)]
 				rollback_resume_executor: Mutex::new(None),
+				#[cfg(test)]
+				disk_resize_executor: Mutex::new(None),
 				pools: PoolRegistry::new(),
 				template_memo: Mutex::new(HashMap::new()),
 				events: Mutex::new(Vec::new()),
@@ -745,6 +810,8 @@ impl Engine {
 				credentials,
 				audit,
 				maintenance_busy: Mutex::new(HashSet::new()),
+				maintenance_changed: Condvar::new(),
+				maintenance_wake: Notify::new(),
 				snapshot_sources: Mutex::new(HashMap::new()),
 				portable_gc_last: Mutex::new(
 					Instant::now()
@@ -887,17 +954,23 @@ impl Engine {
 		mut shutdown: broadcast::Receiver<()>,
 	) -> JoinHandle<()> {
 		let engine = Arc::clone(self);
-		let interval = engine.maintenance_interval();
 		tokio::spawn(async move {
-			let mut ticker = tokio::time::interval(interval);
-			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut next_run = tokio::time::Instant::now();
 			loop {
 				tokio::select! {
-					_ = ticker.tick() => {
-						let engine = Arc::clone(&engine);
-						if let Err(error) = tokio::task::spawn_blocking(move || engine.maintenance_once()).await {
+					() = tokio::time::sleep_until(next_run) => {
+						let worker = Arc::clone(&engine);
+						if let Err(error) =
+							tokio::task::spawn_blocking(move || worker.maintenance_once()).await
+						{
 							tracing::warn!("sandbox maintenance task failed: {error}");
 						}
+						next_run = tokio::time::Instant::now() + engine.maintenance_interval();
+					},
+					() = engine.inner.maintenance_wake.notified() => {
+						let candidate =
+							tokio::time::Instant::now() + engine.maintenance_interval();
+						next_run = next_run.min(candidate);
 					},
 					_ = shutdown.recv() => break,
 				}
@@ -906,16 +979,37 @@ impl Engine {
 	}
 
 	fn maintenance_interval(&self) -> Duration {
-		[
-			self.inner.config.idle_timeout,
-			self.inner.config.history_disk_sec,
-			self.inner.config.history_checkpoint_sec,
-		]
-		.into_iter()
-		.filter(|seconds| *seconds > 0.0)
-		.map(|seconds| Duration::from_secs_f64((seconds / 4.0).clamp(1.0, 30.0)))
-		.min()
-		.unwrap_or(Duration::from_secs(30))
+		let default_idle_timeout = self.inner.config.idle_timeout;
+		let active_idle_timeouts = self.inner.registry.list().into_iter().filter_map(|record| {
+			(record.status == "running").then(|| {
+				record
+					.detail
+					.get("idle_timeout_secs")
+					.and_then(Value::as_f64)
+					.unwrap_or(default_idle_timeout)
+			})
+		});
+		active_idle_timeouts
+			.chain([self.inner.config.history_disk_sec, self.inner.config.history_checkpoint_sec])
+			.filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+			.map(|seconds| Duration::from_secs_f64((seconds / 4.0).clamp(1.0, 30.0)))
+			.min()
+			.unwrap_or(Duration::from_secs(30))
+	}
+
+	fn wake_maintenance(&self) {
+		self.inner.maintenance_wake.notify_one();
+	}
+
+	fn maintenance_permit(&self, id: &str) -> MaintenancePermit {
+		let id = id.to_owned();
+		let mut busy = self.inner.maintenance_busy.lock();
+		while busy.contains(&id) {
+			self.inner.maintenance_changed.wait(&mut busy);
+		}
+		busy.insert(id.clone());
+		drop(busy);
+		MaintenancePermit { inner: Arc::clone(&self.inner), id }
 	}
 
 	fn maintenance_once(&self) {
@@ -947,8 +1041,115 @@ impl Engine {
 			if let Err(error) = self.maintain_sandbox(&record) {
 				tracing::warn!(sandbox = record.id, %error, "sandbox maintenance failed");
 			}
-			self.inner.maintenance_busy.lock().remove(&record.id);
+			self.inner.release_maintenance(&record.id);
 		}
+		if let Err(error) = self.enforce_storage_quota() {
+			tracing::warn!(%error, "sandbox storage quota enforcement failed");
+		}
+	}
+
+	fn enforce_storage_quota(&self) -> Result<()> {
+		let quota_mb = self.inner.config.storage_quota_mb;
+		if quota_mb == 0 {
+			return Ok(());
+		}
+		let quota = quota_mb.saturating_mul(1024 * 1024);
+		let mut total = 0_u64;
+		let mut eligible = Vec::new();
+		for record in self.inner.registry.list() {
+			if record.status == "running" || !record.lifecycle.is_converged() {
+				continue;
+			}
+			let size = self.stored_state_size(&record)?;
+			total = total.saturating_add(size);
+			let eviction_key = match &record.persistence {
+				PersistencePolicy::Ephemeral => Some((0_u8, 0_u8)),
+				PersistencePolicy::Sticky { priority } => Some((1_u8, *priority)),
+				PersistencePolicy::Persistent => None,
+			};
+			if let Some((kind, priority)) = eviction_key {
+				eligible.push((kind, priority, record.created_at, record, size));
+			}
+		}
+		eligible.sort_by(|left, right| {
+			left
+				.0
+				.cmp(&right.0)
+				.then(left.1.cmp(&right.1))
+				.then_with(|| left.2.total_cmp(&right.2))
+		});
+		for (_, _, _, record, size) in eligible {
+			if total <= quota {
+				break;
+			}
+			let transition =
+				self.begin_state_transition(&record.id, LifecyclePhase::Unknown("lost".to_owned()))?;
+			if transition.disposition != TransitionDisposition::Acquired {
+				continue;
+			}
+			if let Err(error) = self.discard_stored_state(&record) {
+				self.fail_state_transition(&record.id, transition.generation, &error);
+				return Err(error);
+			}
+			if let Err(error) =
+				self
+					.inner
+					.registry
+					.update_detail_persisted(self.home(), &record.id, |detail| {
+						detail.insert("reason".to_owned(), json!("evicted"));
+					}) {
+				self.fail_state_transition(&record.id, transition.generation, &error);
+				return Err(error);
+			}
+			self.complete_state_transition(
+				&record.id,
+				transition.generation,
+				LifecyclePhase::Unknown("lost".to_owned()),
+			)?;
+			total = total.saturating_sub(size);
+			if let Some(updated) = self.inner.registry.get(&record.id) {
+				self.publish_record_event("lost", &updated);
+			}
+		}
+		Ok(())
+	}
+
+	fn stored_state_size(&self, record: &VmRecord) -> Result<u64> {
+		Ok(path_size(&self.home().vm_dir(&record.name))?
+			.saturating_add(path_size(&self.recovery_root(&record.id)?)?))
+	}
+
+	fn discard_stored_state(&self, record: &VmRecord) -> Result<()> {
+		let vm_dir = self.home().vm_dir(&record.name);
+		match fs::read_dir(&vm_dir) {
+			Ok(entries) => {
+				for entry in entries {
+					let entry = entry?;
+					if entry.file_name() == "meta.json" {
+						continue;
+					}
+					remove_path(&entry.path())?;
+				}
+			},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(error.into()),
+		}
+		self.delete_local_recovery_history(&record.id)
+	}
+
+	fn apply_ephemeral_discard(&self, record: &VmRecord) -> Result<()> {
+		if record.persistence != PersistencePolicy::Ephemeral {
+			return Ok(());
+		}
+		self.discard_stored_state(record)?;
+		self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), &record.id, |detail| {
+				detail.insert("state_discarded".to_owned(), json!(true));
+				detail.insert("persistence".to_owned(), json!(PersistencePolicy::Ephemeral));
+			})?;
+		Ok(())
 	}
 
 	fn reconcile_lifecycle_transitions(&self) {
@@ -973,7 +1174,7 @@ impl Engine {
 			{
 				tracing::warn!(%error, "sandbox lifecycle reconciliation failed");
 			}
-			self.inner.maintenance_busy.lock().remove(&id);
+			self.inner.release_maintenance(&id);
 		}
 		if let Err(error) = self.reconcile_unplaced_rollback_markers() {
 			tracing::warn!(%error, "unplaced portable rollback reconciliation failed");
@@ -1717,10 +1918,9 @@ impl Engine {
 		if !current.lifecycle.is_converged() || current.status != "running" {
 			return Ok(());
 		}
-		if active == Some(false)
-			&& self.inner.config.idle_timeout > 0.0
-			&& unix_time() - current.last_active >= self.inner.config.idle_timeout
-		{
+		let idle =
+			idle_deadline_elapsed(&current, self.inner.config.idle_timeout, active, unix_time());
+		if idle {
 			<Self as EngineApi>::suspend(self, &record.id)?;
 			self.inc_counter("idle_reaped");
 			return Ok(());
@@ -1765,18 +1965,21 @@ impl Engine {
 			return Ok(None);
 		};
 		let sample = agent.activity(Duration::from_secs(2))?;
-		let changed = {
+		let (changed, network_delta) = {
 			let mut runtimes = self.inner.runtimes.lock();
 			let Some(runtime) = runtimes.get_mut(name) else {
 				return Ok(None);
 			};
-			let changed = runtime.guest_activity.is_some_and(|previous| {
+			let previous = runtime.guest_activity.as_ref();
+			let changed = previous.is_some_and(|previous| {
 				sample.cpu_ticks.saturating_sub(previous.cpu_ticks) >= 10
 					|| sample.disk_sectors != previous.disk_sectors
 					|| sample.network_bytes != previous.network_bytes
 			});
+			let network_delta =
+				previous.map(|previous| sample.network_bytes.saturating_sub(previous.network_bytes));
 			runtime.guest_activity = Some(sample);
-			changed
+			(changed, network_delta)
 		};
 		if changed {
 			let now = unix_time();
@@ -1790,6 +1993,32 @@ impl Engine {
 				.update_detail_persisted(self.home(), id, |detail| {
 					detail.insert("last_active".to_owned(), json!(now));
 				});
+		}
+		if let Some(network_delta) = network_delta {
+			let threshold = self
+				.inner
+				.registry
+				.get(id)
+				.and_then(|record| {
+					record
+						.detail
+						.get("activity_threshold_bytes")
+						.and_then(Value::as_u64)
+				})
+				.unwrap_or(0);
+			if network_delta_exceeds_threshold(network_delta, threshold) {
+				let now = unix_time();
+				self
+					.inner
+					.registry
+					.update(id, |record| record.last_network_active = now);
+				let _ = self
+					.inner
+					.registry
+					.update_detail_persisted(self.home(), id, |detail| {
+						detail.insert("last_network_active".to_owned(), json!(now));
+					});
+			}
 		}
 		Ok(Some(changed))
 	}
@@ -1937,7 +2166,12 @@ impl Engine {
 		self.inner.sandbox_runtime.is_running(vm)
 	}
 
-	fn rollback_uncommitted_runtime(&self, vm: &SandboxVm, runtime: &mut RuntimeState) {
+	fn rollback_uncommitted_runtime(
+		&self,
+		vm: &SandboxVm,
+		runtime: &mut RuntimeState,
+		retain_vm_dir: bool,
+	) {
 		if let Some(stop) = runtime.timeout_stop.take() {
 			let _ = stop.send(());
 		}
@@ -1955,7 +2189,10 @@ impl Engine {
 		} else {
 			teardown_network(vm.name());
 		}
-		let _ = self.remove_sandbox(vm);
+		let _ = self.inner.vpcs.release_sandbox(vm.name());
+		if !retain_vm_dir {
+			let _ = self.remove_sandbox(vm);
+		}
 	}
 
 	/// Once production has atomically published a `suspending` marker, the
@@ -2051,13 +2288,49 @@ impl Engine {
 					.filter_map(Value::as_u64)
 					.filter_map(|port| u16::try_from(port).ok())
 					.collect::<Vec<_>>();
-				state.network = Some(self.inner.net_runtime.block_on(net::setup_sandbox_network(
-					&record.name,
-					&ports,
-					state.network_policy.egress_allow.as_deref(),
-					state.network_policy.egress_allow_domains.as_deref(),
-					state.network_policy.inbound_cidr_allowlist.as_deref(),
-				))?);
+				let vpc_id = state
+					.network_spec
+					.as_ref()
+					.and_then(|spec| spec.get("vpc"))
+					.and_then(Value::as_str)
+					.map(str::to_owned);
+				state.network = Some(if let Some(vpc_id) = vpc_id {
+					let guest_ip = state
+						.network_spec
+						.as_ref()
+						.and_then(|spec| spec.get("guest_config"))
+						.and_then(|config| config.get("guest_ip"))
+						.and_then(Value::as_str)
+						.map(str::to_owned)
+						.ok_or_else(|| EngineError::engine("persisted VPC network has no guest IP"))?;
+					let tenant = record
+						.detail
+						.get("owner_tenant")
+						.and_then(Value::as_str)
+						.unwrap_or("default");
+					self
+						.inner
+						.vpcs
+						.allocate(tenant, &vpc_id, &record.name, Some(&guest_ip))?;
+					let (gateway, prefix) = self.inner.vpcs.gateway_and_prefix(tenant, &vpc_id)?;
+					self.inner.net_runtime.block_on(net::setup_vpc_network(
+						&record.name,
+						&vpc_id,
+						&guest_ip,
+						&gateway,
+						prefix,
+						&ports,
+						state.network_policy.inbound_cidr_allowlist.as_deref(),
+					))?
+				} else {
+					self.inner.net_runtime.block_on(net::setup_sandbox_network(
+						&record.name,
+						&ports,
+						state.network_policy.egress_allow.as_deref(),
+						state.network_policy.egress_allow_domains.as_deref(),
+						state.network_policy.inbound_cidr_allowlist.as_deref(),
+					))?
+				});
 			}
 			let services: Result<()> = (|| {
 				let requested = record
@@ -2218,6 +2491,19 @@ impl Engine {
 		{
 			return Err(EngineError::invalid("timeout must be non-negative"));
 		}
+		if let Some(timeout) = params.idle_timeout_secs
+			&& (!timeout.is_finite() || timeout < 0.0)
+		{
+			return Err(EngineError::invalid("idle_timeout_secs must be non-negative"));
+		}
+		if params
+			.persistence
+			.as_ref()
+			.and_then(PersistencePolicy::sticky_priority)
+			.is_some_and(|priority| priority > 10)
+		{
+			return Err(EngineError::invalid("sticky persistence priority must be between 0 and 10"));
+		}
 		if params.block_network && params.ports.as_ref().is_some_and(|ports| !ports.is_empty()) {
 			return Err(EngineError::invalid("ports cannot be exposed when block_network=True"));
 		}
@@ -2287,6 +2573,9 @@ impl Engine {
 	}
 
 	fn prepare_create(&self, mut params: SandboxCreate) -> Result<CreatePlan> {
+		params
+			.idle_timeout_secs
+			.get_or_insert(self.inner.config.idle_timeout);
 		Self::validate_create(&params)?;
 		let sid = params
 			.name
@@ -2304,6 +2593,7 @@ impl Engine {
 		};
 		let restart_policy = restart_policy_for_ha(&ha).to_owned();
 		self.resolve_ha_encryption_key(&mut params, &ha)?;
+		let relaunch_params = params.clone();
 		let tags = params.tags.clone().unwrap_or_default();
 		let secrets = parse_secrets(params.secrets.take())?;
 		let secret_env = merge_secret_env(&secrets);
@@ -2394,6 +2684,57 @@ impl Engine {
 			networked_warm,
 			networked_warm_linux,
 			s3_specs,
+			relaunch_params,
+			retained_rootfs: false,
+		})
+	}
+
+	fn prepare_relaunch(&self, recipe: &RelaunchRecipe) -> Result<CreatePlan> {
+		let mut params = recipe.params.clone();
+		let sid = params
+			.name
+			.clone()
+			.filter(|name| !name.is_empty())
+			.ok_or_else(|| EngineError::engine("relaunch recipe has no sandbox identity"))?;
+		let relaunch_params = params.clone();
+		let ha = params
+			.ha
+			.clone()
+			.unwrap_or_else(|| self.inner.config.default_ha(false).to_owned());
+		let restart_policy = restart_policy_for_ha(&ha).to_owned();
+		let tags = params.tags.clone().unwrap_or_default();
+		let secrets = parse_secrets(params.secrets.take())?;
+		let secret_env = merge_secret_env(&secrets);
+		let timeout_secs = effective_timeout_secs(params.timeout_secs, params.timeout)?;
+		let mut used_tags = HashSet::new();
+		let volume_specs = self.resolve_volumes(
+			&sid,
+			&params.encryption_key_id,
+			params.volumes.take(),
+			&mut used_tags,
+		)?;
+		let s3_specs = self.resolve_s3_mounts(params.s3_mounts.take(), &mut used_tags)?;
+		Ok(CreatePlan {
+			params,
+			sid,
+			ha,
+			restart_policy,
+			tags,
+			secrets,
+			secret_env,
+			timeout_secs,
+			volume_specs,
+			s3_specs,
+			template_dir: recipe.template_dir.clone(),
+			image_spec: recipe.image_spec.clone(),
+			image_ref: recipe.image_ref.clone(),
+			pool_key: String::new(),
+			warm_volumes: false,
+			host_slot: false,
+			networked_warm: false,
+			networked_warm_linux: false,
+			relaunch_params,
+			retained_rootfs: true,
 		})
 	}
 
@@ -2828,7 +3169,7 @@ impl Engine {
 		// fenced before any agent/network/volume registration.
 		let cancellation = self.launch_cancellation(&plan.sid).or(cancellation);
 		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
 			return Err(error);
 		}
 		// Heartbeats use canonical resource keys after a worker restart; VMM
@@ -2839,7 +3180,7 @@ impl Engine {
 			("disk_mb".to_owned(), json!(plan.params.disk_mb)),
 		]);
 		if let Err(error) = vm.save_meta(resource_meta) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
 			return Err(error);
 		}
 		runtime.volume_locks = plan
@@ -2879,6 +3220,8 @@ impl Engine {
 				host_slot:            false,
 				networked_warm:       false,
 				networked_warm_linux: false,
+				relaunch_params:      SandboxCreate::default(),
+				retained_rootfs:      false,
 			})));
 			return Ok((vm, runtime));
 		}
@@ -2923,6 +3266,7 @@ impl Engine {
 					"ports": sorted_ports(plan.params.ports.as_deref(), &network.tunnels()),
 					"tunnels": tunnels_json(&network.tunnels()),
 					"policy": policy_json(&runtime.network_policy),
+					"vpc": plan.params.nics.as_ref().and_then(|nics| nics.first()).map(|nic| &nic.vpc),
 				}));
 			} else if network_required(&plan.params) {
 				let gc = user_net_guest_config();
@@ -2985,16 +3329,22 @@ impl Engine {
 			meta.insert("block_network".to_owned(), json!(plan.params.block_network));
 			meta.insert("network".to_owned(), runtime.network_spec.clone().unwrap_or(Value::Null));
 			meta.insert("timeout_secs".to_owned(), json!(plan.timeout_secs));
+			if let Some(idle_timeout_secs) = plan.params.idle_timeout_secs {
+				meta.insert("idle_timeout_secs".to_owned(), json!(idle_timeout_secs));
+			}
+			if let Some(activity_threshold_bytes) = plan.params.activity_threshold_bytes {
+				meta.insert("activity_threshold_bytes".to_owned(), json!(activity_threshold_bytes));
+			}
 			meta.insert("runtime_identity".to_owned(), runtime_identity(&runtime));
 			vm.save_meta(meta)?;
 			Ok(())
 		})();
 		if let Err(error) = setup_result {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
 			return Err(error);
 		}
 		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
 			return Err(error);
 		}
 		Ok((vm, runtime))
@@ -3013,6 +3363,9 @@ impl Engine {
 				"127.0.0.1".parse().expect("loopback IP"),
 				net::USER_NET_GATEWAY.parse().expect("user-net gateway IP"),
 			)?;
+		}
+		if plan.retained_rootfs {
+			return self.launch_cold_vm(plan, runtime, start_paused);
 		}
 		if (plan.params.block_network || plan.networked_warm)
 			&& plan.volume_specs.is_empty()
@@ -3156,6 +3509,7 @@ impl Engine {
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		self.launch_sandbox(&vm, &spec)?;
+		copy_agent_marker(&plan.template_dir, vm.dir())?;
 		runtime.s3_proxy = s3_proxy;
 		if network_required(&plan.params) && runtime.network.is_none() {
 			runtime.network_spec = Some(json!({
@@ -3177,16 +3531,27 @@ impl Engine {
 	) -> Result<SandboxVm> {
 		let vm = self.sandbox(&plan.sid);
 		let base_disk = plan.template_dir.join("rootfs.img");
-		if !base_disk.is_file() {
+		let rootfs = vm.dir().join("rootfs.img");
+		if plan.retained_rootfs {
+			if !rootfs.is_file() {
+				return Err(EngineError::not_found(format!(
+					"sandbox '{}' has no retained rootfs.img",
+					plan.sid
+				)));
+			}
+		} else if !base_disk.is_file() {
 			return Err(EngineError::engine(format!(
 				"template {} has no rootfs.img; fresh-boot sandboxes require a disk-backed template",
 				plan.template_dir.display()
 			)));
 		}
 		let kernel = image::assets::default_kernel()?;
-		let mut spec = LaunchSpec::boot_rootfs(vm.api_sock(), kernel, vm.dir().join("rootfs.img"))
-			.with_agent_sock(vm.dir().join("agent.sock"))
-			.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"))
+		let mut spec = LaunchSpec::boot_rootfs(vm.api_sock(), kernel, &rootfs)
+			.with_agent_sock(vm.dir().join("agent.sock"));
+		if !plan.retained_rootfs {
+			spec = spec.with_disk_overlay(base_disk, &rootfs);
+		}
+		spec = spec
 			.with_mem_mib(u64::from(plan.params.memory))
 			.with_cpus(u64::from(plan.params.cpus))
 			.with_rng()
@@ -3233,11 +3598,51 @@ impl Engine {
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
 		self.launch_sandbox(&vm, &spec)?;
+		copy_agent_marker(&plan.template_dir, vm.dir())?;
 		runtime.s3_proxy = s3_proxy;
 		Ok(vm)
 	}
 
 	fn setup_network(&self, name: &str, params: &SandboxCreate) -> Result<SandboxNetwork> {
+		if let Some(nics) = params.nics.as_deref()
+			&& !nics.is_empty()
+		{
+			if nics.len() != 1 || !nics[0].default {
+				return Err(EngineError::invalid("vmon VMs have a single NIC"));
+			}
+			let nic = &nics[0];
+			let requested = match &nic.ipv4 {
+				Value::Bool(true) => None,
+				Value::String(address) => Some(address.as_str()),
+				_ => {
+					return Err(EngineError::invalid(
+						"VPC NIC ipv4 must be a valid IPv4 address or true",
+					));
+				},
+			};
+			let guest_ip =
+				self
+					.inner
+					.vpcs
+					.allocate(&params.owner_tenant, &nic.vpc, name, requested)?;
+			let (gateway, prefix) = self
+				.inner
+				.vpcs
+				.gateway_and_prefix(&params.owner_tenant, &nic.vpc)?;
+			let network = self.inner.net_runtime.block_on(net::setup_vpc_network(
+				name,
+				&nic.vpc,
+				&guest_ip,
+				&gateway,
+				prefix,
+				params.ports.as_deref().unwrap_or(&[]),
+				params.inbound_cidr_allowlist.as_deref(),
+			));
+			if network.is_err() {
+				let _ = self.inner.vpcs.release_sandbox(name);
+			}
+			return network;
+		}
 		let egress_allow = if params.block_network {
 			Some(&[] as &[String])
 		} else {
@@ -3540,6 +3945,7 @@ impl Engine {
 			.inner
 			.registry
 			.observe_transition(self.home(), id, generation, observed)?;
+		self.wake_maintenance();
 		Ok(())
 	}
 
@@ -4347,6 +4753,11 @@ impl Engine {
 		let previous = self.get_record(id, false)?;
 		let (source, mut params) = self.open_recovery(id, recovery_point)?;
 		params.insert("name".to_owned(), json!(id));
+		// A control-plane update made after the checkpoint must win when the
+		// suspended identity is restored.
+		if let Some(idle_timeout_secs) = previous.detail.get("idle_timeout_secs") {
+			params.insert("idle_timeout_secs".to_owned(), idle_timeout_secs.clone());
+		}
 		// Snapshot params predate the durable capture allocation. Carry the
 		// live monotonic counter into the *first* replacement record so a
 		// crash after the new VM is inserted cannot rewind replica ordering.
@@ -4591,6 +5002,7 @@ impl Engine {
 			let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, s3_mounts)?;
 			runtime.s3_proxy = s3_proxy;
 			self.launch_sandbox(&vm, &spec)?;
+			copy_agent_marker(snapshot_dir, vm.dir())?;
 			if let Some(timeout_secs) = options.timeout_secs {
 				runtime.timeout_stop = Some(start_timeout_watchdog(
 					name.clone(),
@@ -4631,6 +5043,13 @@ impl Engine {
 			detail.insert("state_generation".to_owned(), json!(1));
 			detail.insert("tags".to_owned(), json!(options.tags));
 			detail.insert("timeout_secs".to_owned(), json!(options.timeout_secs));
+			if let Some(idle_timeout_secs) = options.idle_timeout_secs {
+				detail.insert("idle_timeout_secs".to_owned(), json!(idle_timeout_secs));
+			}
+			if let Some(activity_threshold_bytes) = options.activity_threshold_bytes {
+				detail.insert("activity_threshold_bytes".to_owned(), json!(activity_threshold_bytes));
+			}
+			detail.insert("persistence".to_owned(), json!(options.persistence));
 			detail.insert("s3_mounts".to_owned(), s3_mounts_meta(s3_mounts));
 			detail.insert("network".to_owned(), json!(runtime.network_spec));
 			if let Some(command) = &options.command {
@@ -4678,6 +5097,8 @@ impl Engine {
 				detail: Value::Object(detail),
 				tags: options.tags.clone(),
 				last_active: now,
+				last_network_active: now,
+				persistence: options.persistence.clone(),
 				terminated_at: None,
 				error: None,
 				lifecycle: LifecycleState {
@@ -4693,6 +5114,7 @@ impl Engine {
 				.inner
 				.registry
 				.insert_persisted(self.home(), record.clone())?;
+			self.wake_maintenance();
 			Ok((vm.clone(), record))
 		})();
 		if result.is_err() {
@@ -5203,6 +5625,8 @@ impl Engine {
 			detail: Value::Object(detail),
 			tags: HashMap::new(),
 			last_active: now,
+			last_network_active: now,
+			persistence: plan.params.persistence.clone().unwrap_or_default(),
 			terminated_at: None,
 			error: None,
 			lifecycle: LifecycleState {
@@ -5220,7 +5644,7 @@ impl Engine {
 			.insert_persisted(self.home(), record.clone())
 		{
 			let mut runtime = runtime;
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, false);
 			return Err(error);
 		}
 		self.inner.runtimes.lock().insert(sid, runtime);
@@ -5338,6 +5762,7 @@ impl Engine {
 		);
 		self.inner.registry.insert_persisted(self.home(), record)?;
 		self.inner.runtimes.lock().insert(sid.to_owned(), runtime);
+		self.wake_maintenance();
 		Ok(())
 	}
 
@@ -6250,6 +6675,254 @@ impl Engine {
 	}
 }
 
+impl Engine {
+	fn stop_locked(&self, id: &str, returncode: Option<i64>) -> Result<Value> {
+		let record = self.get_record(id, false)?;
+		if record.status == "terminated" {
+			return Ok(json!({ "name": id, "status": record.status }));
+		}
+		if record.status == "stopped" {
+			self.apply_ephemeral_discard(&record)?;
+			return Ok(json!({ "name": id, "status": record.status }));
+		}
+		let agent = self
+			.inner
+			.runtimes
+			.lock()
+			.get(&record.name)
+			.and_then(|runtime| runtime.agent.clone())
+			.ok_or_else(|| {
+				EngineError::busy(format!(
+					"sandbox '{id}' cannot stop durably while its guest agent is unavailable"
+				))
+			})?;
+		let was_paused = record.lifecycle.observed == LifecyclePhase::Paused;
+		let flush_result = (|| -> Result<()> {
+			if was_paused {
+				control_for_vm(&self.sandbox(&record.name))?.resume()?;
+				agent.ping(AGENT_REQUEST_TIMEOUT)?;
+			}
+			agent.fs_sync(AGENT_REQUEST_TIMEOUT)?;
+			Ok(())
+		})();
+		if let Err(error) = flush_result {
+			if was_paused {
+				let _ =
+					control_for_vm(&self.sandbox(&record.name)).and_then(|mut control| control.pause());
+			}
+			return Err(error);
+		}
+		let transition = self.begin_state_transition(id, LifecyclePhase::Stopped)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let teardown_rc = match self.teardown(&record) {
+			Ok(code) => code,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		if let Err(error) = self.persist_status(id, "stopped", returncode.or(teardown_rc), None) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		if let Err(error) = self.apply_ephemeral_discard(&record) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		self.complete_state_transition(id, generation, LifecyclePhase::Stopped)?;
+		let record = self.inner.registry.get(id).unwrap_or(record);
+		self.publish_record_event("stopped", &record);
+		Ok(json!({ "name": id, "status": "stopped" }))
+	}
+
+	fn record_used_process_secrets(record: &VmRecord) -> bool {
+		record
+			.detail
+			.get("cold_start_requires_process_secrets")
+			.and_then(Value::as_bool)
+			.unwrap_or_else(|| {
+				record
+					.detail
+					.get("secret_names")
+					.and_then(Value::as_array)
+					.is_some_and(|names| !names.is_empty())
+					|| record
+						.detail
+						.get("credential_names")
+						.and_then(Value::as_array)
+						.is_some_and(|names| !names.is_empty())
+			})
+	}
+
+	fn recipe_for_cold_start(&self, record: &VmRecord) -> Result<RelaunchRecipe> {
+		let recipe = self.inner.relaunch_recipes.lock().get(&record.id).cloned();
+		if let Some(recipe) = recipe {
+			return Ok(recipe);
+		}
+		if Self::record_used_process_secrets(record) {
+			return Err(EngineError::busy(
+				"cold start unavailable: sandbox used secrets and the server restarted; recreate or \
+				 restore from snapshot",
+			));
+		}
+		let persisted = record
+			.detail
+			.get("relaunch_recipe")
+			.and_then(Value::as_object)
+			.ok_or_else(|| {
+				EngineError::busy(
+					"cold start unavailable: relaunch metadata is incomplete; recreate or restore from \
+					 snapshot",
+				)
+			})?;
+		let params = serde_json::from_value(
+			persisted
+				.get("params")
+				.cloned()
+				.ok_or_else(|| EngineError::busy("cold start relaunch parameters are missing"))?,
+		)
+		.map_err(|_| EngineError::busy("cold start relaunch parameters are invalid"))?;
+		let template_dir = persisted
+			.get("template_dir")
+			.and_then(Value::as_str)
+			.map(PathBuf::from)
+			.ok_or_else(|| EngineError::busy("cold start template metadata is missing"))?;
+		let image_ref = persisted
+			.get("image_ref")
+			.and_then(Value::as_str)
+			.map(str::to_owned);
+		Ok(RelaunchRecipe { params, template_dir, image_spec: None, image_ref })
+	}
+
+	fn cold_start(&self, id: &str) -> Result<Value> {
+		let record = self
+			.inner
+			.registry
+			.get(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if !self.inner.relaunch_recipes.lock().contains_key(id)
+			&& Self::record_used_process_secrets(&record)
+		{
+			return Err(EngineError::busy(
+				"cold start unavailable: sandbox used secrets and the server restarted; recreate or \
+				 restore from snapshot",
+			));
+		}
+		let vm = self.sandbox(&record.name);
+		if !vm.dir().is_dir() || !vm.dir().join("rootfs.img").is_file() {
+			return Err(EngineError::not_found(format!("sandbox '{id}' has no retained rootfs.img")));
+		}
+		let recipe = self.recipe_for_cold_start(&record)?;
+		let mut plan = self.prepare_relaunch(&recipe)?;
+		let transition = self.begin_state_transition(id, LifecyclePhase::Running)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let (vm, runtime) = match self.launch_create(&mut plan, false) {
+			Ok(launched) => launched,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
+		if let Err(error) = self.persist_status(id, "running", None, None) {
+			let mut runtime = runtime;
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, true);
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		self.inner.runtimes.lock().insert(record.name, runtime);
+		if let Ok(meta) = vm.meta() {
+			let pid = meta
+				.get("pid")
+				.and_then(Value::as_i64)
+				.and_then(|pid| i32::try_from(pid).ok());
+			let _ = self.inner.registry.update(id, |record| record.pid = pid);
+		}
+		if let Err(error) = self.complete_state_transition(id, generation, LifecyclePhase::Running) {
+			if let Some(record) = self.inner.registry.get(id) {
+				let _ = self.teardown(&record);
+				let _ = self.persist_status(id, "stopped", None, None);
+			}
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		let record = self.get_record(id, false)?;
+		self.publish_record_event("resumed", &record);
+		Ok(record.view())
+	}
+
+	#[allow(clippy::unused_self, reason = "uses self under test builds for mock executor")]
+	fn ensure_disk_resize_available(&self) -> Result<()> {
+		#[cfg(test)]
+		if self.inner.disk_resize_executor.lock().is_some() {
+			return Ok(());
+		}
+		for tool in ["e2fsck", "resize2fs"] {
+			if Command::new(tool).arg("-V").output().is_err() {
+				return Err(EngineError::invalid("disk resize requires host e2fsprogs"));
+			}
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::unused_self, reason = "uses self under test builds for mock executor")]
+	fn build_resized_disk(&self, source: &Path, stage: &Path, new_bytes: u64) -> Result<()> {
+		#[cfg(test)]
+		let executor = self.inner.disk_resize_executor.lock().clone();
+		#[cfg(test)]
+		if let Some(executor) = executor {
+			return executor(source, stage, new_bytes);
+		}
+		let _ = fs::remove_file(stage);
+		let reflinked = Command::new("cp")
+			.args(["--reflink=auto", "--sparse=always"])
+			.arg(source)
+			.arg(stage)
+			.status()
+			.is_ok_and(|status| status.success());
+		if !reflinked {
+			fs::copy(source, stage).map_err(|error| {
+				EngineError::invalid(format!("staging disk resize failed: {error}"))
+			})?;
+		}
+		OpenOptions::new()
+			.write(true)
+			.open(stage)
+			.and_then(|file| file.set_len(new_bytes))
+			.map_err(|error| EngineError::invalid(format!("growing staged disk failed: {error}")))?;
+		for (tool, args, accept_repaired) in [
+			("e2fsck", vec!["-pf"], true),
+			("resize2fs", Vec::new(), false),
+			("e2fsck", vec!["-pf"], true),
+		] {
+			let output = Command::new(tool)
+				.args(args)
+				.arg(stage)
+				.output()
+				.map_err(|_| EngineError::invalid("disk resize requires host e2fsprogs"))?;
+			let code = output.status.code();
+			if !(output.status.success() || (accept_repaired && code == Some(1))) {
+				let stderr = String::from_utf8_lossy(&output.stderr);
+				let stdout = String::from_utf8_lossy(&output.stdout);
+				let detail = if stderr.trim().is_empty() {
+					stdout.trim()
+				} else {
+					stderr.trim()
+				};
+				return Err(EngineError::invalid(format!(
+					"{tool} failed during disk resize: {detail}"
+				)));
+			}
+		}
+		Ok(())
+	}
+}
+
 impl TemplateBooter for Engine {
 	fn boot_verify_and_snapshot(&self, spec: &TemplateSpec) -> Result<()> {
 		let old = self.sandbox(&spec.vm_name);
@@ -6394,6 +7067,7 @@ impl EngineApi for Engine {
 		detail.insert("egress_allow".to_owned(), json!(plan.params.egress_allow));
 		detail.insert("egress_allow_domains".to_owned(), json!(plan.params.egress_allow_domains));
 		detail.insert("inbound_cidr_allowlist".to_owned(), json!(plan.params.inbound_cidr_allowlist));
+		detail.insert("nics".to_owned(), json!(plan.params.nics));
 		detail.insert("pool_size".to_owned(), json!(plan.params.pool_size));
 		if let Some(fs_dir) = &plan.params.fs_dir {
 			// Host-local share: checkpointing/migration must refuse this sandbox.
@@ -6407,6 +7081,36 @@ impl EngineApi for Engine {
 		);
 		detail.insert("ha".to_owned(), json!(plan.ha));
 		detail.insert("restart_policy".to_owned(), json!(plan.restart_policy));
+		let requires_process_secrets = !plan.secrets.is_empty()
+			|| plan
+				.relaunch_params
+				.credentials
+				.as_ref()
+				.is_some_and(|names| !names.is_empty())
+			|| !plan.s3_specs.is_empty();
+		detail
+			.insert("cold_start_requires_process_secrets".to_owned(), json!(requires_process_secrets));
+		let mut recipe_params = plan.relaunch_params.clone();
+		recipe_params.env = Some(runtime.env.clone().into_iter().collect());
+		recipe_params.workdir.clone_from(&runtime.workdir);
+		let recipe = RelaunchRecipe {
+			params:       recipe_params,
+			template_dir: plan.template_dir.clone(),
+			image_spec:   plan.image_spec.clone(),
+			image_ref:    plan.image_ref.clone(),
+		};
+		if !requires_process_secrets {
+			let mut persisted_params = recipe.params.clone();
+			persisted_params.secrets = None;
+			detail.insert(
+				"relaunch_recipe".to_owned(),
+				json!({
+					"params": persisted_params,
+					"template_dir": recipe.template_dir,
+					"image_ref": recipe.image_ref,
+				}),
+			);
+		}
 		if let Some(command) = &plan.params.command {
 			detail.insert("command".to_owned(), json!(command));
 		}
@@ -6454,6 +7158,8 @@ impl EngineApi for Engine {
 			detail: Value::Object(detail),
 			tags: plan.tags.clone(),
 			last_active: now,
+			last_network_active: now,
+			persistence: plan.params.persistence.clone().unwrap_or_default(),
 			terminated_at: None,
 			error: None,
 			lifecycle: LifecycleState {
@@ -6471,10 +7177,16 @@ impl EngineApi for Engine {
 			.insert_persisted(self.home(), record.clone())
 		{
 			let mut runtime = runtime;
-			self.rollback_uncommitted_runtime(&vm, &mut runtime);
+			self.rollback_uncommitted_runtime(&vm, &mut runtime, false);
 			return Err(error);
 		}
 		self.inner.runtimes.lock().insert(plan.sid.clone(), runtime);
+		self.wake_maintenance();
+		self
+			.inner
+			.relaunch_recipes
+			.lock()
+			.insert(plan.sid.clone(), recipe);
 		if let Some(key) = plan
 			.params
 			.idempotency_key
@@ -6558,30 +7270,7 @@ impl EngineApi for Engine {
 	fn stop_with_returncode(&self, id: &str, returncode: Option<i64>) -> Result<Value> {
 		let capture_lock = self.capture_lock(id);
 		let _capture_guard = capture_lock.acquire();
-		let record = self.get_record(id, false)?;
-		if record.status == "terminated" {
-			return Ok(json!({ "name": id, "status": record.status }));
-		}
-		let transition = self.begin_state_transition(id, LifecyclePhase::Stopped)?;
-		if transition.disposition != TransitionDisposition::Acquired {
-			return Ok(self.get_record(id, false)?.view());
-		}
-		let generation = transition.generation;
-		let teardown_rc = match self.teardown(&record) {
-			Ok(code) => code,
-			Err(error) => {
-				self.fail_state_transition(id, generation, &error);
-				return Err(error);
-			},
-		};
-		if let Err(error) = self.persist_status(id, "stopped", returncode.or(teardown_rc), None) {
-			self.fail_state_transition(id, generation, &error);
-			return Err(error);
-		}
-		self.complete_state_transition(id, generation, LifecyclePhase::Stopped)?;
-		let record = self.inner.registry.get(id).unwrap_or(record);
-		self.publish_record_event("stopped", &record);
-		Ok(json!({ "name": id, "status": "stopped" }))
+		self.stop_locked(id, returncode)
 	}
 
 	fn terminate(&self, id: &str, reason: &str) -> Result<Value> {
@@ -6591,6 +7280,7 @@ impl EngineApi for Engine {
 		let returncode = self.teardown(&record)?;
 		let terminated_at = unix_time();
 		self.persist_status(id, "terminated", returncode, Some(terminated_at))?;
+		self.inner.vpcs.release_sandbox(id)?;
 		let oom = detect_oom(id);
 		let actual_reason = if oom { "oom" } else { reason };
 		let _ = self
@@ -6639,7 +7329,9 @@ impl EngineApi for Engine {
 			self.delete_local_recovery_history(id)?;
 			self.remove_sandbox(&vm)?;
 		}
+		self.inner.vpcs.release_sandbox(id)?;
 		self.inner.registry.remove(id);
+		self.inner.relaunch_recipes.lock().remove(id);
 		Ok(json!({ "name": id, "removed": true }))
 	}
 
@@ -6675,6 +7367,9 @@ impl EngineApi for Engine {
 		let capture_lock = self.capture_lock(id);
 		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, false)?;
+		if record.status == "stopped" {
+			return self.cold_start(id);
+		}
 		if self.converge_pending_portable_resume(&record)? {
 			let record = self.get_record(id, false)?;
 			self.publish_record_event("resumed", &record);
@@ -6984,7 +7679,186 @@ impl EngineApi for Engine {
 		Ok(result)
 	}
 
+	fn resize(
+		&self,
+		id: &str,
+		cpus: Option<u32>,
+		memory_mib: Option<u32>,
+		disk_mb: Option<u64>,
+	) -> Result<Value> {
+		if cpus.is_none() && memory_mib.is_none() && disk_mb.is_none() {
+			return Err(EngineError::invalid("resize requires at least one resource field"));
+		}
+		if cpus == Some(0) || memory_mib == Some(0) || disk_mb == Some(0) {
+			return Err(EngineError::invalid("resize resource sizes must be nonzero"));
+		}
+		if cpus.is_some_and(|value| u64::from(value) > MAX_CPUS) {
+			return Err(EngineError::invalid(format!("cpus must be at most {MAX_CPUS}")));
+		}
+		if memory_mib.is_some_and(|value| u64::from(value) > MAX_MEM_MIB) {
+			return Err(EngineError::invalid(format!("memory_mib must be at most {MAX_MEM_MIB}")));
+		}
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
+		let record = self
+			.inner
+			.registry
+			.get(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		if record.status != "running" && record.status != "stopped" {
+			return Err(EngineError::busy(format!(
+				"sandbox '{id}' cannot be resized while {}",
+				record.status
+			)));
+		}
+		let current_cpus = record
+			.detail
+			.get("cpus")
+			.and_then(Value::as_u64)
+			.and_then(|value| u32::try_from(value).ok())
+			.unwrap_or(1);
+		let current_memory = record
+			.detail
+			.get("memory")
+			.and_then(Value::as_u64)
+			.and_then(|value| u32::try_from(value).ok())
+			.unwrap_or(512);
+		let current_disk = record
+			.detail
+			.get("disk_mb")
+			.and_then(Value::as_u64)
+			.ok_or_else(|| EngineError::invalid("sandbox disk size metadata is missing"))?;
+		if disk_mb.is_some_and(|disk| disk < current_disk) {
+			return Err(EngineError::invalid("disk_mb cannot shrink the root disk"));
+		}
+		let target_disk = disk_mb.unwrap_or(current_disk);
+		let target_disk_u32 = u32::try_from(target_disk)
+			.map_err(|_| EngineError::invalid("disk_mb exceeds the supported VM size"))?;
+		let new_bytes = target_disk
+			.checked_mul(1024 * 1024)
+			.ok_or_else(|| EngineError::invalid("disk_mb exceeds the supported host file size"))?;
+		let disk_growth = target_disk > current_disk;
+		let vm = self.sandbox(&record.name);
+		if !vm.dir().is_dir() || !vm.dir().join("rootfs.img").is_file() {
+			return Err(EngineError::not_found(format!("sandbox '{id}' has no retained rootfs.img")));
+		}
+		if disk_growth {
+			self.ensure_disk_resize_available()?;
+		}
+		let old_recipe = self.recipe_for_cold_start(&record)?;
+		let mut new_recipe = old_recipe.clone();
+		new_recipe.params.cpus = cpus.unwrap_or(current_cpus);
+		new_recipe.params.memory = memory_mib.unwrap_or(current_memory);
+		new_recipe.params.disk_mb = target_disk_u32;
+		let was_running = record.status == "running";
+		if was_running {
+			self.stop_locked(id, None)?;
+		}
+
+		let rootfs = vm.dir().join("rootfs.img");
+		let stage = vm.dir().join("rootfs.img.resize-tmp");
+		let backup = vm.dir().join("rootfs.img.pre-resize");
+		if disk_growth {
+			if let Err(error) = self.build_resized_disk(&rootfs, &stage, new_bytes) {
+				let _ = fs::remove_file(&stage);
+				if was_running {
+					let _ = self.cold_start(id);
+				}
+				return Err(error);
+			}
+			let _ = fs::remove_file(&backup);
+			if let Err(error) = fs::rename(&rootfs, &backup).and_then(|()| fs::rename(&stage, &rootfs))
+			{
+				if backup.is_file() && !rootfs.is_file() {
+					let _ = fs::rename(&backup, &rootfs);
+				}
+				let _ = fs::remove_file(&stage);
+				if was_running {
+					let _ = self.cold_start(id);
+				}
+				return Err(EngineError::invalid(format!("installing resized disk failed: {error}")));
+			}
+		}
+
+		let update_result = self
+			.inner
+			.registry
+			.update_detail_persisted(self.home(), id, |detail| {
+				detail.insert("cpus".to_owned(), json!(new_recipe.params.cpus));
+				detail.insert("memory".to_owned(), json!(new_recipe.params.memory));
+				detail.insert("disk_mb".to_owned(), json!(new_recipe.params.disk_mb));
+				if detail.get("relaunch_recipe").is_some() {
+					let mut persisted_params = new_recipe.params.clone();
+					persisted_params.secrets = None;
+					detail.insert(
+						"relaunch_recipe".to_owned(),
+						json!({
+							"params": persisted_params,
+							"template_dir": new_recipe.template_dir,
+							"image_ref": new_recipe.image_ref,
+						}),
+					);
+				}
+			});
+		if let Err(error) = update_result {
+			if disk_growth {
+				let _ = fs::remove_file(&rootfs);
+				let _ = fs::rename(&backup, &rootfs);
+			}
+			if was_running {
+				let _ = self.cold_start(id);
+			}
+			return Err(error);
+		}
+		self
+			.inner
+			.relaunch_recipes
+			.lock()
+			.insert(id.to_owned(), new_recipe);
+		if was_running && let Err(error) = self.cold_start(id) {
+			if disk_growth {
+				let _ = fs::remove_file(&rootfs);
+				let _ = fs::rename(&backup, &rootfs);
+			}
+			self
+				.inner
+				.relaunch_recipes
+				.lock()
+				.insert(id.to_owned(), old_recipe.clone());
+			let _ = self
+				.inner
+				.registry
+				.update_detail_persisted(self.home(), id, |detail| {
+					detail.insert("cpus".to_owned(), json!(current_cpus));
+					detail.insert("memory".to_owned(), json!(current_memory));
+					detail.insert("disk_mb".to_owned(), json!(current_disk));
+					if detail.get("relaunch_recipe").is_some() {
+						let mut persisted_params = old_recipe.params.clone();
+						persisted_params.secrets = None;
+						detail.insert(
+							"relaunch_recipe".to_owned(),
+							json!({
+								"params": persisted_params,
+								"template_dir": old_recipe.template_dir,
+								"image_ref": old_recipe.image_ref,
+							}),
+						);
+					}
+				});
+			let _ = self.cold_start(id);
+			return Err(error);
+		}
+		if disk_growth {
+			let _ = fs::remove_file(&backup);
+		}
+		Ok(self.get_record(id, false)?.view())
+	}
+
 	fn suspend(&self, id: &str) -> Result<Value> {
+		let policy_record = self.get_record(id, true)?;
+		if policy_record.persistence == PersistencePolicy::Ephemeral {
+			return self.stop_with_returncode(id, None);
+		}
 		let capture_lock = self.capture_lock(id);
 		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
@@ -7710,6 +8584,26 @@ impl EngineApi for Engine {
 		Ok(json!({ "deadline_unix": deadline }))
 	}
 
+	fn set_idle_timeout(&self, id: &str, secs: f64) -> Result<Value> {
+		if !secs.is_finite() || secs < 0.0 {
+			return Err(EngineError::invalid("idle_timeout_secs must be non-negative"));
+		}
+		let _maintenance_permit = self.maintenance_permit(id);
+		let capture_lock = self.capture_lock(id);
+		let _capture_guard = capture_lock.acquire();
+		self.get_record(id, false)?;
+		let record =
+			self
+				.inner
+				.registry
+				.set_idle_timeout_persisted(self.home(), id, secs, unix_time())?;
+		if let Some(recipe) = self.inner.relaunch_recipes.lock().get_mut(id) {
+			recipe.params.idle_timeout_secs = Some(secs);
+		}
+		self.wake_maintenance();
+		Ok(record.view())
+	}
+
 	fn metrics(&self, id: &str) -> Result<Value> {
 		self.get_record(id, true)?;
 		control_for_vm(&self.sandbox(id))?.metrics()
@@ -7825,6 +8719,77 @@ impl EngineApi for Engine {
 			stderr,
 			exit,
 		})
+	}
+
+	fn pty_open(&self, id: &str, params: Value) -> Result<PtyStream> {
+		self.get_record(id, true)?;
+		let parts = self
+			.agent_for(id)?
+			.pty_open(params, AGENT_REQUEST_TIMEOUT)?;
+		self.inner.pty_cache.remember(id, [parts.session.clone()]);
+		Ok(PtyStream {
+			session: parts.session,
+			control: Box::new(EnginePtyControl { handle: parts.control }),
+			stdout:  bridge_bytes(parts.stdout),
+			exit:    bridge_exit(parts.exit),
+		})
+	}
+
+	fn pty_attach(&self, id: &str, params: Value) -> Result<PtyStream> {
+		let record = self.get_record(id, false)?;
+		if record.status == "suspended" {
+			self.resume(id)?;
+		}
+		let parts = self
+			.agent_for(id)?
+			.pty_attach(params, AGENT_REQUEST_TIMEOUT)?;
+		self.inner.pty_cache.remember(id, [parts.session.clone()]);
+		Ok(PtyStream {
+			session: parts.session,
+			control: Box::new(EnginePtyControl { handle: parts.control }),
+			stdout:  bridge_bytes(parts.stdout),
+			exit:    bridge_exit(parts.exit),
+		})
+	}
+
+	fn pty_list(&self, id: &str) -> Result<Vec<Value>> {
+		let record = self.get_record(id, false)?;
+		if record.status == "suspended" {
+			return Ok(self.inner.pty_cache.suspended(id));
+		}
+		let sessions = self.agent_for(id)?.pty_list(AGENT_REQUEST_TIMEOUT)?;
+		self.inner.pty_cache.replace(id, sessions.clone());
+		Ok(sessions)
+	}
+
+	fn pty_close(&self, id: &str, session_id: &str) -> Result<Value> {
+		self.get_record(id, true)?;
+		let response = self
+			.agent_for(id)?
+			.pty_close(session_id, AGENT_REQUEST_TIMEOUT)?;
+		self.inner.pty_cache.forget(id, session_id);
+		Ok(response)
+	}
+
+	fn pty_exec(
+		&self,
+		id: &str,
+		session_id: &str,
+		command: &str,
+		timeout: f64,
+	) -> Result<ExecCapture> {
+		if !timeout.is_finite() || timeout <= 0.0 {
+			return Err(EngineError::invalid("PTY exec timeout must be positive and finite"));
+		}
+		self.get_record(id, true)?;
+		let response =
+			self
+				.agent_for(id)?
+				.pty_exec(session_id, command, Duration::from_secs_f64(timeout))?;
+		let stdout = serde_json::from_value(response.get("stdout").cloned().unwrap_or_default())?;
+		let stderr = serde_json::from_value(response.get("stderr").cloned().unwrap_or_default())?;
+		let exit = response.get("code").and_then(Value::as_i64).unwrap_or(-1);
+		Ok(ExecCapture { exit, stdout, stderr })
 	}
 
 	fn shell_start(&self, params: Value) -> Result<ShellSession> {
@@ -8079,6 +9044,24 @@ impl EngineApi for Engine {
 			.and_then(|state| state.network.as_ref())
 			.and_then(|network| network.tunnels().get(&port).cloned())
 			.ok_or_else(|| EngineError::engine("no tunnel for sandbox port"))
+	}
+
+	fn vpc_create(&self, tenant: &str, name: Option<&str>, cidr: Option<&str>) -> Result<Vpc> {
+		net::require_vpc_host()?;
+		self.inner.vpcs.create(tenant, name, cidr)
+	}
+
+	fn vpc_list(&self, tenant: &str) -> Result<Vec<Vpc>> {
+		net::require_vpc_host()?;
+		Ok(self.inner.vpcs.list(tenant))
+	}
+
+	fn vpc_delete(&self, tenant: &str, id: &str) -> Result<()> {
+		net::require_vpc_host()?;
+		self.inner.vpcs.ensure_deletable(tenant, id)?;
+		net::delete_vpc_bridge(id)?;
+		self.inner.vpcs.delete(tenant, id)?;
+		Ok(())
 	}
 
 	fn snapshot(&self, id: &str, name: Option<String>, stop: bool) -> Result<Value> {
@@ -8506,6 +9489,25 @@ impl crate::engine::ExecControl for EngineExecControl {
 		self.handle.kill(signal)
 	}
 }
+impl PtyControl for EnginePtyControl {
+	fn write(&mut self, data: &[u8]) -> Result<()> {
+		self.handle.write(data)
+	}
+
+	fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+		self.handle.resize(rows, cols)
+	}
+
+	fn detach(&mut self) -> Result<()> {
+		self.handle.detach()
+	}
+}
+
+impl Drop for EnginePtyControl {
+	fn drop(&mut self) {
+		let _ = self.handle.detach();
+	}
+}
 
 fn align_process_home(home: &Path) {
 	if crate::home::state_dir() == home {
@@ -8655,6 +9657,20 @@ fn resolve_snapshot_options(
 	let options = serde_json::from_value::<SnapshotOptions>(json!(extra)).map_err(|error| {
 		EngineError::invalid(format!("unsupported or invalid snapshot override: {error}"))
 	})?;
+	if options
+		.persistence
+		.as_ref()
+		.and_then(PersistencePolicy::sticky_priority)
+		.is_some_and(|priority| priority > 10)
+	{
+		return Err(EngineError::invalid("sticky persistence priority must be between 0 and 10"));
+	}
+	if options
+		.idle_timeout_secs
+		.is_some_and(|timeout| !timeout.is_finite() || timeout < 0.0)
+	{
+		return Err(EngineError::invalid("idle_timeout_secs must be non-negative"));
+	}
 	let secrets = parse_secrets(options.secrets)?;
 	let timeout_secs = if options.timeout_secs.is_some() || options.timeout.is_some() {
 		effective_timeout_secs(options.timeout_secs, options.timeout)?
@@ -8670,6 +9686,9 @@ fn resolve_snapshot_options(
 		workdir: options.workdir,
 		tags: options.tags.unwrap_or_default(),
 		timeout_secs,
+		idle_timeout_secs: options.idle_timeout_secs,
+		activity_threshold_bytes: options.activity_threshold_bytes,
+		persistence: options.persistence.unwrap_or_default(),
 		readiness_probe: options.readiness_probe,
 		s3_mounts: options.s3_mounts,
 		command: options.command,
@@ -9209,7 +10228,7 @@ fn stamp_checkpoint_marker(snapshot_dir: &Path, detail: Option<&Map<String, Valu
 	let Some(detail) = detail else {
 		return Ok(());
 	};
-	for candidate in ["template", "restored_from"] {
+	for candidate in ["rootfs", "template", "restored_from"] {
 		let Some(value) = detail
 			.get(candidate)
 			.and_then(Value::as_str)
@@ -9217,13 +10236,29 @@ fn stamp_checkpoint_marker(snapshot_dir: &Path, detail: Option<&Map<String, Valu
 		else {
 			continue;
 		};
-		let src_marker = PathBuf::from(value).join("agent-ready.json");
-		if src_marker.is_file() {
-			fs::copy(src_marker, marker)?;
+		let source = PathBuf::from(value);
+		let source_dir = if candidate == "rootfs" {
+			source.parent().unwrap_or(source.as_path())
+		} else {
+			source.as_path()
+		};
+		if copy_agent_marker(source_dir, snapshot_dir)? {
 			break;
 		}
 	}
 	Ok(())
+}
+
+fn copy_agent_marker(source_dir: &Path, target_dir: &Path) -> Result<bool> {
+	let source = source_dir.join("agent-ready.json");
+	if !source.is_file() {
+		return Ok(false);
+	}
+	let target = target_dir.join("agent-ready.json");
+	if source != target {
+		fs::copy(source, target)?;
+	}
+	Ok(true)
 }
 
 fn ensure_checkpoint_template_present(snapshot_dir: &Path) -> Result<()> {
@@ -9848,10 +10883,15 @@ fn credentials_requested(params: &SandboxCreate) -> bool {
 }
 
 fn network_required(params: &SandboxCreate) -> bool {
-	!params.block_network || credentials_requested(params)
+	!params.block_network
+		|| credentials_requested(params)
+		|| params.nics.as_ref().is_some_and(|nics| !nics.is_empty())
 }
 
 fn reject_macos_host_network_features(params: &SandboxCreate) -> Result<()> {
+	if params.nics.as_ref().is_some_and(|nics| !nics.is_empty()) {
+		return Err(EngineError::invalid("VPCs require a Linux host"));
+	}
 	for (feature, requested) in [
 		("ports", params.ports.as_ref().is_some_and(|v| !v.is_empty())),
 		("egress_allow", params.egress_allow.as_ref().is_some_and(|v| !v.is_empty())),
@@ -10090,6 +11130,58 @@ fn unix_millis() -> u128 {
 		.map_or(0, |duration| duration.as_millis())
 }
 
+fn idle_deadline_elapsed(
+	record: &VmRecord,
+	legacy_timeout: f64,
+	legacy_sample_active: Option<bool>,
+	now: f64,
+) -> bool {
+	if let Some(timeout) = record
+		.detail
+		.get("idle_timeout_secs")
+		.and_then(Value::as_f64)
+	{
+		return timeout > 0.0 && now - record.last_network_active >= timeout;
+	}
+	legacy_sample_active == Some(false)
+		&& legacy_timeout > 0.0
+		&& now - record.last_active >= legacy_timeout
+}
+
+const fn network_delta_exceeds_threshold(delta: u64, threshold: u64) -> bool {
+	delta > threshold
+}
+
+fn path_size(path: &Path) -> Result<u64> {
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+		Err(error) => return Err(error.into()),
+	};
+	if !metadata.is_dir() {
+		return Ok(metadata.len());
+	}
+	let mut size = 0_u64;
+	for entry in fs::read_dir(path)? {
+		size = size.saturating_add(path_size(&entry?.path())?);
+	}
+	Ok(size)
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+	let metadata = match fs::symlink_metadata(path) {
+		Ok(metadata) => metadata,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(error.into()),
+	};
+	if metadata.is_dir() {
+		fs::remove_dir_all(path)?;
+	} else {
+		fs::remove_file(path)?;
+	}
+	Ok(())
+}
+
 const fn backend_name() -> &'static str {
 	if cfg!(target_os = "macos") {
 		"hvf"
@@ -10116,6 +11208,138 @@ mod tests {
 		config.home = temp.path().to_path_buf();
 		config.warm_images = Vec::new();
 		config
+	}
+
+	#[test]
+	fn maintenance_interval_tracks_short_override_with_long_or_disabled_default() {
+		for default_idle_timeout in [300.0, 0.0] {
+			let temp = TempDir::new().expect("temp");
+			let mut config = config_for(&temp);
+			config.idle_timeout = default_idle_timeout;
+			let (engine, _home) = Engine::new_test(config);
+			let mut record = VmRecord::new("sandbox", "sandbox", "running");
+			record.detail = json!({"idle_timeout_secs": 0.0});
+			engine.insert_test_record(record);
+			assert_eq!(engine.maintenance_interval(), Duration::from_secs(30));
+
+			engine
+				.inner
+				.registry
+				.update("sandbox", |record| {
+					record.detail["idle_timeout_secs"] = json!(1.0);
+				})
+				.expect("idle policy update");
+			assert_eq!(engine.maintenance_interval(), Duration::from_secs(1));
+		}
+	}
+	fn insert_stopped_resize_fixture(
+		engine: &Engine,
+		temp: &TempDir,
+		id: &str,
+		with_rootfs: bool,
+		requires_secrets: bool,
+	) {
+		let params = SandboxCreate {
+			name: Some(id.to_owned()),
+			cpus: 2,
+			memory: 1024,
+			disk_mb: 100,
+			..Default::default()
+		};
+		let mut detail = json!({
+			"cpus": 2,
+			"memory": 1024,
+			"disk_mb": 100,
+			"cold_start_requires_process_secrets": requires_secrets,
+		});
+		if !requires_secrets {
+			detail["relaunch_recipe"] = json!({
+				"params": params,
+				"template_dir": temp.path().join("templates/base"),
+				"image_ref": Value::Null,
+			});
+		}
+		write_meta(temp.path(), id, detail.clone());
+		if with_rootfs {
+			fs::write(engine.sandbox(id).dir().join("rootfs.img"), b"rootfs").expect("rootfs");
+		}
+		let mut record = VmRecord::new(id, id, "stopped");
+		record.detail = detail;
+		engine.insert_test_record(record);
+	}
+
+	#[test]
+	fn cold_start_rejects_unknown_sandbox() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let error = engine.cold_start("missing").expect_err("unknown sandbox");
+		assert_eq!(error.code, crate::error::ErrorCode::NotFound);
+	}
+
+	#[test]
+	fn resume_stopped_without_retained_disk_is_not_found() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		insert_stopped_resize_fixture(&engine, &temp, "stopped", false, false);
+		let error = engine.resume("stopped").expect_err("missing retained disk");
+		assert_eq!(error.code, crate::error::ErrorCode::NotFound);
+	}
+
+	#[test]
+	fn cold_start_after_secret_recipe_loss_is_busy() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		insert_stopped_resize_fixture(&engine, &temp, "secret", false, true);
+		let error = engine.cold_start("secret").expect_err("lost secret recipe");
+		assert_eq!(error.code, crate::error::ErrorCode::Busy);
+		assert!(
+			error
+				.message
+				.contains("sandbox used secrets and the server restarted")
+		);
+	}
+
+	#[test]
+	fn resize_validates_and_updates_stopped_shape_without_launching() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		insert_stopped_resize_fixture(&engine, &temp, "resize", true, false);
+		assert_eq!(
+			engine
+				.resize("resize", None, None, None)
+				.expect_err("empty resize")
+				.code,
+			crate::error::ErrorCode::Invalid
+		);
+		assert_eq!(
+			engine
+				.resize("resize", None, None, Some(99))
+				.expect_err("disk shrink")
+				.code,
+			crate::error::ErrorCode::Invalid
+		);
+		let view = engine
+			.resize("resize", Some(4), Some(2048), None)
+			.expect("resize shape");
+		assert_eq!(view["cpus"], 4);
+		assert_eq!(view["memory"], 2048);
+		assert_eq!(view["status"], "stopped");
+		*engine.inner.disk_resize_executor.lock() = Some(Arc::new(|source, stage, bytes| {
+			fs::copy(source, stage)?;
+			OpenOptions::new().write(true).open(stage)?.set_len(bytes)?;
+			Ok(())
+		}));
+		let view = engine
+			.resize("resize", None, None, Some(101))
+			.expect("grow disk");
+		assert_eq!(view["disk_mb"], 101);
+		assert_eq!(
+			fs::metadata(engine.sandbox("resize").dir().join("rootfs.img"))
+				.expect("resized disk")
+				.len(),
+			101 * 1024 * 1024
+		);
+		assert_eq!(runtime.launches.load(Ordering::Relaxed), 0);
 	}
 
 	fn checkpoint_fixture(temp: &TempDir, name: &str) -> PathBuf {
@@ -10806,6 +12030,28 @@ mod tests {
 	}
 
 	#[test]
+	fn snapshot_launch_wakes_maintenance_for_short_idle_override() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		seal_test_snapshot(&engine, "base");
+		let wake = engine.inner.maintenance_wake.notified();
+
+		engine
+			.restore("base", RestoreBody {
+				name:  Some("restored-idle".to_owned()),
+				agent: None,
+				extra: HashMap::from([("idle_timeout_secs".to_owned(), json!(1.0))]),
+			})
+			.expect("restore with short idle policy");
+		engine.inner.net_runtime.handle().block_on(async {
+			tokio::time::timeout(Duration::from_secs(1), wake)
+				.await
+				.expect("snapshot launch must wake maintenance");
+		});
+		assert_eq!(engine.maintenance_interval(), Duration::from_secs(1));
+	}
+
+	#[test]
 	fn fork_rejects_invalid_counts_and_rolls_back_a_partial_batch() {
 		let temp = TempDir::new().expect("temp");
 		let (engine, runtime, _home) = snapshot_engine(&temp, 2);
@@ -11329,7 +12575,49 @@ mod tests {
 			engine.inner.maintenance_busy.lock().contains("pending"),
 			"maintenance must leave the pending operation owned by its transition"
 		);
-		engine.inner.maintenance_busy.lock().remove("pending");
+		engine.inner.release_maintenance("pending");
+	}
+
+	#[test]
+	fn idle_policy_update_waits_for_active_maintenance() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		engine
+			.inner
+			.registry
+			.insert_persisted(engine.home(), VmRecord::new("sandbox", "sandbox", "stopped"))
+			.expect("persist record");
+		assert!(
+			engine
+				.inner
+				.maintenance_busy
+				.lock()
+				.insert("sandbox".to_owned())
+		);
+		let worker_engine = engine.clone();
+		let (started_tx, started_rx) = std::sync::mpsc::channel();
+		let (done_tx, done_rx) = std::sync::mpsc::channel();
+		let worker = std::thread::spawn(move || {
+			started_tx.send(()).expect("report start");
+			done_tx
+				.send(worker_engine.set_idle_timeout("sandbox", 15.0))
+				.expect("report update");
+		});
+		started_rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("idle policy updater started");
+		assert!(
+			done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+			"idle policy update bypassed active maintenance"
+		);
+
+		engine.inner.release_maintenance("sandbox");
+		let view = done_rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("idle policy update finished")
+			.expect("idle policy update");
+		assert_eq!(view["idle_timeout_secs"], 15.0);
+		worker.join().expect("idle policy updater");
 	}
 
 	#[test]
@@ -11543,6 +12831,128 @@ mod tests {
 				.status,
 			"paused",
 			"PID fencing must retain the paused candidate for reconciliation"
+		);
+	}
+	#[test]
+	fn persistence_validation_rejects_invalid_sticky_priority() {
+		let temp = TempDir::new().expect("temp");
+		let (_engine, _home) = Engine::new_test(config_for(&temp));
+		let mut params = valid_create();
+		params.persistence = Some(PersistencePolicy::Sticky { priority: 11 });
+		let error = Engine::validate_create(&params).expect_err("priority above ten");
+		assert_eq!(error.code.as_str(), "invalid");
+		assert!(
+			serde_json::from_value::<SandboxCreate>(json!({
+				"persistence": {"type": "durable"}
+			}))
+			.is_err(),
+			"unknown persistence type must be rejected",
+		);
+
+		let error = resolve_snapshot_options(
+			HashMap::from([("persistence".to_owned(), json!({"type": "sticky", "priority": 11}))]),
+			None,
+		)
+		.err()
+		.expect("restore priority above ten");
+		assert_eq!(error.code.as_str(), "invalid");
+	}
+
+	#[test]
+	fn network_idle_policy_honors_defaults_overrides_disabling_and_activity() {
+		let temp = TempDir::new().expect("temp");
+		let (_engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("idle", "idle", "running");
+		record.last_active = 10.0;
+		record.last_network_active = 10.0;
+
+		assert!(idle_deadline_elapsed(&record, 20.0, Some(false), 30.0));
+		assert!(!idle_deadline_elapsed(&record, 20.0, Some(true), 30.0));
+
+		record.detail = json!({
+			"idle_timeout_secs": 40.0,
+			"activity_threshold_bytes": 100,
+		});
+		assert!(!idle_deadline_elapsed(&record, 20.0, Some(false), 49.0));
+		assert!(idle_deadline_elapsed(&record, 20.0, Some(true), 50.0));
+
+		record.detail["idle_timeout_secs"] = json!(0.0);
+		assert!(!idle_deadline_elapsed(&record, 20.0, Some(false), 1_000.0));
+
+		record.detail["idle_timeout_secs"] = json!(20.0);
+		record.last_network_active = 40.0;
+		assert!(!idle_deadline_elapsed(&record, 20.0, Some(false), 59.0));
+		assert!(idle_deadline_elapsed(&record, 20.0, Some(true), 60.0));
+		assert!(!network_delta_exceeds_threshold(100, 100));
+		assert!(network_delta_exceeds_threshold(101, 100));
+	}
+
+	#[test]
+	fn ephemeral_suspend_policy_hook_discards_rootfs_and_recovery_state() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let mut record = VmRecord::new("ephemeral", "ephemeral", "stopped");
+		record.persistence = PersistencePolicy::Ephemeral;
+		let vm_dir = engine.home().vm_dir("ephemeral");
+		fs::create_dir_all(&vm_dir).expect("vm dir");
+		fs::write(vm_dir.join("meta.json"), b"{}").expect("meta");
+		fs::write(vm_dir.join("rootfs.img"), b"stored rootfs").expect("rootfs");
+		let recovery = engine.recovery_root("ephemeral").expect("recovery");
+		fs::create_dir_all(&recovery).expect("recovery dir");
+		fs::write(recovery.join("point.venc"), b"checkpoint").expect("checkpoint");
+		engine.insert_test_record(record.clone());
+
+		engine.apply_ephemeral_discard(&record).expect("discard");
+
+		assert!(vm_dir.join("meta.json").exists());
+		assert!(!vm_dir.join("rootfs.img").exists());
+		assert!(!recovery.exists());
+		assert_eq!(
+			engine
+				.get_record("ephemeral", false)
+				.expect("record")
+				.detail["state_discarded"],
+			json!(true)
+		);
+	}
+
+	#[test]
+	fn storage_gc_evicts_lower_priority_sticky_and_never_persistent() {
+		let temp = TempDir::new().expect("temp");
+		let mut config = config_for(&temp);
+		config.storage_quota_mb = 2;
+		let (engine, _home) = Engine::new_test(config);
+		for (id, persistence) in [
+			("low", PersistencePolicy::Sticky { priority: 1 }),
+			("high", PersistencePolicy::Sticky { priority: 9 }),
+			("permanent", PersistencePolicy::Persistent),
+		] {
+			let mut record = VmRecord::new(id, id, "stopped");
+			record.persistence = persistence;
+			let dir = engine.home().vm_dir(id);
+			fs::create_dir_all(&dir).expect("vm dir");
+			fs::write(dir.join("meta.json"), b"{}").expect("meta");
+			fs::write(dir.join("rootfs.img"), vec![0_u8; 900 * 1024]).expect("stored state");
+			engine.insert_test_record(record);
+		}
+
+		engine.enforce_storage_quota().expect("storage GC");
+
+		assert_eq!(engine.get_record("low", false).expect("low").status, "lost");
+		assert_eq!(engine.get_record("high", false).expect("high").status, "stopped");
+		assert_eq!(
+			engine
+				.get_record("permanent", false)
+				.expect("persistent")
+				.status,
+			"stopped"
+		);
+		assert!(
+			engine
+				.home()
+				.vm_dir("permanent")
+				.join("rootfs.img")
+				.exists()
 		);
 	}
 }

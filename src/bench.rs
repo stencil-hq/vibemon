@@ -229,7 +229,7 @@ struct FireOutcome {
 }
 
 impl FireOutcome {
-	fn failed(code: String) -> Self {
+	const fn failed(code: String) -> Self {
 		Self { admission: None, completion: None, sid: None, error: Some(code) }
 	}
 }
@@ -569,7 +569,7 @@ fn plan_burst(
 	if options.reference_memory_mib == 0 {
 		return Err(CliError::new("--reference-memory-mib must be greater than zero"));
 	}
-	if !options.headroom.is_finite() || !(0.0 < options.headroom && options.headroom <= 1.0) {
+	if !(options.headroom.is_finite() && 0.0 < options.headroom && options.headroom <= 1.0) {
 		return Err(CliError::new("--memory-headroom must be in (0, 1]"));
 	}
 	if memory_mib == 0 {
@@ -869,8 +869,8 @@ async fn run_open_loop(
 		cutoff_sender,
 	));
 	let mut pending = Vec::with_capacity(lanes);
-	for lane in 0..lanes {
-		let channel = channels[lane].clone();
+	for (lane, channel) in channels.iter().enumerate().take(lanes) {
+		let channel = channel.clone();
 		let context = context.clone();
 		pending.push(tokio::spawn(async move {
 			if batch {
@@ -1353,10 +1353,10 @@ async fn wait_until_removed(
 			return;
 		}
 		if Instant::now() >= deadline {
-			if remaining != usize::MAX {
-				eprintln!("cleanup: {remaining} benchmark sandboxes still listed after 5m");
-			} else {
+			if remaining == usize::MAX {
 				eprintln!("cleanup: could not confirm removal within 5m");
+			} else {
+				eprintln!("cleanup: {remaining} benchmark sandboxes still listed after 5m");
 			}
 			return;
 		}
@@ -1647,11 +1647,21 @@ mod tests {
 		assert!(!drain_stalled(window / 2, window, Duration::ZERO));
 		// Schedule over but progress within the grace: not stalled.
 		let busy = window + STALL_GRACE + Duration::from_secs(1);
-		assert!(!drain_stalled(busy, window, busy - STALL_GRACE + Duration::from_millis(1)));
+		assert!(!drain_stalled(
+			busy,
+			window,
+			busy.checked_sub(STALL_GRACE).unwrap() + Duration::from_millis(1)
+		));
 		// Schedule over and a full grace without progress: stalled.
 		assert!(drain_stalled(busy, window, quiet));
 		// The grace also gates right at the schedule boundary.
-		assert!(!drain_stalled(window + STALL_GRACE - Duration::from_millis(1), window, quiet));
+		assert!(!drain_stalled(
+			(window + STALL_GRACE)
+				.checked_sub(Duration::from_millis(1))
+				.unwrap(),
+			window,
+			quiet
+		));
 	}
 
 	#[test]

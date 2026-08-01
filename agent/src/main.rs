@@ -21,6 +21,7 @@ mod linux_agent {
 		io::{self, Read, Write},
 		net::{Ipv4Addr, TcpStream, ToSocketAddrs},
 		os::unix::{
+			ffi::OsStrExt,
 			fs::{MetadataExt, OpenOptionsExt},
 			io::{AsRawFd, FromRawFd},
 			process::{CommandExt, ExitStatusExt},
@@ -29,7 +30,7 @@ mod linux_agent {
 		str::FromStr,
 		sync::{Arc, Mutex, MutexGuard},
 		thread,
-		time::Duration,
+		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
 	use serde::Deserialize;
@@ -39,6 +40,19 @@ mod linux_agent {
 	type SharedWriter = Arc<Mutex<File>>;
 	type Sessions = Arc<Mutex<HashMap<u32, Session>>>;
 	type PendingWrites = Arc<Mutex<HashMap<u32, PendingWrite>>>;
+	type PtySessions = Arc<Mutex<HashMap<String, PtySessionState>>>;
+
+	struct PtySessionState {
+		pid:        i32,
+		master:     File,
+		cols:       u16,
+		rows:       u16,
+		exec:       Option<String>,
+		created_at: u64,
+		binding:    Option<proto::PtyBinding>,
+		scrollback: proto::Scrollback,
+		exit:       Option<(i32, SystemTime)>,
+	}
 
 	const HVC0: &str = "/dev/hvc0";
 	const CONSOLE: &str = "/dev/console";
@@ -166,10 +180,12 @@ mod linux_agent {
 			.map_err(|err| format!("clone {HVC0}: {err}"))?;
 		let writer = Arc::new(Mutex::new(device));
 		let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+		let pty_sessions: PtySessions = Arc::new(Mutex::new(HashMap::new()));
 		let pending_writes: PendingWrites = Arc::new(Mutex::new(HashMap::new()));
-		spawn_orphan_reaper(sessions.clone());
+		spawn_orphan_reaper(sessions.clone(), pty_sessions.clone());
 
-		let agent = Agent { writer, sessions, pending_writes };
+		let agent =
+			Agent { writer, sessions, pty_sessions, pending_writes, epoch: Arc::new(Mutex::new(0)) };
 
 		// Discard pre-protocol bytes (guest-kernel console noise on hvc0) up to the
 		// host's SYNC marker so the frame loop starts on a clean boundary.
@@ -189,7 +205,9 @@ mod linux_agent {
 	struct Agent {
 		writer:         SharedWriter,
 		sessions:       Sessions,
+		pty_sessions:   PtySessions,
 		pending_writes: PendingWrites,
+		epoch:          Arc<Mutex<u64>>,
 	}
 
 	impl Agent {
@@ -217,6 +235,7 @@ mod linux_agent {
 			};
 
 			match op {
+				proto::OP_HELLO => self.hello(id, &request),
 				"ping" => self.send_resp(
 					id,
 					json!({
@@ -230,7 +249,19 @@ mod linux_agent {
 					Err(error) => self.send_error(id, format!("reading guest activity: {error}")),
 				},
 				"exec" => self.start_exec(id, &request),
+				"pty_open" => self.pty_open(id, &request),
+				"pty_attach" => self.pty_attach(id, &request),
+				"pty_detach" => self.pty_detach(id, &request),
+				"pty_resize" => self.pty_resize(id, &request),
+				"pty_list" => self.pty_list(id),
+				"pty_close" => self.pty_close(id, &request),
+				"pty_exec" => self.pty_exec(id, &request),
 				"fs_read" => self.fs_read(id, &request),
+				"fs_sync" => {
+					// SAFETY: `sync` has no pointer arguments and flushes every mounted filesystem.
+					unsafe { libc::sync() };
+					self.send_resp(id, json!({"ok": true}));
+				},
 				"fs_write" => self.fs_write(id, &request),
 				"fs_list" => self.fs_list(id, &request),
 				"fs_stat" => self.fs_stat(id, &request),
@@ -242,6 +273,440 @@ mod linux_agent {
 				"mount" => self.mount(id, &request),
 				"mount_overlay" => self.mount_overlay(id, &request),
 				_ => self.send_error(id, "unknown op"),
+			}
+		}
+
+		fn hello(&self, id: u32, request: &Value) {
+			let Some(epoch) = request
+				.get("epoch")
+				.and_then(Value::as_u64)
+				.filter(|value| *value != 0)
+			else {
+				self.send_error(id, "hello requires a non-zero epoch");
+				return;
+			};
+			*lock(&self.epoch) = epoch;
+			for session in lock(&self.pty_sessions).values_mut() {
+				session.binding = None;
+			}
+			self.send_resp(id, json!({ "ok": true, "epoch": epoch }));
+		}
+
+		fn pty_open(&self, id: u32, request: &Value) {
+			if lock(&self.pty_sessions).len() >= 128 {
+				self.send_error(id, "session cap reached");
+				return;
+			}
+			let session_id = match request
+				.get("session_id")
+				.and_then(Value::as_str)
+				.filter(|value| !value.is_empty())
+			{
+				Some(value) => value.to_owned(),
+				None => match fs::read_to_string("/proc/sys/kernel/random/uuid") {
+					Ok(value) => value.trim().to_owned(),
+					Err(_) => format!("pty-{}-{}", std::process::id(), id),
+				},
+			};
+			if lock(&self.pty_sessions).contains_key(&session_id) {
+				self.send_error(id, "session already exists");
+				return;
+			}
+			let cols = request
+				.get("cols")
+				.and_then(Value::as_u64)
+				.unwrap_or(80)
+				.clamp(1, u16::MAX as u64) as u16;
+			let rows = request
+				.get("rows")
+				.and_then(Value::as_u64)
+				.unwrap_or(24)
+				.clamp(1, u16::MAX as u64) as u16;
+			let exec = request
+				.get("exec")
+				.and_then(Value::as_str)
+				.map(str::to_owned);
+			let mut master_fd = -1;
+			let mut slave_fd = -1;
+			let winsize =
+				libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+			// SAFETY: openpty initializes both descriptors and only reads winsize.
+			if unsafe {
+				libc::openpty(
+					&mut master_fd,
+					&mut slave_fd,
+					std::ptr::null_mut(),
+					std::ptr::null(),
+					&winsize,
+				)
+			} < 0
+			{
+				self.send_error(id, format!("openpty: {}", io::Error::last_os_error()));
+				return;
+			}
+			if let Err(error) = set_cloexec(master_fd).and_then(|()| set_cloexec(slave_fd)) {
+				close_fd(master_fd);
+				close_fd(slave_fd);
+				self.send_error(id, format!("pty cloexec: {error}"));
+				return;
+			}
+			let mut command = Command::new("sh");
+			if let Some(script) = &exec {
+				command.args(["-lc", script]);
+			} else {
+				command.arg("-l");
+			}
+			if let Some(workdir) = request.get("workdir").and_then(Value::as_str) {
+				command.current_dir(workdir);
+			}
+			if let Some(env) = request.get("env") {
+				match env_object(env) {
+					Ok(values) => command.envs(values),
+					Err(error) => {
+						close_fd(master_fd);
+						close_fd(slave_fd);
+						self.send_error(id, error);
+						return;
+					},
+				};
+			}
+			// SAFETY: child-only closure uses async-signal-safe descriptor/session
+			// syscalls.
+			unsafe {
+				command.pre_exec(move || {
+					if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+						return Err(io::Error::last_os_error());
+					}
+					for target in 0..=2 {
+						if libc::dup2(slave_fd, target) < 0 {
+							return Err(io::Error::last_os_error());
+						}
+					}
+					if slave_fd > 2 {
+						libc::close(slave_fd);
+					}
+					libc::close(master_fd);
+					Ok(())
+				});
+			}
+			let mut child = match command.spawn() {
+				Ok(child) => child,
+				Err(error) => {
+					close_fd(master_fd);
+					close_fd(slave_fd);
+					self.send_error(id, format!("spawn: {error}"));
+					return;
+				},
+			};
+			close_fd(slave_fd);
+			// SAFETY: master_fd is uniquely owned after successful openpty.
+			let master = unsafe { File::from_raw_fd(master_fd) };
+			let reader = match master.try_clone() {
+				Ok(reader) => reader,
+				Err(error) => {
+					let _ = signal_process_group(child.id() as i32, libc::SIGKILL);
+					self.send_error(id, format!("pty clone: {error}"));
+					return;
+				},
+			};
+			let pid = child.id() as i32;
+			let created_at = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_millis() as u64;
+			let binding = proto::PtyBinding { epoch: *lock(&self.epoch), frame_id: id };
+			lock(&self.pty_sessions).insert(session_id.clone(), PtySessionState {
+				pid,
+				master,
+				cols,
+				rows,
+				exec,
+				created_at,
+				binding: Some(binding),
+				scrollback: proto::Scrollback::new(proto::PTY_SCROLLBACK_LIMIT),
+				exit: None,
+			});
+			self.send_resp(
+				id,
+				pty_meta(&session_id, lock(&self.pty_sessions).get(&session_id).unwrap()),
+			);
+			let sessions = self.pty_sessions.clone();
+			let writer = self.writer.clone();
+			let epoch = self.epoch.clone();
+			thread::spawn(move || {
+				let mut reader = reader;
+				let mut buffer = vec![0u8; STREAM_CHUNK];
+				loop {
+					match reader.read(&mut buffer) {
+						Ok(0) | Err(_) => break,
+						Ok(count) => {
+							if !publish_pty_output(
+								&sessions,
+								&writer,
+								&epoch,
+								&session_id,
+								&buffer[..count],
+							) {
+								return;
+							}
+						},
+					}
+				}
+				let status = child.wait().ok();
+				let code = status.and_then(|status| status.code()).unwrap_or(-1);
+				let binding = {
+					let mut all = lock(&sessions);
+					let Some(session) = all.get_mut(&session_id) else {
+						return;
+					};
+					session.exit = Some((code, SystemTime::now()));
+					session.binding.take()
+				};
+				if let Some(binding) = binding
+					&& binding.epoch == *lock(&epoch)
+				{
+					send_json(&writer, proto::FRAME_EXIT, binding.frame_id, &json!({ "code": code }));
+				}
+			});
+		}
+
+		fn pty_attach(&self, id: u32, request: &Value) {
+			let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+				self.send_error(id, "missing session_id");
+				return;
+			};
+			let epoch = *lock(&self.epoch);
+			let mut sessions = lock(&self.pty_sessions);
+			let Some(session) = sessions.get_mut(session_id) else {
+				self.send_error(id, "unknown pty session");
+				return;
+			};
+			if let Some(cols) = request.get("cols").and_then(Value::as_u64) {
+				session.cols = cols.clamp(1, u16::MAX as u64) as u16;
+			}
+			if let Some(rows) = request.get("rows").and_then(Value::as_u64) {
+				session.rows = rows.clamp(1, u16::MAX as u64) as u16;
+			}
+			let winsize = libc::winsize {
+				ws_row:    session.rows,
+				ws_col:    session.cols,
+				ws_xpixel: 0,
+				ws_ypixel: 0,
+			};
+			// SAFETY: the session owns a live PTY master and ioctl only reads winsize.
+			unsafe {
+				libc::ioctl(session.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+			}
+			let binding = proto::PtyBinding { epoch, frame_id: id };
+			session.binding = Some(binding);
+			let replay = session.scrollback.snapshot();
+			let exit_code = session.exit.as_ref().map(|exit| exit.0);
+			let meta = pty_meta(session_id, session);
+
+			// Keep the session lock until the complete initial sequence is on the
+			// wire. The output pump cannot publish live bytes ahead of replay.
+			let result = {
+				let mut writer = lock(&self.writer);
+				write_pty_attach_frames(&mut *writer, id, &meta, &replay, exit_code)
+			};
+			if (result.is_err() || exit_code.is_some()) && session.binding == Some(binding) {
+				session.binding = None;
+			}
+		}
+
+		fn pty_detach(&self, id: u32, request: &Value) {
+			let session_id = request.get("session_id").and_then(Value::as_str);
+			let binding = proto::PtyBinding { epoch: *lock(&self.epoch), frame_id: id };
+			for (name, session) in lock(&self.pty_sessions).iter_mut() {
+				if session_id.is_none_or(|wanted| wanted == name) && session.binding == Some(binding) {
+					session.binding = None;
+				}
+			}
+			self.send_resp(id, json!({ "ok": true }));
+		}
+
+		fn pty_resize(&self, id: u32, request: &Value) {
+			let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+				self.send_error(id, "missing session_id");
+				return;
+			};
+			let mut sessions = lock(&self.pty_sessions);
+			let Some(session) = sessions.get_mut(session_id) else {
+				self.send_error(id, "unknown pty session");
+				return;
+			};
+			if let Some(cols) = request.get("cols").and_then(Value::as_u64) {
+				session.cols = cols.clamp(1, u16::MAX as u64) as u16;
+			}
+			if let Some(rows) = request.get("rows").and_then(Value::as_u64) {
+				session.rows = rows.clamp(1, u16::MAX as u64) as u16;
+			}
+			let ws = libc::winsize {
+				ws_row:    session.rows,
+				ws_col:    session.cols,
+				ws_xpixel: 0,
+				ws_ypixel: 0,
+			};
+			// SAFETY: the session owns a live PTY master and ioctl only reads winsize.
+			let rc = unsafe { libc::ioctl(session.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+			drop(sessions);
+			if rc < 0 {
+				self.send_error(id, format!("pty resize: {}", io::Error::last_os_error()));
+			} else {
+				self.send_resp(id, json!({ "ok": true }));
+			}
+		}
+
+		fn pty_list(&self, id: u32) {
+			let mut sessions = lock(&self.pty_sessions);
+			sessions.retain(|_, session| {
+				session.exit.is_none_or(|(_, exited_at)| {
+					exited_at.elapsed().unwrap_or_default() < Duration::from_mins(1)
+				})
+			});
+			let mut list = sessions
+				.iter()
+				.map(|(name, session)| pty_meta(name, session))
+				.collect::<Vec<_>>();
+			list.sort_by_key(|session| {
+				session
+					.get("created_at_unix_millis")
+					.and_then(Value::as_u64)
+					.unwrap_or_default()
+			});
+			self.send_resp(id, json!({ "ok": true, "sessions": list }));
+		}
+
+		fn pty_close(&self, id: u32, request: &Value) {
+			let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+				self.send_error(id, "missing session_id");
+				return;
+			};
+			let Some(session) = lock(&self.pty_sessions).remove(session_id) else {
+				self.send_error(id, "unknown pty session");
+				return;
+			};
+			let exit_code = session.exit.map(|exit| exit.0);
+			let _ = signal_process_group(session.pid, libc::SIGKILL);
+			if let Some(binding) = session.binding
+				&& binding.epoch == *lock(&self.epoch)
+			{
+				send_json(
+					&self.writer,
+					proto::FRAME_EXIT,
+					binding.frame_id,
+					&json!({ "code": exit_code.unwrap_or(-libc::SIGKILL) }),
+				);
+			}
+			self.send_resp(
+				id,
+				json!({
+					"ok": true,
+					"session_id": session_id,
+					"exit_code": exit_code,
+				}),
+			);
+		}
+
+		fn pty_exec(&self, id: u32, request: &Value) {
+			let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+				self.send_error(id, "missing session_id");
+				return;
+			};
+			let Some(script) = request.get("command").and_then(Value::as_str) else {
+				self.send_error(id, "missing command");
+				return;
+			};
+			let pid = match lock(&self.pty_sessions).get(session_id) {
+				Some(session) if session.exit.is_none() => session.pid,
+				Some(_) => {
+					self.send_error(id, "pty session has exited");
+					return;
+				},
+				None => {
+					self.send_error(id, "unknown pty session");
+					return;
+				},
+			};
+			let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok();
+			let environ = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+			let mut command = Command::new("sh");
+			command
+				.args(["-c", script])
+				.stdin(Stdio::null())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped());
+			if let Some(cwd) = cwd {
+				command.current_dir(cwd);
+			}
+			command.env_clear();
+			for entry in environ
+				.split(|byte| *byte == 0)
+				.filter(|entry| !entry.is_empty())
+			{
+				if let Some(index) = entry.iter().position(|byte| *byte == b'=') {
+					command.env(
+						std::ffi::OsStr::from_bytes(&entry[..index]),
+						std::ffi::OsStr::from_bytes(&entry[index + 1..]),
+					);
+				}
+			}
+			// SAFETY: setsid is async-signal-safe and isolates timeout termination.
+			unsafe {
+				command.pre_exec(|| {
+					if libc::setsid() < 0 {
+						Err(io::Error::last_os_error())
+					} else {
+						Ok(())
+					}
+				});
+			}
+			let mut child = match command.spawn() {
+				Ok(child) => child,
+				Err(error) => {
+					self.send_error(id, format!("pty_exec spawn: {error}"));
+					return;
+				},
+			};
+			let stdout = child.stdout.take().unwrap();
+			let stderr = child.stderr.take().unwrap();
+			let stdout_reader =
+				thread::spawn(move || read_bounded(stdout, proto::PTY_SCROLLBACK_LIMIT));
+			let stderr_reader =
+				thread::spawn(move || read_bounded(stderr, proto::PTY_SCROLLBACK_LIMIT));
+			let timeout = Duration::from_millis(
+				request
+					.get("timeout_ms")
+					.and_then(Value::as_u64)
+					.unwrap_or(60_000),
+			);
+			let deadline = std::time::Instant::now() + timeout;
+			let status = loop {
+				match child.try_wait() {
+					Ok(Some(status)) => break Ok(status),
+					Ok(None) if std::time::Instant::now() < deadline => {
+						thread::sleep(Duration::from_millis(10));
+					},
+					Ok(None) => {
+						let _ = signal_process_group(child.id() as i32, libc::SIGKILL);
+						break child.wait();
+					},
+					Err(error) => break Err(error),
+				}
+			};
+			let stdout = stdout_reader.join().unwrap_or_default();
+			let stderr = stderr_reader.join().unwrap_or_default();
+			match status {
+				Ok(status) => self.send_resp(
+					id,
+					json!({
+						"ok": true,
+						"stdout": stdout,
+						"stderr": stderr,
+						"code": status.code().unwrap_or(-1),
+					}),
+				),
+				Err(error) => self.send_error(id, format!("pty_exec wait: {error}")),
 			}
 		}
 
@@ -453,6 +918,21 @@ mod linux_agent {
 			if self.handle_pending_write_stdin(id, payload) {
 				return;
 			}
+			let epoch = *lock(&self.epoch);
+			let mut pty_sessions = lock(&self.pty_sessions);
+			if let Some(session) = pty_sessions
+				.values_mut()
+				.find(|session| session.binding == Some(proto::PtyBinding { epoch, frame_id: id }))
+			{
+				if payload.is_empty() {
+					session.binding = None;
+				} else if let Err(error) = session.master.write_all(payload) {
+					drop(pty_sessions);
+					self.send_error(id, format!("pty input: {error}"));
+				}
+				return;
+			}
+			drop(pty_sessions);
 
 			let mut sessions = lock(&self.sessions);
 			let Some(session) = sessions.get_mut(&id) else {
@@ -516,7 +996,7 @@ mod linux_agent {
 				drop(writes);
 				match result {
 					Ok(bytes) => self.send_resp(id, json!({"ok": true, "size": bytes})),
-					Err(err) => self.send_error(id, format!("fs_write flush: {err}")),
+					Err(err) => self.send_io_error(id, format!("fs_write flush: {err}"), &err),
 				}
 				return true;
 			}
@@ -526,7 +1006,7 @@ mod linux_agent {
 				Err(err) => {
 					writes.remove(&id);
 					drop(writes);
-					self.send_error(id, format!("fs_write: {err}"));
+					self.send_io_error(id, format!("fs_write: {err}"), &err);
 				},
 			}
 			true
@@ -568,7 +1048,7 @@ mod linux_agent {
 			let mut file = match File::open(&path) {
 				Ok(file) => file,
 				Err(err) => {
-					self.send_error(id, format!("fs_read {path}: {err}"));
+					self.send_io_error(id, format!("fs_read {path}: {err}"), &err);
 					return;
 				},
 			};
@@ -585,7 +1065,7 @@ mod linux_agent {
 						}
 					},
 					Err(err) => {
-						self.send_error(id, format!("fs_read {path}: {err}"));
+						self.send_io_error(id, format!("fs_read {path}: {err}"), &err);
 						return;
 					},
 				}
@@ -613,7 +1093,7 @@ mod linux_agent {
 			{
 				Ok(file) => file,
 				Err(err) => {
-					self.send_error(id, format!("fs_write {path}: {err}"));
+					self.send_io_error(id, format!("fs_write {path}: {err}"), &err);
 					return;
 				},
 			};
@@ -633,7 +1113,7 @@ mod linux_agent {
 			let entries = match fs::read_dir(&path) {
 				Ok(entries) => entries,
 				Err(err) => {
-					self.send_error(id, format!("fs_list {path}: {err}"));
+					self.send_io_error(id, format!("fs_list {path}: {err}"), &err);
 					return;
 				},
 			};
@@ -643,14 +1123,14 @@ mod linux_agent {
 				let entry = match entry {
 					Ok(entry) => entry,
 					Err(err) => {
-						self.send_error(id, format!("fs_list {path}: {err}"));
+						self.send_io_error(id, format!("fs_list {path}: {err}"), &err);
 						return;
 					},
 				};
 				let metadata = match entry.metadata() {
 					Ok(metadata) => metadata,
 					Err(err) => {
-						self.send_error(id, format!("fs_list metadata: {err}"));
+						self.send_io_error(id, format!("fs_list metadata: {err}"), &err);
 						return;
 					},
 				};
@@ -687,7 +1167,7 @@ mod linux_agent {
 						 "mtime": metadata.mtime(),
 					}),
 				),
-				Err(err) => self.send_error(id, format!("fs_stat {path}: {err}")),
+				Err(err) => self.send_io_error(id, format!("fs_stat {path}: {err}"), &err),
 			}
 		}
 
@@ -710,7 +1190,7 @@ mod linux_agent {
 			};
 			match result {
 				Ok(()) => self.send_resp(id, json!({"ok": true})),
-				Err(err) => self.send_error(id, format!("fs_mkdir {path}: {err}")),
+				Err(err) => self.send_io_error(id, format!("fs_mkdir {path}: {err}"), &err),
 			}
 		}
 
@@ -729,7 +1209,7 @@ mod linux_agent {
 			let metadata = match fs::symlink_metadata(&path) {
 				Ok(metadata) => metadata,
 				Err(err) => {
-					self.send_error(id, format!("fs_remove {path}: {err}"));
+					self.send_io_error(id, format!("fs_remove {path}: {err}"), &err);
 					return;
 				},
 			};
@@ -742,7 +1222,7 @@ mod linux_agent {
 			};
 			match result {
 				Ok(()) => self.send_resp(id, json!({"ok": true})),
-				Err(err) => self.send_error(id, format!("fs_remove {path}: {err}")),
+				Err(err) => self.send_io_error(id, format!("fs_remove {path}: {err}"), &err),
 			}
 		}
 
@@ -1018,6 +1498,15 @@ mod linux_agent {
 		fn send_error(&self, id: u32, error: impl Into<String>) {
 			self.send_resp(id, json!({"ok": false, "error": error.into()}));
 		}
+
+		fn send_io_error(&self, id: u32, error: impl Into<String>, source: &io::Error) {
+			let error = error.into();
+			let response = match source.raw_os_error() {
+				Some(errno) => json!({"ok": false, "error": error, "errno": errno}),
+				None => json!({"ok": false, "error": error}),
+			};
+			self.send_resp(id, response);
+		}
 	}
 
 	fn activity_sample() -> io::Result<Value> {
@@ -1097,6 +1586,59 @@ mod linux_agent {
 		let mut guard = lock(writer);
 		proto::write_frame(&mut *guard, ty, id, payload)?;
 		guard.flush()
+	}
+
+	fn write_json_frame<W: Write>(writer: &mut W, ty: u8, id: u32, value: &Value) -> io::Result<()> {
+		let payload = serde_json::to_vec(value)
+			.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+		proto::write_frame(writer, ty, id, &payload)
+	}
+
+	fn write_pty_attach_frames<W: Write>(
+		writer: &mut W,
+		id: u32,
+		meta: &Value,
+		replay: &[u8],
+		exit_code: Option<i32>,
+	) -> io::Result<()> {
+		write_json_frame(writer, proto::FRAME_RESP, id, meta)?;
+		if !replay.is_empty() {
+			proto::write_frame(writer, proto::FRAME_STDOUT, id, replay)?;
+		}
+		if let Some(code) = exit_code {
+			write_json_frame(writer, proto::FRAME_EXIT, id, &json!({ "code": code }))?;
+		}
+		writer.flush()
+	}
+
+	fn publish_pty_output(
+		sessions: &PtySessions,
+		writer: &SharedWriter,
+		epoch: &Arc<Mutex<u64>>,
+		session_id: &str,
+		output: &[u8],
+	) -> bool {
+		let binding = {
+			let mut all = lock(sessions);
+			let Some(session) = all.get_mut(session_id) else {
+				return false;
+			};
+			session.scrollback.push(output);
+			session.binding
+		};
+		if let Some(binding) = binding
+			&& binding.epoch == *lock(epoch)
+			&& send_frame(writer, proto::FRAME_STDOUT, binding.frame_id, output).is_err()
+		{
+			// The host connection died mid-write; unbind so the next attach on a
+			// fresh epoch rebinds cleanly.
+			if let Some(session) = lock(sessions).get_mut(session_id)
+				&& session.binding == Some(binding)
+			{
+				session.binding = None;
+			}
+		}
+		true
 	}
 
 	fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1181,6 +1723,32 @@ mod linux_agent {
 			.collect()
 	}
 
+	fn pty_meta(session_id: &str, session: &PtySessionState) -> Value {
+		json!({
+			"session_id": session_id,
+			"running": session.exit.is_none(),
+			"exit_code": session.exit.as_ref().map(|exit| exit.0),
+			"cols": session.cols,
+			"rows": session.rows,
+			"exec": session.exec.as_deref(),
+			"created_at_unix_millis": session.created_at,
+			"attached_count": u8::from(session.binding.is_some()),
+		})
+	}
+
+	fn read_bounded<R: Read>(mut reader: R, limit: usize) -> Vec<u8> {
+		let mut output = Vec::new();
+		let mut buffer = vec![0u8; STREAM_CHUNK];
+		loop {
+			match reader.read(&mut buffer) {
+				Ok(0) | Err(_) => return output,
+				Ok(count) => {
+					let remaining = limit.saturating_sub(output.len());
+					output.extend_from_slice(&buffer[..count.min(remaining)]);
+				},
+			}
+		}
+	}
 	fn file_type(metadata: &fs::Metadata) -> &'static str {
 		let ty = metadata.file_type();
 		if ty.is_file() {
@@ -1194,10 +1762,10 @@ mod linux_agent {
 		}
 	}
 
-	fn spawn_orphan_reaper(sessions: Sessions) {
+	fn spawn_orphan_reaper(sessions: Sessions, pty_sessions: PtySessions) {
 		thread::spawn(move || {
 			loop {
-				reap_orphans(&sessions);
+				reap_orphans(&sessions, &pty_sessions);
 				thread::sleep(std::time::Duration::from_millis(100));
 			}
 		});
@@ -1226,10 +1794,10 @@ mod linux_agent {
 	/// (so we skip it), and once it leaves the map it has already been reaped
 	/// (so `waitid` can no longer observe it). A leader's status is thus never
 	/// double-reaped, regardless of how the 100ms poll interleaves with exits.
-	fn reap_orphans(sessions: &Sessions) {
-		// Snapshot tracked leader pids, then drop the lock *before* any wait
-		// syscall so we never block the per-session waiter threads on it.
-		let leaders: HashSet<i32> = lock(sessions).values().map(|s| s.pid).collect();
+	fn reap_orphans(sessions: &Sessions, pty_sessions: &PtySessions) {
+		// Snapshot tracked leader pids, then drop the locks before any wait syscall.
+		let mut leaders: HashSet<i32> = lock(sessions).values().map(|session| session.pid).collect();
+		leaders.extend(lock(pty_sessions).values().map(|session| session.pid));
 
 		loop {
 			// SAFETY: an all-zero `siginfo_t` is a valid initial buffer for
@@ -1618,6 +2186,108 @@ mod linux_agent {
 		buf.extend_from_slice(data);
 		while !buf.len().is_multiple_of(4) {
 			buf.push(0);
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{
+			os::{fd::OwnedFd, unix::net::UnixStream},
+			sync::{Barrier, TryLockError},
+		};
+
+		use super::*;
+
+		fn pty_agent(exit_code: Option<i32>) -> (Arc<Agent>, PtySessions, UnixStream) {
+			let (writer, reader) = UnixStream::pair().unwrap();
+			let writer = File::from(OwnedFd::from(writer));
+			let sessions = Arc::new(Mutex::new(HashMap::new()));
+			let mut scrollback = proto::Scrollback::new(proto::PTY_SCROLLBACK_LIMIT);
+			scrollback.push(b"replay");
+			lock(&sessions).insert("session".to_owned(), PtySessionState {
+				pid: 1,
+				master: File::open("/dev/null").unwrap(),
+				cols: 80,
+				rows: 24,
+				exec: None,
+				created_at: 1,
+				binding: None,
+				scrollback,
+				exit: exit_code.map(|code| (code, SystemTime::now())),
+			});
+			let agent = Arc::new(Agent {
+				writer:         Arc::new(Mutex::new(writer)),
+				sessions:       Arc::new(Mutex::new(HashMap::new())),
+				pty_sessions:   Arc::clone(&sessions),
+				pending_writes: Arc::new(Mutex::new(HashMap::new())),
+				epoch:          Arc::new(Mutex::new(7)),
+			});
+			(agent, sessions, reader)
+		}
+
+		#[test]
+		fn pty_attach_replays_before_retained_exit() {
+			let (agent, sessions, mut reader) = pty_agent(Some(23));
+
+			agent.pty_attach(41, &json!({ "session_id": "session" }));
+
+			let meta = proto::read_frame(&mut reader).unwrap().unwrap();
+			let replay = proto::read_frame(&mut reader).unwrap().unwrap();
+			let exit = proto::read_frame(&mut reader).unwrap().unwrap();
+			assert_eq!(meta.ty, proto::FRAME_RESP);
+			assert_eq!(replay, Frame {
+				ty:      proto::FRAME_STDOUT,
+				id:      41,
+				payload: b"replay".to_vec(),
+			});
+			assert_eq!(exit.ty, proto::FRAME_EXIT);
+			assert_eq!(serde_json::from_slice::<Value>(&exit.payload).unwrap(), json!({ "code": 23 }));
+			assert!(lock(&sessions)["session"].binding.is_none());
+		}
+
+		#[test]
+		fn pty_attach_blocks_live_output_until_replay_is_published() {
+			let (agent, sessions, mut reader) = pty_agent(None);
+			let writer_guard = lock(&agent.writer);
+			let barrier = Arc::new(Barrier::new(2));
+			let attaching = {
+				let agent = Arc::clone(&agent);
+				let barrier = Arc::clone(&barrier);
+				thread::spawn(move || {
+					barrier.wait();
+					agent.pty_attach(42, &json!({ "session_id": "session" }));
+				})
+			};
+			barrier.wait();
+			thread::sleep(Duration::from_millis(20));
+			assert!(matches!(sessions.try_lock(), Err(TryLockError::WouldBlock)));
+
+			let publishing = {
+				let sessions = Arc::clone(&sessions);
+				let writer = Arc::clone(&agent.writer);
+				let epoch = Arc::clone(&agent.epoch);
+				thread::spawn(move || {
+					assert!(publish_pty_output(&sessions, &writer, &epoch, "session", b"live"));
+				})
+			};
+			drop(writer_guard);
+			attaching.join().unwrap();
+			publishing.join().unwrap();
+
+			let meta = proto::read_frame(&mut reader).unwrap().unwrap();
+			let replay = proto::read_frame(&mut reader).unwrap().unwrap();
+			let live = proto::read_frame(&mut reader).unwrap().unwrap();
+			assert_eq!(meta.ty, proto::FRAME_RESP);
+			assert_eq!(replay, Frame {
+				ty:      proto::FRAME_STDOUT,
+				id:      42,
+				payload: b"replay".to_vec(),
+			});
+			assert_eq!(live, Frame {
+				ty:      proto::FRAME_STDOUT,
+				id:      42,
+				payload: b"live".to_vec(),
+			});
 		}
 	}
 }

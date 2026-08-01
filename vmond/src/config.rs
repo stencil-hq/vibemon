@@ -96,6 +96,8 @@ pub struct ServeConfig {
 	pub boot_concurrency: usize,
 	/// Idle sandbox timeout in seconds.
 	pub idle_timeout: f64,
+	/// Stored sandbox-state quota in MiB; zero disables eviction.
+	pub storage_quota_mb: u64,
 	/// Live disk-history capture cadence in seconds; zero disables it.
 	pub history_disk_sec: f64,
 	/// Full checkpoint-history cadence in seconds; zero disables it.
@@ -242,6 +244,7 @@ impl Default for ServeConfig {
 			net_slots: 0,
 			boot_concurrency: 0,
 			idle_timeout: 300.0,
+			storage_quota_mb: 0,
 			history_disk_sec: 300.0,
 			history_checkpoint_sec: 3600.0,
 			history_retention: 24,
@@ -299,6 +302,7 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"net_slots",
 	"boot_concurrency",
 	"idle_timeout",
+	"storage_quota_mb",
 	"history_disk_sec",
 	"history_checkpoint_sec",
 	"history_retention",
@@ -353,6 +357,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("net_slots", "VMON_NET_SLOTS"),
 	("boot_concurrency", "VMON_BOOT_CONCURRENCY"),
 	("idle_timeout", "VMON_IDLE_TIMEOUT"),
+	("storage_quota_mb", "VMON_STORAGE_QUOTA_MB"),
 	("history_disk_sec", "VMON_HISTORY_DISK_SEC"),
 	("history_checkpoint_sec", "VMON_HISTORY_CHECKPOINT_SEC"),
 	("history_retention", "VMON_HISTORY_RETENTION"),
@@ -407,6 +412,7 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("net_slots", "--net-slots"),
 	("boot_concurrency", "--boot-concurrency"),
 	("idle_timeout", "--idle-timeout"),
+	("storage_quota_mb", "--storage-quota-mb"),
 	("history_disk_sec", "--history-disk-sec"),
 	("history_checkpoint_sec", "--history-checkpoint-sec"),
 	("history_retention", "--history-retention"),
@@ -741,6 +747,11 @@ fn apply_value(
 			config.warm_images = coerce_warm_images(value, config.warm_pool_size)?;
 		},
 		"idle_timeout" => config.idle_timeout = positive_float(key, value)?,
+		"storage_quota_mb" => {
+			let parsed = coerce_int(key, value)?;
+			config.storage_quota_mb = u64::try_from(parsed)
+				.map_err(|_| EngineError::invalid("storage_quota_mb must be non-negative"))?;
+		},
 		"history_disk_sec" => config.history_disk_sec = non_negative_float(key, value)?,
 		"history_checkpoint_sec" => {
 			config.history_checkpoint_sec = non_negative_float(key, value)?;

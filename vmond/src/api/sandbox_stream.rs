@@ -326,15 +326,14 @@ mod tests {
 		let engine = StubEngine::new();
 		engine.set_get(Err(EngineError::not_found("unknown sandbox 'ghost'")));
 		let (api, _temp) = test_api(engine);
-		let error = match api
+		let Err(error) = api
 			.watch(admin_request(pb::WatchSandboxRequest {
 				id:          "ghost".to_owned(),
 				until_ready: false,
 			}))
 			.await
-		{
-			Ok(_) => panic!("unknown sid must be rejected"),
-			Err(error) => error,
+		else {
+			panic!("unknown sid must be rejected");
 		};
 		assert_eq!(error.code(), Code::NotFound);
 	}

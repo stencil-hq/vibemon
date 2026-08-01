@@ -24,8 +24,8 @@ use crate::{
 
 const DEFAULT_MEM_MIB: u64 = 512;
 const DEFAULT_CPUS: u64 = 1;
-const MAX_CPUS: u64 = 64;
-const MAX_MEM_MIB: u64 = 64 * 1024;
+pub(crate) const MAX_CPUS: u64 = 64;
+pub(crate) const MAX_MEM_MIB: u64 = 64 * 1024;
 const MAX_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);

@@ -167,9 +167,9 @@ impl Autoscaler {
 				)]
 				let signed = delta as i64;
 				if let Some(cmd) = &self.options.scale_up_cmd {
-					run_hook(cmd, desired, signed, live, None, None).await
+					run_hook(cmd, desired, signed, live, None, None).await;
 				} else {
-					tracing::info!(desired, delta, live, "scale up (no hook configured)")
+					tracing::info!(desired, delta, live, "scale up (no hook configured)");
 				}
 			},
 			Plan::Down { desired, drain } => {
@@ -366,7 +366,7 @@ mod tests {
 		assert_eq!(desired, 2);
 		assert_eq!(drain, vec!["idle".to_owned(), "low".to_owned()], "emptiest workers drain");
 
-		scaler.last_down = now.checked_sub(Duration::from_secs(60));
+		scaler.last_down = now.checked_sub(Duration::from_mins(1));
 		assert_eq!(scaler.plan(now), Plan::Hold, "inside cooldown_down must hold");
 		scaler.last_down = now.checked_sub(Duration::from_secs(301));
 		assert!(matches!(scaler.plan(now), Plan::Down { .. }), "cooldown elapsed");

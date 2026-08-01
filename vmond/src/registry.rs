@@ -17,6 +17,32 @@ use crate::{EngineError, Result, engine::spawn::replace_meta_map, home::Home};
 /// Engine seam for re-acquiring writable volume locks after registry rehydrate.
 pub type VolumeLockRequests = Vec<(String, Vec<String>)>;
 
+/// Stored-state retention policy for a sandbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum PersistencePolicy {
+	#[default]
+	Persistent,
+	Sticky {
+		#[serde(default = "default_sticky_priority")]
+		priority: u8,
+	},
+	Ephemeral,
+}
+
+const fn default_sticky_priority() -> u8 {
+	5
+}
+
+impl PersistencePolicy {
+	pub const fn sticky_priority(&self) -> Option<u8> {
+		match self {
+			Self::Sticky { priority } => Some(*priority),
+			_ => None,
+		}
+	}
+}
+
 /// A lifecycle state encoded as the historical lowercase JSON string.
 ///
 /// Unknown values round-trip exactly so a newer control plane cannot be
@@ -206,39 +232,45 @@ pub struct ReconciliationInput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmRecord {
 	/// Stable sandbox id.
-	pub id:                String,
+	pub id:                  String,
 	/// Human-facing sandbox name.
-	pub name:              String,
+	pub name:                String,
 	/// Lifecycle status.
-	pub status:            String,
+	pub status:              String,
 	/// Per-VM monitor process id.
-	pub pid:               Option<i32>,
+	pub pid:                 Option<i32>,
 	/// Image, template, fork, or restore source.
-	pub source:            Option<String>,
+	pub source:              Option<String>,
 	/// Unix creation timestamp.
-	pub created_at:        f64,
+	pub created_at:          f64,
 	/// Timeout in seconds from last activity.
-	pub timeout:           Option<f64>,
+	pub timeout:             Option<f64>,
 	/// Raw metadata detail spread into API views.
-	pub detail:            Value,
+	pub detail:              Value,
 	/// String tags used for filtering.
-	pub tags:              HashMap<String, String>,
+	pub tags:                HashMap<String, String>,
 	/// Unix timestamp of last activity.
-	pub last_active:       f64,
+	pub last_active:         f64,
+	/// Unix timestamp of the last qualifying network sample.
+	#[serde(default)]
+	pub last_network_active: f64,
+	/// Stored-state retention and eviction behavior.
+	#[serde(default)]
+	pub persistence:         PersistencePolicy,
 	/// Unix termination timestamp.
-	pub terminated_at:     Option<f64>,
+	pub terminated_at:       Option<f64>,
 	/// Terminal error string.
-	pub error:             Option<String>,
+	pub error:               Option<String>,
 	/// Desired/observed lifecycle state and its generation.
 	#[serde(default)]
-	pub lifecycle:         LifecycleState,
+	pub lifecycle:           LifecycleState,
 	/// Stable production ownership incarnation, distinct from mutable owner
 	/// epoch.
 	#[serde(default)]
-	pub incarnation_epoch: i64,
+	pub incarnation_epoch:   i64,
 	/// The complete non-secret identity needed to rebuild runtime resources.
 	#[serde(default)]
-	pub runtime_identity:  SafeRuntimeIdentity,
+	pub runtime_identity:    SafeRuntimeIdentity,
 }
 
 impl VmRecord {
@@ -258,6 +290,8 @@ impl VmRecord {
 			detail: Value::Object(Map::new()),
 			tags: HashMap::new(),
 			last_active: now,
+			last_network_active: now,
+			persistence: PersistencePolicy::default(),
 			terminated_at: None,
 			error: None,
 			incarnation_epoch: 0,
@@ -297,6 +331,8 @@ impl VmRecord {
 		out.insert("source".to_owned(), json!(self.source));
 		out.insert("created_at".to_owned(), json!(self.created_at));
 		out.insert("last_active".to_owned(), json!(self.last_active));
+		out.insert("last_network_active".to_owned(), json!(self.last_network_active));
+		out.insert("persistence".to_owned(), json!(self.persistence));
 		out.insert("expires_at".to_owned(), json!(self.expires_at()));
 		out.insert("terminated_at".to_owned(), json!(self.terminated_at));
 		out.insert("error".to_owned(), json!(self.error));
@@ -394,6 +430,14 @@ impl Registry {
 				detail: Value::Object(meta.clone()),
 				tags: tags_of(&meta),
 				last_active: number_field(&meta, "last_active").unwrap_or(created_at),
+				last_network_active: number_field(&meta, "last_network_active")
+					.or_else(|| number_field(&meta, "last_active"))
+					.unwrap_or(created_at),
+				persistence: meta
+					.get("persistence")
+					.cloned()
+					.and_then(|value| serde_json::from_value(value).ok())
+					.unwrap_or_default(),
 				terminated_at: number_field(&meta, "terminated_at"),
 				error: string_field(&meta, "error"),
 				incarnation_epoch: meta
@@ -502,6 +546,8 @@ impl Registry {
 		meta.insert("sandbox_id".to_owned(), json!(record.id));
 		meta.insert("created_at".to_owned(), json!(record.created_at));
 		meta.insert("last_active".to_owned(), json!(record.last_active));
+		meta.insert("last_network_active".to_owned(), json!(record.last_network_active));
+		meta.insert("persistence".to_owned(), json!(record.persistence));
 		meta.insert("status".to_owned(), json!(record.status));
 		meta.insert("terminated_at".to_owned(), json!(record.terminated_at));
 		meta.insert("error".to_owned(), json!(record.error));
@@ -799,6 +845,38 @@ impl Registry {
 		write_meta_map(&home.meta_path(&record.name), &meta)?;
 		record.runtime_identity = identity;
 		Ok(())
+	}
+
+	/// Atomically replace a sandbox's idle policy and rearm its network-idle
+	/// clock.
+	pub fn set_idle_timeout_persisted(
+		&self,
+		home: &Home,
+		id: &str,
+		timeout_secs: f64,
+		rearmed_at: f64,
+	) -> Result<VmRecord> {
+		let mut records = self.records.write();
+		let record = records
+			.get_mut(id)
+			.ok_or_else(|| EngineError::not_found(format!("unknown sandbox '{id}'")))?;
+		let mut meta = read_meta_map(&home.meta_path(&record.name))?;
+		meta.insert("idle_timeout_secs".to_owned(), json!(timeout_secs));
+		meta.insert("last_network_active".to_owned(), json!(rearmed_at));
+		if let Some(params) = meta
+			.get_mut("relaunch_recipe")
+			.and_then(Value::as_object_mut)
+			.and_then(|recipe| recipe.get_mut("params"))
+			.and_then(Value::as_object_mut)
+		{
+			params.insert("idle_timeout_secs".to_owned(), json!(timeout_secs));
+		}
+		set_lifecycle_meta(&mut meta, &record.lifecycle);
+		meta.insert("status".to_owned(), json!(record.status));
+		write_meta_map(&home.meta_path(&record.name), &meta)?;
+		record.last_network_active = rearmed_at;
+		record.detail = Value::Object(meta);
+		Ok(record.clone())
 	}
 
 	/// Atomically merge non-lifecycle metadata without allowing a concurrent
@@ -1747,6 +1825,42 @@ mod tests {
 				.observe_transition(&home, "sandbox", original.generation, LifecyclePhase::Running)
 				.is_err()
 		);
+	}
+
+	#[test]
+	fn idle_policy_update_is_atomic_and_survives_rehydrate() {
+		let tmp = tempfile::tempdir().expect("tempdir");
+		let home = Home::new(tmp.path());
+		let registry = Registry::new();
+		write_fixture(
+			&home,
+			"sandbox",
+			json!({
+				"relaunch_recipe": {
+					"params": {
+						"idle_timeout_secs": 300.0,
+					}
+				}
+			}),
+		);
+		let record = VmRecord::new("sandbox", "sandbox", "stopped");
+		registry
+			.insert_persisted(&home, record)
+			.expect("persist record");
+
+		let updated = registry
+			.set_idle_timeout_persisted(&home, "sandbox", 12.5, 42.0)
+			.expect("set idle policy");
+		assert_eq!(updated.last_network_active, 42.0);
+		assert_eq!(updated.detail["idle_timeout_secs"], 12.5);
+		assert_eq!(updated.detail["relaunch_recipe"]["params"]["idle_timeout_secs"], 12.5);
+
+		let rehydrated = Registry::new();
+		rehydrated.rehydrate(&home).expect("rehydrate");
+		let restored = rehydrated.get("sandbox").expect("sandbox");
+		assert_eq!(restored.last_network_active, 42.0);
+		assert_eq!(restored.detail["idle_timeout_secs"], 12.5);
+		assert_eq!(restored.detail["relaunch_recipe"]["params"]["idle_timeout_secs"], 12.5);
 	}
 
 	fn write_fixture(home: &Home, name: &str, value: Value) {

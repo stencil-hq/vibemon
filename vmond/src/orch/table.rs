@@ -391,7 +391,7 @@ mod tests {
 		// expected ~25% of draws; equality would sit at 50%.
 		assert!(idle_wins > 32, "idle worker won only {idle_wins}/64 draws");
 
-		table.penalize("idle", Duration::from_secs(60));
+		table.penalize("idle", Duration::from_mins(1));
 		for _attempt in 0..16 {
 			assert_eq!(table.pick(&needs(256), &[]).expect("busy still fits").wid, "busy");
 		}
@@ -405,7 +405,7 @@ mod tests {
 		});
 		let mut fresh = heartbeat("w", 1_000);
 		fresh.ts_ms = 10;
-		table.upsert(fresh.clone());
+		table.upsert(fresh);
 		let mut stale = heartbeat("w", 0);
 		stale.ts_ms = 5;
 		table.upsert(stale);

@@ -2,7 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, HashMap},
-	io::Write,
+	io::{Read, Write},
 	os::unix::net::UnixStream,
 	path::Path,
 	sync::{
@@ -63,6 +63,22 @@ pub struct ExecSessionParts {
 	pub exit:    Receiver<Result<ExitStatus>>,
 }
 
+/// Live attachment to a persistent guest PTY.
+pub struct PtyAgentStream {
+	pub session: Value,
+	pub control: PtyAgentHandle,
+	pub stdout:  Receiver<Vec<u8>>,
+	pub exit:    Receiver<Result<ExitStatus>>,
+}
+
+/// Input/control channel for one persistent PTY attachment.
+#[derive(Clone)]
+pub struct PtyAgentHandle {
+	inner:      Arc<AgentInner>,
+	frame_id:   u32,
+	session_id: String,
+}
+
 /// Exit status reported by the guest agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExitStatus {
@@ -87,6 +103,7 @@ struct AgentInner {
 	writer:  Mutex<UnixStream>,
 	state:   Mutex<State>,
 	next_id: AtomicU32,
+	epoch:   u64,
 }
 
 #[derive(Default)]
@@ -128,12 +145,28 @@ impl AgentConn {
 			writer:  Mutex::new(writer),
 			state:   Mutex::new(State::default()),
 			next_id: AtomicU32::new(1),
+			epoch:   random_epoch()?,
 		});
 		let reader_inner = Arc::clone(&inner);
 		thread::Builder::new()
 			.name("vmon-agent-reader".to_string())
 			.spawn(move || reader_loop(reader_inner, stream))?;
-		Ok(Self { inner })
+		let conn = Self { inner };
+		// The epoch handshake is mandatory: it fences PTY sink bindings from
+		// stale connections, so a guest that cannot echo it is unusable. Bound
+		// the exchange separately from the (potentially long) boot timeout, and
+		// tear the reader down on every failure path.
+		let handshake_timeout = connect_timeout.min(Duration::from_secs(5));
+		let hello = conn
+			.request(proto::OP_HELLO, json!({ "epoch": conn.inner.epoch }), handshake_timeout)
+			.inspect_err(|_| conn.close())?;
+		if hello.get("epoch").and_then(Value::as_u64) != Some(conn.inner.epoch) {
+			conn.close();
+			return Err(EngineError::engine(
+				"guest agent handshake failed: epoch not echoed; rebuild vmon-agent",
+			));
+		}
+		Ok(conn)
 	}
 
 	/// Return true once the reader has marked the connection closed.
@@ -160,6 +193,11 @@ impl AgentConn {
 		ensure_response_object(&resp)?;
 		response_ok(&resp, "agent request failed")?;
 		Ok(resp)
+	}
+
+	/// Connection epoch used to prevent stream-id reuse across reconnects.
+	pub fn epoch(&self) -> u64 {
+		self.inner.epoch
 	}
 
 	/// Ping the guest agent, retrying dropped early requests until timeout.
@@ -358,6 +396,11 @@ impl AgentConn {
 		Ok(data)
 	}
 
+	/// Flush every mounted guest filesystem before discarding VM memory.
+	pub fn fs_sync(&self, timeout: Duration) -> Result<Value> {
+		self.request("fs_sync", Value::Null, timeout)
+	}
+
 	/// Write a guest file with the default mode.
 	pub fn fs_write(&self, path: &Path, data: &[u8], timeout: Duration) -> Result<Value> {
 		self.fs_write_with_mode(path, data, 0o644, timeout)
@@ -450,6 +493,106 @@ impl AgentConn {
 		Ok((id, rx))
 	}
 
+	/// Open a persistent PTY and bind its output to this connection.
+	pub fn pty_open(&self, params: Value, timeout: Duration) -> Result<PtyAgentStream> {
+		self.open_pty_stream("pty_open", params, timeout)
+	}
+
+	/// Rebind an existing persistent PTY to this connection.
+	pub fn pty_attach(&self, params: Value, timeout: Duration) -> Result<PtyAgentStream> {
+		self.open_pty_stream("pty_attach", params, timeout)
+	}
+
+	fn open_pty_stream(&self, op: &str, params: Value, timeout: Duration) -> Result<PtyAgentStream> {
+		let session_id = params
+			.get("session_id")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_owned();
+		let payload = request_payload(op, params)?;
+		let id = self.new_id();
+		let (pending_tx, pending_rx) = mpsc::channel();
+		let (stdout_tx, stdout_rx) = mpsc::channel();
+		let (stderr_tx, _stderr_rx) = mpsc::channel();
+		let (exit_tx, exit_rx) = mpsc::channel();
+		{
+			let mut state = self.inner.state.lock();
+			ensure_open(&state)?;
+			state.pending.insert(id, pending_tx);
+			state.sessions.insert(id, SessionSink {
+				stdout: stdout_tx,
+				stderr: stderr_tx,
+				exit:   exit_tx,
+			});
+		}
+		if let Err(error) = self.inner.send_json(proto::FRAME_REQ, id, &payload) {
+			self.remove_pending(id);
+			self.remove_session(id);
+			return Err(error);
+		}
+		let response = match recv_pending(pending_rx, timeout, "PTY request timed out") {
+			Ok(response) => response,
+			Err(error) => {
+				self.remove_pending(id);
+				self.remove_session(id);
+				return Err(error);
+			},
+		};
+		if response_is_false(&response) {
+			self.remove_session(id);
+			let message = response_error_message(&response, "PTY request failed");
+			return Err(if message == "session cap reached" {
+				EngineError::busy(message)
+			} else {
+				response_error(&response, "PTY request failed")
+			});
+		}
+		let actual_id = response
+			.get("session_id")
+			.and_then(Value::as_str)
+			.unwrap_or(&session_id)
+			.to_owned();
+		Ok(PtyAgentStream {
+			session: response,
+			control: PtyAgentHandle {
+				inner:      Arc::clone(&self.inner),
+				frame_id:   id,
+				session_id: actual_id,
+			},
+			stdout:  stdout_rx,
+			exit:    exit_rx,
+		})
+	}
+
+	/// List sessions from the guest source of truth.
+	pub fn pty_list(&self, timeout: Duration) -> Result<Vec<Value>> {
+		let response = self.request("pty_list", Value::Null, timeout)?;
+		Ok(response
+			.get("sessions")
+			.and_then(Value::as_array)
+			.cloned()
+			.unwrap_or_default())
+	}
+
+	/// Terminate a persistent guest PTY.
+	pub fn pty_close(&self, session_id: &str, timeout: Duration) -> Result<Value> {
+		self.request("pty_close", json!({ "session_id": session_id }), timeout)
+	}
+
+	/// Execute a sibling command in a persistent PTY's context.
+	pub fn pty_exec(&self, session_id: &str, command: &str, timeout: Duration) -> Result<Value> {
+		self.request(
+			"pty_exec",
+			json!({
+				"session_id": session_id,
+				"command": command,
+				"request_id": self.inner.next_id.load(Ordering::Relaxed),
+				"timeout_ms": timeout.as_millis() as u64,
+			}),
+			timeout + Duration::from_secs(1),
+		)
+	}
+
 	fn new_id(&self) -> u32 {
 		loop {
 			let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -471,6 +614,39 @@ impl AgentConn {
 		let mut state = self.inner.state.lock();
 		state.pending.remove(&id);
 		state.downloads.remove(&id);
+	}
+}
+
+impl PtyAgentHandle {
+	/// Write input bytes to the attached guest PTY.
+	pub fn write(&self, data: &[u8]) -> Result<()> {
+		for chunk in data.chunks(proto::MAX_PAYLOAD_LEN) {
+			self
+				.inner
+				.send_frame(proto::FRAME_STDIN, self.frame_id, chunk)?;
+		}
+		Ok(())
+	}
+
+	/// Resize the persistent PTY.
+	pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+		self.inner.send_json(
+			proto::FRAME_REQ,
+			self.frame_id,
+			&json!({
+				"op": "pty_resize",
+				"session_id": self.session_id,
+				"rows": rows,
+				"cols": cols,
+			}),
+		)
+	}
+
+	/// Unbind this connection without terminating the guest process.
+	pub fn detach(&self) -> Result<()> {
+		self
+			.inner
+			.send_frame(proto::FRAME_STDIN, self.frame_id, &[])
 	}
 }
 
@@ -733,10 +909,10 @@ fn handle_resp(inner: &AgentInner, id: u32, payload: &[u8]) -> Result<()> {
 		let _ = tx.send(Ok(result.clone()));
 	}
 	if let Some(session) = session_error {
-		let message = response_error_message(&result, "agent request failed");
+		let error = response_error(&result, "agent request failed");
 		drop(session.stdout);
 		drop(session.stderr);
-		let _ = session.exit.send(Err(EngineError::engine(message)));
+		let _ = session.exit.send(Err(error));
 	}
 	Ok(())
 }
@@ -807,6 +983,13 @@ fn request_payload(op: &str, params: Value) -> Result<Value> {
 	Ok(Value::Object(obj))
 }
 
+fn random_epoch() -> Result<u64> {
+	let mut bytes = [0u8; 8];
+	std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+	let epoch = u64::from_ne_bytes(bytes);
+	Ok(if epoch == 0 { 1 } else { epoch })
+}
+
 fn ensure_open(state: &State) -> Result<()> {
 	if state.closed {
 		Err(EngineError::engine("agent connection closed"))
@@ -825,7 +1008,7 @@ fn ensure_response_object(resp: &Value) -> Result<()> {
 
 fn response_ok(resp: &Value, default: &str) -> Result<()> {
 	if response_is_false(resp) {
-		Err(EngineError::engine(response_error_message(resp, default)))
+		Err(response_error(resp, default))
 	} else {
 		Ok(())
 	}
@@ -842,6 +1025,16 @@ fn response_error_message(resp: &Value, default: &str) -> String {
 		.filter(|message| !message.is_empty())
 		.unwrap_or(default)
 		.to_string()
+}
+
+fn response_error(resp: &Value, default: &str) -> EngineError {
+	let message = response_error_message(resp, default);
+	match resp.get("errno").and_then(Value::as_i64) {
+		Some(2) => EngineError::not_found(message),
+		Some(1 | 13) => EngineError::forbidden(message),
+		Some(20 | 21 | 39) => EngineError::invalid(message),
+		_ => EngineError::engine(message),
+	}
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {
@@ -880,11 +1073,22 @@ mod tests {
 		proto::read_frame(stream).unwrap().unwrap()
 	}
 
+	/// Next non-handshake request; answers the connect HELLO like a real agent.
 	fn next_req(stream: &mut UnixStream) -> (u32, Value) {
 		loop {
-			let frame = next_frame(stream);
+			let frame = proto::read_frame(stream).unwrap().unwrap();
 			if frame.ty == proto::FRAME_REQ {
-				let payload = serde_json::from_slice(&frame.payload).unwrap();
+				let payload: Value = serde_json::from_slice(&frame.payload).unwrap();
+				if payload.get("op").and_then(Value::as_str) == Some(proto::OP_HELLO) {
+					let epoch = payload.get("epoch").cloned().unwrap_or(Value::Null);
+					write_json(
+						stream,
+						proto::FRAME_RESP,
+						frame.id,
+						json!({ "ok": true, "epoch": epoch }),
+					);
+					continue;
+				}
 				return (frame.id, payload);
 			}
 		}
@@ -998,6 +1202,24 @@ mod tests {
 		assert_eq!(err.message, "boom");
 		drop(conn);
 		handle.join().unwrap();
+	}
+
+	#[test]
+	fn agent_error_resp_maps_filesystem_errno() {
+		let cases = [
+			(2, ErrorCode::NotFound),
+			(13, ErrorCode::Forbidden),
+			(1, ErrorCode::Forbidden),
+			(21, ErrorCode::Invalid),
+			(20, ErrorCode::Invalid),
+			(39, ErrorCode::Invalid),
+		];
+		for (errno, expected) in cases {
+			let response = json!({ "ok": false, "error": "filesystem failure", "errno": errno });
+			let error = response_error(&response, "fallback");
+			assert_eq!(error.code, expected, "engine code for errno {errno}");
+			assert_eq!(error.message, "filesystem failure");
+		}
 	}
 
 	#[test]

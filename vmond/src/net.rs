@@ -1,15 +1,15 @@
 //! Host networking: preallocated slot pool, in-memory /30 lease allocator,
-//! per-create TAP setup, egress policy, and loopback tunnels. Port of
-//! python/vmon/net.py, redesigned so per-create networking cost does not
-//! scale with create rate.
+//! per-create TAP setup, egress policy, and loopback tunnels.
+//!
+//! Port of python/vmon/net.py, redesigned so per-create networking cost does
+//! not scale with create rate.
 //!
 //! # Fast paths
-//! - `block_network=true` sandboxes (the default) never reach this module on
-//!   the spawn path: the engine gates every `setup_sandbox_network` call on
-//!   `network_required()` (`!block_network || credentials_requested`), and
-//!   teardown consults `lease_for`, which returns `None` without touching any
-//!   allocator or broker state. Blocked-network creates therefore perform zero
-//!   host networking work.
+//! - `block_network=true` sandboxes without credentials or a VPC NIC never
+//!   reach the default network setup path: the engine gates calls on
+//!   `network_required()` (`!block_network || credentials_requested ||
+//!   vpc_nic_requested`), and teardown consults `lease_for`, which returns
+//!   `None` without touching any allocator or broker state.
 //! - IP leases live in an in-memory allocator (`LeaseStore`) loaded once per
 //!   journal path. Allocate/release mutate memory and hand a snapshot to a
 //!   background writer thread; the on-disk JSON map keeps its historical format
@@ -96,10 +96,10 @@ pub const USER_NET_DNS: [&str; 1] = ["10.0.2.3"];
 ///
 /// Linux reads the kernel's `/proc/net/dev` counters; unsupported platforms and
 /// unreadable counter files report no available counters.
-pub(crate) fn host_network_bytes() -> Option<(u64, u64)> {
+pub(crate) const fn host_network_bytes() -> Option<(u64, u64)> {
 	#[cfg(target_os = "linux")]
 	{
-		parse_proc_net_dev(&fs::read_to_string(PROC_NET_DEV).ok()?)
+		Some(parse_proc_net_dev(&fs::read_to_string(PROC_NET_DEV).ok()?))
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -108,7 +108,7 @@ pub(crate) fn host_network_bytes() -> Option<(u64, u64)> {
 }
 
 #[cfg(any(test, target_os = "linux"))]
-fn parse_proc_net_dev(contents: &str) -> Option<(u64, u64)> {
+fn parse_proc_net_dev(contents: &str) -> (u64, u64) {
 	let mut ingress = 0_u64;
 	let mut egress = 0_u64;
 
@@ -130,7 +130,7 @@ fn parse_proc_net_dev(contents: &str) -> Option<(u64, u64)> {
 		egress = egress.saturating_add(transmitted);
 	}
 
-	Some((ingress, egress))
+	(ingress, egress)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -254,6 +254,7 @@ pub struct SandboxNetwork {
 	tunnels:              TunnelSet,
 	egress_allow:         Option<Vec<String>>,
 	egress_allow_domains: Option<Vec<String>>,
+	vpc_bridge:           Option<String>,
 }
 
 impl SandboxNetwork {
@@ -277,17 +278,23 @@ impl SandboxNetwork {
 			tunnels,
 			egress_allow,
 			egress_allow_domains,
+			vpc_bridge,
 		} = self;
 		drop(tunnels);
-		teardown_tap(
-			&tap.name,
-			Some(&tap.guest_ip),
-			Some(&tap.host_ip),
-			tap.prefix,
-			egress_allow.as_deref(),
-			egress_allow_domains.as_deref(),
-		)?;
-		release_guest_config(&name)
+		if let Some(bridge) = vpc_bridge {
+			SystemVpcBridge.detach_tap(&bridge, &tap.name)?;
+		} else {
+			teardown_tap(
+				&tap.name,
+				Some(&tap.guest_ip),
+				Some(&tap.host_ip),
+				tap.prefix,
+				egress_allow.as_deref(),
+				egress_allow_domains.as_deref(),
+			)?;
+			release_guest_config(&name)?;
+		}
+		Ok(())
 	}
 }
 
@@ -423,7 +430,148 @@ pub async fn setup_sandbox_network(
 		guest_config,
 		tunnels,
 		egress_allow: egress_allow.map(<[String]>::to_vec),
+		vpc_bridge: None,
 		egress_allow_domains: egress_allow_domains.map(<[String]>::to_vec),
+	})
+}
+
+/// Host bridge operations used by routed VPC networking.
+///
+/// `Sync` keeps async VPC setup futures `Send`; implementations are stateless
+/// command seams.
+pub(crate) trait VpcBridge: Sync {
+	fn ensure_bridge(&self, bridge: &str, gateway: &str, prefix: u8) -> Result<()>;
+	fn attach_tap(&self, bridge: &str, tap: &str) -> Result<()>;
+	fn detach_tap(&self, bridge: &str, tap: &str) -> Result<()>;
+	fn delete_bridge(&self, bridge: &str) -> Result<()>;
+}
+
+pub(crate) struct SystemVpcBridge;
+
+impl VpcBridge for SystemVpcBridge {
+	fn ensure_bridge(&self, bridge: &str, gateway: &str, prefix: u8) -> Result<()> {
+		system_vpc_ensure_bridge(bridge, gateway, prefix)
+	}
+
+	fn attach_tap(&self, bridge: &str, tap: &str) -> Result<()> {
+		system_vpc_attach_tap(bridge, tap)
+	}
+
+	fn detach_tap(&self, _bridge: &str, tap: &str) -> Result<()> {
+		system_vpc_detach_tap(tap)
+	}
+
+	fn delete_bridge(&self, bridge: &str) -> Result<()> {
+		system_vpc_delete_bridge(bridge)
+	}
+}
+
+pub(crate) fn vpc_bridge_name(id: &str) -> Result<String> {
+	let suffix = id
+		.strip_prefix("vpc-")
+		.filter(|suffix| suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+		.ok_or_else(|| EngineError::invalid("VPC id must be a vpc-<8hex> identifier"))?;
+	Ok(format!("vmonbr-{suffix}"))
+}
+
+pub(crate) fn delete_vpc_bridge(id: &str) -> Result<()> {
+	SystemVpcBridge.delete_bridge(&vpc_bridge_name(id)?)
+}
+
+pub(crate) fn require_vpc_host() -> Result<()> {
+	if cfg!(target_os = "linux") {
+		Ok(())
+	} else {
+		Err(EngineError::invalid("VPCs require a Linux host"))
+	}
+}
+
+pub(crate) async fn setup_vpc_network(
+	name: &str,
+	vpc_id: &str,
+	guest_ip: &str,
+	gateway: &str,
+	prefix: u8,
+	ports: &[u16],
+	inbound_cidr_allowlist: Option<&[String]>,
+) -> Result<SandboxNetwork> {
+	setup_vpc_network_with_bridge(
+		&SystemVpcBridge,
+		name,
+		vpc_id,
+		guest_ip,
+		gateway,
+		prefix,
+		ports,
+		inbound_cidr_allowlist,
+	)
+	.await
+}
+
+async fn setup_vpc_network_with_bridge(
+	bridge_ops: &dyn VpcBridge,
+	name: &str,
+	vpc_id: &str,
+	guest_ip: &str,
+	gateway: &str,
+	prefix: u8,
+	ports: &[u16],
+	inbound_cidr_allowlist: Option<&[String]>,
+) -> Result<SandboxNetwork> {
+	if !cfg!(target_os = "linux") && !cfg!(test) {
+		return Err(EngineError::invalid("VPCs require a Linux host"));
+	}
+	let bridge = vpc_bridge_name(vpc_id)?;
+	let tap_name = tap_name(name);
+	bridge_ops.ensure_bridge(&bridge, gateway, prefix)?;
+	bridge_ops.attach_tap(&bridge, &tap_name)?;
+	let tunnels = match TunnelSet::new(guest_ip, ports, inbound_cidr_allowlist).await {
+		Ok(tunnels) => tunnels,
+		Err(error) => {
+			let _ = bridge_ops.detach_tap(&bridge, &tap_name);
+			return Err(error);
+		},
+	};
+	let dns = DEFAULT_DNS
+		.iter()
+		.map(|value| (*value).to_owned())
+		.collect::<Vec<_>>();
+	let network = format!(
+		"{}/{}",
+		Ipv4Addr::from(u32::from(parse_ipv4(guest_ip)?) & (u32::MAX << (32 - prefix))),
+		prefix
+	);
+	let config = GuestConfig {
+		tap: tap_name.clone(),
+		host_ip: gateway.to_owned(),
+		guest_ip: guest_ip.to_owned(),
+		prefix,
+		network,
+		dns: dns.clone(),
+	};
+	let guest_config = GuestNetworkConfig {
+		tap: tap_name.clone(),
+		guest_ip: guest_ip.to_owned(),
+		host_ip: gateway.to_owned(),
+		prefix,
+		dns,
+	};
+	Ok(SandboxNetwork {
+		name: name.to_owned(),
+		config,
+		tap: TapLease {
+			name: tap_name,
+			guest_ip: guest_ip.to_owned(),
+			host_ip: gateway.to_owned(),
+			prefix,
+			network: vpc_id.to_owned(),
+			egress_allow: Vec::new(),
+		},
+		guest_config,
+		tunnels,
+		egress_allow: None,
+		egress_allow_domains: None,
+		vpc_bridge: Some(bridge),
 	})
 }
 
@@ -502,9 +650,11 @@ pub const fn has_net_admin() -> bool {
 /// Test seam: when installed, every broker round trip is routed through this
 /// handler instead of the Unix socket, letting tests count and answer them.
 #[cfg(test)]
-pub(crate) static BROKER_STUB: LazyLock<
-	Mutex<Option<Box<dyn FnMut(&broker::Request) -> Result<Option<TapLease>> + Send>>>,
-> = LazyLock::new(|| Mutex::new(None));
+type BrokerStubFn = Box<dyn FnMut(&broker::Request) -> Result<Option<TapLease>> + Send>;
+
+#[cfg(test)]
+pub(crate) static BROKER_STUB: LazyLock<Mutex<Option<BrokerStubFn>>> =
+	LazyLock::new(|| Mutex::new(None));
 
 fn broker_request(request: broker::Request) -> Result<Option<TapLease>> {
 	#[cfg(test)]
@@ -988,8 +1138,7 @@ pub fn configure_slot_pool(count: usize) {
 				);
 			},
 		})
-		.map(drop)
-		.unwrap_or_else(|error| tracing::warn!(%error, "spawning network slot fill failed"));
+		.map_or_else(|error| tracing::warn!(%error, "spawning network slot fill failed"), drop);
 }
 
 /// Carve slot leases from the in-memory allocator and preallocate their TAPs
@@ -1802,7 +1951,7 @@ enum RefreshTarget {
 	Iptables { guest_cidr: String },
 	/// Elements of a pooled slot's nftables egress set, updated as one
 	/// batched `nft -f -` invocation per refresh cycle.
-	#[allow(dead_code)]
+	#[allow(dead_code, reason = "reserved for egress policy expansion")]
 	NftSet { set: String },
 }
 
@@ -1989,7 +2138,7 @@ impl DomainRefresher {
 	}
 
 	/// Remove every applied address for `target` (fail-closed cleanup).
-	fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
+	const fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
 		#[cfg(not(target_os = "linux"))]
 		let _ = (name, target, applied);
 		#[cfg(target_os = "linux")]
@@ -2122,6 +2271,104 @@ fn run(argv: &[String], check: bool) -> Result<RunOutput> {
 		return Err(EngineError::engine(format!("{} failed: {detail}", argv.join(" "))));
 	}
 	Ok(RunOutput { code })
+}
+
+#[cfg(target_os = "linux")]
+fn system_vpc_ensure_bridge(bridge: &str, gateway: &str, prefix: u8) -> Result<()> {
+	require_net_admin()?;
+	if !run(&argv(["ip", "link", "show", "dev", bridge]), false)?.success() {
+		run(&argv(["ip", "link", "add", "name", bridge, "type", "bridge"]), true)?;
+	}
+	run(
+		&[
+			"ip".to_owned(),
+			"address".to_owned(),
+			"replace".to_owned(),
+			format!("{gateway}/{prefix}"),
+			"dev".to_owned(),
+			bridge.to_owned(),
+		],
+		true,
+	)?;
+	run(&argv(["ip", "link", "set", "dev", bridge, "up"]), true)?;
+	Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_vpc_ensure_bridge(_bridge: &str, _gateway: &str, _prefix: u8) -> Result<()> {
+	Err(EngineError::invalid("VPCs require a Linux host"))
+}
+
+#[cfg(target_os = "linux")]
+fn system_vpc_attach_tap(bridge: &str, tap: &str) -> Result<()> {
+	require_net_admin()?;
+	if !run(&argv(["ip", "link", "show", "dev", tap]), false)?.success() {
+		let uid = {
+			// SAFETY: geteuid has no preconditions and reads process credentials.
+			unsafe { libc::geteuid() }.to_string()
+		};
+		run(
+			&[
+				"ip".to_owned(),
+				"tuntap".to_owned(),
+				"add".to_owned(),
+				"dev".to_owned(),
+				tap.to_owned(),
+				"mode".to_owned(),
+				"tap".to_owned(),
+				"user".to_owned(),
+				uid,
+			],
+			true,
+		)?;
+	}
+	run(
+		&[
+			"ip".to_owned(),
+			"link".to_owned(),
+			"set".to_owned(),
+			"dev".to_owned(),
+			tap.to_owned(),
+			"master".to_owned(),
+			bridge.to_owned(),
+		],
+		true,
+	)?;
+	run(&argv(["ip", "link", "set", "dev", tap, "up"]), true)?;
+	Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_vpc_attach_tap(_bridge: &str, _tap: &str) -> Result<()> {
+	Err(EngineError::invalid("VPCs require a Linux host"))
+}
+
+#[cfg(target_os = "linux")]
+fn system_vpc_detach_tap(tap: &str) -> Result<()> {
+	require_net_admin()?;
+	if run(&argv(["ip", "link", "show", "dev", tap]), false)?.success() {
+		run(&argv(["ip", "link", "delete", "dev", tap]), true)?;
+	}
+	Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_vpc_detach_tap(_tap: &str) -> Result<()> {
+	Err(EngineError::invalid("VPCs require a Linux host"))
+}
+
+#[cfg(target_os = "linux")]
+fn system_vpc_delete_bridge(bridge: &str) -> Result<()> {
+	require_net_admin()?;
+	if run(&argv(["ip", "link", "show", "dev", bridge]), false)?.success() {
+		run(&argv(["ip", "link", "delete", "dev", bridge, "type", "bridge"]), true)?;
+	}
+	Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_vpc_delete_bridge(_bridge: &str) -> Result<()> {
+	Err(EngineError::invalid("VPCs require a Linux host"))
 }
 
 #[cfg(test)]
@@ -2485,6 +2732,55 @@ mod tests {
 			 0 0 0 18446744073709551615 0 0 0 0 0 0 0\nbad-value: x 0 0 0 0 0 0 0 3 0 0 0 0 0 0 0\n",
 		);
 
-		assert_eq!(counters, Some((u64::MAX, u64::MAX)));
+		assert_eq!(counters, (u64::MAX, u64::MAX));
+	}
+	struct FakeVpcBridge {
+		calls: Mutex<Vec<String>>,
+	}
+
+	impl VpcBridge for FakeVpcBridge {
+		fn ensure_bridge(&self, bridge: &str, gateway: &str, prefix: u8) -> Result<()> {
+			self
+				.calls
+				.lock()
+				.push(format!("bridge:{bridge}:{gateway}/{prefix}"));
+			Ok(())
+		}
+
+		fn attach_tap(&self, bridge: &str, tap: &str) -> Result<()> {
+			self.calls.lock().push(format!("attach:{bridge}:{tap}"));
+			Ok(())
+		}
+
+		fn detach_tap(&self, bridge: &str, tap: &str) -> Result<()> {
+			self.calls.lock().push(format!("detach:{bridge}:{tap}"));
+			Ok(())
+		}
+
+		fn delete_bridge(&self, bridge: &str) -> Result<()> {
+			self.calls.lock().push(format!("delete:{bridge}"));
+			Ok(())
+		}
+	}
+
+	#[tokio::test]
+	async fn vpc_setup_uses_isolated_bridge_seam() {
+		let bridge = FakeVpcBridge { calls: Mutex::new(Vec::new()) };
+		let _network = setup_vpc_network_with_bridge(
+			&bridge,
+			"sandbox",
+			"vpc-1234abcd",
+			"10.88.0.2",
+			"10.88.0.1",
+			24,
+			&[],
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(bridge.calls.lock().clone(), vec![
+			"bridge:vmonbr-1234abcd:10.88.0.1/24".to_owned(),
+			format!("attach:vmonbr-1234abcd:{}", tap_name("sandbox")),
+		]);
 	}
 }
