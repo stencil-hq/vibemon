@@ -53,15 +53,15 @@ runs:
       shell: bash
       run: cargo build --locked
 
-    - name: Build static guest agent
-      shell: bash
-      run: just agent-musl
-
     - name: Cache guest assets
       uses: actions/cache@v4
       with:
         path: target/test-assets
         key: test-assets-${{ runner.arch }}-${{ hashFiles('demo/fetch-test-assets.sh') }}
+
+    - name: Build static guest agent
+      shell: bash
+      run: just agent-musl
 
     - name: Fetch test assets
       shell: bash
