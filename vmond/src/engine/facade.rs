@@ -5175,7 +5175,11 @@ impl Engine {
 		let mut control = control_for_vm(vm)?;
 		control.pause()?;
 		// Copy all guest-writable state while devices and vCPUs are quiesced.
-		let snapshot_result = control.snapshot(name, None, track).and_then(|_| {
+		let snapshot_result = control.snapshot(name, None, track);
+		// The control server closes idle connections after five seconds; sealing an
+		// encrypted snapshot can take longer, so resume over a fresh connection.
+		drop(control);
+		let snapshot_result = snapshot_result.and_then(|_| {
 			if let Some(disk_src) = disk_src.filter(|path| path.is_file()) {
 				fs::create_dir_all(&dir)?;
 				fs::copy(disk_src, dir.join("rootfs.img"))?;
@@ -5184,14 +5188,14 @@ impl Engine {
 			Ok(Value::Null)
 		});
 		if let Err(error) = snapshot_result {
-			let _ = control.resume();
+			let _ = control_for_vm(vm).and_then(|mut control| control.resume());
 			return Err(error);
 		}
 		if hold_paused {
 			// A production suspend keeps the precise captured state frozen until
 			// its portable recovery point is committed.
 		} else if keep_running {
-			control.resume()?;
+			control_for_vm(vm)?.resume()?;
 		} else {
 			let _ = self.stop_sandbox(vm, true);
 		}
