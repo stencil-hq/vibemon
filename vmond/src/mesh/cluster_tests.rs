@@ -575,6 +575,59 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	async fn background_migration_update_preserves_process_local_secrets() {
+		if !require_test_database() {
+			return;
+		}
+		let _guard = pg::TEST_DATABASE_LOCK.lock().await;
+		reset_test_database();
+		let mock_s3 = MockS3::start();
+		let home_a = tempfile::tempdir().unwrap();
+		let home_b = tempfile::tempdir().unwrap();
+		let runtime_a = build_runtime(mock_s3.addr, &home_a);
+		let runtime_b = build_runtime(mock_s3.addr, &home_b);
+		let secrets = serde_json::json!([{
+			"name": "migration",
+			"values": {"MIGRATION_SECRET": "retained"},
+		}]);
+		let mut params = serde_json::Map::new();
+		params.insert("image".to_owned(), serde_json::json!("debian"));
+		params.insert("secrets".to_owned(), secrets.clone());
+		params.insert("_mesh_migration_id".to_owned(), serde_json::json!("token"));
+		let mut record = put_record(&runtime_a, CreateRecordWire {
+			sid: "background-migration".to_owned(),
+			params,
+			owner: "node-target".to_owned(),
+			epoch: 1,
+			idempotency_key: "background-migration-key".to_owned(),
+			ha: "off".to_owned(),
+			restart_policy: "none".to_owned(),
+			created_at: 1.0,
+		});
+		record
+			.params
+			.insert("_mesh_migration_delta_dir".to_owned(), serde_json::json!("/staged/delta"));
+
+		let updated = MeshRecordStore::update_exact(&*runtime_a, record)
+			.expect("persist background migration stage");
+		assert_eq!(updated.params.get("secrets"), Some(&secrets));
+		let durable = MeshRecordStore::get(&*runtime_b, "background-migration")
+			.expect("read durable migration")
+			.expect("migration record");
+		assert!(
+			!durable.params.contains_key("secrets"),
+			"process-local secrets must remain absent from PostgreSQL"
+		);
+
+		tokio::task::spawn_blocking(move || {
+			drop(runtime_a);
+			drop(runtime_b);
+		})
+		.await
+		.unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
 	async fn test_portable_points_share_lifecycle_generation_but_fence_stale_owner() {
 		if !require_test_database() {
 			return;
