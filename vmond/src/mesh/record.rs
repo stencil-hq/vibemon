@@ -614,7 +614,11 @@ impl RecordStore {
 		set_handoff(&mut intent.params, source, target, token, "active", true);
 		let (params, secrets) = split_secrets(&intent.params);
 		intent.params = params;
-		store_secrets(&mut inner, &intent.sid, secrets);
+		// A target may already hold process-local secrets replicated for the
+		// source generation. An intent without new secrets must not erase them.
+		if let Some(secrets) = secrets {
+			inner.secrets.insert(intent.sid.clone(), secrets);
+		}
 		self.persist_meta(&mut inner, &intent)?;
 		Ok(with_secrets(&inner, intent))
 	}
@@ -965,11 +969,32 @@ mod tests {
 		recovered
 			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
 			.unwrap();
+
 		let record = recovered
 			.claim_migration_handoff(SOURCE, SOURCE_EPOCH, TARGET, TOKEN, target_intent())
 			.unwrap();
 		assert_eq!((record.owner.as_str(), record.epoch), (TARGET, TARGET_EPOCH));
 		assert!(handoff_claimed(&record.params));
+	}
+	#[test]
+	fn target_claim_retains_process_local_source_secrets() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		let mut source = source_record();
+		source.params.insert(
+			"secrets".to_owned(),
+			serde_json::json!([{"name": "migration", "values": {"TOKEN": "secret"}}]),
+		);
+		store.put(source).unwrap();
+		store
+			.begin_migration_handoff(SID, SOURCE, SOURCE_EPOCH, TARGET, TOKEN)
+			.unwrap();
+
+		let claimed = store
+			.claim_migration_handoff(SOURCE, SOURCE_EPOCH, TARGET, TOKEN, target_intent())
+			.unwrap();
+
+		assert!(claimed.params.contains_key("secrets"));
 	}
 
 	#[test]

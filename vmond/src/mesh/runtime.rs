@@ -2872,7 +2872,7 @@ impl MeshRecordStore for MeshRuntime {
 		if let Some(store) = &self.cluster_store {
 			let (params, secrets) = record::split_secrets(&intent.params);
 			intent.params = params;
-			let claimed = store
+			let mut claimed = store
 				.claim_migration_handoff(
 					&intent.sid,
 					&source_owner,
@@ -2882,7 +2882,10 @@ impl MeshRecordStore for MeshRuntime {
 					&intent,
 				)
 				.map_err(engine_to_mesh)?;
-			self.records.remember_secrets(&claimed.sid, secrets);
+			if let Some(secrets) = secrets {
+				self.records.remember_secrets(&claimed.sid, Some(secrets));
+			}
+			self.records.attach_secrets(&mut claimed);
 			Ok(record_wire(claimed))
 		} else {
 			self
