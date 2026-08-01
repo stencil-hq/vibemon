@@ -31,6 +31,18 @@ export interface SandboxCreateRequest {
   env?: Record<string, string> | null;
   fs_dir?: string | null;
   ha?: string | null;
+  /** Seconds without qualifying guest network activity before the idle action runs; 0 disables. */
+  idle_timeout_secs?: number | null;
+  /** Raw guest NIC byte delta per activity-sampling interval below which the VM counts idle. */
+  activity_threshold_bytes?: number | null;
+  /** Stored-state lifecycle: retention, storage-GC eviction priority, or discard on stop/suspend. */
+  persistence?:
+    | { type: "persistent" }
+    | { type: "sticky"; priority?: number }
+    | { type: "ephemeral" }
+    | null;
+  /** Single routed NIC attachment to a VPC (Linux hosts). */
+  nics?: { vpc: string; ipv4: string | true; default?: boolean }[] | null;
   idempotency_key?: string | null;
   image?: string | null;
   inbound_cidr_allowlist?: string[] | null;
@@ -88,6 +100,8 @@ export interface SnapshotFilesystemRequest {
 /** Runtime-only fields that can change without altering captured VM devices. */
 export interface SnapshotRuntimeOptions {
   agent?: boolean | null;
+  /** Block or allow guest networking after restore. */
+  block_network?: boolean | null;
   command?: string[] | null;
   env?: Record<string, string> | null;
   readiness_probe?: number | string | { port: number } | null;
@@ -96,6 +110,12 @@ export interface SnapshotRuntimeOptions {
   tags?: Record<string, string> | null;
   timeout?: number | null;
   timeout_secs?: number | null;
+  idle_timeout_secs?: number | null;
+  activity_threshold_bytes?: number | null;
+  persistence?:
+    | { type: "persistent" }
+    | { type: "sticky"; priority?: number }
+    | { type: "ephemeral" };
   workdir?: string | null;
 }
 
@@ -137,6 +157,7 @@ export interface SandboxInfo {
   source?: string | null;
   created_at?: number;
   last_active?: number;
+  last_network_active?: number;
   expires_at?: number | null;
   terminated_at?: number | null;
   error?: string | null;

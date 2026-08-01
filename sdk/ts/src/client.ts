@@ -9,6 +9,7 @@ import {
   SnapshotService,
   SystemService,
   VolumeService,
+  VpcService,
 } from "./gen/vmon/v1/api_pb";
 import type {
   ForkRequest,
@@ -43,6 +44,7 @@ export class Client {
   readonly volumes: VolumeAPI;
   readonly pools: PoolAPI;
   readonly mesh: MeshAPI;
+  readonly vpcs: VpcAPI;
   readonly functions: FunctionAPI;
   readonly apps: AppAPI;
   /** Bind the client to a driver implementation. */
@@ -52,6 +54,7 @@ export class Client {
     this.snapshots = new SnapshotAPI(this);
     this.volumes = new VolumeAPI(this);
     this.pools = new PoolAPI(this);
+    this.vpcs = new VpcAPI(this);
     this.mesh = new MeshAPI(this);
     this.functions = new FunctionAPI(this);
     this.apps = new AppAPI(this);
@@ -306,6 +309,40 @@ export class VolumeAPI {
   /** Delete a persistent volume. */
   async delete(name: string): Promise<void> {
     await this.#client.driver.call(VolumeService.method.delete, { name });
+  }
+}
+
+/** Private network returned by the VPC service. */
+export interface Vpc {
+  id: string;
+  name: string;
+  cidr: string;
+  createdAtUnixMillis: bigint;
+}
+
+/** Private routed network operations. */
+export class VpcAPI {
+  readonly #client: Client;
+  /** Bind VPC operations to a client. */
+  constructor(client: Client) {
+    this.#client = client;
+  }
+  /** Create a private network. */
+  async create(options: { name?: string; cidr?: string } = {}): Promise<Vpc> {
+    return (
+      await this.#client.driver.call(VpcService.method.create, {
+        name: options.name ?? "",
+        cidr: options.cidr ?? "",
+      })
+    ).message;
+  }
+  /** List private networks in creation order. */
+  async list(): Promise<Vpc[]> {
+    return (await this.#client.driver.call(VpcService.method.list, {})).message.vpcs;
+  }
+  /** Delete an unattached private network. */
+  async delete(id: string): Promise<void> {
+    await this.#client.driver.call(VpcService.method.delete, { id });
   }
 }
 

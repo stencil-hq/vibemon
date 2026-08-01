@@ -11,6 +11,8 @@ export {
   type SandboxCreateRequestWithSecrets,
   SnapshotAPI,
   VolumeAPI,
+  type Vpc,
+  VpcAPI,
 } from "./client";
 export {
   type Driver,
@@ -71,8 +73,8 @@ export type {
   PoolStats,
   RecoveryPoint,
   RestoreRequest,
-  SandboxCreateRequest,
   S3MountSpec,
+  SandboxCreateRequest,
   SandboxInfo,
   SandboxMetrics,
   ServerInfo,
@@ -89,6 +91,8 @@ export {
   LogStream,
   Process,
   type ProcessOptions,
+  PtyStream,
+  type PtyStreamOptions,
   type StreamHandle,
 } from "./process";
 export {

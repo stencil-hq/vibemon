@@ -8,6 +8,10 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
+    "./freestyle": {
+      "types": "./src/freestyle.ts",
+      "import": "./src/freestyle.ts"
+    },
     "./functions": {
       "types": "./src/functions.ts",
       "import": "./src/functions.ts"

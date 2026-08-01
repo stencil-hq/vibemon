@@ -16,13 +16,13 @@ import type {
   ExecResult,
   FileInfo,
   NetworkPolicy,
+  RecoveryPoint,
   SandboxInfo,
   SandboxMetrics,
-  RecoveryPoint,
   TunnelSet,
 } from "./models";
 import type { ProcessOptions } from "./process";
-import { ConsoleStream, LogStream, Process } from "./process";
+import { ConsoleStream, LogStream, Process, PtyStream } from "./process";
 import type { SecretInput } from "./values";
 import { mergeSecretEnv } from "./values";
 
@@ -127,6 +127,83 @@ export class Sandbox {
       { onStdout, onStderr },
     );
   }
+  /** Open a server-persistent PTY session. */
+  async ptyOpen(
+    options: {
+      sessionId?: string;
+      cols?: number;
+      rows?: number;
+      exec?: string;
+      env?: Record<string, string>;
+      workdir?: string;
+      onData?: (data: Uint8Array) => void;
+      onExit?: (code: number) => void;
+      onClose?: () => void;
+      onError?: (error: Error) => void;
+    } = {},
+  ): Promise<PtyStream> {
+    const { onData, onExit, onClose, onError, ...start } = options;
+    const stream = new PtyStream(
+      (inputs) => channelFor(this).duplex(SandboxService.method.ptyOpen, inputs),
+      {
+        case: "ptyOpen",
+        value: {
+          sandboxId: this.id,
+          sessionId: start.sessionId ?? "",
+          cols: start.cols ?? 80,
+          rows: start.rows ?? 24,
+          exec: start.exec,
+          env: start.env ?? {},
+          workdir: start.workdir,
+        },
+      },
+      { onData, onExit, onClose, onError },
+    );
+    await stream.meta;
+    return stream;
+  }
+  /** Attach to an existing server-persistent PTY session. */
+  async ptyAttach(
+    sessionId: string,
+    options: {
+      cols?: number;
+      rows?: number;
+      onData?: (data: Uint8Array) => void;
+      onExit?: (code: number) => void;
+      onClose?: () => void;
+      onError?: (error: Error) => void;
+    } = {},
+  ): Promise<PtyStream> {
+    const { cols, rows, onData, onExit, onClose, onError } = options;
+    const stream = new PtyStream(
+      (inputs) => channelFor(this).duplex(SandboxService.method.ptyAttach, inputs),
+      { case: "ptyAttach", value: { sandboxId: this.id, sessionId, cols, rows } },
+      { onData, onExit, onClose, onError },
+    );
+    await stream.meta;
+    return stream;
+  }
+  /** List persistent PTY sessions in this sandbox. */
+  async ptyList() {
+    return (await channelFor(this).call(SandboxService.method.ptyList, { id: this.id })).sessions;
+  }
+  /** Terminate and remove a persistent PTY session. */
+  async ptyClose(sessionId: string) {
+    return channelFor(this).call(SandboxService.method.ptyClose, {
+      id: this.id,
+      sessionId,
+    });
+  }
+  /** Execute a sibling command in a persistent PTY session's context. */
+  async ptyExec(sessionId: string, command: string, timeoutMs = 60_000) {
+    const response = await channelFor(this).call(SandboxService.method.ptyExec, {
+      id: this.id,
+      sessionId,
+      command,
+      timeout: timeoutMs / 1000,
+    });
+    return { code: Number(response.code), stdout: response.stdout, stderr: response.stderr };
+  }
   /** Attach a read-only console stream. */
   async attach(): Promise<ConsoleStream> {
     return new ConsoleStream(() =>
@@ -189,7 +266,7 @@ export class Sandbox {
     );
     return this.#info;
   }
-  /** Resume a paused sandbox or restore a durably suspended sandbox. */
+  /** Resume paused/suspended state or fresh-boot a stopped sandbox. */
   async resume(): Promise<SandboxInfo> {
     this.#info = mergeInfo(
       this.#info,
@@ -197,6 +274,21 @@ export class Sandbox {
         (await channelFor(this).call(SandboxService.method.resume, { id: this.id })).json,
       ),
     );
+    return this.#info;
+  }
+  /** Resize CPU, memory, or the grow-only root disk. */
+  async resize(options: {
+    cpus?: number;
+    memoryMib?: number;
+    diskMb?: number | bigint;
+  }): Promise<SandboxInfo> {
+    const view = await channelFor(this).call(SandboxService.method.resize, {
+      id: this.id,
+      cpus: options.cpus,
+      memoryMib: options.memoryMib,
+      diskMb: options.diskMb === undefined ? undefined : BigInt(options.diskMb),
+    });
+    this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;
   }
 
@@ -241,6 +333,17 @@ export class Sandbox {
     const view = await channelFor(this).call(SandboxService.method.extend, {
       id: this.id,
       secs: BigInt(secs),
+    });
+    this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
+    return this.#info;
+  }
+  /** Replace and rearm the network-idle suspension policy; zero disables it. */
+  async setIdleTimeout(secs: number): Promise<SandboxInfo> {
+    if (!Number.isFinite(secs) || secs < 0)
+      throw new TypeError("idle timeout seconds must be non-negative");
+    const view = await channelFor(this).call(SandboxService.method.setIdleTimeout, {
+      id: this.id,
+      idleTimeoutSecs: secs,
     });
     this.#info = mergeInfo(this.#info, parseResponseJson(view.json));
     return this.#info;

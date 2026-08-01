@@ -3,7 +3,6 @@ import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/p
 import { Code, createRouterTransport } from "@connectrpc/connect";
 import type { Driver, DriverRequestOptions, DriverResponse, EndpointInfo } from "../src";
 import { APIError, Client, EventStream, LogStream, MeshDriver } from "../src";
-import { channelFor, sandboxFromRoute } from "../src/sandbox";
 import {
   type ExecInput,
   ExecInputSchema,
@@ -14,6 +13,7 @@ import {
   Stream,
 } from "../src/gen/vmon/v1/api_pb";
 import { BridgeFrameSchema } from "../src/gen/vmon/v1/bridge_pb";
+import { channelFor, sandboxFromRoute } from "../src/sandbox";
 
 const servers: Bun.Server<BridgeSocketState>[] = [];
 afterEach(() => {
@@ -142,6 +142,52 @@ test("Process sends start, resize, stdin and decodes stdout and exit over the br
   expect(stdin?.case === "stdin" && new TextDecoder().decode(stdin.value)).toBe("hi");
   expect(events).toEqual([{ stream: "stdout", text: "hi" }]);
   expect(stdout).toEqual(["hi"]);
+});
+
+test("PtyStream parses mandatory metadata before delivering output", async () => {
+  const inputs: ExecInput["input"][] = [];
+  const server = bridgeServer({
+    "/vmon.v1.SandboxService/PtyOpen": {
+      onMessage(conn, payload) {
+        const input = fromBinary(ExecInputSchema, payload).input;
+        inputs.push(input);
+        if (input.case === "ptyOpen")
+          conn.sendMessage(
+            execOutput({
+              case: "pty",
+              value: {
+                sessionId: "term-1",
+                running: true,
+                cols: 100,
+                rows: 40,
+                createdAtUnixMillis: 123n,
+                attachedCount: 1,
+                suspended: false,
+              },
+            }),
+          );
+        if (input.case === "stdin") {
+          conn.sendMessage(
+            execOutput({ case: "chunk", value: { stream: Stream.CONSOLE, data: input.value } }),
+          );
+          conn.sendMessage(execOutput({ case: "exit", value: { code: 0n } }));
+          conn.end();
+        }
+      },
+    },
+  });
+  const stream = await clientFor(server).sandboxes.ref("s1").ptyOpen({
+    sessionId: "term-1",
+    cols: 100,
+    rows: 40,
+  });
+  expect(stream.sessionId).toBe("term-1");
+  expect(await stream.meta).toMatchObject({ sessionId: "term-1", cols: 100, rows: 40 });
+  stream.write("hello");
+  const chunks: string[] = [];
+  for await (const chunk of stream) chunks.push(new TextDecoder().decode(chunk));
+  expect(chunks).toEqual(["hello"]);
+  expect(inputs.map((input) => input.case)).toEqual(["ptyOpen", "stdin"]);
 });
 
 test("shell waits for the ready frame and decodes its exit", async () => {

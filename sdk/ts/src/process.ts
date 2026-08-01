@@ -1,7 +1,11 @@
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { AsyncQueue, deferred } from "./async-queue";
 import { ProtocolError, parseResponseJson } from "./errors";
-import type { ExecInputSchema, ExecOutput } from "./gen/vmon/v1/api_pb";
+import type {
+  ExecInputSchema,
+  ExecOutput,
+  PtySession as PtySessionMessage,
+} from "./gen/vmon/v1/api_pb";
 import { Stream } from "./gen/vmon/v1/api_pb";
 import type { EventRecord, ExecExit } from "./models";
 
@@ -138,6 +142,107 @@ export class Process implements AsyncIterable<ExecEvent> {
     this.#inputs.end();
     this.#events.fail(error);
     this.#exit.reject(error);
+  }
+}
+
+/** Options for a persistent PTY stream. */
+export interface PtyStreamOptions {
+  onData?: (data: Uint8Array) => void;
+  onExit?: (code: number) => void;
+  onClose?: () => void;
+  onError?: (error: Error) => void;
+}
+
+/** Bidirectional attachment to a server-persistent PTY session. */
+export class PtyStream implements AsyncIterable<Uint8Array> {
+  readonly #inputs = new AsyncQueue<ExecInputInit>();
+  readonly #chunks = new AsyncQueue<Uint8Array>();
+  readonly #metadata = deferred<PtySessionMessage>();
+  readonly #options: PtyStreamOptions;
+  #closed = false;
+  #session: PtySessionMessage | null = null;
+  #sawExit = false;
+  /** Start an open or attach stream. */
+  constructor(
+    open: (inputs: AsyncIterable<ExecInputInit>) => Promise<StreamHandle<ExecOutput>>,
+    first: ExecInputInit["input"],
+    options: PtyStreamOptions = {},
+  ) {
+    this.#options = options;
+    this.#inputs.push({ input: first });
+    void this.#run(open);
+  }
+  /** Metadata from the mandatory first server frame. */
+  get meta(): Promise<PtySessionMessage> {
+    return this.#metadata.promise;
+  }
+  /** Stable session id, once the first frame has arrived. */
+  get sessionId(): string | undefined {
+    return this.#session?.sessionId;
+  }
+  /** Write bytes to the PTY. */
+  write(data: Uint8Array | string): void {
+    this.#send({
+      case: "stdin",
+      value: typeof data === "string" ? new TextEncoder().encode(data) : data,
+    });
+  }
+  /** Change the PTY dimensions. */
+  resize(rows: number, cols: number): void {
+    this.#send({ case: "resize", value: { rows, cols } });
+  }
+  /** Detach this stream without terminating the server session. */
+  detach(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#inputs.push({ input: { case: "eof", value: {} } });
+    this.#inputs.end();
+  }
+  /** Alias for detach; closing a stream never terminates its PTY session. */
+  close(): void {
+    this.detach();
+  }
+  [Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+    return this.#chunks[Symbol.asyncIterator]();
+  }
+  async #run(
+    open: (inputs: AsyncIterable<ExecInputInit>) => Promise<StreamHandle<ExecOutput>>,
+  ): Promise<void> {
+    try {
+      const handle = await open(this.#inputs);
+      for await (const output of handle.stream) {
+        if (this.#session === null) {
+          if (output.output.case !== "pty")
+            throw new ProtocolError("PTY stream did not begin with session metadata");
+          this.#session = output.output.value;
+          this.#metadata.resolve(output.output.value);
+          continue;
+        }
+        if (output.output.case === "chunk") {
+          const data = output.output.value.data;
+          this.#options.onData?.(data);
+          this.#chunks.push(data);
+        } else if (output.output.case === "exit") {
+          this.#sawExit = true;
+          this.#options.onExit?.(Number(output.output.value.code));
+        } else {
+          throw new ProtocolError("malformed PTY output frame");
+        }
+      }
+      if (!this.#closed && !this.#sawExit)
+        throw new ProtocolError("PTY transport ended unexpectedly");
+      this.#chunks.end();
+      this.#options.onClose?.();
+    } catch (error) {
+      const failure = error instanceof Error ? error : new ProtocolError("PTY stream failed");
+      this.#metadata.reject(failure);
+      this.#chunks.fail(failure);
+      this.#options.onError?.(failure);
+    }
+  }
+  #send(input: ExecInputInit["input"]): void {
+    if (this.#closed) throw new ProtocolError("PTY stream is not open");
+    this.#inputs.push({ input });
   }
 }
 
