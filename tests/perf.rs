@@ -18,9 +18,13 @@ use std::{
 
 use serde_json::{Value, json};
 use vmon_proto::v1 as pb;
-use vmond::engine::{
-	agent::AgentConn,
-	spawn::{LaunchSpec, SandboxRuntime, SandboxVm, VmonRuntime},
+use vmond::{
+	engine::{
+		agent::AgentConn,
+		spawn::{LaunchSpec, SandboxRuntime, SandboxVm, VmonRuntime},
+	},
+	home::Home,
+	security::{EncryptedArchive, Keyring},
 };
 
 const EXTRA_PATH: &str =
@@ -388,7 +392,13 @@ fn create_to_first_exec_latency_breakdown_and_p50_p95() {
 		.unwrap();
 	remove_sandbox(&server, &base_id);
 
-	let snapshot_dir = test_home.join("snapshots").join(&snap_name);
+	let snapshot_archive = test_home
+		.join("snapshots")
+		.join(format!("{snap_name}.venc"));
+	let keyring = Keyring::open(&Home::new(&test_home)).unwrap();
+	let snapshot_dir =
+		EncryptedArchive::open(&snapshot_archive, &test_home.join("perf-snapshot"), &keyring)
+			.unwrap();
 	let runtime = VmonRuntime;
 
 	for i in 0..num_samples {
