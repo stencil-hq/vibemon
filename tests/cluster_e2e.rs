@@ -950,15 +950,13 @@ fn replica_list(node: &NodeProc) -> Vec<String> {
 		.collect()
 }
 
-fn exec_capture(
+fn try_exec_capture(
 	node: &NodeProc,
 	sid: &str,
 	cmd: &[&str],
 	timeout: Duration,
-) -> (i64, String, String) {
-	let grpc = node.grpc().unwrap_or_else(|err| {
-		panic!("gRPC connect to {} failed: {err}\nlog tail:\n{}", node.name, node.log_tail())
-	});
+) -> Result<(i64, String, String), String> {
+	let grpc = node.grpc()?;
 	let mut sandboxes = grpc.sandboxes();
 	let request = pb::ExecCaptureRequest {
 		id:   sid.to_owned(),
@@ -970,20 +968,50 @@ fn exec_capture(
 	};
 	let response = grpc
 		.block_on(sandboxes.exec_capture(request))
-		.unwrap_or_else(|status| {
-			panic!(
+		.map_err(|status| {
+			format!(
 				"exec {cmd:?} via {} failed: {}\nlog tail:\n{}",
 				node.name,
 				common::api::status_detail(&status),
 				node.log_tail()
 			)
-		})
+		})?
 		.into_inner();
-	(
+	Ok((
 		response.code,
 		String::from_utf8_lossy(&response.stdout).into_owned(),
 		String::from_utf8_lossy(&response.stderr).into_owned(),
-	)
+	))
+}
+
+fn exec_capture(
+	node: &NodeProc,
+	sid: &str,
+	cmd: &[&str],
+	timeout: Duration,
+) -> (i64, String, String) {
+	try_exec_capture(node, sid, cmd, timeout).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn eventually_guest_file(node: &NodeProc, sid: &str, path: &str, expected: &str) {
+	let command = ["cat", path];
+	let deadline = Instant::now() + Duration::from_secs(45);
+	loop {
+		match try_exec_capture(node, sid, &command, Duration::from_secs(15)) {
+			Ok((0, stdout, _)) if stdout.contains(expected) => return,
+			Ok((exit, stdout, stderr)) => {
+				assert!(
+					Instant::now() < deadline,
+					"restored guest file did not contain replicated volume data: exit={exit} \
+					 stdout={stdout:?} stderr={stderr:?}"
+				);
+			},
+			Err(error) => {
+				assert!(Instant::now() < deadline, "restored guest file remained unavailable: {error}");
+			},
+		}
+		thread::sleep(POLL_INTERVAL);
+	}
 }
 
 fn volume_lease(row: &Value, volume: &str) -> Value {
@@ -1235,22 +1263,7 @@ fn two_node_readonly_volume_ha_materializes_on_survivor() {
 			},
 		);
 		assert_eq!(restored.get("node").and_then(Value::as_str), Some(node_b.as_str()));
-		let materialized = gateway_b
-			.home
-			.join("volumes")
-			.join(&vol_name)
-			.join("sentinel.txt");
-		let got = eventually(
-			"volume data to materialize on survivor",
-			Duration::from_secs(30),
-			Duration::from_secs(1),
-			|| fs::read_to_string(&materialized).ok(),
-		);
-		assert_eq!(got.trim(), sentinel);
-		let (exit, stdout, stderr) =
-			exec_capture(&gateway_b, &sid, &["cat", "/data/sentinel.txt"], Duration::from_secs(30));
-		assert_eq!(exit, 0, "guest read failed stdout={stdout:?} stderr={stderr:?}");
-		assert!(stdout.contains(sentinel), "restored guest did not read volume data: {stdout:?}");
+		eventually_guest_file(&gateway_b, &sid, "/data/sentinel.txt", sentinel);
 	}));
 	remove_sandbox_best_effort(&[&gateway_b, &gateway_a], &sid);
 	gateway_a.stop();
@@ -1416,6 +1429,14 @@ fn two_node_migrate_moves_running_sandbox() {
 			matches!(local_sandbox_exists(source, &sid), Ok(false)).then_some(())
 		});
 	}));
+	if result.is_err() {
+		for gateway in [&gateway_a, &gateway_b] {
+			eprintln!("{} log tail:\n{}", gateway.name, gateway.log_tail());
+			eprintln!("{} listing: {:?}", gateway.name, try_list_sandboxes(gateway));
+			let record = gateway.home.join("records").join(format!("{sid}.json"));
+			eprintln!("{} record: {:?}", gateway.name, fs::read_to_string(record));
+		}
+	}
 	remove_sandbox_best_effort(&[&gateway_a, &gateway_b], &sid);
 	gateway_a.stop();
 	gateway_b.stop();
@@ -1532,27 +1553,19 @@ fn three_node_writable_volume_quorum_ha() {
 			},
 		);
 		let restorer_index = restored.0;
-		let materialized = gateways[restorer_index]
-			.home
-			.join("volumes")
-			.join(&vol_name)
-			.join("written.txt");
-		let got = eventually(
-			"written volume data to materialize on restorer",
-			Duration::from_secs(30),
-			Duration::from_secs(1),
-			|| fs::read_to_string(&materialized).ok(),
-		);
-		assert_eq!(got.trim(), sentinel);
-		let (exit, stdout, stderr) = exec_capture(
-			&gateways[restorer_index],
-			&sid,
-			&["cat", "/data/written.txt"],
-			Duration::from_secs(30),
-		);
-		assert_eq!(exit, 0, "guest post-restore read failed stdout={stdout:?} stderr={stderr:?}");
-		assert!(stdout.contains(sentinel), "restored guest did not read its write: {stdout:?}");
+		eventually_guest_file(&gateways[restorer_index], &sid, "/data/written.txt", sentinel);
 	}));
+	if result.is_err() {
+		for (index, gateway) in gateways.iter().enumerate() {
+			eprintln!("{} log tail:\n{}", gateway.name, gateway.log_tail());
+			eprintln!("{} listing: {:?}", gateway.name, try_list_sandboxes(gateway));
+			if index != 0 {
+				eprintln!("{} replicas: {:?}", gateway.name, replica_list(gateway));
+			}
+			let record = gateway.home.join("records").join(format!("{sid}.json"));
+			eprintln!("{} record: {:?}", gateway.name, fs::read_to_string(record));
+		}
+	}
 	remove_sandbox_best_effort(&[&gateways[2], &gateways[1], &gateways[0]], &sid);
 	for gateway in &mut gateways {
 		gateway.stop();

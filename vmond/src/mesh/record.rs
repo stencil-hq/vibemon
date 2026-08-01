@@ -31,6 +31,7 @@ pub(crate) const HANDOFF_TOKEN_FIELD: &str = "_mesh_migration_handoff_token";
 pub(crate) const HANDOFF_STATE_FIELD: &str = "_mesh_migration_handoff_state";
 pub(crate) const HANDOFF_SOURCE_FIELD: &str = "_mesh_migration_handoff_source";
 pub(crate) const HANDOFF_CLAIMED_FIELD: &str = "_mesh_migration_handoff_claimed";
+const MIGRATION_COMMITTED_FIELD: &str = "_mesh_migration_committed";
 
 pub type Params = JsonMap<String, JsonValue>;
 
@@ -268,9 +269,10 @@ impl RecordStore {
 		let (clean, secrets) = split_secrets(&record.params);
 		record.params = clean;
 		let mut inner = self.inner.write();
+		write_record(&self.root, &record.sid, &record.to_wire())?;
 		store_secrets(&mut inner, &record.sid, secrets);
-		inner.meta.insert(record.sid.clone(), record.clone());
-		write_record(&self.root, &record.sid, &record.to_wire())
+		inner.meta.insert(record.sid.clone(), record);
+		Ok(())
 	}
 
 	/// Apply the `/v1/mesh/record/put` acceptance rule: accept iff no local
@@ -289,20 +291,24 @@ impl RecordStore {
 			.is_some_and(|existing| record.owner == existing.owner && record.epoch == existing.epoch);
 		clear_handoff(&mut record.params);
 		if same_lineage && let Some(existing) = &existing {
-			for key in handoff_fields() {
-				if let Some(value) = existing.params.get(key) {
-					record.params.insert(key.to_owned(), value.clone());
+			if migration_committed(&existing.params) && !migration_committed(&record.params) {
+				record.params.clone_from(&existing.params);
+			} else {
+				for key in handoff_fields() {
+					if let Some(value) = existing.params.get(key) {
+						record.params.insert(key.to_owned(), value.clone());
+					}
 				}
 			}
 		}
 		let (params, secrets) = split_secrets(&record.params);
 		record.params = params;
+		self.persist_meta(&mut inner, &record)?;
 		if let Some(secrets) = secrets {
 			inner.secrets.insert(record.sid.clone(), secrets);
 		} else if !same_lineage {
 			inner.secrets.remove(&record.sid);
 		}
-		self.persist_meta(&mut inner, &record)?;
 		Ok(true)
 	}
 
@@ -348,6 +354,134 @@ impl RecordStore {
 		record.epoch = epoch;
 		self.put(record.clone())?;
 		Ok(Some(record))
+	}
+
+	/// Claim one observed lineage as a durable, non-serving restore intent.
+	pub(crate) fn claim_restore_pending(
+		&self,
+		sid: &str,
+		expected_owner: &str,
+		expected_epoch: i64,
+		new_owner: &str,
+		pending: &JsonValue,
+	) -> Result<CreateRecord> {
+		if sid.is_empty()
+			|| expected_owner.is_empty()
+			|| new_owner.is_empty()
+			|| expected_epoch < 0
+			|| !pending.is_object()
+		{
+			return Err(EngineError::invalid("invalid pending restore claim"));
+		}
+		let mut inner = self.inner.write();
+		let mut record =
+			inner.meta.get(sid).cloned().ok_or_else(|| {
+				EngineError::not_found(format!("sandbox {sid} has no ownership record"))
+			})?;
+		if record.owner == new_owner && record.params.get("_mesh_restore_pending") == Some(pending) {
+			return Ok(with_secrets(&inner, record));
+		}
+		if record.owner != expected_owner || record.epoch != expected_epoch {
+			return Err(EngineError::busy(format!("restore ownership fenced for sandbox {sid}")));
+		}
+		if let Some(existing) = record.params.get("_mesh_restore_pending")
+			&& existing != pending
+		{
+			return Err(EngineError::invalid(format!(
+				"pending restore intent for {sid} conflicts with the claimed lineage"
+			)));
+		}
+		record.epoch = record
+			.epoch
+			.checked_add(1)
+			.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+		new_owner.clone_into(&mut record.owner);
+		record
+			.params
+			.insert("_mesh_restore_pending".to_owned(), pending.clone());
+		self.persist_meta(&mut inner, &record)?;
+		Ok(with_secrets(&inner, record))
+	}
+
+	/// Verify that one exact local restore claim remains pending and
+	/// non-serving.
+	pub(crate) fn renew_restore_pending(&self, sid: &str, owner: &str, epoch: i64) -> bool {
+		self.inner.read().meta.get(sid).is_some_and(|record| {
+			record.owner == owner
+				&& record.epoch == epoch
+				&& record.params.contains_key("_mesh_restore_pending")
+		})
+	}
+
+	/// Promote an exact pending claim by persisting restored parameters before
+	/// routing it.
+	pub(crate) fn commit_restore_pending(
+		&self,
+		sid: &str,
+		owner: &str,
+		epoch: i64,
+		params: Params,
+		ha: &str,
+		restart_policy: &str,
+	) -> Result<CreateRecord> {
+		let (mut params, secrets) = split_secrets(&params);
+		for field in [
+			"_mesh_restore_pending",
+			"_mesh_rollback_pending",
+			"restore_pending",
+			"rollback_pending",
+			"_mesh_lifecycle_operation",
+		] {
+			params.remove(field);
+		}
+		let mut inner = self.inner.write();
+		let mut record =
+			inner.meta.get(sid).cloned().ok_or_else(|| {
+				EngineError::not_found(format!("sandbox {sid} has no ownership record"))
+			})?;
+		if record.owner != owner || record.epoch != epoch {
+			return Err(EngineError::busy(format!("restore ownership fenced for sandbox {sid}")));
+		}
+		record.params = params;
+		ha.clone_into(&mut record.ha);
+		restart_policy.clone_into(&mut record.restart_policy);
+		self.persist_meta(&mut inner, &record)?;
+		store_secrets(&mut inner, sid, secrets);
+		Ok(with_secrets(&inner, record))
+	}
+
+	/// Release only an exact pending claim while advancing beyond every observed
+	/// epoch.
+	pub(crate) fn release_restore_claim(
+		&self,
+		sid: &str,
+		owner: &str,
+		epoch: i64,
+		previous_owner: &str,
+		previous_epoch: i64,
+	) -> Result<Option<CreateRecord>> {
+		if owner.is_empty() || previous_owner.is_empty() || epoch < 0 || previous_epoch < 0 {
+			return Err(EngineError::invalid("invalid restore claim release"));
+		}
+		let restored_epoch = previous_epoch
+			.max(epoch)
+			.checked_add(1)
+			.ok_or_else(|| EngineError::invalid("ownership epoch exceeds local range"))?;
+		let mut inner = self.inner.write();
+		let Some(mut record) = inner.meta.get(sid).cloned() else {
+			return Ok(None);
+		};
+		if record.owner != owner
+			|| record.epoch != epoch
+			|| !record.params.contains_key("_mesh_restore_pending")
+		{
+			return Ok(None);
+		}
+		record.params.remove("_mesh_restore_pending");
+		previous_owner.clone_into(&mut record.owner);
+		record.epoch = restored_epoch;
+		self.persist_meta(&mut inner, &record)?;
+		Ok(Some(with_secrets(&inner, record)))
 	}
 
 	/// Persist one exact source-to-target migration authorization.
@@ -555,8 +689,9 @@ impl RecordStore {
 	}
 
 	fn persist_meta(&self, inner: &mut RecordInner, record: &CreateRecord) -> Result<()> {
+		write_record(&self.root, &record.sid, &record.to_wire())?;
 		inner.meta.insert(record.sid.clone(), record.clone());
-		write_record(&self.root, &record.sid, &record.to_wire())
+		Ok(())
 	}
 
 	/// Return all valid records in stable sandbox-id order.
@@ -571,16 +706,14 @@ impl RecordStore {
 
 	/// Remove a create record and any memory-only secret material.
 	pub fn remove(&self, sid: &str) -> Result<()> {
-		{
-			let mut inner = self.inner.write();
-			inner.meta.remove(sid);
-			inner.secrets.remove(sid);
-		}
+		let mut inner = self.inner.write();
 		match fs::remove_file(self.root.join(format!("{sid}.json"))) {
 			Ok(()) => {},
 			Err(err) if err.kind() == ErrorKind::NotFound => {},
 			Err(err) => return Err(err.into()),
 		}
+		inner.meta.remove(sid);
+		inner.secrets.remove(sid);
 		Ok(())
 	}
 
@@ -611,6 +744,12 @@ const fn handoff_fields() -> [&'static str; 5] {
 	]
 }
 
+fn migration_committed(params: &Params) -> bool {
+	params
+		.get(MIGRATION_COMMITTED_FIELD)
+		.and_then(JsonValue::as_bool)
+		== Some(true)
+}
 fn handoff_present(params: &Params) -> bool {
 	handoff_fields()
 		.into_iter()
@@ -854,5 +993,130 @@ mod tests {
 		let record = store.get(SID).unwrap();
 		assert!(handoff_matches(&record.params, SOURCE, TARGET, TOKEN));
 		assert!(!handoff_claimed(&record.params));
+	}
+
+	#[test]
+	fn equal_epoch_replication_cannot_rollback_committed_migration() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		let mut committed = target_intent();
+		committed
+			.params
+			.insert(MIGRATION_COMMITTED_FIELD.to_owned(), JsonValue::Bool(true));
+		committed
+			.params
+			.insert("rootfs".to_owned(), JsonValue::String("target-rootfs".to_owned()));
+		store.put(committed).unwrap();
+
+		let mut stale = target_intent();
+		stale
+			.params
+			.insert("rootfs".to_owned(), JsonValue::String("source-rootfs".to_owned()));
+		assert!(store.put_if_newer(stale).unwrap());
+
+		let record = store.get(SID).unwrap();
+		assert!(migration_committed(&record.params));
+		assert_eq!(record.params.get("rootfs").and_then(JsonValue::as_str), Some("target-rootfs"));
+	}
+
+	#[test]
+	fn pending_restore_claim_is_durable_and_releases_to_a_fresh_epoch() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		store.put(source_record()).unwrap();
+		let pending = serde_json::json!({
+			"kind": "replica",
+			"source_owner": SOURCE,
+			"source_epoch": SOURCE_EPOCH,
+		});
+		let claimed = store
+			.claim_restore_pending(SID, SOURCE, SOURCE_EPOCH, TARGET, &pending)
+			.unwrap();
+		assert_eq!((claimed.owner.as_str(), claimed.epoch), (TARGET, TARGET_EPOCH));
+		assert!(store.renew_restore_pending(SID, TARGET, TARGET_EPOCH));
+		drop(store);
+
+		let recovered = RecordStore::new(temp.path());
+		recovered.load();
+		assert!(recovered.renew_restore_pending(SID, TARGET, TARGET_EPOCH));
+		assert!(
+			recovered
+				.release_restore_claim(SID, "other", TARGET_EPOCH, SOURCE, SOURCE_EPOCH)
+				.unwrap()
+				.is_none()
+		);
+		let released = recovered
+			.release_restore_claim(SID, TARGET, TARGET_EPOCH, SOURCE, SOURCE_EPOCH)
+			.unwrap()
+			.unwrap();
+		assert_eq!((released.owner.as_str(), released.epoch), (SOURCE, TARGET_EPOCH + 1));
+		assert!(!released.params.contains_key("_mesh_restore_pending"));
+		assert!(!recovered.put_if_newer(source_record()).unwrap());
+	}
+
+	#[test]
+	fn pending_restore_claim_promotes_only_its_exact_epoch() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		store.put(source_record()).unwrap();
+		let pending = serde_json::json!({"kind": "rerun", "source_owner": SOURCE});
+		store
+			.claim_restore_pending(SID, SOURCE, SOURCE_EPOCH, TARGET, &pending)
+			.unwrap();
+		let mut params = Params::new();
+		params.insert("name".to_owned(), JsonValue::String(SID.to_owned()));
+		let committed = store
+			.commit_restore_pending(SID, TARGET, TARGET_EPOCH, params, "async", "rerun")
+			.unwrap();
+		assert_eq!((committed.owner.as_str(), committed.epoch), (TARGET, TARGET_EPOCH));
+		assert!(!committed.params.contains_key("_mesh_restore_pending"));
+		assert!(!store.renew_restore_pending(SID, TARGET, TARGET_EPOCH));
+	}
+	#[test]
+	fn failed_restore_attempt_retries_the_same_pending_generation() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		store.put(source_record()).unwrap();
+		let pending = serde_json::json!({
+			"kind": "replica",
+			"source_owner": SOURCE,
+			"source_epoch": SOURCE_EPOCH,
+		});
+		let first = store
+			.claim_restore_pending(SID, SOURCE, SOURCE_EPOCH, TARGET, &pending)
+			.unwrap();
+		assert!(store.renew_restore_pending(SID, TARGET, TARGET_EPOCH));
+
+		let retry = store
+			.claim_restore_pending(SID, SOURCE, SOURCE_EPOCH, TARGET, &pending)
+			.unwrap();
+		assert_eq!(retry, first);
+		assert_eq!(retry.params.get("_mesh_restore_pending"), Some(&pending));
+	}
+
+	#[test]
+	fn failed_restore_commit_keeps_the_pending_record_in_memory() {
+		let temp = tempfile::tempdir().unwrap();
+		let root = temp.path().join("records");
+		let backup = temp.path().join("records-backup");
+		let store = RecordStore::new(&root);
+		store.put(source_record()).unwrap();
+		let pending = serde_json::json!({"kind": "rerun", "source_owner": SOURCE});
+		store
+			.claim_restore_pending(SID, SOURCE, SOURCE_EPOCH, TARGET, &pending)
+			.unwrap();
+		fs::rename(&root, &backup).unwrap();
+		fs::write(&root, b"not a directory").unwrap();
+
+		let mut params = Params::new();
+		params.insert("name".to_owned(), JsonValue::String(SID.to_owned()));
+		assert!(
+			store
+				.commit_restore_pending(SID, TARGET, TARGET_EPOCH, params, "async", "rerun")
+				.is_err()
+		);
+		let record = store.get(SID).unwrap();
+		assert_eq!(record.params.get("_mesh_restore_pending"), Some(&pending));
+		assert!(store.renew_restore_pending(SID, TARGET, TARGET_EPOCH));
 	}
 }

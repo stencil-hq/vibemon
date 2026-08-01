@@ -205,9 +205,9 @@ pub trait ReconcileEngine: Send + Sync {
 		snapshot_dir: &'a Path,
 		quorum_ok: bool,
 	) -> BoxFuture<'a, Result<SandboxRecord>>;
-	/// Activate an exact paused restore candidate only after its ownership
-	/// record is durably committed. Implementations must be idempotent so a
-	/// reconciler retry can finish an interrupted post-commit activation.
+	/// Activate an exact paused restore candidate while its pending ownership
+	/// marker still fences routing. Implementations must be idempotent so a
+	/// restart can finish activation before the serving commit.
 	fn activate_candidate<'a>(&'a self, sid: &'a str) -> BoxFuture<'a, Result<()>>;
 	fn record_volume_leases(&self, sid: &str, leases: &[LeaseRecord]) -> Result<()>;
 	fn record_idempotency(&self, sid: &str, key: &str) -> Result<()>;
@@ -472,6 +472,11 @@ impl<'a> Reconciler<'a> {
 					"cannot replicate {sid} without an authoritative ownership record"
 				)));
 			};
+			if record_restore_pending(&owner_record) {
+				last.remove(sid);
+				self.checkpoint_times.lock().remove(sid);
+				return Ok(());
+			}
 			if owner_record.owner != self.mesh.node_id() {
 				return Err(EngineError::invalid(format!(
 					"cannot replicate {sid}: owner {} is not this node",
@@ -600,12 +605,8 @@ impl<'a> Reconciler<'a> {
 
 	async fn reconcile_orphan(&self, sid: &str, dead: &str) {
 		let result = async {
-			let restore_pending = self.records.get(sid)?.is_some_and(|record| {
-				record
-					.params
-					.as_object()
-					.is_some_and(|params| params.contains_key("_mesh_restore_pending"))
-			});
+			let create_record = self.records.get(sid)?;
+			let restore_pending = create_record.as_ref().is_some_and(record_restore_pending);
 			let local_candidate_missing = self.mesh.local_candidate_missing(sid)?;
 			if !restore_pending
 				&& !local_candidate_missing
@@ -619,10 +620,9 @@ impl<'a> Reconciler<'a> {
 				warn!("deferring restore of {sid}: prior owner {dead} is still reachable");
 				return Ok(true);
 			}
-			if self.mesh.is_nonserving_lifecycle(sid)? {
+			if !restore_pending && self.mesh.is_nonserving_lifecycle(sid)? {
 				return Ok(false);
 			}
-			let create_record = self.records.get(sid)?;
 			let ha = create_record
 				.as_ref()
 				.map_or("async", |record| record.ha.as_str());
@@ -650,7 +650,13 @@ impl<'a> Reconciler<'a> {
 				} else {
 					HashSet::from([dead.to_owned()])
 				};
-				if self.mesh.restore_owner(sid, &exclude).as_deref() != Some(self.mesh.node_id()) {
+				let retrying_local_claim = restore_pending
+					&& create_record
+						.as_ref()
+						.is_some_and(|record| record.owner == self.mesh.node_id());
+				if !retrying_local_claim
+					&& self.mesh.restore_owner(sid, &exclude).as_deref() != Some(self.mesh.node_id())
+				{
 					return Ok(true);
 				}
 			}
@@ -773,10 +779,9 @@ impl<'a> Reconciler<'a> {
 				.mesh
 				.claim_restore_epoch_observed(sid, owner, lineage, &pending)?;
 			let mut claim = ClaimGuard::new(self, sid, owner, epoch, lineage);
-			// A response-path failure after the durable commit can leave the
-			// exact candidate alive under this still-pending claim. Never
-			// launch a second VM with the same name: re-validate the observed
-			// claim and retry the idempotent CAS against that live candidate.
+			// A crash after candidate launch but before the serving commit can
+			// leave the exact VM paused under this pending claim. Re-validate the
+			// claim and finish activation without launching a second VM.
 			if self.engine.candidate_is_running(sid) {
 				let restored = match self.engine.get(sid) {
 					Ok(restored) if restored.name == sid => restored,
@@ -788,17 +793,37 @@ impl<'a> Reconciler<'a> {
 					},
 				};
 				claim.restored = Some(restored.clone());
-				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
-					claim.abort().await;
-					return Err(EngineError::busy(format!(
-						"restore of {sid} lost ownership epoch {epoch} before retained commit"
-					)));
-				}
-				if let Err(error) =
+				let retained = async {
+					if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+						return Err(EngineError::busy(format!(
+							"restore of {sid} lost ownership epoch {epoch} before retained lease recovery"
+						)));
+					}
+					claim.lease_records = self
+						.leases
+						.acquire_writable_volume_leases(&rec.params, epoch)
+						.await?;
 					self
 						.engine
-						.set_ha_metadata(&restored.name, &lineage.ha, &lineage.restart_policy)
-				{
+						.record_volume_leases(&restored.name, &claim.lease_records)?;
+					if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+						return Err(EngineError::busy(format!(
+							"restore of {sid} lost ownership epoch {epoch} before retained activation"
+						)));
+					}
+					self
+						.engine
+						.set_ha_metadata(&restored.name, &lineage.ha, &lineage.restart_policy)?;
+					self.engine.activate_candidate(sid).await?;
+					if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+						return Err(EngineError::busy(format!(
+							"restore of {sid} lost ownership epoch {epoch} after retained activation"
+						)));
+					}
+					Ok::<(), EngineError>(())
+				}
+				.await;
+				if let Err(error) = retained {
 					claim.abort().await;
 					return Err(error);
 				}
@@ -817,7 +842,6 @@ impl<'a> Reconciler<'a> {
 				}
 				claim.committed = true;
 				self.engine.end_restore_cancellation(sid);
-				self.engine.activate_candidate(sid).await?;
 				if let Err(error) = self.replicas.drop_replica(&rec) {
 					warn!(sid, %error, "restored replica remains cached after retained commit");
 				}
@@ -870,6 +894,12 @@ impl<'a> Reconciler<'a> {
 				self
 					.engine
 					.record_volume_leases(&restored.name, &claim.lease_records)?;
+				self.engine.activate_candidate(sid).await?;
+				if !self.mesh.renew_restore_epoch(sid, owner, epoch)? {
+					return Err(EngineError::busy(format!(
+						"restore of {sid} lost ownership epoch {epoch} after activation"
+					)));
+				}
 				// A commit error may be a response-path failure after PostgreSQL
 				// applied the exact CAS. Retry the idempotent operation once;
 				// if its outcome remains ambiguous, retain the fenced candidate
@@ -899,7 +929,6 @@ impl<'a> Reconciler<'a> {
 				}
 				claim.committed = true;
 				self.engine.end_restore_cancellation(sid);
-				self.engine.activate_candidate(sid).await?;
 				Ok::<_, EngineError>(())
 			}
 			.await;
@@ -1151,6 +1180,13 @@ fn replica_matches_restore_pending(replica: &ReplicaRecord, pending: &Value) -> 
 			== Some(replica.checkpoint_generation)
 }
 
+fn record_restore_pending(record: &CreateRecord) -> bool {
+	record
+		.params
+		.as_object()
+		.is_some_and(|params| params.contains_key("_mesh_restore_pending"))
+}
+
 fn record_can_rerun(record: &CreateRecord) -> bool {
 	record.restart_policy == "rerun" || record.ha.contains("rerun")
 }
@@ -1194,6 +1230,7 @@ mod tests {
 		suspended:       bool,
 		retain_owner:    bool,
 		commit_failures: AtomicUsize,
+		commits:         AtomicUsize,
 	}
 
 	impl MeshReconcileState for Mesh {
@@ -1280,6 +1317,7 @@ mod tests {
 			_: &str,
 			_: &str,
 		) -> Result<()> {
+			self.commits.fetch_add(1, Ordering::SeqCst);
 			if self
 				.commit_failures
 				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| failures.checked_sub(1))
@@ -1426,9 +1464,13 @@ mod tests {
 	}
 
 	struct Engine {
-		record:   SandboxRecord,
-		removes:  AtomicUsize,
-		restores: AtomicUsize,
+		record:              SandboxRecord,
+		removes:             AtomicUsize,
+		restores:            AtomicUsize,
+		activations:         AtomicUsize,
+		activation_failures: AtomicUsize,
+		candidate_running:   AtomicBool,
+		lease_records:       AtomicUsize,
 	}
 
 	impl ReconcileEngine for Engine {
@@ -1442,6 +1484,7 @@ mod tests {
 
 		fn remove(&self, _: &str) -> Result<()> {
 			self.removes.fetch_add(1, Ordering::SeqCst);
+			self.candidate_running.store(false, Ordering::SeqCst);
 			Ok(())
 		}
 
@@ -1463,14 +1506,27 @@ mod tests {
 			_: bool,
 		) -> BoxFuture<'a, Result<SandboxRecord>> {
 			self.restores.fetch_add(1, Ordering::SeqCst);
+			self.candidate_running.store(true, Ordering::SeqCst);
 			Box::pin(async move { Ok(self.record.clone()) })
 		}
 
 		fn activate_candidate<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<()>> {
-			Box::pin(async { Ok(()) })
+			self.activations.fetch_add(1, Ordering::SeqCst);
+			let fail = self
+				.activation_failures
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| failures.checked_sub(1))
+				.is_ok();
+			Box::pin(async move {
+				if fail {
+					Err(EngineError::engine("activation failed"))
+				} else {
+					Ok(())
+				}
+			})
 		}
 
 		fn record_volume_leases(&self, _: &str, _: &[LeaseRecord]) -> Result<()> {
+			self.lease_records.fetch_add(1, Ordering::SeqCst);
 			Ok(())
 		}
 
@@ -1495,7 +1551,7 @@ mod tests {
 		}
 
 		fn candidate_is_running(&self, _: &str) -> bool {
-			self.restores.load(Ordering::SeqCst) > 0
+			self.candidate_running.load(Ordering::SeqCst)
 		}
 	}
 
@@ -1585,6 +1641,7 @@ mod tests {
 	}
 
 	struct Leases {
+		acquisitions:     AtomicUsize,
 		record_releases:  AtomicUsize,
 		granted_releases: AtomicUsize,
 	}
@@ -1599,6 +1656,7 @@ mod tests {
 			_: &'a Value,
 			_: u64,
 		) -> BoxFuture<'a, Result<Vec<LeaseRecord>>> {
+			self.acquisitions.fetch_add(1, Ordering::SeqCst);
 			Box::pin(async { Ok(vec![]) })
 		}
 
@@ -1754,14 +1812,22 @@ mod tests {
 
 	fn test_engine() -> Engine {
 		Engine {
-			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
-			removes:  AtomicUsize::new(0),
-			restores: AtomicUsize::new(0),
+			record:              SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
+			removes:             AtomicUsize::new(0),
+			restores:            AtomicUsize::new(0),
+			activations:         AtomicUsize::new(0),
+			activation_failures: AtomicUsize::new(0),
+			lease_records:       AtomicUsize::new(0),
+			candidate_running:   AtomicBool::new(false),
 		}
 	}
 
 	fn test_leases() -> Leases {
-		Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) }
+		Leases {
+			acquisitions:     AtomicUsize::new(0),
+			record_releases:  AtomicUsize::new(0),
+			granted_releases: AtomicUsize::new(0),
+		}
 	}
 
 	#[tokio::test]
@@ -1857,16 +1923,12 @@ mod tests {
 			suspended:       false,
 			retain_owner:    false,
 			commit_failures: AtomicUsize::new(0),
+			commits:         AtomicUsize::new(0),
 		};
-		let engine = Engine {
-			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
-			removes:  AtomicUsize::new(0),
-			restores: AtomicUsize::new(0),
-		};
+		let engine = test_engine();
 		let records = Records;
 		let replicas = Replicas { held: false };
-		let leases =
-			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let leases = test_leases();
 		let client = Client::new();
 		let reconciler = Reconciler::new(
 			ReconcileConfig {
@@ -1900,16 +1962,12 @@ mod tests {
 			suspended:       true,
 			retain_owner:    false,
 			commit_failures: AtomicUsize::new(0),
+			commits:         AtomicUsize::new(0),
 		};
-		let engine = Engine {
-			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
-			removes:  AtomicUsize::new(0),
-			restores: AtomicUsize::new(0),
-		};
+		let engine = test_engine();
 		let records = Records;
 		let replicas = Replicas { held: true };
-		let leases =
-			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let leases = test_leases();
 		let client = Client::new();
 		let reconciler = Reconciler::new(
 			ReconcileConfig {
@@ -1938,6 +1996,7 @@ mod tests {
 			suspended:       false,
 			retain_owner:    true,
 			commit_failures: AtomicUsize::new(2),
+			commits:         AtomicUsize::new(0),
 		};
 		let engine = test_engine();
 		let records = Records;
@@ -1964,6 +2023,47 @@ mod tests {
 		);
 		assert_eq!(engine.restores.load(Ordering::SeqCst), 1);
 		assert_eq!(engine.removes.load(Ordering::SeqCst), 0);
+		assert_eq!(leases.acquisitions.load(Ordering::SeqCst), 2);
+		assert_eq!(engine.lease_records.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test]
+	async fn activation_failure_aborts_before_commit_and_retries_from_pending() {
+		let mesh = Mesh {
+			suspended:       false,
+			retain_owner:    true,
+			commit_failures: AtomicUsize::new(0),
+			commits:         AtomicUsize::new(0),
+		};
+		let engine = test_engine();
+		engine.activation_failures.store(1, Ordering::SeqCst);
+		let records = Records;
+		let replicas = Replicas { held: false };
+		let leases = test_leases();
+		let client = Client::new();
+		let reconciler =
+			Reconciler::new(test_config(), &mesh, &engine, &records, &replicas, &leases, &client);
+		let lineage = records.get("sandbox").unwrap().unwrap();
+
+		assert!(
+			reconciler
+				.restore_from_replica("sandbox", "node-a", Some(&lineage), true)
+				.await
+				.is_err()
+		);
+		assert_eq!(mesh.commits.load(Ordering::SeqCst), 0);
+		assert_eq!(engine.removes.load(Ordering::SeqCst), 1);
+		assert!(!engine.candidate_running.load(Ordering::SeqCst));
+
+		assert!(
+			!reconciler
+				.restore_from_replica("sandbox", "node-a", Some(&lineage), true)
+				.await
+				.unwrap()
+		);
+		assert_eq!(mesh.commits.load(Ordering::SeqCst), 1);
+		assert_eq!(engine.restores.load(Ordering::SeqCst), 2);
+		assert_eq!(engine.activations.load(Ordering::SeqCst), 2);
 	}
 
 	#[test]
@@ -2002,15 +2102,10 @@ mod tests {
 			aborts:   AtomicUsize::new(0),
 			commits:  AtomicUsize::new(0),
 		};
-		let engine = Engine {
-			record:   SandboxRecord { name: "sandbox".to_owned(), detail: Map::new() },
-			removes:  AtomicUsize::new(0),
-			restores: AtomicUsize::new(0),
-		};
+		let engine = test_engine();
 		let records = Records;
 		let replicas = Replicas { held: false };
-		let leases =
-			Leases { record_releases: AtomicUsize::new(0), granted_releases: AtomicUsize::new(0) };
+		let leases = test_leases();
 		let client = Client::new();
 		let reconciler = Reconciler::new(
 			ReconcileConfig {

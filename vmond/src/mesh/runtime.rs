@@ -744,7 +744,6 @@ impl MeshRuntime {
 			.and_then(Value::as_str)
 			.ok_or_else(|| MeshError::invalid("migration intent has no token"))?;
 		let _target_guard = records.try_begin_target_migration(&record.sid, migration_id)?;
-		records.notify_source_migration_claim(&record).await?;
 		if record
 			.params
 			.get("_mesh_migration_committed")
@@ -758,6 +757,7 @@ impl MeshRuntime {
 			}
 			return Ok(record);
 		}
+		records.notify_source_migration_claim(&record).await?;
 		let delta_dir = if let Some(path) = record
 			.params
 			.get("_mesh_migration_delta_dir")
@@ -2697,6 +2697,21 @@ impl MeshRecordStore for MeshRuntime {
 		Ok(record_wire(self.records.get(&sid).expect("record was just inserted")))
 	}
 
+	fn put_if_newer(&self, record: CreateRecordWire) -> MeshResult<bool> {
+		if self.cluster_store.is_some() {
+			let should_put = MeshRecordStore::get(self, &record.sid)?
+				.is_none_or(|existing| record.epoch >= existing.epoch);
+			if should_put {
+				MeshRecordStore::put(self, record)?;
+			}
+			return Ok(should_put);
+		}
+		self
+			.records
+			.put_if_newer(create_record(record)?)
+			.map_err(engine_to_mesh)
+	}
+
 	fn update_exact(&self, record: CreateRecordWire) -> MeshResult<CreateRecordWire> {
 		if let Some(store) = &self.cluster_store {
 			let mut record = create_record(record)?;
@@ -3290,13 +3305,29 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 			let record = store.claim_next(sid, owner)?;
 			return Ok(i64_to_u64(record.epoch));
 		}
-		let epoch = MeshControl::authoritative_owner(self, sid)
-			.map_err(mesh_to_engine)?
-			.map_or(1, |(_, epoch)| i64_to_u64(epoch).saturating_add(1));
-		self
+		let previous = self
 			.records
-			.update_owner(sid, owner, u64_to_i64(epoch))?
+			.get(sid)
 			.ok_or_else(|| EngineError::not_found(format!("no create record for sandbox {sid}")))?;
+		let pending = json!({
+			"kind": "restore",
+			"source_owner": previous.owner,
+			"source_epoch": previous.epoch,
+		});
+		let claimed = self.records.claim_restore_pending(
+			sid,
+			&previous.owner,
+			previous.epoch,
+			owner,
+			&pending,
+		)?;
+		let epoch = i64_to_u64(claimed.epoch);
+		self.owners.write().remove(sid);
+		self
+			.restoring
+			.write()
+			.insert(sid.to_owned(), (owner.to_owned(), epoch));
+		self.owner_lease_deadlines.lock().remove(sid);
 		Ok(epoch)
 	}
 
@@ -3329,25 +3360,31 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 			self.owner_lease_deadlines.lock().remove(sid);
 			return Ok(epoch);
 		}
-		let current = self
-			.records
-			.get(sid)
-			.ok_or_else(|| EngineError::not_found(format!("no create record for sandbox {sid}")))?;
-		if current.owner != previous.owner || current.epoch != u64_to_i64(previous.epoch) {
-			return Err(EngineError::busy(format!("restore ownership fenced for sandbox {sid}")));
-		}
-		self.claim_restore_epoch(sid, owner)
+		let claimed = self.records.claim_restore_pending(
+			sid,
+			&previous.owner,
+			u64_to_i64(previous.epoch),
+			owner,
+			pending,
+		)?;
+		let epoch = i64_to_u64(claimed.epoch);
+		self.owners.write().remove(sid);
+		self
+			.restoring
+			.write()
+			.insert(sid.to_owned(), (owner.to_owned(), epoch));
+		self.owner_lease_deadlines.lock().remove(sid);
+		Ok(epoch)
 	}
 
 	fn owns_epoch(&self, sid: &str, owner: &str, epoch: u64) -> Result<bool> {
 		if let Some(store) = &self.cluster_store {
 			return store.owns_epoch(sid, owner, u64_to_i64(epoch));
 		}
-		Ok(MeshControl::authoritative_owner(self, sid)
-			.map_err(mesh_to_engine)?
-			.is_some_and(|(current, current_epoch)| {
-				current == owner && i64_to_u64(current_epoch) == epoch
-			}))
+		Ok(self
+			.records
+			.get(sid)
+			.is_some_and(|record| record.owner == owner && record.epoch == u64_to_i64(epoch)))
 	}
 
 	fn finalize_restore_epoch(&self, sid: &str, owner: &str, epoch: u64) -> Result<()> {
@@ -3372,7 +3409,12 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 					Ok(true)
 				});
 		}
-		self.owns_epoch(sid, owner, i64_to_u64(epoch))
+		Ok(self.records.renew_restore_pending(sid, owner, epoch)
+			&& self
+				.restoring
+				.read()
+				.get(sid)
+				.is_some_and(|current| current == &(owner.to_owned(), i64_to_u64(epoch))))
 	}
 
 	fn abort_restore_epoch(
@@ -3389,7 +3431,7 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 					&& record.epoch == u64_to_i64(epoch)
 					&& record.params.contains_key("_mesh_restore_pending")
 			}) {
-				// The atomic pending marker is the retryable, non-serving
+				// The durable pending marker is the retryable, non-serving
 				// recovery journal; a failed candidate must not release it.
 				return Ok(());
 			}
@@ -3403,8 +3445,39 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 			else {
 				return Ok(());
 			};
+			let mut restoring = self.restoring.write();
+			if restoring
+				.get(sid)
+				.is_some_and(|(current_owner, current_epoch)| {
+					current_owner == owner && *current_epoch == epoch
+				}) {
+				restoring.remove(sid);
+			}
+			drop(restoring);
+			MeshControl::forget_owner(self, sid);
 			MeshControl::record_owner(self, sid, &restored.owner, restored.epoch);
 			return Ok(());
+		}
+		if self
+			.records
+			.renew_restore_pending(sid, owner, u64_to_i64(epoch))
+		{
+			return Ok(());
+		}
+		if let Some(restored) = self.records.release_restore_claim(
+			sid,
+			owner,
+			u64_to_i64(epoch),
+			previous_owner,
+			u64_to_i64(previous_epoch),
+		)? {
+			let mut restoring = self.restoring.write();
+			if restoring.get(sid) == Some(&(owner.to_owned(), epoch)) {
+				restoring.remove(sid);
+			}
+			drop(restoring);
+			MeshControl::forget_owner(self, sid);
+			MeshControl::record_owner(self, sid, &restored.owner, restored.epoch);
 		}
 		Ok(())
 	}
@@ -3453,14 +3526,36 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 			}
 			return Ok(());
 		}
-		self.finalize_restore_epoch(sid, owner, epoch)
+		let record = self.records.commit_restore_pending(
+			sid,
+			owner,
+			u64_to_i64(epoch),
+			params_object(params)?,
+			ha,
+			restart_policy,
+		)?;
+		self
+			.owners
+			.write()
+			.insert(sid.to_owned(), (owner.to_owned(), epoch));
+		let mut restoring = self.restoring.write();
+		if restoring.get(sid) == Some(&(owner.to_owned(), epoch)) {
+			restoring.remove(sid);
+		}
+		drop(restoring);
+		MeshControl::record_owner(self, sid, &record.owner, record.epoch);
+		Ok(())
 	}
 
 	fn restore_commit_applied(&self, sid: &str, owner: &str, epoch: u64) -> Result<bool> {
-		let Some(store) = &self.cluster_store else {
-			return Ok(false);
-		};
-		Ok(store.resolve(sid)?.is_some_and(|record| {
+		if let Some(store) = &self.cluster_store {
+			return Ok(store.resolve(sid)?.is_some_and(|record| {
+				record.owner == owner
+					&& record.epoch == u64_to_i64(epoch)
+					&& !record_is_staging(&record.params)
+			}));
+		}
+		Ok(self.records.get(sid).is_some_and(|record| {
 			record.owner == owner
 				&& record.epoch == u64_to_i64(epoch)
 				&& !record_is_staging(&record.params)

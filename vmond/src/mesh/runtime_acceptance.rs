@@ -801,7 +801,6 @@ async fn committed_migration_retries_activation_without_rolling_back_ownership()
 		"persist_leases",
 		"durable_commit",
 		"activate",
-		"confirm_source",
 		"activate"
 	]);
 }

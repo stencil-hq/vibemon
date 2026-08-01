@@ -43,6 +43,7 @@ use crate::{
 	mesh::{
 		proxy::{self, MeshError, MeshPeer, OwnerProxyDecision, OwnerRecord},
 		routes::{CreateRecordWire, MeshControl, MeshRecordStore, MeshRouteState, apply_view_detail},
+		runtime::record_is_staging,
 	},
 	models::{ExecBody, ExtendBody, ForkBody, NetworkBody, PoolPutBody, RestoreBody, SandboxCreate},
 	security::{
@@ -2234,6 +2235,26 @@ fn record_matches_tags(record: &CreateRecordWire, tags: Option<&HashMap<String, 
 	true
 }
 
+fn mesh_record_placeholder(record: &CreateRecordWire, owner_tenant: &str) -> Value {
+	let staging = record_is_staging(&record.params);
+	let mut view = serde_json::json!({
+		"id": record.sid,
+		"name": record.sid,
+		"ha": record.ha,
+		"restart_policy": record.restart_policy,
+		"created_at": record.created_at,
+		"status": if staging { "starting" } else { "running" },
+		"owner_tenant": owner_tenant,
+	});
+	if !staging {
+		view
+			.as_object_mut()
+			.expect("mesh record placeholder is an object")
+			.insert("node".to_owned(), Value::String(record.owner.clone()));
+	}
+	view
+}
+
 fn credential_record(metadata: CredentialMetadata) -> pb::CredentialRecord {
 	pb::CredentialRecord {
 		name:                   metadata.name,
@@ -2386,6 +2407,10 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 				if !record_matches_tags(&rec, tags.as_ref()) {
 					continue;
 				}
+				if record_is_staging(&rec.params) {
+					views.push(mesh_record_placeholder(&rec, owner_tenant));
+					continue;
+				}
 				let sid = rec.sid.clone();
 				if rec.owner == local_node {
 					let engine = self.state.engine.clone();
@@ -2393,28 +2418,10 @@ impl pb::sandbox_service_server::SandboxService for GrpcApi {
 					if let Ok(Ok(view)) = view_res {
 						views.push(apply_view_detail(view, &rec));
 					} else {
-						views.push(serde_json::json!({
-							"id": rec.sid,
-							"name": rec.sid,
-							"node": rec.owner,
-							"ha": rec.ha,
-							"restart_policy": rec.restart_policy,
-							"created_at": rec.created_at,
-							"status": "running",
-							"owner_tenant": owner_tenant,
-						}));
+						views.push(mesh_record_placeholder(&rec, owner_tenant));
 					}
 				} else {
-					views.push(serde_json::json!({
-						"id": rec.sid,
-						"name": rec.sid,
-						"node": rec.owner,
-						"ha": rec.ha,
-						"restart_policy": rec.restart_policy,
-						"created_at": rec.created_at,
-						"status": "running",
-						"owner_tenant": owner_tenant,
-					}));
+					views.push(mesh_record_placeholder(&rec, owner_tenant));
 				}
 			}
 			views
@@ -3901,5 +3908,24 @@ mod tests {
 		assert_eq!(sequences.first(), Some(&1));
 		assert_eq!(sequences.last(), Some(&EVENT_COUNT));
 		assert_eq!(page_loads.load(std::sync::atomic::Ordering::Relaxed), 2);
+	}
+	#[test]
+	fn pending_restore_list_view_does_not_expose_a_serving_owner() {
+		let mut pending = serde_json::Map::new();
+		pending.insert("_mesh_restore_pending".to_owned(), json!({"kind": "replica"}));
+		let record = CreateRecordWire {
+			sid:             "sandbox".to_owned(),
+			params:          pending,
+			owner:           "candidate".to_owned(),
+			epoch:           1,
+			idempotency_key: "create".to_owned(),
+			ha:              "async".to_owned(),
+			restart_policy:  "none".to_owned(),
+			created_at:      1.0,
+		};
+
+		let view = mesh_record_placeholder(&record, "default");
+		assert_eq!(view.get("status").and_then(Value::as_str), Some("starting"));
+		assert!(view.get("node").is_none());
 	}
 }

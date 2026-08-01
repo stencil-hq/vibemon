@@ -1264,6 +1264,9 @@ async fn mesh_migrate_receive(
 		)
 		.await,
 	)?;
+	if let Err(error) = replicate_record(&state, record.clone(), false).await {
+		tracing::warn!(%error, sid = %sid, "target migration record replication deferred");
+	}
 	state
 		.engine
 		.migrate_activate_target(sid.clone(), record.epoch)
@@ -2453,11 +2456,8 @@ pub(crate) async fn migrate_sandbox_to(
 		},
 	};
 	let downtime_ms = blackout.elapsed().as_millis() as u64;
-	if let Err(err) = replicate_record(state, record, false).await {
-		tracing::warn!(error = %err, "target migration record replication deferred after commit");
-	}
-	// The pre-receive record is now a committed-cleanup record. Rewriting it is
-	// harmless and keeps retry metadata durable if a prior write was interrupted.
+	// Target confirmation makes source cleanup safe. Retain the journal unless
+	// both source leases and migration artifacts are released.
 	let leases_clean = state
 		.leases
 		.release_record_volume_leases(sandbox_id)

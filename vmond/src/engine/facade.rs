@@ -10310,6 +10310,7 @@ fn capture_checkpoint_volumes(
 		return Ok(());
 	};
 	let dest_root = snapshot_dir.join("volumes");
+	fs::create_dir(&dest_root)?;
 	let mut seen = HashSet::new();
 	for spec in volumes.values() {
 		let Some(name) = spec
