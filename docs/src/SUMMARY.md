@@ -39,6 +39,7 @@
 - [Files and Ports](sdk/files-and-ports.md)
 - [Volumes and Secrets](sdk/volumes-and-secrets.md)
 - [Snapshots](sdk/snapshots.md)
+- [Freestyle Compatibility](sdk/freestyle.md)
 - [Durable Functions](sdk/functions.md)
 - [Errors](sdk/errors.md)
 - [Testing](sdk/testing.md)

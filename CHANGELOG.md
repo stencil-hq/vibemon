@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Freestyle compatibility facades for TypeScript, Python, and Go SDKs
 - Added Google Cloud Platform (GCP) deployment stack with Pulumi and automated rollout scripts
 - Added `--boot-concurrency` flag to bound concurrently booting local sandboxes
 - Added `no_wait` option to sandbox creation to return once admitted instead of waiting for readiness
