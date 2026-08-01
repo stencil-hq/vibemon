@@ -692,6 +692,27 @@ class _SandboxService(api_pb2_grpc.SandboxServiceServicer):
         self._sandbox(context, request.id)
         return _view_json({"deadline_unix": 1_800_000_000})
 
+    def SetIdleTimeout(
+        self, request: api_pb2.SetIdleTimeoutRequest, context: Any
+    ) -> api_pb2.JsonView:
+        self._enter(
+            context,
+            "SetIdleTimeout",
+            {
+                "id": request.id,
+                "idle_timeout_secs": (
+                    float(request.idle_timeout_secs)
+                    if request.HasField("idle_timeout_secs")
+                    else None
+                ),
+            },
+        )
+        sandbox = self._sandbox(context, request.id)
+        with self._stub._lock:
+            sandbox["view"]["idle_timeout_secs"] = float(request.idle_timeout_secs)
+            view = dict(sandbox["view"])
+        return _view_json(view)
+
     def Metrics(self, request: api_pb2.SandboxRef, context: Any) -> api_pb2.JsonView:
         self._enter(context, "Metrics", {"id": request.id})
         self._sandbox(context, request.id)

@@ -144,6 +144,7 @@ class _ProcessSession:
         timeout: float | None,
         tty: bool,
         consume_ready: bool,
+        consume_pty: bool,
         thread_name: str,
     ) -> None:
         self.stdout = ByteStream()
@@ -155,18 +156,21 @@ class _ProcessSession:
         self._signal: int | None = None
         self._ready_name: str | None = None
         self._error: BaseException | None = None
+        self._pty: api_pb2.PtySession | None = None
         self._send_lock = threading.Lock()
         self._stdin_closed = False
         self._closing = False
         self._first = first_input
         self._inputs: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._responses, self._endpoint = starter(self._make_inputs)
-        if consume_ready:
-            try:
+        try:
+            if consume_ready:
                 self._consume_ready()
-            except BaseException:
-                self._shutdown()
-                raise
+            if consume_pty:
+                self._consume_pty()
+        except BaseException:
+            self._shutdown()
+            raise
         self._reader = threading.Thread(target=self._read_loop, name=thread_name, daemon=True)
         self._reader.start()
 
@@ -195,6 +199,10 @@ class _ProcessSession:
     def ready_name(self) -> str | None:
         return self._ready_name
 
+    @property
+    def pty(self) -> api_pb2.PtySession | None:
+        return self._pty
+
     def _consume_ready(self) -> None:
         try:
             frame = next(iter(self._responses))
@@ -207,6 +215,19 @@ class _ProcessSession:
         if frame.WhichOneof("output") != "ready" or not frame.ready.sandbox_id:
             raise ProtocolError("shell ready frame omitted the sandbox id")
         self._ready_name = frame.ready.sandbox_id
+
+    def _consume_pty(self) -> None:
+        try:
+            frame = next(iter(self._responses))
+        except StopIteration:
+            raise ProtocolError("PTY stream closed before its metadata frame") from None
+        except grpc.RpcError as exc:
+            raise translate_rpc_error(
+                exc, endpoint=self._endpoint, fallback_message="PTY setup failed"
+            ) from exc
+        if frame.WhichOneof("output") != "pty" or not frame.pty.session_id:
+            raise ProtocolError("PTY metadata frame omitted the session id")
+        self._pty = frame.pty
 
     def write_stdin(self, data: bytes | bytearray | memoryview | str) -> None:
         raw = data.encode() if isinstance(data, str) else bytes(data)
@@ -268,8 +289,10 @@ class _ProcessSession:
                 if kind == "ready":
                     self._error = ProtocolError("unexpected process ready frame")
                     return
+                if kind == "pty":
+                    self._error = ProtocolError("unexpected PTY metadata frame")
+                    return
                 self._error = ProtocolError("unknown process frame")
-                return
             if self._returncode is None:
                 self._error = ProtocolError("process stream closed before an exit frame")
         except grpc.RpcError as exc:
@@ -333,6 +356,29 @@ class Process:
         return self
 
     def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+class PtyStream(Process):
+    """One client attachment to a server-persistent pseudo-terminal session."""
+
+    def __init__(self, session: _ProcessSession) -> None:
+        super().__init__(session)
+        if session.pty is None:
+            raise ProtocolError("PTY stream omitted session metadata")
+        self.session = session.pty
+
+    @property
+    def session_id(self) -> str:
+        """Return the stable server-assigned session identifier."""
+        return self.session.session_id
+
+    def write(self, data: bytes | bytearray | memoryview | str) -> None:
+        """Write bytes or UTF-8 text to the terminal."""
+        self.stdin.write(data)
+
+    def detach(self) -> None:
+        """Disconnect this attachment without terminating the guest session."""
         self.close()
 
 
@@ -497,6 +543,7 @@ def open_process(
     timeout: float | None = None,
     tty: bool = False,
     consume_ready: bool = False,
+    consume_pty: bool = False,
     thread_name: str = "vmon-process",
 ) -> Process:
     """Open a streaming exec or shell session over a bidi gRPC call."""
@@ -507,6 +554,27 @@ def open_process(
             timeout=timeout,
             tty=tty,
             consume_ready=consume_ready,
+            consume_pty=consume_pty,
+            thread_name=thread_name,
+        )
+    )
+
+
+def open_pty_stream(
+    starter: SessionStarter,
+    first_input: api_pb2.ExecInput,
+    *,
+    thread_name: str = "vmon-pty",
+) -> PtyStream:
+    """Open an attachment to a server-persistent PTY over the exec stream."""
+    return PtyStream(
+        _ProcessSession(
+            starter,
+            first_input,
+            timeout=None,
+            tty=True,
+            consume_ready=False,
+            consume_pty=True,
             thread_name=thread_name,
         )
     )

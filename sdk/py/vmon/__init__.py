@@ -22,6 +22,7 @@ from .context import Context, ContextStore
 from .decorators import CurrentCall, batched, concurrent, current_call
 from .driver import Driver, MeshDriver, parse_dsn
 from .errors import ActorLostError, APIError, ProtocolError, RemoteFunctionError, TransportError
+from .freestyle import Freestyle, freestyle
 from .image import Image, ImageError, ImageSource, ImageStep
 from .models import (
     EventRecord,
@@ -130,6 +131,7 @@ __all__ = [
     "EventRecord",
     "ExecExit",
     "ExecResult",
+    "Freestyle",
     "FileInfo",
     "Files",
     "FunctionCall",
@@ -194,6 +196,7 @@ __all__ = [
     "current_call",
     "decode_value",
     "encode_value",
+    "freestyle",
     "enter",
     "exit",
     "function",

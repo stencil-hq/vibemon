@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import json
+import math
 import socket
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -23,7 +24,14 @@ from ._endpoint import (
 )
 from .driver import response_endpoint
 from .errors import APIError, ProtocolError
-from .process import ConsoleStream, LogStream, Process, open_process
+from .process import (
+    ConsoleStream,
+    LogStream,
+    Process,
+    PtyStream,
+    open_process,
+    open_pty_stream,
+)
 from .secret import Secret, merge_secrets
 from .v1 import api_pb2
 from .volume import S3Mount, Volume
@@ -162,6 +170,10 @@ def _clone_create_extra(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         "disk_mb",
         "timeout",
         "timeout_secs",
+        "idle_timeout_secs",
+        "activity_threshold_bytes",
+        "persistence",
+        "nics",
         "workdir",
         "env",
         "secrets",
@@ -820,6 +832,22 @@ class Sandbox:
         )
         return self.info
 
+    def set_idle_timeout(self, secs: float) -> SandboxInfo:
+        """Replace and rearm the network-idle suspension policy; zero disables it."""
+        secs = float(secs)
+        if not math.isfinite(secs) or secs < 0:
+            raise ValueError("idle timeout seconds must be non-negative")
+        self._update(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.SetIdleTimeout(
+                    api_pb2.SetIdleTimeoutRequest(id=self.id, idle_timeout_secs=secs)
+                ),
+                error="set idle timeout returned a non-object response",
+            ),
+            "set idle timeout returned a non-object response",
+        )
+        return self.info
+
     def migrate(self, target: str) -> SandboxInfo:
         """Migrate the sandbox to a mesh node and re-pin its serving endpoint."""
         if not target:
@@ -835,6 +863,117 @@ class Sandbox:
         )
         self._endpoint = self._client.driver.resolve_sandbox(self.id, self._endpoint)
         return self.info
+
+    def resize(
+        self,
+        *,
+        cpus: int | None = None,
+        memory_mib: int | None = None,
+        disk_mb: int | None = None,
+    ) -> SandboxInfo:
+        """Resize vCPUs or memory, or grow the root disk, and return the updated view."""
+        request = api_pb2.ResizeSandboxRequest(id=self.id)
+        if cpus is not None:
+            request.cpus = int(cpus)
+        if memory_mib is not None:
+            request.memory_mib = int(memory_mib)
+        if disk_mb is not None:
+            request.disk_mb = int(disk_mb)
+        self._update(
+            self._view_rpc(
+                lambda stubs: stubs.sandbox.Resize(request),
+                error="resize returned a malformed response",
+            ),
+            "resize returned a malformed response",
+        )
+        return self.info
+
+    def pty_open(
+        self,
+        *,
+        session_id: str | None = None,
+        cols: int | None = None,
+        rows: int | None = None,
+        exec: str | None = None,
+        env: Mapping[str, str] | None = None,
+        workdir: str | None = None,
+    ) -> PtyStream:
+        """Create and attach to a server-persistent guest terminal."""
+        start = api_pb2.PtyOpenStart(sandbox_id=self.id)
+        if session_id is not None:
+            start.session_id = session_id
+        if cols is not None:
+            start.cols = int(cols)
+        if rows is not None:
+            start.rows = int(rows)
+        if exec is not None:
+            start.exec = exec
+        if env is not None:
+            start.env.update({str(key): str(value) for key, value in env.items()})
+        if workdir is not None:
+            start.workdir = workdir
+        return self._open_pty("PtyOpen", api_pb2.ExecInput(pty_open=start))
+
+    def pty_attach(
+        self,
+        session_id: str,
+        *,
+        cols: int | None = None,
+        rows: int | None = None,
+    ) -> PtyStream:
+        """Attach to a persistent terminal by stable session id."""
+        start = api_pb2.PtyAttachStart(sandbox_id=self.id, session_id=session_id)
+        if cols is not None:
+            start.cols = int(cols)
+        if rows is not None:
+            start.rows = int(rows)
+        return self._open_pty("PtyAttach", api_pb2.ExecInput(pty_attach=start))
+
+    def _open_pty(self, rpc_name: str, first: api_pb2.ExecInput) -> PtyStream:
+        def starter(
+            make_inputs: Callable[[], Iterable[api_pb2.ExecInput]],
+        ) -> tuple[Any, str]:
+            return self._client.driver.call(
+                lambda stubs: getattr(stubs.sandbox, rpc_name)(make_inputs()),
+                endpoint=self._endpoint,
+                stream=True,
+            )
+
+        return open_pty_stream(starter, first, thread_name=f"vmon-pty-{self.id}")
+
+    def pty_list(self) -> list[api_pb2.PtySession]:
+        """List persistent terminal sessions owned by this sandbox."""
+        response = self._rpc(lambda stubs: stubs.sandbox.PtyList(api_pb2.SandboxRef(id=self.id)))
+        return list(response.sessions)
+
+    def pty_close(self, session_id: str) -> api_pb2.PtySessionCloseResponse:
+        """Terminate a persistent terminal session."""
+        return self._rpc(
+            lambda stubs: stubs.sandbox.PtyClose(
+                api_pb2.PtyCloseRequest(id=self.id, session_id=session_id)
+            )
+        )
+
+    def pty_exec(
+        self,
+        session_id: str,
+        command: str,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        """Run a sibling command in a persistent terminal's guest context."""
+        request = api_pb2.PtyExecRequest(
+            id=self.id,
+            session_id=session_id,
+            command=command,
+        )
+        if timeout is not None:
+            request.timeout = float(timeout)
+        response = self._rpc(lambda stubs: stubs.sandbox.PtyExec(request))
+        return ExecResult(
+            returncode=response.code,
+            stdout=response.stdout,
+            stderr=response.stderr,
+        )
 
     def snapshot(self, name: str | None = None, *, stop: bool = False) -> str:
         """Create a full VM snapshot and return its server-assigned name."""
@@ -1088,8 +1227,31 @@ class _AsyncSandbox:
     async def extend(self, secs: int) -> SandboxInfo:
         return await asyncio.to_thread(self._sandbox.extend, secs)
 
+    async def set_idle_timeout(self, secs: float) -> SandboxInfo:
+        """Replace and rearm the network-idle suspension policy."""
+        return await asyncio.to_thread(self._sandbox.set_idle_timeout, secs)
+
     async def migrate(self, target: str) -> SandboxInfo:
         return await asyncio.to_thread(self._sandbox.migrate, target)
+
+    async def resize(self, *args: Any, **kwargs: Any) -> SandboxInfo:
+        return await asyncio.to_thread(self._sandbox.resize, *args, **kwargs)
+
+    async def pty_open(self, *args: Any, **kwargs: Any) -> PtyStream:
+        return await asyncio.to_thread(self._sandbox.pty_open, *args, **kwargs)
+
+    async def pty_attach(self, *args: Any, **kwargs: Any) -> PtyStream:
+
+        return await asyncio.to_thread(self._sandbox.pty_attach, *args, **kwargs)
+
+    async def pty_list(self) -> list[api_pb2.PtySession]:
+        return await asyncio.to_thread(self._sandbox.pty_list)
+
+    async def pty_close(self, session_id: str) -> api_pb2.PtySessionCloseResponse:
+        return await asyncio.to_thread(self._sandbox.pty_close, session_id)
+
+    async def pty_exec(self, *args: Any, **kwargs: Any) -> ExecResult:
+        return await asyncio.to_thread(self._sandbox.pty_exec, *args, **kwargs)
 
     async def snapshot(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self._sandbox.snapshot, *args, **kwargs)

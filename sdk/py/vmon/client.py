@@ -14,6 +14,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
 
 from ._endpoint import GrpcStubs, decode_view, dump_json
@@ -62,6 +63,7 @@ class Client:
         self.sandboxes = SandboxAPI(self)
         self.snapshots = SnapshotAPI(self)
         self.volumes = VolumeAPI(self)
+        self.vpcs = VpcAPI(self)
         self.pools = PoolAPI(self)
         self.mesh = MeshAPI(self)
         self._closed = False
@@ -322,6 +324,10 @@ class SandboxAPI:
         memory: int = 512,
         disk_mb: int = 1024,
         timeout: float | None = 300,
+        idle_timeout_secs: int | None = None,
+        activity_threshold_bytes: int | None = None,
+        persistence: Mapping[str, Any] | None = None,
+        nics: Sequence[Mapping[str, Any]] | None = None,
         timeout_secs: int | None = None,
         workdir: str | None = None,
         env: dict[str, str] | None = None,
@@ -358,6 +364,10 @@ class SandboxAPI:
                 "disk_mb": int(disk_mb),
                 "timeout": timeout,
                 "timeout_secs": timeout_secs,
+                "idle_timeout_secs": idle_timeout_secs,
+                "activity_threshold_bytes": activity_threshold_bytes,
+                "persistence": dict(persistence) if persistence is not None else None,
+                "nics": [dict(nic) for nic in nics] if nics is not None else None,
                 "workdir": workdir,
                 "env": {str(key): str(value) for key, value in (env or {}).items()}
                 if env is not None
@@ -685,6 +695,53 @@ class PoolAPI:
         """Delete every warm pool visible to this client."""
         for pool in self.list():
             pool.delete()
+
+
+@dataclass(frozen=True, slots=True)
+class Vpc:
+    """A routed private network managed by vmon."""
+
+    id: str
+    name: str
+    cidr: str
+    created_at_unix_millis: int
+
+
+class VpcAPI:
+    """Create, list, and delete routed private networks."""
+
+    def __init__(self, client: Client) -> None:
+        self._client = client
+
+    def create(self, name: str | None = None, cidr: str | None = None) -> Vpc:
+        """Create a routed VPC."""
+        request = api_pb2.VpcCreateRequest()
+        if name is not None:
+            request.name = name
+        if cidr is not None:
+            request.cidr = cidr
+        response, _ = self._client.driver.call(lambda stubs: stubs.vpc.Create(request))
+        return self._from_proto(response)
+
+    def list(self) -> builtins.list[Vpc]:
+        """List routed VPCs."""
+        response, _ = self._client.driver.call(
+            lambda stubs: stubs.vpc.List(api_pb2.ListVpcsRequest())
+        )
+        return [self._from_proto(vpc) for vpc in response.vpcs]
+
+    def delete(self, vpc_id: str) -> None:
+        """Delete an unattached routed VPC."""
+        self._client.driver.call(lambda stubs: stubs.vpc.Delete(api_pb2.VpcRef(id=vpc_id)))
+
+    @staticmethod
+    def _from_proto(vpc: api_pb2.Vpc) -> Vpc:
+        return Vpc(
+            id=vpc.id,
+            name=vpc.name,
+            cidr=vpc.cidr,
+            created_at_unix_millis=vpc.created_at_unix_millis,
+        )
 
 
 class MeshAPI:

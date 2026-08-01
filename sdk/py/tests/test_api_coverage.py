@@ -153,6 +153,9 @@ def test_sandbox_lifecycle_network_snapshots_and_forks(monkeypatch, mvm_home) ->
             assert points[0].created_at_unix_millis == 1_700_000_000_000
             assert sandbox.rollback(points[0].name).observed_state == "running"
             assert sandbox.extend(15).raw["deadline_unix"] == 1_800_000_000
+            assert sandbox.set_idle_timeout(0).raw["idle_timeout_secs"] == 0
+            idle_update = server.last_rpc("SandboxService/SetIdleTimeout", id="box/name")
+            assert idle_update.json["idle_timeout_secs"] == 0
             assert sandbox.metrics()["vcpu_exits"] == 7
             assert sandbox.node == server.node_id
             assert sandbox.migrate("node-b").node == "node-b"

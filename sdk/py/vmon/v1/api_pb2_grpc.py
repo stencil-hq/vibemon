@@ -95,6 +95,11 @@ class SandboxServiceStub:
                 request_serializer=vmon_dot_v1_dot_api__pb2.ExtendSandboxRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
                 _registered_method=True)
+        self.SetIdleTimeout = channel.unary_unary(
+                '/vmon.v1.SandboxService/SetIdleTimeout',
+                request_serializer=vmon_dot_v1_dot_api__pb2.SetIdleTimeoutRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
         self.Metrics = channel.unary_unary(
                 '/vmon.v1.SandboxService/Metrics',
                 request_serializer=vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
@@ -189,6 +194,36 @@ class SandboxServiceStub:
                 '/vmon.v1.SandboxService/Rollback',
                 request_serializer=vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.SerializeToString,
                 response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
+        self.Resize = channel.unary_unary(
+                '/vmon.v1.SandboxService/Resize',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ResizeSandboxRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+                _registered_method=True)
+        self.PtyOpen = channel.stream_stream(
+                '/vmon.v1.SandboxService/PtyOpen',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
+                _registered_method=True)
+        self.PtyAttach = channel.stream_stream(
+                '/vmon.v1.SandboxService/PtyAttach',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
+                _registered_method=True)
+        self.PtyList = channel.unary_unary(
+                '/vmon.v1.SandboxService/PtyList',
+                request_serializer=vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.PtySessionList.FromString,
+                _registered_method=True)
+        self.PtyClose = channel.unary_unary(
+                '/vmon.v1.SandboxService/PtyClose',
+                request_serializer=vmon_dot_v1_dot_api__pb2.PtyCloseRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.PtySessionCloseResponse.FromString,
+                _registered_method=True)
+        self.PtyExec = channel.unary_unary(
+                '/vmon.v1.SandboxService/PtyExec',
+                request_serializer=vmon_dot_v1_dot_api__pb2.PtyExecRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.PtyExecResponse.FromString,
                 _registered_method=True)
 
 
@@ -348,6 +383,14 @@ class SandboxServiceServicer:
         Replaces: POST /v1/sandboxes/{id}/extend
         Errors:
         - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetIdleTimeout(self, request, context):
+        """Replaces the sandbox's per-VM network-idle suspension policy and rearms
+        its idle clock. Zero disables network-idle suspension.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -569,6 +612,96 @@ class SandboxServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Resize(self, request, context):
+        """Resizes sandbox resources. A running sandbox is stopped, resized, and
+        cold-booted; a stopped sandbox is resized in place and boots with the new
+        shape on the next Resume. Disk state survives, in-memory state does not.
+
+        `cpus` and `memory_mib` replace the VM shape. `disk_mb` may only grow the
+        root disk. Disk growth is transactional: the RPC succeeds only after the
+        ext4 filesystem grows, and any resize or reboot failure restores the
+        original disk and VM shape.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+        - `invalid` (INVALID_ARGUMENT): No fields set, zero sizes, a `disk_mb` shrink,
+        or disk growth requested on a host without e2fsprogs.
+        - `busy` (UNAVAILABLE): The sandbox is mid-transition, or it was created with
+        secrets this server process no longer holds (daemon restarted since create).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PtyOpen(self, request_iterator, context):
+        """Opens a server-persistent interactive PTY session inside the sandbox.
+
+        The first ExecInput must carry `pty_open`; later inputs carry `stdin`,
+        `resize`, or `eof`. The first ExecOutput carries `pty` with the assigned
+        session id, then live output chunks. The session and its guest process are
+        guest-agent state: they survive client disconnects, sandbox suspend/resume,
+        and are inherited by forks, until closed or the sandbox stops.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+        - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+        - `busy` (RESOURCE_EXHAUSTED): The per-sandbox session cap (128) is reached.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PtyAttach(self, request_iterator, context):
+        """Reattaches to a persistent PTY session by id.
+
+        The first ExecInput must carry `pty_attach`. The first ExecOutput carries
+        `pty`, followed by the retained scrollback replayed as output chunks, then
+        live output. Attaching a session whose sandbox is suspended resumes the
+        sandbox first.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PtyList(self, request, context):
+        """Lists persistent PTY sessions, including recently exited ones (retained ~60s).
+
+        Errors:
+        - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PtyClose(self, request, context):
+        """Terminates a persistent PTY session's process (SIGKILL) and removes the session.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PtyExec(self, request, context):
+        """Runs a command in a persistent PTY session's context and captures its output.
+
+        The command executes through `sh -c` as a sibling process sharing the
+        session leader's working directory and environment; it never writes into
+        the interactive stream. Output capture is bounded (1 MiB per stream).
+
+        Errors:
+        - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+        - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+        - `invalid` (INVALID_ARGUMENT): Empty command.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SandboxServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -630,6 +763,11 @@ def add_SandboxServiceServicer_to_server(servicer, server):
             'Extend': grpc.unary_unary_rpc_method_handler(
                     servicer.Extend,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.ExtendSandboxRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'SetIdleTimeout': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetIdleTimeout,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.SetIdleTimeoutRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
             ),
             'Metrics': grpc.unary_unary_rpc_method_handler(
@@ -726,6 +864,36 @@ def add_SandboxServiceServicer_to_server(servicer, server):
                     servicer.Rollback,
                     request_deserializer=vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.FromString,
                     response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'Resize': grpc.unary_unary_rpc_method_handler(
+                    servicer.Resize,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ResizeSandboxRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.JsonView.SerializeToString,
+            ),
+            'PtyOpen': grpc.stream_stream_rpc_method_handler(
+                    servicer.PtyOpen,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ExecInput.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ExecOutput.SerializeToString,
+            ),
+            'PtyAttach': grpc.stream_stream_rpc_method_handler(
+                    servicer.PtyAttach,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ExecInput.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.ExecOutput.SerializeToString,
+            ),
+            'PtyList': grpc.unary_unary_rpc_method_handler(
+                    servicer.PtyList,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.SandboxRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.PtySessionList.SerializeToString,
+            ),
+            'PtyClose': grpc.unary_unary_rpc_method_handler(
+                    servicer.PtyClose,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.PtyCloseRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.PtySessionCloseResponse.SerializeToString,
+            ),
+            'PtyExec': grpc.unary_unary_rpc_method_handler(
+                    servicer.PtyExec,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.PtyExecRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.PtyExecResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1072,6 +1240,33 @@ class SandboxService:
             target,
             '/vmon.v1.SandboxService/Extend',
             vmon_dot_v1_dot_api__pb2.ExtendSandboxRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetIdleTimeout(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/SetIdleTimeout',
+            vmon_dot_v1_dot_api__pb2.SetIdleTimeoutRequest.SerializeToString,
             vmon_dot_v1_dot_api__pb2.JsonView.FromString,
             options,
             channel_credentials,
@@ -1586,6 +1781,168 @@ class SandboxService:
             '/vmon.v1.SandboxService/Rollback',
             vmon_dot_v1_dot_api__pb2.RollbackSandboxRequest.SerializeToString,
             vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Resize(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/Resize',
+            vmon_dot_v1_dot_api__pb2.ResizeSandboxRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.JsonView.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PtyOpen(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/vmon.v1.SandboxService/PtyOpen',
+            vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PtyAttach(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/vmon.v1.SandboxService/PtyAttach',
+            vmon_dot_v1_dot_api__pb2.ExecInput.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.ExecOutput.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PtyList(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/PtyList',
+            vmon_dot_v1_dot_api__pb2.SandboxRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.PtySessionList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PtyClose(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/PtyClose',
+            vmon_dot_v1_dot_api__pb2.PtyCloseRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.PtySessionCloseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PtyExec(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.SandboxService/PtyExec',
+            vmon_dot_v1_dot_api__pb2.PtyExecRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.PtyExecResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -2320,6 +2677,183 @@ class PoolService:
             target,
             '/vmon.v1.PoolService/Delete',
             vmon_dot_v1_dot_api__pb2.PoolRef.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Ok.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class VpcServiceStub:
+    """VpcService manages private layer-2 networks that sandbox NICs attach to.
+    VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+    macOS hosts reject every VPC operation with `invalid`.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Create = channel.unary_unary(
+                '/vmon.v1.VpcService/Create',
+                request_serializer=vmon_dot_v1_dot_api__pb2.VpcCreateRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Vpc.FromString,
+                _registered_method=True)
+        self.List = channel.unary_unary(
+                '/vmon.v1.VpcService/List',
+                request_serializer=vmon_dot_v1_dot_api__pb2.ListVpcsRequest.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.VpcList.FromString,
+                _registered_method=True)
+        self.Delete = channel.unary_unary(
+                '/vmon.v1.VpcService/Delete',
+                request_serializer=vmon_dot_v1_dot_api__pb2.VpcRef.SerializeToString,
+                response_deserializer=vmon_dot_v1_dot_api__pb2.Ok.FromString,
+                _registered_method=True)
+
+
+class VpcServiceServicer:
+    """VpcService manages private layer-2 networks that sandbox NICs attach to.
+    VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+    macOS hosts reject every VPC operation with `invalid`.
+    """
+
+    def Create(self, request, context):
+        """Creates a VPC with an optional name and IPv4 CIDR (default 10.77.0.0/16).
+
+        Errors:
+        - `invalid` (INVALID_ARGUMENT): Malformed CIDR, or the host cannot back VPCs.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def List(self, request, context):
+        """Lists VPCs.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Delete(self, request, context):
+        """Deletes a VPC with no attached sandboxes.
+
+        Errors:
+        - `not_found` (NOT_FOUND): The specified VPC ID does not exist.
+        - `busy` (ABORTED): Sandboxes are still attached to the VPC.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_VpcServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Create': grpc.unary_unary_rpc_method_handler(
+                    servicer.Create,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.VpcCreateRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Vpc.SerializeToString,
+            ),
+            'List': grpc.unary_unary_rpc_method_handler(
+                    servicer.List,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.ListVpcsRequest.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.VpcList.SerializeToString,
+            ),
+            'Delete': grpc.unary_unary_rpc_method_handler(
+                    servicer.Delete,
+                    request_deserializer=vmon_dot_v1_dot_api__pb2.VpcRef.FromString,
+                    response_serializer=vmon_dot_v1_dot_api__pb2.Ok.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vmon.v1.VpcService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vmon.v1.VpcService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class VpcService:
+    """VpcService manages private layer-2 networks that sandbox NICs attach to.
+    VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+    macOS hosts reject every VPC operation with `invalid`.
+    """
+
+    @staticmethod
+    def Create(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.VpcService/Create',
+            vmon_dot_v1_dot_api__pb2.VpcCreateRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.Vpc.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def List(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.VpcService/List',
+            vmon_dot_v1_dot_api__pb2.ListVpcsRequest.SerializeToString,
+            vmon_dot_v1_dot_api__pb2.VpcList.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Delete(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vmon.v1.VpcService/Delete',
+            vmon_dot_v1_dot_api__pb2.VpcRef.SerializeToString,
             vmon_dot_v1_dot_api__pb2.Ok.FromString,
             options,
             channel_credentials,

@@ -315,6 +315,14 @@ class ExtendSandboxRequest(_message.Message):
     secs: int
     def __init__(self, id: _Optional[str] = ..., secs: _Optional[int] = ...) -> None: ...
 
+class SetIdleTimeoutRequest(_message.Message):
+    __slots__ = ("id", "idle_timeout_secs")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    IDLE_TIMEOUT_SECS_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    idle_timeout_secs: float
+    def __init__(self, id: _Optional[str] = ..., idle_timeout_secs: _Optional[float] = ...) -> None: ...
+
 class LogsRequest(_message.Message):
     __slots__ = ("id", "follow", "tail")
     ID_FIELD_NUMBER: _ClassVar[int]
@@ -375,28 +383,185 @@ class ExecCaptureResponse(_message.Message):
     def __init__(self, code: _Optional[int] = ..., signal: _Optional[int] = ..., stdout: _Optional[bytes] = ..., stderr: _Optional[bytes] = ...) -> None: ...
 
 class ExecInput(_message.Message):
-    __slots__ = ("start", "shell_params_json", "stdin", "eof", "resize")
+    __slots__ = ("start", "shell_params_json", "stdin", "eof", "resize", "pty_open", "pty_attach")
     START_FIELD_NUMBER: _ClassVar[int]
     SHELL_PARAMS_JSON_FIELD_NUMBER: _ClassVar[int]
     STDIN_FIELD_NUMBER: _ClassVar[int]
     EOF_FIELD_NUMBER: _ClassVar[int]
     RESIZE_FIELD_NUMBER: _ClassVar[int]
+    PTY_OPEN_FIELD_NUMBER: _ClassVar[int]
+    PTY_ATTACH_FIELD_NUMBER: _ClassVar[int]
     start: ExecStart
     shell_params_json: str
     stdin: bytes
     eof: Eof
     resize: Resize
-    def __init__(self, start: _Optional[_Union[ExecStart, _Mapping]] = ..., shell_params_json: _Optional[str] = ..., stdin: _Optional[bytes] = ..., eof: _Optional[_Union[Eof, _Mapping]] = ..., resize: _Optional[_Union[Resize, _Mapping]] = ...) -> None: ...
+    pty_open: PtyOpenStart
+    pty_attach: PtyAttachStart
+    def __init__(self, start: _Optional[_Union[ExecStart, _Mapping]] = ..., shell_params_json: _Optional[str] = ..., stdin: _Optional[bytes] = ..., eof: _Optional[_Union[Eof, _Mapping]] = ..., resize: _Optional[_Union[Resize, _Mapping]] = ..., pty_open: _Optional[_Union[PtyOpenStart, _Mapping]] = ..., pty_attach: _Optional[_Union[PtyAttachStart, _Mapping]] = ...) -> None: ...
 
 class ExecOutput(_message.Message):
-    __slots__ = ("chunk", "exit", "ready")
+    __slots__ = ("chunk", "exit", "ready", "pty")
     CHUNK_FIELD_NUMBER: _ClassVar[int]
     EXIT_FIELD_NUMBER: _ClassVar[int]
     READY_FIELD_NUMBER: _ClassVar[int]
+    PTY_FIELD_NUMBER: _ClassVar[int]
     chunk: Output
     exit: Exit
     ready: Ready
-    def __init__(self, chunk: _Optional[_Union[Output, _Mapping]] = ..., exit: _Optional[_Union[Exit, _Mapping]] = ..., ready: _Optional[_Union[Ready, _Mapping]] = ...) -> None: ...
+    pty: PtySession
+    def __init__(self, chunk: _Optional[_Union[Output, _Mapping]] = ..., exit: _Optional[_Union[Exit, _Mapping]] = ..., ready: _Optional[_Union[Ready, _Mapping]] = ..., pty: _Optional[_Union[PtySession, _Mapping]] = ...) -> None: ...
+
+class PtyOpenStart(_message.Message):
+    __slots__ = ("sandbox_id", "session_id", "cols", "rows", "exec", "env", "workdir")
+    class EnvEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    SANDBOX_ID_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    COLS_FIELD_NUMBER: _ClassVar[int]
+    ROWS_FIELD_NUMBER: _ClassVar[int]
+    EXEC_FIELD_NUMBER: _ClassVar[int]
+    ENV_FIELD_NUMBER: _ClassVar[int]
+    WORKDIR_FIELD_NUMBER: _ClassVar[int]
+    sandbox_id: str
+    session_id: str
+    cols: int
+    rows: int
+    exec: str
+    env: _containers.ScalarMap[str, str]
+    workdir: str
+    def __init__(self, sandbox_id: _Optional[str] = ..., session_id: _Optional[str] = ..., cols: _Optional[int] = ..., rows: _Optional[int] = ..., exec: _Optional[str] = ..., env: _Optional[_Mapping[str, str]] = ..., workdir: _Optional[str] = ...) -> None: ...
+
+class PtyAttachStart(_message.Message):
+    __slots__ = ("sandbox_id", "session_id", "cols", "rows")
+    SANDBOX_ID_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    COLS_FIELD_NUMBER: _ClassVar[int]
+    ROWS_FIELD_NUMBER: _ClassVar[int]
+    sandbox_id: str
+    session_id: str
+    cols: int
+    rows: int
+    def __init__(self, sandbox_id: _Optional[str] = ..., session_id: _Optional[str] = ..., cols: _Optional[int] = ..., rows: _Optional[int] = ...) -> None: ...
+
+class PtySession(_message.Message):
+    __slots__ = ("session_id", "running", "exit_code", "cols", "rows", "exec", "created_at_unix_millis", "attached_count", "suspended")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    RUNNING_FIELD_NUMBER: _ClassVar[int]
+    EXIT_CODE_FIELD_NUMBER: _ClassVar[int]
+    COLS_FIELD_NUMBER: _ClassVar[int]
+    ROWS_FIELD_NUMBER: _ClassVar[int]
+    EXEC_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    ATTACHED_COUNT_FIELD_NUMBER: _ClassVar[int]
+    SUSPENDED_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    running: bool
+    exit_code: int
+    cols: int
+    rows: int
+    exec: str
+    created_at_unix_millis: int
+    attached_count: int
+    suspended: bool
+    def __init__(self, session_id: _Optional[str] = ..., running: _Optional[bool] = ..., exit_code: _Optional[int] = ..., cols: _Optional[int] = ..., rows: _Optional[int] = ..., exec: _Optional[str] = ..., created_at_unix_millis: _Optional[int] = ..., attached_count: _Optional[int] = ..., suspended: _Optional[bool] = ...) -> None: ...
+
+class PtySessionList(_message.Message):
+    __slots__ = ("sessions",)
+    SESSIONS_FIELD_NUMBER: _ClassVar[int]
+    sessions: _containers.RepeatedCompositeFieldContainer[PtySession]
+    def __init__(self, sessions: _Optional[_Iterable[_Union[PtySession, _Mapping]]] = ...) -> None: ...
+
+class PtyCloseRequest(_message.Message):
+    __slots__ = ("id", "session_id")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    session_id: str
+    def __init__(self, id: _Optional[str] = ..., session_id: _Optional[str] = ...) -> None: ...
+
+class PtySessionCloseResponse(_message.Message):
+    __slots__ = ("session_id", "exit_code")
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXIT_CODE_FIELD_NUMBER: _ClassVar[int]
+    session_id: str
+    exit_code: int
+    def __init__(self, session_id: _Optional[str] = ..., exit_code: _Optional[int] = ...) -> None: ...
+
+class PtyExecRequest(_message.Message):
+    __slots__ = ("id", "session_id", "command", "timeout")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    COMMAND_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    session_id: str
+    command: str
+    timeout: float
+    def __init__(self, id: _Optional[str] = ..., session_id: _Optional[str] = ..., command: _Optional[str] = ..., timeout: _Optional[float] = ...) -> None: ...
+
+class PtyExecResponse(_message.Message):
+    __slots__ = ("code", "stdout", "stderr")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    STDOUT_FIELD_NUMBER: _ClassVar[int]
+    STDERR_FIELD_NUMBER: _ClassVar[int]
+    code: int
+    stdout: bytes
+    stderr: bytes
+    def __init__(self, code: _Optional[int] = ..., stdout: _Optional[bytes] = ..., stderr: _Optional[bytes] = ...) -> None: ...
+
+class ResizeSandboxRequest(_message.Message):
+    __slots__ = ("id", "cpus", "memory_mib", "disk_mb")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    CPUS_FIELD_NUMBER: _ClassVar[int]
+    MEMORY_MIB_FIELD_NUMBER: _ClassVar[int]
+    DISK_MB_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    cpus: int
+    memory_mib: int
+    disk_mb: int
+    def __init__(self, id: _Optional[str] = ..., cpus: _Optional[int] = ..., memory_mib: _Optional[int] = ..., disk_mb: _Optional[int] = ...) -> None: ...
+
+class Vpc(_message.Message):
+    __slots__ = ("id", "name", "cidr", "created_at_unix_millis")
+    ID_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    CIDR_FIELD_NUMBER: _ClassVar[int]
+    CREATED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    name: str
+    cidr: str
+    created_at_unix_millis: int
+    def __init__(self, id: _Optional[str] = ..., name: _Optional[str] = ..., cidr: _Optional[str] = ..., created_at_unix_millis: _Optional[int] = ...) -> None: ...
+
+class VpcCreateRequest(_message.Message):
+    __slots__ = ("name", "cidr")
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    CIDR_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    cidr: str
+    def __init__(self, name: _Optional[str] = ..., cidr: _Optional[str] = ...) -> None: ...
+
+class ListVpcsRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class VpcList(_message.Message):
+    __slots__ = ("vpcs",)
+    VPCS_FIELD_NUMBER: _ClassVar[int]
+    vpcs: _containers.RepeatedCompositeFieldContainer[Vpc]
+    def __init__(self, vpcs: _Optional[_Iterable[_Union[Vpc, _Mapping]]] = ...) -> None: ...
+
+class VpcRef(_message.Message):
+    __slots__ = ("id",)
+    ID_FIELD_NUMBER: _ClassVar[int]
+    id: str
+    def __init__(self, id: _Optional[str] = ...) -> None: ...
 
 class FilePathRequest(_message.Message):
     __slots__ = ("id", "path")

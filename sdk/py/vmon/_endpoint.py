@@ -185,6 +185,7 @@ _GRPC_STATUS_TO_CODE = {
     grpc.StatusCode.NOT_FOUND: "not_found",
     grpc.StatusCode.INVALID_ARGUMENT: "invalid",
     grpc.StatusCode.UNAUTHENTICATED: "unauthorized",
+    grpc.StatusCode.PERMISSION_DENIED: "forbidden",
     grpc.StatusCode.FAILED_PRECONDITION: "not_running",
     grpc.StatusCode.ABORTED: "busy",
     grpc.StatusCode.UNIMPLEMENTED: "unsupported",
@@ -310,6 +311,7 @@ class GrpcStubs:
         self.snapshots = api_pb2_grpc.SnapshotServiceStub(channel)
         self.volumes = api_pb2_grpc.VolumeServiceStub(channel)
         self.pools = api_pb2_grpc.PoolServiceStub(channel)
+        self.vpc = api_pb2_grpc.VpcServiceStub(channel)
         self.system = api_pb2_grpc.SystemServiceStub(channel)
         self.artifacts = api_pb2_grpc.ArtifactServiceStub(channel)
         self.functions = api_pb2_grpc.FunctionServiceStub(channel)
@@ -587,7 +589,13 @@ class EndpointTransport:
 
     @staticmethod
     def _error_from_response(response: httpx.Response) -> APIError:
-        code = "unauthorized" if response.status_code in {401, 403} else str(response.status_code)
+        code = (
+            "unauthorized"
+            if response.status_code == 401
+            else "forbidden"
+            if response.status_code == 403
+            else str(response.status_code)
+        )
         message = response.text.strip() or f"vmon API HTTP {response.status_code}"
         retryable = False
         action = None
