@@ -9979,7 +9979,11 @@ fn valid_virtiofs_tag(tag: &str) -> bool {
 fn restore_s3_mount_params(
 	params: &mut Map<String, Value>,
 ) -> Result<Option<HashMap<String, String>>> {
-	let Some(source) = params.get("s3_mounts").cloned() else {
+	let Some(source) = params
+		.get("s3_mounts")
+		.filter(|mounts| !mounts.is_null())
+		.cloned()
+	else {
 		return Ok(None);
 	};
 	let mounts = source
@@ -12501,6 +12505,16 @@ mod tests {
 		assert!(params["s3_mounts"]["/mnt/data"].get("tag").is_none());
 		assert!(params["s3_mounts"]["/mnt/data"].get("auth").is_none());
 		assert!(params["s3_mounts"]["/mnt/data"].get("access_key").is_none());
+	}
+
+	#[test]
+	fn restored_s3_mounts_allow_null_optional_value() {
+		let mut params = Map::from_iter([("s3_mounts".to_owned(), Value::Null)]);
+
+		assert_eq!(
+			restore_s3_mount_params(&mut params).expect("optional S3 mounts are accepted"),
+			None
+		);
 	}
 
 	#[test]
