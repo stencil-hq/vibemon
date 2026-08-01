@@ -348,6 +348,57 @@ def test_ordered_batch_return_exceptions_is_per_item_and_then_exhausts() -> None
     assert values[1] == 7
 
 
+def test_ordered_batch_retries_result_that_commits_with_terminal_status() -> None:
+    class Calls:
+        def __init__(self) -> None:
+            self.last_result_attempts = 0
+
+        def GetResult(self, request):
+            if request.index == 0:
+                envelope = encode_value(2, codec=ValueCodec.JSON, compress=False)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-0",
+                    input_index=0,
+                    value=value_to_proto(envelope),
+                )
+            if request.index == 1:
+                self.last_result_attempts += 1
+                if self.last_result_attempts == 1:
+                    raise APIError("result commit raced fetch", code="not_found", status=404)
+                return api_pb2.CallResult(
+                    call=request.call,
+                    input_id="input-1",
+                    input_index=1,
+                    error=api_pb2.CallError(
+                        code="invalid",
+                        message="bad item",
+                        type="TypeError",
+                    ),
+                )
+            raise APIError("exhausted", code="not_found", status=404)
+
+        def Get(self, request):
+            return api_pb2.CallRecord(
+                ref=request,
+                status=api_pb2.CALL_STATUS_SUCCEEDED,
+                input_count=2,
+            )
+
+    calls = Calls()
+
+    class Driver:
+        def call(self, operation, *, endpoint=None, stream=False):
+            return operation(SimpleNamespace(calls=calls)), "owner"
+
+    batch = BatchCall.from_id("terminal-race", client=SimpleNamespace(driver=Driver()))
+    values = list(batch.results(return_exceptions=True))
+    assert values[0] == 2
+    assert isinstance(values[1], RemoteFunctionError)
+    assert values[1].remote_type == "TypeError"
+    assert calls.last_result_attempts == 2
+
+
 def test_unordered_batch_keeps_durable_completion_sequence() -> None:
     class Calls:
         def GetResult(self, request):

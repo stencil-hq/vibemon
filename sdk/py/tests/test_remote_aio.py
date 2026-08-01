@@ -401,6 +401,62 @@ def test_native_aio_ordered_batch_preserves_item_errors_before_terminal_cancel()
     asyncio.run(scenario())
 
 
+def test_native_aio_ordered_batch_retries_terminal_result_race() -> None:
+    async def scenario() -> None:
+        class Calls:
+            def __init__(self) -> None:
+                self.last_result_attempts = 0
+
+            async def GetResult(self, request, **kwargs):
+                if request.index == 0:
+                    envelope = encode_value(
+                        2,
+                        codec=ValueCodec.JSON,
+                        compression=ValueCompression.NONE,
+                    )
+                    return api_pb2.CallResult(
+                        call=request.call,
+                        input_id="input-0",
+                        input_index=0,
+                        value=value_to_proto(envelope),
+                    )
+                if request.index == 1:
+                    self.last_result_attempts += 1
+                    if self.last_result_attempts == 1:
+                        raise _NotFound()
+                    return api_pb2.CallResult(
+                        call=request.call,
+                        input_id="input-1",
+                        input_index=1,
+                        error=api_pb2.CallError(
+                            code="invalid",
+                            message="bad item",
+                            type="TypeError",
+                        ),
+                    )
+                raise _NotFound()
+
+            async def Get(self, request, **kwargs):
+                return api_pb2.CallRecord(
+                    ref=request,
+                    status=api_pb2.CALL_STATUS_SUCCEEDED,
+                    input_count=2,
+                )
+
+        calls = Calls()
+        client = SimpleNamespace(driver=_Driver(calls))
+        iterator = BatchCall(FunctionCall("terminal-race-aio", client)).aio.results(
+            return_exceptions=True
+        )
+        values = [value async for value in iterator]
+        assert values[0] == 2
+        assert isinstance(values[1], RemoteFunctionError)
+        assert values[1].remote_type == "TypeError"
+        assert calls.last_result_attempts == 2
+
+    asyncio.run(scenario())
+
+
 def test_native_aio_ordered_batch_reconnects_get_result_transport() -> None:
     async def scenario() -> None:
         requests: list[tuple[str, int]] = []

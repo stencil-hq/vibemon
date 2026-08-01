@@ -105,6 +105,10 @@ def _reconnectable_rpc(error: BaseException) -> bool:
     }
 
 
+def _batch_result_should_exist(record: pb.CallRecord, index: int) -> bool:
+    return record.status == pb.CALL_STATUS_SUCCEEDED and index < record.input_count
+
+
 def _watch_call(stubs: Any, *, request: pb.WatchCallRequest) -> Any:
     return stubs.calls.Watch(request)
 
@@ -807,6 +811,7 @@ class BatchCall(Generic[R]):
         try:
             if order_outputs:
                 next_index = 0
+                terminal_retry: int | None = None
                 while True:
                     request = pb.GetCallResultRequest(
                         call=pb.CallRef(call_id=self.id),
@@ -851,6 +856,13 @@ class BatchCall(Generic[R]):
                             raise self._feeder_errors[0] from None
                         if record.status not in _TERMINAL:
                             time.sleep(0.02)
+                            continue
+                        if _batch_result_should_exist(record, next_index):
+                            if terminal_retry == next_index:
+                                raise RuntimeError(
+                                    f"batch {self.id} is missing committed result {next_index}"
+                                ) from None
+                            terminal_retry = next_index
                             continue
                         failure: BaseException | None = None
                         if record.HasField("error"):
@@ -1202,6 +1214,7 @@ class _AsyncBatchCall(Generic[R]):
 
             if order_outputs:
                 next_index = 0
+                terminal_retry: int | None = None
                 failures = 0
                 while True:
                     current = _aio_endpoint(self._call._client, self._call._endpoint)
@@ -1268,6 +1281,13 @@ class _AsyncBatchCall(Generic[R]):
                             failures = 0
                             if record.status not in _TERMINAL:
                                 await asyncio.sleep(0.02)
+                                continue
+                            if _batch_result_should_exist(record, next_index):
+                                if terminal_retry == next_index:
+                                    raise RuntimeError(
+                                        f"batch {self.id} is missing committed result {next_index}"
+                                    ) from None
+                                terminal_retry = next_index
                                 continue
                             if self._feeder is not None:
                                 await self._feeder
