@@ -618,6 +618,13 @@ mod tests {
 			!durable.params.contains_key("secrets"),
 			"process-local secrets must remain absent from PostgreSQL"
 		);
+		let sanitized_update = MeshRecordStore::update_exact(&*runtime_a, durable)
+			.expect("persist sanitized background retry");
+		assert_eq!(
+			sanitized_update.params.get("secrets"),
+			Some(&secrets),
+			"a durable-record retry must retain same-lineage process-local secrets"
+		);
 
 		tokio::task::spawn_blocking(move || {
 			drop(runtime_a);
