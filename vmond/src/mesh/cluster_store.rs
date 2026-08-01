@@ -3894,6 +3894,67 @@ mod tests {
 	}
 
 	#[test]
+	fn pending_restore_claim_stays_renewable_before_activation() {
+		use std::net::TcpStream;
+
+		const URL: &str = "postgresql://fastbench:fastbench@127.0.0.1:15433/fastbench";
+		if TcpStream::connect(("127.0.0.1", 15433)).is_err() {
+			eprintln!("SKIP pending restore renewal test: PostgreSQL fixture unavailable");
+			return;
+		}
+		let _database_guard = test_database_guard();
+		let store = ProductionStore::connect(URL).expect("connect fixture");
+		store.clear_for_test().expect("clear fixture");
+		let record = CreateRecord::new(
+			"pending-restore",
+			serde_json::Map::new(),
+			"node-a",
+			1,
+			"pending-restore-key",
+			"async",
+			"none",
+			0.0,
+		)
+		.expect("ownership");
+		reserve_fixture_record(&store, &record).expect("record ownership");
+		store
+			.with_client(|client| {
+				client
+					.execute(
+						"UPDATE sandbox_ownership SET owner_lease_expires_at = 0 WHERE sid = $1",
+						&[&"pending-restore"],
+					)
+					.map_err(database_error)?;
+				Ok(())
+			})
+			.expect("expire source lease");
+		let pending = json!({
+			"kind": "replica",
+			"source_owner": "node-a",
+			"source_epoch": 1,
+			"replica_digest": "digest",
+			"checkpoint_generation": 1,
+		});
+
+		let claimed = store
+			.claim_expected_pending("pending-restore", "node-a", 1, "node-b", &pending)
+			.expect("claim pending restore");
+		assert_eq!((claimed.owner.as_str(), claimed.epoch), ("node-b", 2));
+		assert_eq!(claimed.params.get("_mesh_restore_pending"), Some(&pending));
+		let retried = store
+			.claim_expected_pending("pending-restore", "node-a", 1, "node-b", &pending)
+			.expect("retry exact pending restore claim");
+		assert_eq!((retried.owner.as_str(), retried.epoch), ("node-b", 2));
+		assert!(
+			store
+				.renew_owner_lease("pending-restore", "node-b", 2)
+				.expect("renew pending restore")
+				.is_some(),
+			"pending ownership must remain renewable while its candidate is non-serving"
+		);
+	}
+
+	#[test]
 	fn committed_suspend_is_immediately_claimable_at_a_fresh_epoch() {
 		use std::net::TcpStream;
 

@@ -5554,16 +5554,18 @@ impl Engine {
 		self.sandbox_is_running(&self.sandbox(sid)).unwrap_or(false)
 	}
 
-	/// Rearm the VMM owner watchdog after a mesh ownership renewal without
-	/// counting the renewal as guest activity.
+	/// Re-arm the VMM owner watchdog after a mesh ownership renewal without
+	/// counting the renewal as guest activity. Live paused restore candidates
+	/// remain non-serving until their ownership commit completes.
 	pub(crate) fn mesh_rearm_owner_lease(&self, sid: &str, secs: u64) -> Result<()> {
 		let record = self.get_record(sid, false)?;
-		if record.status != "running" || !self.sandbox_is_running(&self.sandbox(sid))? {
-			return Err(EngineError::busy(format!(
-				"sandbox '{sid}' is not a running local candidate"
-			)));
+		if !matches!(record.status.as_str(), "running" | "paused")
+			|| !self.sandbox_is_running(&self.sandbox(sid))?
+		{
+			return Err(EngineError::busy(format!("sandbox '{sid}' is not a live local candidate")));
 		}
-		control_for_vm(&self.sandbox(sid))?.rearm_owner_lease(secs)?;
+		let mut control = control_for_vm(&self.sandbox(sid))?;
+		control.rearm_owner_lease(secs)?;
 		Ok(())
 	}
 
@@ -12798,6 +12800,48 @@ mod tests {
 				.last_active,
 			123.0
 		);
+	}
+
+	#[test]
+	fn paused_candidate_owner_lease_rearm_stays_non_serving() {
+		use std::{
+			io::{BufRead, BufReader, Write},
+			os::unix::net::UnixListener,
+		};
+
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let sid = "paused-lease";
+		let socket = engine.sandbox(sid).dir().join("owner.sock");
+		write_meta(temp.path(), sid, json!({"sock": socket, "status": "paused"}));
+		engine.insert_test_record(VmRecord::new(sid, sid, "paused"));
+
+		let listener = UnixListener::bind(&socket).expect("bind control socket");
+		let server = thread::spawn(move || {
+			let (mut stream, _) = listener.accept().expect("accept control client");
+			stream.write_all(b"{\"api\":1}\n").expect("write banner");
+			stream.flush().expect("flush banner");
+			let mut line = String::new();
+			BufReader::new(stream.try_clone().expect("clone control stream"))
+				.read_line(&mut line)
+				.expect("read request");
+			let request: Value = serde_json::from_str(&line).expect("request json");
+			let reply = json!({
+				"id": request.get("id"),
+				"ok": true,
+				"result": {"deadline_unix": 1_900_000_000_i64},
+			});
+			writeln!(stream, "{reply}").expect("write reply");
+			request
+		});
+
+		engine
+			.mesh_rearm_owner_lease(sid, 15)
+			.expect("rearm paused candidate");
+		let request = server.join().expect("control server");
+		assert_eq!(request.get("method"), Some(&json!("rearm_owner_lease")));
+		assert_eq!(request.pointer("/params/secs"), Some(&json!(15)));
+		assert_eq!(engine.get_record(sid, false).expect("record").status, "paused");
 	}
 
 	#[test]
