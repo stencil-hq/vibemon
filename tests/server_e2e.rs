@@ -94,6 +94,10 @@ struct Server {
 
 impl Server {
 	fn start(home: &Path) -> Self {
+		Self::start_with_args(home, &[])
+	}
+
+	fn start_with_args(home: &Path, args: &[&str]) -> Self {
 		let log = home.join("server-e2e.log");
 		let log_file = fs::OpenOptions::new()
 			.create(true)
@@ -104,6 +108,7 @@ impl Server {
 		cmd.arg("serve")
 			.arg("--home")
 			.arg(home)
+			.args(args)
 			.env("PATH", tool_path())
 			.stdin(Stdio::null())
 			.stdout(log_file.try_clone().expect("clone log handle"))
@@ -505,6 +510,154 @@ fn files_roundtrip_binary_clean() {
 }
 
 #[test]
+fn resize_reboots_with_new_shape_and_retained_disk() {
+	if !require_server_e2e() {
+		return;
+	}
+	let server = Server::start(&HOME);
+	let view = create_sandbox(&server, json!({}));
+	let id = sandbox_id(&view);
+	let (exit, _, stderr) = exec(&server, &id, &[
+		"/bin/sh",
+		"-c",
+		"mkdir -p /root/vmon-resize && printf 'retained\\n' >/root/vmon-resize/marker",
+	]);
+	assert_eq!(exit, 0, "write resize marker: {stderr}");
+
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	let resized = grpc
+		.block_on(sandboxes.resize(pb::ResizeSandboxRequest {
+			id:         id.clone(),
+			cpus:       Some(2),
+			memory_mib: Some(1024),
+			disk_mb:    None,
+		}))
+		.unwrap_or_else(|status| panic!("resize failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	let resized: Value = serde_json::from_str(&resized.json).expect("resize view JSON");
+	assert_eq!(resized["cpus"], 2);
+	assert_eq!(resized["memory"], 1024);
+	assert_eq!(resized["status"], "running");
+
+	let (exit, stdout, stderr) = exec(&server, &id, &[
+		"/bin/sh",
+		"-c",
+		"cat /root/vmon-resize/marker; grep -c '^processor' /proc/cpuinfo",
+	]);
+	assert_eq!(exit, 0, "read after resize: {stderr}");
+	assert_eq!(stdout.lines().collect::<Vec<_>>(), ["retained", "2"]);
+
+	let (exit, _, stderr) =
+		exec(&server, &id, &["/bin/sh", "-c", "printf stopped >/root/vmon-resize/cold-stop-marker"]);
+	assert_eq!(exit, 0, "write cold-stop marker: {stderr}");
+	grpc
+		.block_on(sandboxes.pause(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| panic!("pause failed: {}", common::api::status_detail(&status)));
+	grpc
+		.block_on(sandboxes.stop(pb::StopSandboxRequest { id: id.clone(), returncode: None }))
+		.unwrap_or_else(|status| panic!("stop failed: {}", common::api::status_detail(&status)));
+	grpc
+		.block_on(sandboxes.resume(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| panic!("restart failed: {}", common::api::status_detail(&status)));
+	let (exit, stdout, stderr) =
+		exec(&server, &id, &["/bin/sh", "-c", "cat /root/vmon-resize/cold-stop-marker"]);
+	assert_eq!(exit, 0, "read after cold stop: {stderr}");
+	assert_eq!(stdout, "stopped");
+	remove_sandbox(&server, &id);
+}
+
+#[test]
+fn short_idle_override_wakes_long_default_scheduler() {
+	if !require_server_e2e() {
+		return;
+	}
+	let server = Server::start_with_args(&HOME, &["--idle-timeout", "300"]);
+	let view = create_sandbox(
+		&server,
+		json!({"idle_timeout_secs": 0, "activity_threshold_bytes": 1_000_000}),
+	);
+	let id = sandbox_id(&view);
+	thread::sleep(Duration::from_secs(2));
+	assert_eq!(sandbox_view(&server, &id)["status"], "running");
+
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+	grpc
+		.block_on(sandboxes.set_idle_timeout(pb::SetIdleTimeoutRequest {
+			id:                id.clone(),
+			idle_timeout_secs: Some(1.0),
+		}))
+		.unwrap_or_else(|status| {
+			panic!("idle policy update failed: {}", common::api::status_detail(&status))
+		});
+
+	let deadline = Instant::now() + Duration::from_secs(8);
+	let suspended = loop {
+		let current = sandbox_view(&server, &id);
+		if current["status"] == "suspended" {
+			break current;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"1s VM idle override was not sampled under a 300s daemon default; view={current}; log \
+			 tail:\n{}",
+			server.log_tail()
+		);
+		thread::sleep(Duration::from_millis(100));
+	};
+	assert_eq!(suspended["idle_timeout_secs"], 1.0);
+	remove_sandbox(&server, &id);
+}
+
+#[test]
+fn idle_policy_update_survives_suspend_resume() {
+	if !require_server_e2e() {
+		return;
+	}
+	let server = Server::start(&HOME);
+	let view = create_sandbox(&server, json!({"idle_timeout_secs": 30}));
+	let id = sandbox_id(&view);
+	let grpc = server.grpc();
+	let mut sandboxes = grpc.sandboxes();
+
+	grpc
+		.block_on(sandboxes.suspend(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| panic!("suspend failed: {}", common::api::status_detail(&status)));
+	grpc
+		.block_on(sandboxes.set_idle_timeout(pb::SetIdleTimeoutRequest {
+			id:                id.clone(),
+			idle_timeout_secs: Some(0.0),
+		}))
+		.unwrap_or_else(|status| {
+			panic!("idle policy update failed: {}", common::api::status_detail(&status))
+		});
+	let resumed = grpc
+		.block_on(sandboxes.resume(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| panic!("resume failed: {}", common::api::status_detail(&status)))
+		.into_inner();
+	let resumed: Value = serde_json::from_str(&resumed.json).expect("resume view JSON");
+	assert_eq!(resumed["status"], "running");
+	assert_eq!(resumed["idle_timeout_secs"], 0.0);
+	grpc
+		.block_on(sandboxes.suspend(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| {
+			panic!("second suspend failed: {}", common::api::status_detail(&status))
+		});
+	let resumed_again = grpc
+		.block_on(sandboxes.resume(pb::SandboxRef { id: id.clone() }))
+		.unwrap_or_else(|status| {
+			panic!("second resume failed: {}", common::api::status_detail(&status))
+		})
+		.into_inner();
+	let resumed_again: Value =
+		serde_json::from_str(&resumed_again.json).expect("second resume view JSON");
+	assert_eq!(resumed_again["status"], "running");
+	assert_eq!(resumed_again["idle_timeout_secs"], 0.0);
+	remove_sandbox(&server, &id);
+}
+
+#[test]
 fn snapshot_restore_preserves_disk_state() {
 	if !require_server_e2e() {
 		return;
@@ -656,11 +809,17 @@ fn volumes_rw_and_ro_roundtrip() {
 	assert_eq!(exit, 0, "guest write to rw volume failed");
 	remove_sandbox(&server, &wid);
 
-	// Host sees the write.
+	// Plaintext is removed after teardown; the encrypted archive is authoritative.
 	let host_file = HOME.join("volumes").join(&volume).join("f");
-	let content = fs::read_to_string(&host_file)
-		.unwrap_or_else(|e| panic!("host volume file {}: {e}", host_file.display()));
-	assert_eq!(content.trim(), "vol-data");
+	assert!(!host_file.exists(), "volume plaintext persisted after teardown");
+	assert!(
+		HOME
+			.join("security")
+			.join("volumes")
+			.join(format!("{volume}.venc"))
+			.is_file(),
+		"encrypted volume archive was not sealed"
+	);
 
 	let reader =
 		create_sandbox(&server, json!({"volumes": {"/ro": {"name": volume, "read_only": true}}}));
@@ -704,8 +863,8 @@ fn s3_mount_lazy_read_and_volatile_write() {
 	let id = sandbox_id(&view);
 	assert_eq!(fixture.range_reads(), 0, "mount setup must not fetch object bytes");
 
-	let (exit, stdout, _) = exec(&server, &id, &["/bin/sh", "-c", "cat /mnt/s3/hello.txt"]);
-	assert_eq!(exit, 0, "guest lazy S3 read failed");
+	let (exit, stdout, stderr) = exec(&server, &id, &["/bin/sh", "-c", "cat /mnt/s3/hello.txt"]);
+	assert_eq!(exit, 0, "guest lazy S3 read failed: {stderr}");
 	assert_eq!(stdout, "hello s3\n");
 	assert!(fixture.range_reads() > 0, "guest read did not issue a ranged S3 request");
 
