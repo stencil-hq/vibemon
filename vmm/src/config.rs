@@ -1396,6 +1396,7 @@ mod tests {
 		assert_eq!(cfg.user_net_allow_host_port, Some(8443));
 	}
 
+	#[cfg(target_os = "macos")]
 	#[test]
 	fn rejects_restricted_user_net_without_a_nonzero_gateway_port() {
 		assert_config_err_contains(
@@ -1415,9 +1416,31 @@ mod tests {
 			],
 			"must be nonzero",
 		);
+	}
+
+	#[test]
+	fn rejects_gateway_port_without_restricted_user_net() {
 		assert_config_err_contains(
 			&["vmon", "--kernel", "k", "--user-net-allow-host-port", "8443"],
 			"requires --user-net-restricted",
+		);
+	}
+
+	#[cfg(not(target_os = "macos"))]
+	#[test]
+	fn rejects_restricted_user_net_on_unsupported_hosts() {
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--net",
+				"user",
+				"--user-net-restricted",
+				"--user-net-allow-host-port",
+				"8443",
+			],
+			"supported only on macOS",
 		);
 	}
 
