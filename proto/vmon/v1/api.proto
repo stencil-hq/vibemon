@@ -115,6 +115,10 @@ service SandboxService {
   //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
   rpc Extend(ExtendSandboxRequest) returns (JsonView);
 
+  // Replaces the sandbox's per-VM network-idle suspension policy and rearms
+  // its idle clock. Zero disables network-idle suspension.
+  rpc SetIdleTimeout(SetIdleTimeoutRequest) returns (JsonView);
+
   // Retrieves real-time performance and utilization metrics for the microVM.
   // Includes CPU utilization, memory footprint, virtio block/net throughput, and guest metrics.
   //
@@ -253,6 +257,72 @@ service SandboxService {
   // Restores this sandbox identity to one immutable retained recovery point.
   // The current VM remains authoritative until the replacement is ready to cut over.
   rpc Rollback(RollbackSandboxRequest) returns (JsonView);
+
+  // Resizes sandbox resources. A running sandbox is stopped, resized, and
+  // cold-booted; a stopped sandbox is resized in place and boots with the new
+  // shape on the next Resume. Disk state survives, in-memory state does not.
+  //
+  // `cpus` and `memory_mib` replace the VM shape. `disk_mb` may only grow the
+  // root disk. Disk growth is transactional: the RPC succeeds only after the
+  // ext4 filesystem grows, and any resize or reboot failure restores the
+  // original disk and VM shape.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `invalid` (INVALID_ARGUMENT): No fields set, zero sizes, a `disk_mb` shrink,
+  //     or disk growth requested on a host without e2fsprogs.
+  //   - `busy` (UNAVAILABLE): The sandbox is mid-transition, or it was created with
+  //     secrets this server process no longer holds (daemon restarted since create).
+  rpc Resize(ResizeSandboxRequest) returns (JsonView);
+
+  // Opens a server-persistent interactive PTY session inside the sandbox.
+  //
+  // The first ExecInput must carry `pty_open`; later inputs carry `stdin`,
+  // `resize`, or `eof`. The first ExecOutput carries `pty` with the assigned
+  // session id, then live output chunks. The session and its guest process are
+  // guest-agent state: they survive client disconnects, sandbox suspend/resume,
+  // and are inherited by forks, until closed or the sandbox stops.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  //   - `busy` (RESOURCE_EXHAUSTED): The per-sandbox session cap (128) is reached.
+  rpc PtyOpen(stream ExecInput) returns (stream ExecOutput);
+
+  // Reattaches to a persistent PTY session by id.
+  //
+  // The first ExecInput must carry `pty_attach`. The first ExecOutput carries
+  // `pty`, followed by the retained scrollback replayed as output chunks, then
+  // live output. Attaching a session whose sandbox is suspended resumes the
+  // sandbox first.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+  rpc PtyAttach(stream ExecInput) returns (stream ExecOutput);
+
+  // Lists persistent PTY sessions, including recently exited ones (retained ~60s).
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+  rpc PtyList(SandboxRef) returns (PtySessionList);
+
+  // Terminates a persistent PTY session's process (SIGKILL) and removes the session.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+  rpc PtyClose(PtyCloseRequest) returns (PtySessionCloseResponse);
+
+  // Runs a command in a persistent PTY session's context and captures its output.
+  //
+  // The command executes through `sh -c` as a sibling process sharing the
+  // session leader's working directory and environment; it never writes into
+  // the interactive stream. Output capture is bounded (1 MiB per stream).
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+  //   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+  //   - `invalid` (INVALID_ARGUMENT): Empty command.
+  rpc PtyExec(PtyExecRequest) returns (PtyExecResponse);
 }
 
 // SnapshotService manages saved microVM snapshots, enabling restorations and high-density forks.
@@ -339,6 +409,27 @@ service PoolService {
   // Errors:
   //   - `not_found` (NOT_FOUND): The specified pool reference does not exist.
   rpc Delete(PoolRef) returns (Ok);
+}
+
+// VpcService manages private layer-2 networks that sandbox NICs attach to.
+// VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+// macOS hosts reject every VPC operation with `invalid`.
+service VpcService {
+  // Creates a VPC with an optional name and IPv4 CIDR (default 10.77.0.0/16).
+  //
+  // Errors:
+  //   - `invalid` (INVALID_ARGUMENT): Malformed CIDR, or the host cannot back VPCs.
+  rpc Create(VpcCreateRequest) returns (Vpc);
+
+  // Lists VPCs.
+  rpc List(ListVpcsRequest) returns (VpcList);
+
+  // Deletes a VPC with no attached sandboxes.
+  //
+  // Errors:
+  //   - `not_found` (NOT_FOUND): The specified VPC ID does not exist.
+  //   - `busy` (ABORTED): Sandboxes are still attached to the VPC.
+  rpc Delete(VpcRef) returns (Ok);
 }
 
 // SystemService provides administrative queries and streams engine-wide event feeds.
@@ -459,6 +550,15 @@ message ExtendSandboxRequest {
   uint64 secs = 2;
 }
 
+// SetIdleTimeoutRequest replaces one sandbox's network-idle suspension policy.
+message SetIdleTimeoutRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Seconds without qualifying network activity before suspension; zero disables.
+  optional double idle_timeout_secs = 2;
+}
+
 // LogsRequest represents criteria for streaming microVM logs.
 message LogsRequest {
   // The unique identifier of the target sandbox.
@@ -542,6 +642,12 @@ message ExecInput {
 
     // Requests a change in the guest's pseudoterminal (pty) window dimensions.
     Resize resize = 5;
+
+    // Required first message on the `/pty-open` stream to open a persistent session.
+    PtyOpenStart pty_open = 6;
+
+    // Required first message on the `/pty-attach` stream to rebind a session.
+    PtyAttachStart pty_attach = 7;
   }
 }
 
@@ -557,7 +663,180 @@ message ExecOutput {
 
     // Emitted exactly once upon successful session initialization before any chunks are sent.
     Ready ready = 3;
+
+    // Session metadata; emitted exactly once as the first frame of PtyOpen and PtyAttach.
+    PtySession pty = 4;
   }
+}
+
+// PtyOpenStart opens a server-persistent PTY session inside a sandbox.
+message PtyOpenStart {
+  // Target sandbox.
+  string sandbox_id = 1;
+
+  // Optional caller-chosen session id; the server generates a UUID when empty.
+  string session_id = 2;
+
+  // Terminal columns; defaults to 80.
+  uint32 cols = 3;
+
+  // Terminal rows; defaults to 24.
+  uint32 rows = 4;
+
+  // Optional command run interactively through `sh -lc`; defaults to a login shell.
+  optional string exec = 5;
+
+  // Optional environment variables for the session process.
+  map<string, string> env = 6;
+
+  // Optional working directory.
+  optional string workdir = 7;
+}
+
+// PtyAttachStart reattaches to an existing persistent PTY session.
+message PtyAttachStart {
+  // Target sandbox.
+  string sandbox_id = 1;
+
+  // Session to rebind.
+  string session_id = 2;
+
+  // Optional new terminal size applied on attach.
+  optional uint32 cols = 3;
+  optional uint32 rows = 4;
+}
+
+// PtySession describes one persistent PTY session.
+message PtySession {
+  // Stable session identifier, unique per sandbox and preserved across forks.
+  string session_id = 1;
+
+  // True while the session's process is alive.
+  bool running = 2;
+
+  // Exit code, present once the process has exited (retained ~60s).
+  optional int64 exit_code = 3;
+
+  // Current terminal size.
+  uint32 cols = 4;
+  uint32 rows = 5;
+
+  // The `exec` command the session was opened with, if any.
+  optional string exec = 6;
+
+  // Session creation time.
+  int64 created_at_unix_millis = 7;
+
+  // Number of currently attached streams.
+  uint32 attached_count = 8;
+
+  // True while the owning sandbox is suspended; attach resumes the sandbox.
+  bool suspended = 9;
+}
+
+// PtySessionList enumerates a sandbox's persistent PTY sessions.
+message PtySessionList {
+  // Sessions in creation order, including recently exited ones.
+  repeated PtySession sessions = 1;
+}
+
+// PtyCloseRequest terminates one persistent PTY session.
+message PtyCloseRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Session to terminate.
+  string session_id = 2;
+}
+
+// PtySessionCloseResponse reports the closed session's final state.
+message PtySessionCloseResponse {
+  // The closed session id.
+  string session_id = 1;
+
+  // Exit code when the process had already exited before the close.
+  optional int64 exit_code = 2;
+}
+
+// PtyExecRequest runs one captured command in a PTY session's context.
+message PtyExecRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // Session whose working directory and environment the command inherits.
+  string session_id = 2;
+
+  // Command line run through `sh -c`.
+  string command = 3;
+
+  // Optional command timeout in seconds; the process is killed when exceeded.
+  optional double timeout = 4;
+}
+
+// PtyExecResponse carries the captured result of one PtyExec command.
+message PtyExecResponse {
+  // The process termination status exit code.
+  int64 code = 1;
+
+  // Complete stdout buffer contents (bounded at 1 MiB).
+  bytes stdout = 2;
+
+  // Complete stderr buffer contents (bounded at 1 MiB).
+  bytes stderr = 3;
+}
+
+// ResizeSandboxRequest changes a sandbox's resource shape.
+message ResizeSandboxRequest {
+  // The unique identifier of the target sandbox.
+  string id = 1;
+
+  // New whole vCPU count.
+  optional uint32 cpus = 2;
+
+  // New memory size in MiB.
+  optional uint32 memory_mib = 3;
+
+  // New root disk size in MB; growth only.
+  optional uint64 disk_mb = 4;
+}
+
+// Vpc describes one private network.
+message Vpc {
+  // Stable VPC identifier.
+  string id = 1;
+
+  // Optional human-readable name.
+  string name = 2;
+
+  // IPv4 CIDR the VPC routes.
+  string cidr = 3;
+
+  // Creation time.
+  int64 created_at_unix_millis = 4;
+}
+
+// VpcCreateRequest creates a private network.
+message VpcCreateRequest {
+  // Optional human-readable name.
+  string name = 1;
+
+  // Optional IPv4 CIDR; defaults to 10.77.0.0/16.
+  string cidr = 2;
+}
+
+// ListVpcsRequest lists private networks.
+message ListVpcsRequest {}
+
+// VpcList enumerates private networks.
+message VpcList {
+  // Known VPCs in creation order.
+  repeated Vpc vpcs = 1;
+}
+
+// VpcRef references one private network by id.
+message VpcRef {
+  // The unique identifier of the target VPC.
+  string id = 1;
 }
 
 // FilePathRequest specifies a file path within a sandbox's guest filesystem.

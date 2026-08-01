@@ -19,37 +19,44 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SandboxService_Create_FullMethodName      = "/vmon.v1.SandboxService/Create"
-	SandboxService_BatchCreate_FullMethodName = "/vmon.v1.SandboxService/BatchCreate"
-	SandboxService_Watch_FullMethodName       = "/vmon.v1.SandboxService/Watch"
-	SandboxService_List_FullMethodName        = "/vmon.v1.SandboxService/List"
-	SandboxService_Get_FullMethodName         = "/vmon.v1.SandboxService/Get"
-	SandboxService_Stop_FullMethodName        = "/vmon.v1.SandboxService/Stop"
-	SandboxService_Remove_FullMethodName      = "/vmon.v1.SandboxService/Remove"
-	SandboxService_Terminate_FullMethodName   = "/vmon.v1.SandboxService/Terminate"
-	SandboxService_Pause_FullMethodName       = "/vmon.v1.SandboxService/Pause"
-	SandboxService_Resume_FullMethodName      = "/vmon.v1.SandboxService/Resume"
-	SandboxService_Suspend_FullMethodName     = "/vmon.v1.SandboxService/Suspend"
-	SandboxService_Extend_FullMethodName      = "/vmon.v1.SandboxService/Extend"
-	SandboxService_Metrics_FullMethodName     = "/vmon.v1.SandboxService/Metrics"
-	SandboxService_Logs_FullMethodName        = "/vmon.v1.SandboxService/Logs"
-	SandboxService_ExecCapture_FullMethodName = "/vmon.v1.SandboxService/ExecCapture"
-	SandboxService_Exec_FullMethodName        = "/vmon.v1.SandboxService/Exec"
-	SandboxService_Shell_FullMethodName       = "/vmon.v1.SandboxService/Shell"
-	SandboxService_Attach_FullMethodName      = "/vmon.v1.SandboxService/Attach"
-	SandboxService_FileRead_FullMethodName    = "/vmon.v1.SandboxService/FileRead"
-	SandboxService_FileWrite_FullMethodName   = "/vmon.v1.SandboxService/FileWrite"
-	SandboxService_FileDelete_FullMethodName  = "/vmon.v1.SandboxService/FileDelete"
-	SandboxService_FileList_FullMethodName    = "/vmon.v1.SandboxService/FileList"
-	SandboxService_FileStat_FullMethodName    = "/vmon.v1.SandboxService/FileStat"
-	SandboxService_NetworkGet_FullMethodName  = "/vmon.v1.SandboxService/NetworkGet"
-	SandboxService_NetworkSet_FullMethodName  = "/vmon.v1.SandboxService/NetworkSet"
-	SandboxService_Tunnels_FullMethodName     = "/vmon.v1.SandboxService/Tunnels"
-	SandboxService_Migrate_FullMethodName     = "/vmon.v1.SandboxService/Migrate"
-	SandboxService_Snapshot_FullMethodName    = "/vmon.v1.SandboxService/Snapshot"
-	SandboxService_SnapshotFs_FullMethodName  = "/vmon.v1.SandboxService/SnapshotFs"
-	SandboxService_History_FullMethodName     = "/vmon.v1.SandboxService/History"
-	SandboxService_Rollback_FullMethodName    = "/vmon.v1.SandboxService/Rollback"
+	SandboxService_Create_FullMethodName         = "/vmon.v1.SandboxService/Create"
+	SandboxService_BatchCreate_FullMethodName    = "/vmon.v1.SandboxService/BatchCreate"
+	SandboxService_Watch_FullMethodName          = "/vmon.v1.SandboxService/Watch"
+	SandboxService_List_FullMethodName           = "/vmon.v1.SandboxService/List"
+	SandboxService_Get_FullMethodName            = "/vmon.v1.SandboxService/Get"
+	SandboxService_Stop_FullMethodName           = "/vmon.v1.SandboxService/Stop"
+	SandboxService_Remove_FullMethodName         = "/vmon.v1.SandboxService/Remove"
+	SandboxService_Terminate_FullMethodName      = "/vmon.v1.SandboxService/Terminate"
+	SandboxService_Pause_FullMethodName          = "/vmon.v1.SandboxService/Pause"
+	SandboxService_Resume_FullMethodName         = "/vmon.v1.SandboxService/Resume"
+	SandboxService_Suspend_FullMethodName        = "/vmon.v1.SandboxService/Suspend"
+	SandboxService_Extend_FullMethodName         = "/vmon.v1.SandboxService/Extend"
+	SandboxService_SetIdleTimeout_FullMethodName = "/vmon.v1.SandboxService/SetIdleTimeout"
+	SandboxService_Metrics_FullMethodName        = "/vmon.v1.SandboxService/Metrics"
+	SandboxService_Logs_FullMethodName           = "/vmon.v1.SandboxService/Logs"
+	SandboxService_ExecCapture_FullMethodName    = "/vmon.v1.SandboxService/ExecCapture"
+	SandboxService_Exec_FullMethodName           = "/vmon.v1.SandboxService/Exec"
+	SandboxService_Shell_FullMethodName          = "/vmon.v1.SandboxService/Shell"
+	SandboxService_Attach_FullMethodName         = "/vmon.v1.SandboxService/Attach"
+	SandboxService_FileRead_FullMethodName       = "/vmon.v1.SandboxService/FileRead"
+	SandboxService_FileWrite_FullMethodName      = "/vmon.v1.SandboxService/FileWrite"
+	SandboxService_FileDelete_FullMethodName     = "/vmon.v1.SandboxService/FileDelete"
+	SandboxService_FileList_FullMethodName       = "/vmon.v1.SandboxService/FileList"
+	SandboxService_FileStat_FullMethodName       = "/vmon.v1.SandboxService/FileStat"
+	SandboxService_NetworkGet_FullMethodName     = "/vmon.v1.SandboxService/NetworkGet"
+	SandboxService_NetworkSet_FullMethodName     = "/vmon.v1.SandboxService/NetworkSet"
+	SandboxService_Tunnels_FullMethodName        = "/vmon.v1.SandboxService/Tunnels"
+	SandboxService_Migrate_FullMethodName        = "/vmon.v1.SandboxService/Migrate"
+	SandboxService_Snapshot_FullMethodName       = "/vmon.v1.SandboxService/Snapshot"
+	SandboxService_SnapshotFs_FullMethodName     = "/vmon.v1.SandboxService/SnapshotFs"
+	SandboxService_History_FullMethodName        = "/vmon.v1.SandboxService/History"
+	SandboxService_Rollback_FullMethodName       = "/vmon.v1.SandboxService/Rollback"
+	SandboxService_Resize_FullMethodName         = "/vmon.v1.SandboxService/Resize"
+	SandboxService_PtyOpen_FullMethodName        = "/vmon.v1.SandboxService/PtyOpen"
+	SandboxService_PtyAttach_FullMethodName      = "/vmon.v1.SandboxService/PtyAttach"
+	SandboxService_PtyList_FullMethodName        = "/vmon.v1.SandboxService/PtyList"
+	SandboxService_PtyClose_FullMethodName       = "/vmon.v1.SandboxService/PtyClose"
+	SandboxService_PtyExec_FullMethodName        = "/vmon.v1.SandboxService/PtyExec"
 )
 
 // SandboxServiceClient is the client API for SandboxService service.
@@ -136,6 +143,9 @@ type SandboxServiceClient interface {
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	Extend(ctx context.Context, in *ExtendSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Replaces the sandbox's per-VM network-idle suspension policy and rearms
+	// its idle clock. Zero disables network-idle suspension.
+	SetIdleTimeout(ctx context.Context, in *SetIdleTimeoutRequest, opts ...grpc.CallOption) (*JsonView, error)
 	// Retrieves real-time performance and utilization metrics for the microVM.
 	// Includes CPU utilization, memory footprint, virtio block/net throughput, and guest metrics.
 	//
@@ -257,6 +267,66 @@ type SandboxServiceClient interface {
 	// Restores this sandbox identity to one immutable retained recovery point.
 	// The current VM remains authoritative until the replacement is ready to cut over.
 	Rollback(ctx context.Context, in *RollbackSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Resizes sandbox resources. A running sandbox is stopped, resized, and
+	// cold-booted; a stopped sandbox is resized in place and boots with the new
+	// shape on the next Resume. Disk state survives, in-memory state does not.
+	//
+	// `cpus` and `memory_mib` replace the VM shape. `disk_mb` may only grow the
+	// root disk. Disk growth is transactional: the RPC succeeds only after the
+	// ext4 filesystem grows, and any resize or reboot failure restores the
+	// original disk and VM shape.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `invalid` (INVALID_ARGUMENT): No fields set, zero sizes, a `disk_mb` shrink,
+	//     or disk growth requested on a host without e2fsprogs.
+	//   - `busy` (UNAVAILABLE): The sandbox is mid-transition, or it was created with
+	//     secrets this server process no longer holds (daemon restarted since create).
+	Resize(ctx context.Context, in *ResizeSandboxRequest, opts ...grpc.CallOption) (*JsonView, error)
+	// Opens a server-persistent interactive PTY session inside the sandbox.
+	//
+	// The first ExecInput must carry `pty_open`; later inputs carry `stdin`,
+	// `resize`, or `eof`. The first ExecOutput carries `pty` with the assigned
+	// session id, then live output chunks. The session and its guest process are
+	// guest-agent state: they survive client disconnects, sandbox suspend/resume,
+	// and are inherited by forks, until closed or the sandbox stops.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `busy` (RESOURCE_EXHAUSTED): The per-sandbox session cap (128) is reached.
+	PtyOpen(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error)
+	// Reattaches to a persistent PTY session by id.
+	//
+	// The first ExecInput must carry `pty_attach`. The first ExecOutput carries
+	// `pty`, followed by the retained scrollback replayed as output chunks, then
+	// live output. Attaching a session whose sandbox is suspended resumes the
+	// sandbox first.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	PtyAttach(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error)
+	// Lists persistent PTY sessions, including recently exited ones (retained ~60s).
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	PtyList(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*PtySessionList, error)
+	// Terminates a persistent PTY session's process (SIGKILL) and removes the session.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	PtyClose(ctx context.Context, in *PtyCloseRequest, opts ...grpc.CallOption) (*PtySessionCloseResponse, error)
+	// Runs a command in a persistent PTY session's context and captures its output.
+	//
+	// The command executes through `sh -c` as a sibling process sharing the
+	// session leader's working directory and environment; it never writes into
+	// the interactive stream. Output capture is bounded (1 MiB per stream).
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `invalid` (INVALID_ARGUMENT): Empty command.
+	PtyExec(ctx context.Context, in *PtyExecRequest, opts ...grpc.CallOption) (*PtyExecResponse, error)
 }
 
 type sandboxServiceClient struct {
@@ -393,6 +463,16 @@ func (c *sandboxServiceClient) Extend(ctx context.Context, in *ExtendSandboxRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(JsonView)
 	err := c.cc.Invoke(ctx, SandboxService_Extend_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) SetIdleTimeout(ctx context.Context, in *SetIdleTimeoutRequest, opts ...grpc.CallOption) (*JsonView, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonView)
+	err := c.cc.Invoke(ctx, SandboxService_SetIdleTimeout_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -613,6 +693,72 @@ func (c *sandboxServiceClient) Rollback(ctx context.Context, in *RollbackSandbox
 	return out, nil
 }
 
+func (c *sandboxServiceClient) Resize(ctx context.Context, in *ResizeSandboxRequest, opts ...grpc.CallOption) (*JsonView, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JsonView)
+	err := c.cc.Invoke(ctx, SandboxService_Resize_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) PtyOpen(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[6], SandboxService_PtyOpen_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExecInput, ExecOutput]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_PtyOpenClient = grpc.BidiStreamingClient[ExecInput, ExecOutput]
+
+func (c *sandboxServiceClient) PtyAttach(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ExecInput, ExecOutput], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SandboxService_ServiceDesc.Streams[7], SandboxService_PtyAttach_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExecInput, ExecOutput]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_PtyAttachClient = grpc.BidiStreamingClient[ExecInput, ExecOutput]
+
+func (c *sandboxServiceClient) PtyList(ctx context.Context, in *SandboxRef, opts ...grpc.CallOption) (*PtySessionList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PtySessionList)
+	err := c.cc.Invoke(ctx, SandboxService_PtyList_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) PtyClose(ctx context.Context, in *PtyCloseRequest, opts ...grpc.CallOption) (*PtySessionCloseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PtySessionCloseResponse)
+	err := c.cc.Invoke(ctx, SandboxService_PtyClose_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxServiceClient) PtyExec(ctx context.Context, in *PtyExecRequest, opts ...grpc.CallOption) (*PtyExecResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PtyExecResponse)
+	err := c.cc.Invoke(ctx, SandboxService_PtyExec_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SandboxServiceServer is the server API for SandboxService service.
 // All implementations must embed UnimplementedSandboxServiceServer
 // for forward compatibility.
@@ -697,6 +843,9 @@ type SandboxServiceServer interface {
 	// Errors:
 	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
 	Extend(context.Context, *ExtendSandboxRequest) (*JsonView, error)
+	// Replaces the sandbox's per-VM network-idle suspension policy and rearms
+	// its idle clock. Zero disables network-idle suspension.
+	SetIdleTimeout(context.Context, *SetIdleTimeoutRequest) (*JsonView, error)
 	// Retrieves real-time performance and utilization metrics for the microVM.
 	// Includes CPU utilization, memory footprint, virtio block/net throughput, and guest metrics.
 	//
@@ -818,6 +967,66 @@ type SandboxServiceServer interface {
 	// Restores this sandbox identity to one immutable retained recovery point.
 	// The current VM remains authoritative until the replacement is ready to cut over.
 	Rollback(context.Context, *RollbackSandboxRequest) (*JsonView, error)
+	// Resizes sandbox resources. A running sandbox is stopped, resized, and
+	// cold-booted; a stopped sandbox is resized in place and boots with the new
+	// shape on the next Resume. Disk state survives, in-memory state does not.
+	//
+	// `cpus` and `memory_mib` replace the VM shape. `disk_mb` may only grow the
+	// root disk. Disk growth is transactional: the RPC succeeds only after the
+	// ext4 filesystem grows, and any resize or reboot failure restores the
+	// original disk and VM shape.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `invalid` (INVALID_ARGUMENT): No fields set, zero sizes, a `disk_mb` shrink,
+	//     or disk growth requested on a host without e2fsprogs.
+	//   - `busy` (UNAVAILABLE): The sandbox is mid-transition, or it was created with
+	//     secrets this server process no longer holds (daemon restarted since create).
+	Resize(context.Context, *ResizeSandboxRequest) (*JsonView, error)
+	// Opens a server-persistent interactive PTY session inside the sandbox.
+	//
+	// The first ExecInput must carry `pty_open`; later inputs carry `stdin`,
+	// `resize`, or `eof`. The first ExecOutput carries `pty` with the assigned
+	// session id, then live output chunks. The session and its guest process are
+	// guest-agent state: they survive client disconnects, sandbox suspend/resume,
+	// and are inherited by forks, until closed or the sandbox stops.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `busy` (RESOURCE_EXHAUSTED): The per-sandbox session cap (128) is reached.
+	PtyOpen(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error
+	// Reattaches to a persistent PTY session by id.
+	//
+	// The first ExecInput must carry `pty_attach`. The first ExecOutput carries
+	// `pty`, followed by the retained scrollback replayed as output chunks, then
+	// live output. Attaching a session whose sandbox is suspended resumes the
+	// sandbox first.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	PtyAttach(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error
+	// Lists persistent PTY sessions, including recently exited ones (retained ~60s).
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified sandbox ID does not exist.
+	PtyList(context.Context, *SandboxRef) (*PtySessionList, error)
+	// Terminates a persistent PTY session's process (SIGKILL) and removes the session.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	PtyClose(context.Context, *PtyCloseRequest) (*PtySessionCloseResponse, error)
+	// Runs a command in a persistent PTY session's context and captures its output.
+	//
+	// The command executes through `sh -c` as a sibling process sharing the
+	// session leader's working directory and environment; it never writes into
+	// the interactive stream. Output capture is bounded (1 MiB per stream).
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The sandbox or session id does not exist.
+	//   - `not_running` (FAILED_PRECONDITION): The sandbox is not running.
+	//   - `invalid` (INVALID_ARGUMENT): Empty command.
+	PtyExec(context.Context, *PtyExecRequest) (*PtyExecResponse, error)
 	mustEmbedUnimplementedSandboxServiceServer()
 }
 
@@ -863,6 +1072,9 @@ func (UnimplementedSandboxServiceServer) Suspend(context.Context, *SandboxRef) (
 }
 func (UnimplementedSandboxServiceServer) Extend(context.Context, *ExtendSandboxRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Extend not implemented")
+}
+func (UnimplementedSandboxServiceServer) SetIdleTimeout(context.Context, *SetIdleTimeoutRequest) (*JsonView, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetIdleTimeout not implemented")
 }
 func (UnimplementedSandboxServiceServer) Metrics(context.Context, *SandboxRef) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Metrics not implemented")
@@ -920,6 +1132,24 @@ func (UnimplementedSandboxServiceServer) History(context.Context, *SandboxRef) (
 }
 func (UnimplementedSandboxServiceServer) Rollback(context.Context, *RollbackSandboxRequest) (*JsonView, error) {
 	return nil, status.Error(codes.Unimplemented, "method Rollback not implemented")
+}
+func (UnimplementedSandboxServiceServer) Resize(context.Context, *ResizeSandboxRequest) (*JsonView, error) {
+	return nil, status.Error(codes.Unimplemented, "method Resize not implemented")
+}
+func (UnimplementedSandboxServiceServer) PtyOpen(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error {
+	return status.Error(codes.Unimplemented, "method PtyOpen not implemented")
+}
+func (UnimplementedSandboxServiceServer) PtyAttach(grpc.BidiStreamingServer[ExecInput, ExecOutput]) error {
+	return status.Error(codes.Unimplemented, "method PtyAttach not implemented")
+}
+func (UnimplementedSandboxServiceServer) PtyList(context.Context, *SandboxRef) (*PtySessionList, error) {
+	return nil, status.Error(codes.Unimplemented, "method PtyList not implemented")
+}
+func (UnimplementedSandboxServiceServer) PtyClose(context.Context, *PtyCloseRequest) (*PtySessionCloseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PtyClose not implemented")
+}
+func (UnimplementedSandboxServiceServer) PtyExec(context.Context, *PtyExecRequest) (*PtyExecResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PtyExec not implemented")
 }
 func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
 func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
@@ -1136,6 +1366,24 @@ func _SandboxService_Extend_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxServiceServer).Extend(ctx, req.(*ExtendSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_SetIdleTimeout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetIdleTimeoutRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).SetIdleTimeout(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_SetIdleTimeout_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).SetIdleTimeout(ctx, req.(*SetIdleTimeoutRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1446,6 +1694,92 @@ func _SandboxService_Rollback_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxService_Resize_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResizeSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).Resize(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_Resize_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).Resize(ctx, req.(*ResizeSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_PtyOpen_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SandboxServiceServer).PtyOpen(&grpc.GenericServerStream[ExecInput, ExecOutput]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_PtyOpenServer = grpc.BidiStreamingServer[ExecInput, ExecOutput]
+
+func _SandboxService_PtyAttach_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SandboxServiceServer).PtyAttach(&grpc.GenericServerStream[ExecInput, ExecOutput]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SandboxService_PtyAttachServer = grpc.BidiStreamingServer[ExecInput, ExecOutput]
+
+func _SandboxService_PtyList_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).PtyList(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_PtyList_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).PtyList(ctx, req.(*SandboxRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_PtyClose_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PtyCloseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).PtyClose(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_PtyClose_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).PtyClose(ctx, req.(*PtyCloseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_PtyExec_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PtyExecRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).PtyExec(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_PtyExec_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).PtyExec(ctx, req.(*PtyExecRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1492,6 +1826,10 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Extend",
 			Handler:    _SandboxService_Extend_Handler,
+		},
+		{
+			MethodName: "SetIdleTimeout",
+			Handler:    _SandboxService_SetIdleTimeout_Handler,
 		},
 		{
 			MethodName: "Metrics",
@@ -1553,6 +1891,22 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Rollback",
 			Handler:    _SandboxService_Rollback_Handler,
 		},
+		{
+			MethodName: "Resize",
+			Handler:    _SandboxService_Resize_Handler,
+		},
+		{
+			MethodName: "PtyList",
+			Handler:    _SandboxService_PtyList_Handler,
+		},
+		{
+			MethodName: "PtyClose",
+			Handler:    _SandboxService_PtyClose_Handler,
+		},
+		{
+			MethodName: "PtyExec",
+			Handler:    _SandboxService_PtyExec_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -1587,6 +1941,18 @@ var SandboxService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "Attach",
 			Handler:       _SandboxService_Attach_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "PtyOpen",
+			Handler:       _SandboxService_PtyOpen_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "PtyAttach",
+			Handler:       _SandboxService_PtyAttach_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "vmon/v1/api.proto",
@@ -2448,6 +2814,212 @@ var PoolService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Delete",
 			Handler:    _PoolService_Delete_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "vmon/v1/api.proto",
+}
+
+const (
+	VpcService_Create_FullMethodName = "/vmon.v1.VpcService/Create"
+	VpcService_List_FullMethodName   = "/vmon.v1.VpcService/List"
+	VpcService_Delete_FullMethodName = "/vmon.v1.VpcService/Delete"
+)
+
+// VpcServiceClient is the client API for VpcService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// VpcService manages private layer-2 networks that sandbox NICs attach to.
+// VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+// macOS hosts reject every VPC operation with `invalid`.
+type VpcServiceClient interface {
+	// Creates a VPC with an optional name and IPv4 CIDR (default 10.77.0.0/16).
+	//
+	// Errors:
+	//   - `invalid` (INVALID_ARGUMENT): Malformed CIDR, or the host cannot back VPCs.
+	Create(ctx context.Context, in *VpcCreateRequest, opts ...grpc.CallOption) (*Vpc, error)
+	// Lists VPCs.
+	List(ctx context.Context, in *ListVpcsRequest, opts ...grpc.CallOption) (*VpcList, error)
+	// Deletes a VPC with no attached sandboxes.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified VPC ID does not exist.
+	//   - `busy` (ABORTED): Sandboxes are still attached to the VPC.
+	Delete(ctx context.Context, in *VpcRef, opts ...grpc.CallOption) (*Ok, error)
+}
+
+type vpcServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewVpcServiceClient(cc grpc.ClientConnInterface) VpcServiceClient {
+	return &vpcServiceClient{cc}
+}
+
+func (c *vpcServiceClient) Create(ctx context.Context, in *VpcCreateRequest, opts ...grpc.CallOption) (*Vpc, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Vpc)
+	err := c.cc.Invoke(ctx, VpcService_Create_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vpcServiceClient) List(ctx context.Context, in *ListVpcsRequest, opts ...grpc.CallOption) (*VpcList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VpcList)
+	err := c.cc.Invoke(ctx, VpcService_List_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vpcServiceClient) Delete(ctx context.Context, in *VpcRef, opts ...grpc.CallOption) (*Ok, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ok)
+	err := c.cc.Invoke(ctx, VpcService_Delete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// VpcServiceServer is the server API for VpcService service.
+// All implementations must embed UnimplementedVpcServiceServer
+// for forward compatibility.
+//
+// VpcService manages private layer-2 networks that sandbox NICs attach to.
+// VPCs are backed by per-VPC host bridges and exist on Linux/KVM hosts only;
+// macOS hosts reject every VPC operation with `invalid`.
+type VpcServiceServer interface {
+	// Creates a VPC with an optional name and IPv4 CIDR (default 10.77.0.0/16).
+	//
+	// Errors:
+	//   - `invalid` (INVALID_ARGUMENT): Malformed CIDR, or the host cannot back VPCs.
+	Create(context.Context, *VpcCreateRequest) (*Vpc, error)
+	// Lists VPCs.
+	List(context.Context, *ListVpcsRequest) (*VpcList, error)
+	// Deletes a VPC with no attached sandboxes.
+	//
+	// Errors:
+	//   - `not_found` (NOT_FOUND): The specified VPC ID does not exist.
+	//   - `busy` (ABORTED): Sandboxes are still attached to the VPC.
+	Delete(context.Context, *VpcRef) (*Ok, error)
+	mustEmbedUnimplementedVpcServiceServer()
+}
+
+// UnimplementedVpcServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedVpcServiceServer struct{}
+
+func (UnimplementedVpcServiceServer) Create(context.Context, *VpcCreateRequest) (*Vpc, error) {
+	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
+}
+func (UnimplementedVpcServiceServer) List(context.Context, *ListVpcsRequest) (*VpcList, error) {
+	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+}
+func (UnimplementedVpcServiceServer) Delete(context.Context, *VpcRef) (*Ok, error) {
+	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedVpcServiceServer) mustEmbedUnimplementedVpcServiceServer() {}
+func (UnimplementedVpcServiceServer) testEmbeddedByValue()                    {}
+
+// UnsafeVpcServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to VpcServiceServer will
+// result in compilation errors.
+type UnsafeVpcServiceServer interface {
+	mustEmbedUnimplementedVpcServiceServer()
+}
+
+func RegisterVpcServiceServer(s grpc.ServiceRegistrar, srv VpcServiceServer) {
+	// If the following call panics, it indicates UnimplementedVpcServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&VpcService_ServiceDesc, srv)
+}
+
+func _VpcService_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VpcCreateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VpcServiceServer).Create(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VpcService_Create_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VpcServiceServer).Create(ctx, req.(*VpcCreateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VpcService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListVpcsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VpcServiceServer).List(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VpcService_List_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VpcServiceServer).List(ctx, req.(*ListVpcsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VpcService_Delete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VpcRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VpcServiceServer).Delete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VpcService_Delete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VpcServiceServer).Delete(ctx, req.(*VpcRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// VpcService_ServiceDesc is the grpc.ServiceDesc for VpcService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var VpcService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vmon.v1.VpcService",
+	HandlerType: (*VpcServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Create",
+			Handler:    _VpcService_Create_Handler,
+		},
+		{
+			MethodName: "List",
+			Handler:    _VpcService_List_Handler,
+		},
+		{
+			MethodName: "Delete",
+			Handler:    _VpcService_Delete_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
