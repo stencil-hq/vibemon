@@ -26,7 +26,9 @@ pub(super) const EDEADLK: i32 = 35;
 pub(super) const ENAMETOOLONG: i32 = 36;
 pub(super) const ENOSYS: i32 = 38;
 pub(super) const ENOTEMPTY: i32 = 39;
+#[cfg(any(target_os = "macos", all(test, not(target_os = "windows"))))]
 pub(super) const ELOOP: i32 = 40;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(super) const EOVERFLOW: i32 = 75;
 pub(super) const EOPNOTSUPP: i32 = 95;
 pub(super) const EADDRINUSE: i32 = 98;

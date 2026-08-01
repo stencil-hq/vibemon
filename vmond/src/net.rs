@@ -96,6 +96,10 @@ pub const USER_NET_DNS: [&str; 1] = ["10.0.2.3"];
 ///
 /// Linux reads the kernel's `/proc/net/dev` counters; unsupported platforms and
 /// unreadable counter files report no available counters.
+#[cfg_attr(
+	not(target_os = "linux"),
+	allow(clippy::missing_const_for_fn, reason = "Linux reads runtime network counters.")
+)]
 pub(crate) fn host_network_bytes() -> Option<(u64, u64)> {
 	#[cfg(target_os = "linux")]
 	{
@@ -2138,6 +2142,10 @@ impl DomainRefresher {
 	}
 
 	/// Remove every applied address for `target` (fail-closed cleanup).
+	#[cfg_attr(
+		not(target_os = "linux"),
+		allow(clippy::missing_const_for_fn, reason = "Linux performs runtime firewall cleanup.")
+	)]
 	fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
 		#[cfg(not(target_os = "linux"))]
 		let _ = (name, target, applied);
