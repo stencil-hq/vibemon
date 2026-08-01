@@ -96,7 +96,7 @@ pub const USER_NET_DNS: [&str; 1] = ["10.0.2.3"];
 ///
 /// Linux reads the kernel's `/proc/net/dev` counters; unsupported platforms and
 /// unreadable counter files report no available counters.
-pub(crate) const fn host_network_bytes() -> Option<(u64, u64)> {
+pub(crate) fn host_network_bytes() -> Option<(u64, u64)> {
 	#[cfg(target_os = "linux")]
 	{
 		Some(parse_proc_net_dev(&fs::read_to_string(PROC_NET_DEV).ok()?))
@@ -2138,7 +2138,7 @@ impl DomainRefresher {
 	}
 
 	/// Remove every applied address for `target` (fail-closed cleanup).
-	const fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
+	fn purge(name: &str, target: &RefreshTarget, applied: &BTreeMap<String, usize>) {
 		#[cfg(not(target_os = "linux"))]
 		let _ = (name, target, applied);
 		#[cfg(target_os = "linux")]
