@@ -2942,9 +2942,12 @@ impl MeshReplicaStore for MeshRuntime {
 				params,
 				false,
 			)
-			.map_err(engine_to_mesh)?
-			.with_object_key(object_key)
 			.map_err(engine_to_mesh)?;
+			let local = if object_key.is_empty() {
+				local
+			} else {
+				local.with_object_key(object_key).map_err(engine_to_mesh)?
+			};
 			self.replicas.put_record(local).map_err(engine_to_mesh)?;
 			self.sweep_replica_cache();
 			Ok(())

@@ -1320,7 +1320,6 @@ async fn mesh_replica_receive(
 	};
 	let name = string_or(params.get("name"), String::new());
 	if digest.is_empty()
-		|| object_key.is_empty()
 		|| source_url.is_empty()
 		|| source_node.is_empty()
 		|| source_epoch.is_none()
@@ -1329,8 +1328,8 @@ async fn mesh_replica_receive(
 	{
 		return Err(MeshRouteError::detail(
 			StatusCode::UNPROCESSABLE_ENTITY,
-			"digest, object_key, source_url, source_node, source_epoch, checkpoint_generation, and \
-			 params.name are required",
+			"digest, source_url, source_node, source_epoch, checkpoint_generation, and params.name \
+			 are required",
 		));
 	}
 	if state.engine.has_sandbox(&name) {
