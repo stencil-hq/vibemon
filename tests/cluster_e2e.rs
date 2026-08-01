@@ -1342,6 +1342,15 @@ fn two_node_migrate_moves_running_sandbox() {
 			(&gateway_b, &gateway_a, node_a.as_str())
 		};
 
+		let (exit, stdout, stderr) = exec_capture(
+			source,
+			&sid,
+			&["/bin/sh", "-c", "printf %s \"$MIGRATION_SECRET\""],
+			Duration::from_secs(30),
+		);
+		assert_eq!(exit, 0, "pre-migration secret read failed stdout={stdout:?} stderr={stderr:?}");
+		assert_eq!(stdout, secret_marker, "secret binding was absent before migration");
+
 		// One marker in guest RAM (tmpfs) and one on the writable rootfs: live
 		// migration must ship both the final RAM delta and the disk block delta.
 		let write_markers = format!(
