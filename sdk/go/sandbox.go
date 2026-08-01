@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -304,6 +305,124 @@ func (sandbox *Sandbox) Suspend(ctx context.Context) (*Sandbox, error) {
 	})
 }
 
+// Resize changes CPU or memory and grows the root disk.
+func (sandbox *Sandbox) Resize(ctx context.Context, options ResizeOptions) (*Sandbox, error) {
+	request := &pb.ResizeSandboxRequest{Id: sandbox.ID}
+	if options.CPUs != 0 {
+		request.Cpus = &options.CPUs
+	}
+	if options.MemoryMiB != 0 {
+		request.MemoryMib = &options.MemoryMiB
+	}
+	if options.DiskMB != 0 {
+		request.DiskMb = &options.DiskMB
+	}
+	return sandbox.action(ctx, "resize sandbox", func(
+		ctx context.Context,
+		service pb.SandboxServiceClient,
+		opts ...grpc.CallOption,
+	) (*pb.JsonView, error) {
+		return service.Resize(ctx, request, opts...)
+	})
+}
+
+// PtyList lists persistent terminal sessions owned by this sandbox.
+func (sandbox *Sandbox) PtyList(ctx context.Context) ([]PtySessionInfo, error) {
+	var response *pb.PtySessionList
+	err := sandbox.invoke(ctx, "list pty sessions", func(
+		ctx context.Context,
+		service pb.SandboxServiceClient,
+		opts ...grpc.CallOption,
+	) error {
+		var callErr error
+		response, callErr = service.PtyList(ctx, &pb.SandboxRef{Id: sandbox.ID}, opts...)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	sessions := response.GetSessions()
+	out := make([]PtySessionInfo, 0, len(sessions))
+	for _, session := range sessions {
+		out = append(out, ptySessionInfo(session))
+	}
+	return out, nil
+}
+
+// PtyClose terminates one persistent terminal session.
+func (sandbox *Sandbox) PtyClose(ctx context.Context, sessionID string) (PtyCloseResult, error) {
+	if sessionID == "" {
+		return PtyCloseResult{}, errors.New("vmon: pty session id must not be empty")
+	}
+	var response *pb.PtySessionCloseResponse
+	err := sandbox.invoke(ctx, "close pty session", func(
+		ctx context.Context,
+		service pb.SandboxServiceClient,
+		opts ...grpc.CallOption,
+	) error {
+		var callErr error
+		response, callErr = service.PtyClose(
+			ctx,
+			&pb.PtyCloseRequest{Id: sandbox.ID, SessionId: sessionID},
+			opts...,
+		)
+		return callErr
+	})
+	if err != nil {
+		return PtyCloseResult{}, err
+	}
+	return PtyCloseResult{SessionID: response.GetSessionId(), ExitCode: response.ExitCode}, nil
+}
+
+// PtyExec runs a captured command as a sibling in a persistent terminal context.
+func (sandbox *Sandbox) PtyExec(
+	ctx context.Context,
+	sessionID string,
+	command string,
+	timeout *float64,
+) (ExecResult, error) {
+	if sessionID == "" {
+		return ExecResult{}, errors.New("vmon: pty session id must not be empty")
+	}
+	if command == "" {
+		return ExecResult{}, errors.New("vmon: pty exec command must not be empty")
+	}
+	var response *pb.PtyExecResponse
+	err := sandbox.invoke(ctx, "exec in pty session", func(
+		ctx context.Context,
+		service pb.SandboxServiceClient,
+		opts ...grpc.CallOption,
+	) error {
+		var callErr error
+		response, callErr = service.PtyExec(ctx, &pb.PtyExecRequest{
+			Id: sandbox.ID, SessionId: sessionID, Command: command, Timeout: timeout,
+		}, opts...)
+		return callErr
+	})
+	if err != nil {
+		return ExecResult{}, err
+	}
+	return ExecResult{
+		ExitCode: response.GetCode(),
+		Stdout:   response.GetStdout(),
+		Stderr:   response.GetStderr(),
+	}, nil
+}
+
+func ptySessionInfo(session *pb.PtySession) PtySessionInfo {
+	return PtySessionInfo{
+		SessionID:           session.GetSessionId(),
+		Running:             session.GetRunning(),
+		ExitCode:            session.ExitCode,
+		Cols:                session.GetCols(),
+		Rows:                session.GetRows(),
+		Exec:                session.Exec,
+		CreatedAtUnixMillis: session.GetCreatedAtUnixMillis(),
+		AttachedCount:       session.GetAttachedCount(),
+		Suspended:           session.GetSuspended(),
+	}
+}
+
 // History lists immutable disk and checkpoint recovery points from oldest to newest.
 func (sandbox *Sandbox) History(ctx context.Context) ([]RecoveryPoint, error) {
 	var response *pb.RecoveryPointList
@@ -342,6 +461,16 @@ func (sandbox *Sandbox) Rollback(ctx context.Context, recoveryPoint string) (*Sa
 func (sandbox *Sandbox) Extend(ctx context.Context, seconds uint64) (*Sandbox, error) {
 	return sandbox.action(ctx, "extend sandbox", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
 		return service.Extend(ctx, &pb.ExtendSandboxRequest{Id: sandbox.ID, Secs: seconds}, opts...)
+	})
+}
+
+// SetIdleTimeout replaces and rearms the network-idle suspension policy; zero disables it.
+func (sandbox *Sandbox) SetIdleTimeout(ctx context.Context, seconds float64) (*Sandbox, error) {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 {
+		return nil, errors.New("vmon: idle timeout seconds must be non-negative")
+	}
+	return sandbox.action(ctx, "set sandbox idle timeout", func(ctx context.Context, service pb.SandboxServiceClient, opts ...grpc.CallOption) (*pb.JsonView, error) {
+		return service.SetIdleTimeout(ctx, &pb.SetIdleTimeoutRequest{Id: sandbox.ID, IdleTimeoutSecs: &seconds}, opts...)
 	})
 }
 

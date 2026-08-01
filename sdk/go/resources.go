@@ -454,6 +454,85 @@ func (s *PoolService) Clear(ctx context.Context) error {
 	return nil
 }
 
+// VpcService manages routed private networks.
+type VpcService struct{ client *Client }
+
+// Vpcs returns the routed private-network service.
+func (client *Client) Vpcs() *VpcService { return &VpcService{client: client} }
+
+// Create provisions a routed private network.
+func (service *VpcService) Create(ctx context.Context, options VPCCreateOptions) (VPC, error) {
+	var response *pb.Vpc
+	_, err := service.client.unary(ctx, "", "create vpc", func(
+		ctx context.Context,
+		conn grpc.ClientConnInterface,
+		opts ...grpc.CallOption,
+	) error {
+		var callErr error
+		response, callErr = pb.NewVpcServiceClient(conn).Create(ctx, &pb.VpcCreateRequest{
+			Name: options.Name,
+			Cidr: options.CIDR,
+		}, opts...)
+		return callErr
+	})
+	if err != nil {
+		return VPC{}, err
+	}
+	return vpcFromProto(response), nil
+}
+
+// List lists routed private networks.
+func (service *VpcService) List(ctx context.Context) ([]VPC, error) {
+	var response *pb.VpcList
+	_, err := service.client.unary(ctx, "", "list vpcs", func(
+		ctx context.Context,
+		conn grpc.ClientConnInterface,
+		opts ...grpc.CallOption,
+	) error {
+		var callErr error
+		response, callErr = pb.NewVpcServiceClient(conn).List(
+			ctx,
+			&pb.ListVpcsRequest{},
+			opts...,
+		)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	vpcs := response.GetVpcs()
+	out := make([]VPC, 0, len(vpcs))
+	for _, vpc := range vpcs {
+		out = append(out, vpcFromProto(vpc))
+	}
+	return out, nil
+}
+
+// Delete removes an unattached routed private network.
+func (service *VpcService) Delete(ctx context.Context, id string) error {
+	if id == "" {
+		return errors.New("vmon: vpc id must not be empty")
+	}
+	_, err := service.client.unary(ctx, "", "delete vpc", func(
+		ctx context.Context,
+		conn grpc.ClientConnInterface,
+		opts ...grpc.CallOption,
+	) error {
+		_, callErr := pb.NewVpcServiceClient(conn).Delete(ctx, &pb.VpcRef{Id: id}, opts...)
+		return callErr
+	})
+	return err
+}
+
+func vpcFromProto(vpc *pb.Vpc) VPC {
+	return VPC{
+		ID:                  vpc.GetId(),
+		Name:                vpc.GetName(),
+		CIDR:                vpc.GetCidr(),
+		CreatedAtUnixMillis: vpc.GetCreatedAtUnixMillis(),
+	}
+}
+
 // MeshService monitors mesh cluster topology.
 type MeshService struct{ client *Client }
 

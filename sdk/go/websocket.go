@@ -227,6 +227,146 @@ func (sandbox *Sandbox) Exec(ctx context.Context, request ExecRequest) (*Process
 	return process, nil
 }
 
+// PtyStream is one client attachment to a server-persistent terminal session.
+// Detaching closes only this stream and leaves the guest process running.
+type PtyStream struct {
+	process *Process
+	Info    PtySessionInfo
+}
+
+// PtyOpen creates a persistent terminal session and consumes its metadata frame.
+func (sandbox *Sandbox) PtyOpen(ctx context.Context, options PtyOpenOptions) (*PtyStream, error) {
+	start := &pb.PtyOpenStart{
+		SandboxId: sandbox.ID,
+		SessionId: options.SessionID,
+		Cols:      options.Cols,
+		Rows:      options.Rows,
+		Env:       options.Env,
+	}
+	if options.Exec != "" {
+		start.Exec = &options.Exec
+	}
+	if options.Workdir != "" {
+		start.Workdir = &options.Workdir
+	}
+	return sandbox.openPtyStream(ctx, "open pty session", func(
+		service pb.SandboxServiceClient,
+		streamCtx context.Context,
+	) (grpc.BidiStreamingClient[pb.ExecInput, pb.ExecOutput], *pb.ExecInput, error) {
+		stream, err := service.PtyOpen(streamCtx)
+		return stream, &pb.ExecInput{Input: &pb.ExecInput_PtyOpen{PtyOpen: start}}, err
+	})
+}
+
+// PtyAttach reconnects to a persistent terminal session by stable identifier.
+func (sandbox *Sandbox) PtyAttach(
+	ctx context.Context,
+	sessionID string,
+	options PtyAttachOptions,
+) (*PtyStream, error) {
+	if sessionID == "" {
+		return nil, errors.New("vmon: pty session id must not be empty")
+	}
+	start := &pb.PtyAttachStart{SandboxId: sandbox.ID, SessionId: sessionID}
+	if options.Cols != 0 {
+		start.Cols = &options.Cols
+	}
+	if options.Rows != 0 {
+		start.Rows = &options.Rows
+	}
+	return sandbox.openPtyStream(ctx, "attach pty session", func(
+		service pb.SandboxServiceClient,
+		streamCtx context.Context,
+	) (grpc.BidiStreamingClient[pb.ExecInput, pb.ExecOutput], *pb.ExecInput, error) {
+		stream, err := service.PtyAttach(streamCtx)
+		return stream, &pb.ExecInput{Input: &pb.ExecInput_PtyAttach{PtyAttach: start}}, err
+	})
+}
+
+func (sandbox *Sandbox) openPtyStream(
+	ctx context.Context,
+	operation string,
+	open func(
+		pb.SandboxServiceClient,
+		context.Context,
+	) (grpc.BidiStreamingClient[pb.ExecInput, pb.ExecOutput], *pb.ExecInput, error),
+) (*PtyStream, error) {
+	conn, err := sandbox.streamConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stream, first, err := open(pb.NewSandboxServiceClient(conn), streamCtx)
+	if err != nil {
+		cancel()
+		return nil, apiErrorFromStatus(err, operation)
+	}
+	process := &Process{stream: stream, cancel: cancel}
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	if err := process.send(first, operation); err != nil {
+		_ = process.closeWithState()
+		return nil, err
+	}
+	output, err := stream.Recv()
+	if err != nil {
+		_ = process.closeWithState()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, apiErrorFromStatus(err, operation, stream.Trailer())
+	}
+	session := output.GetPty()
+	if session == nil || session.GetSessionId() == "" {
+		_ = process.closeWithState()
+		return nil, &ProtocolError{Operation: operation, Message: "missing pty session metadata"}
+	}
+	return &PtyStream{process: process, Info: ptySessionInfo(session)}, nil
+}
+
+// Receive waits for one output or exit frame.
+func (stream *PtyStream) Receive(ctx context.Context) (ExecEvent, error) {
+	if stream == nil || stream.process == nil {
+		return ExecEvent{}, errors.New("vmon: pty stream is not open")
+	}
+	return stream.process.Receive(ctx)
+}
+
+// Write writes bytes to the terminal.
+func (stream *PtyStream) Write(ctx context.Context, data []byte) error {
+	if stream == nil || stream.process == nil {
+		return errors.New("vmon: pty stream is not open")
+	}
+	return stream.process.WriteStdin(ctx, data)
+}
+
+// Resize changes the terminal dimensions.
+func (stream *PtyStream) Resize(ctx context.Context, rows, columns uint16) error {
+	if stream == nil || stream.process == nil {
+		return errors.New("vmon: pty stream is not open")
+	}
+	return stream.process.Resize(ctx, rows, columns)
+}
+
+// Wait blocks until the persistent terminal process exits.
+func (stream *PtyStream) Wait(ctx context.Context) (ExecExit, error) {
+	if stream == nil || stream.process == nil {
+		return ExecExit{}, errors.New("vmon: pty stream is not open")
+	}
+	return stream.process.Wait(ctx)
+}
+
+// Detach disconnects this client while leaving the guest terminal session running.
+func (stream *PtyStream) Detach(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if stream == nil || stream.process == nil {
+		return nil
+	}
+	return stream.process.Close()
+}
+
 // send serializes one client frame onto the stream.
 func (process *Process) send(input *pb.ExecInput, operation string) error {
 	process.sendMu.Lock()

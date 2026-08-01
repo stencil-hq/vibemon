@@ -29,6 +29,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added Go SDK support for persistent PTY sessions, VM resizing, and VPC management
 - Added Freestyle compatibility facades for TypeScript, Python, and Go SDKs
 - Added Google Cloud Platform (GCP) deployment stack with Pulumi and automated rollout scripts
 - Added `--boot-concurrency` flag to bound concurrently booting local sandboxes

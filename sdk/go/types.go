@@ -204,6 +204,14 @@ type SandboxCreateRequest struct {
 	Timeout *float64 `json:"timeout,omitempty"`
 	// TimeoutSeconds is the sandbox idle timeout in seconds.
 	TimeoutSeconds *uint64 `json:"timeout_secs,omitempty"`
+	// IdleTimeoutSeconds is the network-idle reclaim timeout. A pointer to zero disables reclaim.
+	IdleTimeoutSeconds *uint64 `json:"idle_timeout_secs,omitempty"`
+	// ActivityThresholdBytes is the guest NIC byte threshold that still counts as idle.
+	ActivityThresholdBytes *uint64 `json:"activity_threshold_bytes,omitempty"`
+	// Persistence controls stored-state retention and storage-GC behavior.
+	Persistence *PersistencePolicy `json:"persistence,omitempty"`
+	// NICs attaches the sandbox to at most one routed VPC.
+	NICs []NIC `json:"nics,omitempty"`
 	// Workdir is the default guest working directory.
 	Workdir string `json:"workdir,omitempty"`
 	// Env contains non-secret environment variables.
@@ -221,7 +229,7 @@ type SandboxCreateRequest struct {
 	// FilesystemDirectory selects a host filesystem source where supported.
 	FilesystemDirectory string `json:"fs_dir,omitempty"`
 	// BlockNetwork disables guest network access.
-	BlockNetwork bool `json:"block_network,omitempty"`
+	BlockNetwork bool `json:"block_network"`
 	// Ports lists guest TCP ports to expose.
 	Ports []uint16 `json:"ports,omitempty"`
 	// EgressAllow lists allowed destination CIDRs.
@@ -345,6 +353,83 @@ type ExecRequest struct {
 	Timeout *float64 `json:"timeout,omitempty"`
 	// TTY requests a pseudoterminal.
 	TTY bool `json:"tty,omitempty"`
+}
+
+// PersistencePolicy controls sandbox stored-state retention.
+type PersistencePolicy struct {
+	// Type is persistent, sticky, or ephemeral.
+	Type string `json:"type"`
+	// Priority is used by sticky storage GC. Lower priorities are evicted first.
+	Priority *uint32 `json:"priority,omitempty"`
+}
+
+// NIC describes one routed VPC attachment.
+type NIC struct {
+	// VPC is the VPC identifier.
+	VPC string `json:"vpc"`
+	// IPv4 is either a requested address string or true for automatic assignment.
+	IPv4 any `json:"ipv4"`
+	// Default installs this NIC's default route.
+	Default bool `json:"default"`
+}
+
+// ResizeOptions describes optional sandbox resource changes.
+type ResizeOptions struct {
+	// CPUs is the new whole-vCPU count. Zero leaves it unchanged.
+	CPUs uint32
+	// MemoryMiB is the new memory size in MiB. Zero leaves it unchanged.
+	MemoryMiB uint32
+	// DiskMB is the new root disk size in MB. Zero leaves it unchanged.
+	DiskMB uint64
+}
+
+// PtyOpenOptions configures a persistent guest-owned terminal session.
+type PtyOpenOptions struct {
+	SessionID string
+	Cols      uint32
+	Rows      uint32
+	Exec      string
+	Env       map[string]string
+	Workdir   string
+}
+
+// PtyAttachOptions configures reattachment and an optional terminal resize.
+type PtyAttachOptions struct {
+	Cols uint32
+	Rows uint32
+}
+
+// PtySessionInfo describes one server-persistent terminal session.
+type PtySessionInfo struct {
+	SessionID           string
+	Running             bool
+	ExitCode            *int64
+	Cols                uint32
+	Rows                uint32
+	Exec                *string
+	CreatedAtUnixMillis int64
+	AttachedCount       uint32
+	Suspended           bool
+}
+
+// PtyCloseResult reports a closed terminal session.
+type PtyCloseResult struct {
+	SessionID string
+	ExitCode  *int64
+}
+
+// VPC describes one routed private network.
+type VPC struct {
+	ID                  string
+	Name                string
+	CIDR                string
+	CreatedAtUnixMillis int64
+}
+
+// VPCCreateOptions configures a routed private network.
+type VPCCreateOptions struct {
+	Name string
+	CIDR string
 }
 
 // ExecResult is the decoded captured-exec response.
