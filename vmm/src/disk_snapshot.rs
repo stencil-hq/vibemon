@@ -5,7 +5,7 @@
 //! device state and is restored by cold-booting with `rootfs.img`.
 
 use std::{
-	fs::{self, File, OpenOptions},
+	fs::{self, OpenOptions},
 	io::Write,
 	path::{Path, PathBuf},
 	sync::atomic::{AtomicU64, Ordering},
@@ -123,13 +123,19 @@ fn write_manifest(path: &Path, manifest: &DiskManifest) -> Result<()> {
 		.map_err(|e| err(format!("syncing disk recovery manifest {}: {e}", path.display())))
 }
 
+#[cfg_attr(
+	not(unix),
+	allow(clippy::unnecessary_wraps, reason = "Windows has no portable directory fsync")
+)]
 fn sync_dir(path: &Path) -> Result<()> {
 	#[cfg(unix)]
 	{
-		File::open(path)
+		fs::File::open(path)
 			.and_then(|file| file.sync_all())
 			.map_err(|e| err(format!("syncing directory {}: {e}", path.display())))?;
 	}
+	#[cfg(not(unix))]
+	let _ = path;
 	Ok(())
 }
 
@@ -206,7 +212,7 @@ mod tests {
 		let tmp = TestDir::new();
 		let source = tmp.path().join("source.img");
 		let point = tmp.path().join("point");
-		let mut source_file = File::create(&source).unwrap();
+		let mut source_file = fs::File::create(&source).unwrap();
 		source_file.write_all(b"before").unwrap();
 		source_file.sync_all().unwrap();
 		write_disk_point(&point, |image| {

@@ -48,12 +48,11 @@ use crate::{
 	},
 };
 
-/// Create `dest` as a copy-on-write reflink of `base` (instant on
-/// reflink-capable filesystems like btrfs/XFS), falling back to a full byte
-/// copy where the filesystem lacks reflink support (e.g. ext4). The destination
-/// must not exist: it is created exclusively without following a final symlink,
-/// and the returned file descriptor is the one handed to the block backend so a
-/// later path swap cannot make the guest open some other host file.
+/// Creates `dest` as an exclusive copy-on-write overlay of `base`.
+///
+/// Reflink-capable filesystems clone instantly; other filesystems copy the
+/// bytes. The returned descriptor remains bound to the created file even if
+/// an attacker later swaps its path.
 #[cfg(target_os = "windows")]
 pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	use std::io::{Read, Write};
@@ -86,6 +85,11 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	Ok(output)
 }
 
+/// Creates `dest` as an exclusive copy-on-write overlay of `base`.
+///
+/// Reflink-capable filesystems clone instantly; other filesystems copy the
+/// bytes. The returned descriptor remains bound to the created file even if
+/// an attacker later swaps its path.
 #[cfg(not(target_os = "windows"))]
 pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	let base_path_meta = fs::symlink_metadata(base)
@@ -290,7 +294,7 @@ fn clone_open_disk(source: &File, destination: &Path) -> Result<DiskCapture> {
 		.open(destination)
 		.map_err(|e| err(format!("creating disk recovery image: {e}")))?;
 	source.seek(SeekFrom::Start(0))?;
-	let mut buffer = [0u8; 64 * 1024];
+	let mut buffer = vec![0u8; 64 * 1024];
 	loop {
 		let read = source.read(&mut buffer)?;
 		if read == 0 {
