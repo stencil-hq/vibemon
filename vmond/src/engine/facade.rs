@@ -5548,20 +5548,23 @@ impl Engine {
 		)
 	}
 
-	/// Fail closed when runtime lease reconciliation cannot prove a local
-	/// candidate is still alive.
+	/// Prove that a locally registered running or paused candidate still owns a
+	/// live runtime. A half-launched VMM is not a candidate until its registry
+	/// record is durably installed.
 	pub(crate) fn candidate_is_running(&self, sid: &str) -> bool {
-		self.sandbox_is_running(&self.sandbox(sid)).unwrap_or(false)
+		self
+			.inner
+			.registry
+			.get(sid)
+			.is_some_and(|record| matches!(record.status.as_str(), "running" | "paused"))
+			&& self.sandbox_is_running(&self.sandbox(sid)).unwrap_or(false)
 	}
 
 	/// Re-arm the VMM owner watchdog after a mesh ownership renewal without
 	/// counting the renewal as guest activity. Live paused restore candidates
 	/// remain non-serving until their ownership commit completes.
 	pub(crate) fn mesh_rearm_owner_lease(&self, sid: &str, secs: u64) -> Result<()> {
-		let record = self.get_record(sid, false)?;
-		if !matches!(record.status.as_str(), "running" | "paused")
-			|| !self.sandbox_is_running(&self.sandbox(sid))?
-		{
+		if !self.candidate_is_running(sid) {
 			return Err(EngineError::busy(format!("sandbox '{sid}' is not a live local candidate")));
 		}
 		let mut control = control_for_vm(&self.sandbox(sid))?;
@@ -12800,6 +12803,21 @@ mod tests {
 				.last_active,
 			123.0
 		);
+	}
+
+	#[test]
+	fn pre_registry_launch_window_is_not_a_live_candidate() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let sid = "launching-candidate";
+		fs::create_dir_all(engine.sandbox(sid).dir()).expect("half-launched runtime");
+
+		assert!(
+			!engine.candidate_is_running(sid),
+			"runtime liveness alone must not expose a pre-registry launch"
+		);
+		engine.insert_test_record(VmRecord::new(sid, sid, "paused"));
+		assert!(engine.candidate_is_running(sid), "registered paused candidate should be live");
 	}
 
 	#[test]
