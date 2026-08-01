@@ -12,6 +12,7 @@ pub mod fs;
 #[cfg(target_os = "windows")]
 #[path = "fs_windows.rs"]
 pub mod fs;
+mod fuse_errno;
 pub mod mmio;
 pub mod net;
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
@@ -474,7 +475,7 @@ enum SharedSource {
 /// Fairness: each ready source gets one bounded servicing pass per poll wake
 /// ([`QUEUE_PASS_BUDGET`]); an exhausted pass re-arms its queue event instead
 /// of looping in place, so one saturated device cannot starve its siblings.
-/// Backend fds (tap, io_uring, ...) are level-triggered, so a bounded pass
+/// Backend fds (tap, `io_uring`, ...) are level-triggered, so a bounded pass
 /// there re-fires poll on its own.
 #[cfg(unix)]
 pub fn run_shared_worker(devices: Vec<DeviceWorker>, kill_evt: EventFd) -> Result<()> {

@@ -174,7 +174,7 @@ use vm_memory::GuestAddress;
 
 #[cfg(not(target_os = "windows"))]
 use super::fs;
-use super::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice};
+use super::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, fuse_errno as errno};
 
 #[cfg(target_os = "windows")]
 mod remote_fuse {
@@ -439,12 +439,6 @@ mod remote_fuse {
 
 #[cfg(target_os = "windows")]
 mod libc {
-	pub const EACCES: i32 = 13;
-	pub const EINVAL: i32 = 22;
-	pub const EIO: i32 = 5;
-	pub const ENOENT: i32 = 2;
-	pub const ENOSYS: i32 = 38;
-	pub const EROFS: i32 = 30;
 	pub const W_OK: i32 = 2;
 	pub const DT_DIR: u8 = 4;
 	pub const DT_REG: u8 = 8;
@@ -538,7 +532,7 @@ impl RemoteFsState {
 	}
 
 	fn call(&mut self, request: &proto::Request) -> std::result::Result<ProxyReply, i32> {
-		let payload = serde_json::to_vec(request).map_err(|_| -libc::EIO)?;
+		let payload = serde_json::to_vec(request).map_err(|_| -errno::EIO)?;
 
 		for _ in 0..2 {
 			if self.conn.is_none() {
@@ -567,7 +561,7 @@ impl RemoteFsState {
 				proto::OK_DATA => return Ok(ProxyReply::Data(payload)),
 				proto::ERR => {
 					let reply =
-						serde_json::from_slice::<proto::ErrReply>(&payload).map_err(|_| -libc::EIO)?;
+						serde_json::from_slice::<proto::ErrReply>(&payload).map_err(|_| -errno::EIO)?;
 					return Err(proxy_errno(&reply.code));
 				},
 				_ => {
@@ -576,7 +570,7 @@ impl RemoteFsState {
 			}
 		}
 
-		Err(-libc::EIO)
+		Err(-errno::EIO)
 	}
 
 	#[cfg(not(target_os = "windows"))]
@@ -609,16 +603,16 @@ impl RemoteFsState {
 	fn stat(&mut self, path: &str) -> std::result::Result<proto::StatReply, i32> {
 		let request = proto::Request::Stat { tag: self.tag.clone(), path: path.to_owned() };
 		match self.call(&request)? {
-			ProxyReply::Json(payload) => serde_json::from_slice(&payload).map_err(|_| -libc::EIO),
-			ProxyReply::Data(_) => Err(-libc::EIO),
+			ProxyReply::Json(payload) => serde_json::from_slice(&payload).map_err(|_| -errno::EIO),
+			ProxyReply::Data(_) => Err(-errno::EIO),
 		}
 	}
 
 	fn list(&mut self, path: &str) -> std::result::Result<proto::ListReply, i32> {
 		let request = proto::Request::List { tag: self.tag.clone(), path: path.to_owned() };
 		match self.call(&request)? {
-			ProxyReply::Json(payload) => serde_json::from_slice(&payload).map_err(|_| -libc::EIO),
-			ProxyReply::Data(_) => Err(-libc::EIO),
+			ProxyReply::Json(payload) => serde_json::from_slice(&payload).map_err(|_| -errno::EIO),
+			ProxyReply::Data(_) => Err(-errno::EIO),
 		}
 	}
 
@@ -627,7 +621,7 @@ impl RemoteFsState {
 			proto::Request::Read { tag: self.tag.clone(), path: path.to_owned(), offset, len };
 		match self.call(&request)? {
 			ProxyReply::Data(payload) => Ok(payload),
-			ProxyReply::Json(_) => Err(-libc::EIO),
+			ProxyReply::Json(_) => Err(-errno::EIO),
 		}
 	}
 
@@ -772,7 +766,7 @@ impl RemoteFsState {
 		};
 		let req_len = header.len as usize;
 		if req_len < fs::IN_HEADER_SIZE || req_len > req.len() {
-			return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+			return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 		}
 		let req = &req[..req_len];
 		let body_cap = writable
@@ -799,13 +793,13 @@ impl RemoteFsState {
 			},
 			fs::FUSE_LOOKUP => {
 				let Some(name) = request_name(req) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				let Some(parent) = self.path(header.nodeid) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::ENOENT, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::ENOENT, &[]);
 				};
 				let Some(path) = child_path(&parent, name) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				match self.stat(&path) {
 					Ok(stat) => {
@@ -830,7 +824,7 @@ impl RemoteFsState {
 				} else {
 					self
 						.path(header.nodeid)
-						.ok_or(-libc::ENOENT)
+						.ok_or(-errno::ENOENT)
 						.and_then(|path| self.stat(&path))
 				};
 				match stat {
@@ -848,23 +842,23 @@ impl RemoteFsState {
 			},
 			fs::FUSE_OPEN | fs::FUSE_OPENDIR => {
 				let Some(flags) = fs::read_struct::<u32>(req, fs::IN_HEADER_SIZE) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				if write_intent(flags) {
-					return fs::write_reply(mem, writable, header.unique, -libc::EROFS, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EROFS, &[]);
 				}
 				if self.path(header.nodeid).is_none() {
-					return fs::write_reply(mem, writable, header.unique, -libc::ENOENT, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::ENOENT, &[]);
 				}
 				let out = fs::FuseOpenOut { fh: header.nodeid, ..Default::default() };
 				fs::write_reply(mem, writable, header.unique, 0, fs::struct_bytes(&out))
 			},
 			fs::FUSE_READ => {
 				let Some(read) = fs::read_struct::<fs::FuseReadIn>(req, fs::IN_HEADER_SIZE) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				let Some(path) = self.path(header.nodeid) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::ENOENT, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::ENOENT, &[]);
 				};
 				let len = (read.size as usize).min(body_cap) as u32;
 				if len == 0 {
@@ -880,10 +874,10 @@ impl RemoteFsState {
 			},
 			fs::FUSE_READDIR | fs::FUSE_READDIRPLUS => {
 				let Some(read) = fs::read_struct::<fs::FuseReadIn>(req, fs::IN_HEADER_SIZE) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				let Some(path) = self.path(header.nodeid) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::ENOENT, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::ENOENT, &[]);
 				};
 				let max = (read.size as usize).min(body_cap);
 				let entries = if header.opcode == fs::FUSE_READDIRPLUS {
@@ -903,10 +897,10 @@ impl RemoteFsState {
 			},
 			fs::FUSE_ACCESS => {
 				let Some(mask) = fs::read_struct::<u32>(req, fs::IN_HEADER_SIZE) else {
-					return fs::write_reply(mem, writable, header.unique, -libc::EINVAL, &[]);
+					return fs::write_reply(mem, writable, header.unique, -errno::EINVAL, &[]);
 				};
 				let error = if mask & libc::W_OK as u32 != 0 {
-					-libc::EROFS
+					-errno::EROFS
 				} else {
 					0
 				};
@@ -918,7 +912,7 @@ impl RemoteFsState {
 			| fs::FUSE_FSYNC
 			| fs::FUSE_FSYNCDIR => fs::write_reply(mem, writable, header.unique, 0, &[]),
 			fs::FUSE_FORGET | fs::FUSE_BATCH_FORGET | fs::FUSE_INTERRUPT => 0,
-			fs::FUSE_READLINK => fs::write_reply(mem, writable, header.unique, -libc::ENOSYS, &[]),
+			fs::FUSE_READLINK => fs::write_reply(mem, writable, header.unique, -errno::ENOSYS, &[]),
 			fs::FUSE_SETATTR
 			| fs::FUSE_SYMLINK
 			| fs::FUSE_MKNOD
@@ -930,8 +924,8 @@ impl RemoteFsState {
 			| fs::FUSE_WRITE
 			| fs::FUSE_CREATE
 			| fs::FUSE_FALLOCATE
-			| fs::FUSE_RENAME2 => fs::write_reply(mem, writable, header.unique, -libc::EROFS, &[]),
-			_ => fs::write_reply(mem, writable, header.unique, -libc::ENOSYS, &[]),
+			| fs::FUSE_RENAME2 => fs::write_reply(mem, writable, header.unique, -errno::EROFS, &[]),
+			_ => fs::write_reply(mem, writable, header.unique, -errno::ENOSYS, &[]),
 		}
 	}
 }
@@ -946,11 +940,11 @@ struct DirentInfo {
 
 fn proxy_errno(code: &str) -> i32 {
 	match code {
-		"not_found" => -libc::ENOENT,
-		"access" => -libc::EACCES,
-		"bad_request" => -libc::EINVAL,
-		"stale" | "io" => -libc::EIO,
-		_ => -libc::EIO,
+		"not_found" => -errno::ENOENT,
+		"access" => -errno::EACCES,
+		"bad_request" => -errno::EINVAL,
+		"stale" | "io" => -errno::EIO,
+		_ => -errno::EIO,
 	}
 }
 
@@ -1438,16 +1432,20 @@ mod tests {
 		let mut device = RemoteFs::new("data".to_owned(), PathBuf::from("/missing/proxy.sock"));
 		assert_eq!(
 			run_op(&mut device, &fuse_request(fs::FUSE_WRITE, fs::FUSE_ROOT_ID, &[])).0,
-			-libc::EROFS
+			-errno::EROFS
 		);
 		assert_eq!(
 			run_op(&mut device, &fuse_request(fs::FUSE_MKDIR, fs::FUSE_ROOT_ID, b"new\0")).0,
-			-libc::EROFS
+			-errno::EROFS
 		);
 		let write_open = (libc::O_WRONLY as u32).to_le_bytes();
 		assert_eq!(
 			run_op(&mut device, &fuse_request(fs::FUSE_OPEN, fs::FUSE_ROOT_ID, &write_open)).0,
-			-libc::EROFS
+			-errno::EROFS
+		);
+		assert_eq!(
+			run_op(&mut device, &fuse_request(u32::MAX, fs::FUSE_ROOT_ID, &[])).0,
+			-errno::ENOSYS
 		);
 	}
 
@@ -1465,7 +1463,7 @@ mod tests {
 		proxy.join().expect("proxy stopped after first request");
 		assert_eq!(
 			run_op(&mut device, &fuse_request(fs::FUSE_LOOKUP, fs::FUSE_ROOT_ID, b"dir\0")).0,
-			-libc::EIO
+			-errno::EIO
 		);
 		drop(device);
 		stdfs::remove_dir_all(dir).expect("remove temp directory");

@@ -50,7 +50,10 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	snapshot::FsStateSer,
-	virtio::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid},
+	virtio::{
+		Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid,
+		fuse_errno as errno,
+	},
 };
 
 pub(super) const QUEUE_SIZE: u16 = 64;
@@ -641,8 +644,8 @@ const fn rename2_flags_supported(flags: u32) -> bool {
 
 /// Map a host I/O error to the negative FUSE errno the guest expects
 /// (defaulting to `-EIO` when the OS gave no errno, e.g. a Rust-side failure).
-fn neg_errno(e: &std::io::Error) -> i32 {
-	-e.raw_os_error().unwrap_or(libc::EIO)
+fn neg_errno(error: &std::io::Error) -> i32 {
+	-errno::from_io(error)
 }
 
 /// First NUL-terminated name in `buf[off..]` (the single-name request tail).
@@ -1248,7 +1251,7 @@ impl FsState {
 		let nodeid = h.nodeid;
 		let req_len = h.len as usize;
 		if req_len < IN_HEADER_SIZE || req_len > req.len() {
-			return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+			return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 		}
 		let req = &req[..req_len];
 		// Capacity available for the reply body (after the out-header).
@@ -1289,7 +1292,7 @@ impl FsState {
 			},
 			FUSE_LOOKUP => {
 				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let resolved = self
 					.inodes
@@ -1311,9 +1314,9 @@ impl FsState {
 							};
 							write_reply(mem, writable, unique, 0, struct_bytes(&out))
 						},
-						Err(_) => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+						Err(_) => write_reply(mem, writable, unique, -errno::ENOENT, &[]),
 					},
-					None => write_reply(mem, writable, unique, -libc::ENOENT, &[]),
+					None => write_reply(mem, writable, unique, -errno::ENOENT, &[]),
 				}
 			},
 			FUSE_READLINK => match self.confined_lstat_path(nodeid) {
@@ -1338,7 +1341,7 @@ impl FsState {
 						|| accmode == libc::O_RDWR as u32
 						|| flags & (libc::O_CREAT as u32 | libc::O_TRUNC as u32) != 0);
 				if read_only && wants_write {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				// Open the resolved, root-confined path without following a
 				// final-component symlink, then track the real fd so later
@@ -1360,7 +1363,7 @@ impl FsState {
 			},
 			FUSE_READ => {
 				let Some(rin) = read_struct::<FuseReadIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let want = (rin.size as usize).min(body_cap);
 				let mut buf = vec![0u8; want];
@@ -1396,7 +1399,7 @@ impl FsState {
 					},
 					Err(e) => write_reply(mem, writable, unique, neg_errno(&e), &[]),
 				},
-				None => write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+				None => write_reply(mem, writable, unique, -errno::EINVAL, &[]),
 			},
 			FUSE_STATFS => {
 				let st = FuseKstatfs { bsize: 4096, namelen: 255, frsize: 4096, ..Default::default() };
@@ -1444,14 +1447,14 @@ impl FsState {
 			FUSE_INTERRUPT => 0,
 			FUSE_CREATE => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(cin) = read_struct::<FuseCreateIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseCreateIn>())
 				else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(child) = self
 					.inodes
@@ -1459,7 +1462,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				// Create + open the child without following a final-component
 				// symlink: with O_CREAT|O_NOFOLLOW an already-present symlink at
@@ -1505,17 +1508,17 @@ impl FsState {
 			},
 			FUSE_WRITE => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(win) = read_struct::<FuseWriteIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let data_off = IN_HEADER_SIZE + std::mem::size_of::<FuseWriteIn>();
 				let Some(end) = data_off.checked_add(win.size as usize) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(data) = req.get(data_off..end) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				// Write through the tracked handle; fall back to a confined
 				// O_NOFOLLOW reopen by nodeid for a stale/unknown fh (post-
@@ -1538,10 +1541,10 @@ impl FsState {
 			},
 			FUSE_SETATTR => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(sin) = read_struct::<FuseSetattrIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let path = match self.confined_existing_path(nodeid) {
 					Ok(path) => path,
@@ -1572,14 +1575,14 @@ impl FsState {
 			},
 			FUSE_MKNOD => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(min) = read_struct::<FuseMknodIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMknodIn>())
 				else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(child) = self
 					.inodes
@@ -1587,13 +1590,13 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				#[allow(clippy::unnecessary_cast, reason = "S_IF* are c_int on macOS, c_uint on Linux")]
 				let (ifmt, ifreg) = (libc::S_IFMT as u32, libc::S_IFREG as u32);
 				let kind = min.mode & ifmt;
 				if kind != 0 && kind != ifreg {
-					return write_reply(mem, writable, unique, -libc::EOPNOTSUPP, &[]);
+					return write_reply(mem, writable, unique, -errno::EOPNOTSUPP, &[]);
 				}
 				let mut create = fs::OpenOptions::new();
 				create
@@ -1608,14 +1611,14 @@ impl FsState {
 			},
 			FUSE_MKDIR => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(min) = read_struct::<FuseMkdirIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseMkdirIn>())
 				else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(child) = self
 					.inodes
@@ -1623,7 +1626,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				match fs::DirBuilder::new()
 					.mode(min.mode & !min.umask & 0o7777)
@@ -1635,10 +1638,10 @@ impl FsState {
 			},
 			FUSE_UNLINK => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(child) = self
 					.inodes
@@ -1646,7 +1649,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				match fs::remove_file(&child) {
 					Ok(()) => {
@@ -1658,10 +1661,10 @@ impl FsState {
 			},
 			FUSE_RMDIR => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(name) = first_name(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(child) = self
 					.inodes
@@ -1669,7 +1672,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				match fs::remove_dir(&child) {
 					Ok(()) => {
@@ -1681,7 +1684,7 @@ impl FsState {
 			},
 			FUSE_RENAME | FUSE_RENAME2 => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				// v1 carries `fuse_rename_in { newdir }`; v2 `fuse_rename2_in {
 				// newdir, flags, padding }`, both followed by the two names.
@@ -1690,32 +1693,32 @@ impl FsState {
 						Some(r) => {
 							(r.newdir, r.flags, IN_HEADER_SIZE + std::mem::size_of::<FuseRename2In>())
 						},
-						None => return write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+						None => return write_reply(mem, writable, unique, -errno::EINVAL, &[]),
 					}
 				} else {
 					match read_struct::<FuseRenameIn>(req, IN_HEADER_SIZE) {
 						Some(r) => (r.newdir, 0, IN_HEADER_SIZE + std::mem::size_of::<FuseRenameIn>()),
-						None => return write_reply(mem, writable, unique, -libc::EINVAL, &[]),
+						None => return write_reply(mem, writable, unique, -errno::EINVAL, &[]),
 					}
 				};
 				let Some((oldname, newname)) = two_names(req, names_off) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let (Some(op), Some(np)) =
 					(self.inodes.get(&nodeid).cloned(), self.inodes.get(&newdir).cloned())
 				else {
-					return write_reply(mem, writable, unique, -libc::ENOENT, &[]);
+					return write_reply(mem, writable, unique, -errno::ENOENT, &[]);
 				};
 				let (Some(src), Some(dst)) =
 					(self.resolve_new_child(&op, oldname), self.resolve_new_child(&np, newname))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				if !rename2_flags_supported(flags) {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				}
 				if flags & RENAME_NOREPLACE != 0 && dst.exists() {
-					return write_reply(mem, writable, unique, -libc::EEXIST, &[]);
+					return write_reply(mem, writable, unique, -errno::EEXIST, &[]);
 				}
 				match fs::rename(&src, &dst) {
 					Ok(()) => {
@@ -1727,10 +1730,10 @@ impl FsState {
 			},
 			FUSE_SYMLINK => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some((name, target)) = two_names(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(link) = self
 					.inodes
@@ -1738,7 +1741,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				let target = PathBuf::from(OsStr::from_bytes(target));
 				match std::os::unix::fs::symlink(&target, &link) {
@@ -1748,14 +1751,14 @@ impl FsState {
 			},
 			FUSE_LINK => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(lin) = read_struct::<FuseLinkIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let Some(name) = first_name(req, IN_HEADER_SIZE + std::mem::size_of::<FuseLinkIn>())
 				else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				let src = match self.confined_existing_path(lin.oldnodeid) {
 					Ok(src) => src,
@@ -1767,7 +1770,7 @@ impl FsState {
 					.cloned()
 					.and_then(|parent| self.resolve_new_child(&parent, name))
 				else {
-					return write_reply(mem, writable, unique, -libc::EACCES, &[]);
+					return write_reply(mem, writable, unique, -errno::EACCES, &[]);
 				};
 				match fs::hard_link(&src, &dst) {
 					Ok(()) => self.reply_entry(mem, writable, unique, dst),
@@ -1776,16 +1779,16 @@ impl FsState {
 			},
 			FUSE_FALLOCATE => {
 				if read_only {
-					return write_reply(mem, writable, unique, -libc::EROFS, &[]);
+					return write_reply(mem, writable, unique, -errno::EROFS, &[]);
 				}
 				let Some(fin) = read_struct::<FuseFallocateIn>(req, IN_HEADER_SIZE) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				if fin.mode & !FALLOC_FL_KEEP_SIZE != 0 {
-					return write_reply(mem, writable, unique, -libc::EOPNOTSUPP, &[]);
+					return write_reply(mem, writable, unique, -errno::EOPNOTSUPP, &[]);
 				}
 				let Some(want) = fin.offset.checked_add(fin.length) else {
-					return write_reply(mem, writable, unique, -libc::EINVAL, &[]);
+					return write_reply(mem, writable, unique, -errno::EINVAL, &[]);
 				};
 				if fin.mode & FALLOC_FL_KEEP_SIZE != 0 {
 					return write_reply(mem, writable, unique, 0, &[]);
@@ -1807,7 +1810,7 @@ impl FsState {
 			},
 			// Unknown / still-unsupported opcodes (xattrs, readdirplus, ioctl,
 			// ...): -ENOSYS makes the guest stop asking and fall back where it can.
-			_ => write_reply(mem, writable, unique, -libc::ENOSYS, &[]),
+			_ => write_reply(mem, writable, unique, -errno::ENOSYS, &[]),
 		}
 	}
 }
@@ -2258,7 +2261,7 @@ mod tests {
 				&mut fs,
 				&fuse_request(FUSE_RENAME2, FUSE_ROOT_ID, &rename2_payload(flags, b"old", b"dst")),
 			);
-			assert_eq!(err, -libc::EINVAL, "unsupported rename2 flag rejected");
+			assert_eq!(err, -errno::EINVAL, "unsupported rename2 flag rejected");
 			assert_eq!(
 				fs::read(root.join("old")).unwrap(),
 				b"old",
@@ -2289,7 +2292,7 @@ mod tests {
 				&rename2_payload(RENAME_NOREPLACE, b"noreplace-src", b"noreplace-dst"),
 			),
 		);
-		assert_eq!(err, -libc::EEXIST, "RENAME_NOREPLACE still rejects existing dst");
+		assert_eq!(err, -errno::EEXIST, "RENAME_NOREPLACE still rejects existing dst");
 		assert_eq!(fs::read(root.join("noreplace-src")).unwrap(), b"src");
 		assert_eq!(fs::read(root.join("noreplace-dst")).unwrap(), b"dst");
 
@@ -2322,7 +2325,7 @@ mod tests {
 		let mut payload = struct_bytes(&cin).to_vec();
 		payload.extend_from_slice(b"new\0");
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_CREATE, FUSE_ROOT_ID, &payload));
-		assert_eq!(err, -libc::EROFS, "CREATE rejected read-only");
+		assert_eq!(err, -errno::EROFS, "CREATE rejected read-only");
 
 		let win = FuseWriteIn {
 			fh:          FUSE_ROOT_ID,
@@ -2336,16 +2339,16 @@ mod tests {
 		let mut payload = struct_bytes(&win).to_vec();
 		payload.extend_from_slice(b"y");
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, FUSE_ROOT_ID, &payload));
-		assert_eq!(err, -libc::EROFS, "WRITE rejected read-only");
+		assert_eq!(err, -errno::EROFS, "WRITE rejected read-only");
 
 		let min = FuseMkdirIn { mode: 0o755, umask: 0 };
 		let mut payload = struct_bytes(&min).to_vec();
 		payload.extend_from_slice(b"d\0");
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_MKDIR, FUSE_ROOT_ID, &payload));
-		assert_eq!(err, -libc::EROFS, "MKDIR rejected read-only");
+		assert_eq!(err, -errno::EROFS, "MKDIR rejected read-only");
 
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_UNLINK, FUSE_ROOT_ID, b"existing\0"));
-		assert_eq!(err, -libc::EROFS, "UNLINK rejected read-only");
+		assert_eq!(err, -errno::EROFS, "UNLINK rejected read-only");
 		assert!(root.join("existing").exists(), "read-only UNLINK must not delete");
 
 		fs::remove_dir_all(root).unwrap();
@@ -2366,7 +2369,7 @@ mod tests {
 		let mut wo = (libc::O_WRONLY as u32).to_le_bytes().to_vec();
 		wo.extend_from_slice(&0u32.to_le_bytes());
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_OPEN, FUSE_ROOT_ID, &wo));
-		assert_eq!(err, -libc::EROFS, "write-open of a read-only share is rejected");
+		assert_eq!(err, -errno::EROFS, "write-open of a read-only share is rejected");
 
 		fs::remove_dir_all(root).unwrap();
 	}
@@ -2437,14 +2440,14 @@ mod tests {
 		let mut flags = (libc::O_RDONLY as u32).to_le_bytes().to_vec();
 		flags.extend_from_slice(&0u32.to_le_bytes());
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_OPEN, ent.nodeid, &flags));
-		assert_eq!(err, -libc::ELOOP, "OPEN refuses a final-component symlink");
+		assert_eq!(err, -errno::ELOOP, "OPEN refuses a final-component symlink");
 
 		// A fallback WRITE by nodeid (unknown fh) is likewise refused.
 		let win = FuseWriteIn { fh: 0, offset: 0, size: 1, ..Default::default() };
 		let mut payload = struct_bytes(&win).to_vec();
 		payload.extend_from_slice(b"x");
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_WRITE, ent.nodeid, &payload));
-		assert_eq!(err, -libc::ELOOP, "fallback WRITE refuses a final-component symlink");
+		assert_eq!(err, -errno::ELOOP, "fallback WRITE refuses a final-component symlink");
 
 		fs::remove_dir_all(root).unwrap();
 	}
@@ -2469,10 +2472,10 @@ mod tests {
 		std::os::unix::fs::symlink(&outside, root.join("d")).unwrap();
 
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_GETATTR, file.nodeid, &[]));
-		assert_eq!(err, -libc::EACCES, "GETATTR refuses parent symlink escape");
+		assert_eq!(err, -errno::EACCES, "GETATTR refuses parent symlink escape");
 		let rin = FuseReadIn { fh: 0, size: 7, ..Default::default() };
 		let (err, _) = run_op(&mut fs, &fuse_request(FUSE_READ, file.nodeid, struct_bytes(&rin)));
-		assert_eq!(err, -libc::EACCES, "fallback READ refuses parent symlink escape");
+		assert_eq!(err, -errno::EACCES, "fallback READ refuses parent symlink escape");
 
 		fs::remove_dir_all(root).unwrap();
 		fs::remove_dir_all(outside).unwrap();

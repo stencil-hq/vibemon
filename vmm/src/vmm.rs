@@ -13,7 +13,7 @@
 //! see [`crate::virtio::run_shared_worker`]), and the main thread which runs
 //! the run/control loop. Optional helpers (pager handler, agent bridge,
 //! deadline timer) add at most one thread each. Windows builds
-//! (vmm_windows.rs) keep one worker thread per device instead, because
+//! (`vmm_windows.rs`) keep one worker thread per device instead, because
 //! `WaitForMultipleObjects` caps a wait set at 64 handles.
 
 use std::{
@@ -3746,10 +3746,11 @@ impl Vmm {
 			}
 		}
 		let _ = self.worker_kill_evt.write(1);
-		if let Some(h) = self.device_loop.take() {
-			if h.join().is_err() && join_error.is_none() {
-				join_error = Some("device worker thread panicked during shutdown");
-			}
+		if let Some(h) = self.device_loop.take()
+			&& h.join().is_err()
+			&& join_error.is_none()
+		{
+			join_error = Some("device worker thread panicked during shutdown");
 		}
 		if let Some(pager) = &self.pager {
 			pager.request_stop();

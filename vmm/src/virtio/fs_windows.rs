@@ -33,7 +33,10 @@ use crate::{
 	memory::GuestMemoryMmap,
 	result::{Result, err},
 	snapshot::FsStateSer,
-	virtio::{Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid},
+	virtio::{
+		Interrupt, QUEUE_PASS_BUDGET, QueuePass, VirtioDevice, descriptor_range_valid,
+		fuse_errno as errno,
+	},
 };
 
 const QUEUE_SIZE: u16 = 64;
@@ -51,15 +54,6 @@ const FUSE_INIT: u32 = 26;
 const FUSE_OPENDIR: u32 = 27;
 const FUSE_RELEASEDIR: u32 = 29;
 const FUSE_ACCESS: u32 = 34;
-const EIO: i32 = 5;
-const EACCES: i32 = 13;
-const ENOTDIR: i32 = 20;
-const EISDIR: i32 = 21;
-const EINVAL: i32 = 22;
-const ENOENT: i32 = 2;
-const ENOSYS: i32 = 38;
-const EROFS: i32 = 30;
-const EOVERFLOW: i32 = 75;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -249,14 +243,7 @@ fn safe_lookup_name(name: &str) -> bool {
 }
 
 fn fuse_errno(error: &io::Error) -> i32 {
-	match error.kind() {
-		io::ErrorKind::NotFound => ENOENT,
-		io::ErrorKind::PermissionDenied => EACCES,
-		io::ErrorKind::InvalidInput => EINVAL,
-		io::ErrorKind::IsADirectory => EISDIR,
-		io::ErrorKind::NotADirectory => ENOTDIR,
-		_ => EIO,
-	}
+	errno::from_io(error)
 }
 
 const fn mutating_opcode(opcode: u32) -> bool {
@@ -402,11 +389,11 @@ impl Fs {
 
 	fn dispatch(&mut self, request: &[u8], max_body: usize) -> (i32, Vec<u8>) {
 		let Some(header) = read_pod::<InHeader>(request, 0) else {
-			return (-EINVAL, Vec::new());
+			return (-errno::EINVAL, Vec::new());
 		};
 		let header_len = header.len as usize;
 		if header_len < std::mem::size_of::<InHeader>() || header_len > request.len() {
-			return (-EINVAL, Vec::new());
+			return (-errno::EINVAL, Vec::new());
 		}
 		let request = &request[..header_len];
 		let path = self.inodes.get(&header.nodeid).cloned();
@@ -420,17 +407,17 @@ impl Fs {
 			},
 			FUSE_LOOKUP => {
 				let Some(parent) = path else {
-					return (-ENOENT, Vec::new());
+					return (-errno::ENOENT, Vec::new());
 				};
 				let name = request
 					.get(std::mem::size_of::<InHeader>()..)
 					.and_then(|bytes| bytes.split(|byte| *byte == 0).next())
 					.unwrap_or_default();
 				let Ok(name) = std::str::from_utf8(name) else {
-					return (-EINVAL, Vec::new());
+					return (-errno::EINVAL, Vec::new());
 				};
 				if !safe_lookup_name(name) {
-					return (-EINVAL, Vec::new());
+					return (-errno::EINVAL, Vec::new());
 				}
 				let (file, candidate) = match open_confined(&self.root, &parent.join(name)) {
 					Ok(value) => value,
@@ -441,7 +428,7 @@ impl Fs {
 					Err(error) => return (-fuse_errno(&error), Vec::new()),
 				};
 				let Some(id) = self.intern(candidate) else {
-					return (-EOVERFLOW, Vec::new());
+					return (-errno::EOVERFLOW, Vec::new());
 				};
 				(
 					0,
@@ -458,7 +445,7 @@ impl Fs {
 			},
 			FUSE_GETATTR => {
 				let Some(path) = path else {
-					return (-ENOENT, Vec::new());
+					return (-errno::ENOENT, Vec::new());
 				};
 				let (file, _) = match open_confined(&self.root, &path) {
 					Ok(value) => value,
@@ -480,7 +467,7 @@ impl Fs {
 			},
 			FUSE_OPEN | FUSE_OPENDIR => {
 				let Some(path) = path else {
-					return (-ENOENT, Vec::new());
+					return (-errno::ENOENT, Vec::new());
 				};
 				let (file, _) = match open_confined(&self.root, &path) {
 					Ok(value) => value,
@@ -491,22 +478,22 @@ impl Fs {
 					Err(error) => return (-fuse_errno(&error), Vec::new()),
 				};
 				if header.opcode == FUSE_OPEN && is_dir {
-					return (-EISDIR, Vec::new());
+					return (-errno::EISDIR, Vec::new());
 				}
 				if header.opcode == FUSE_OPENDIR && !is_dir {
-					return (-ENOTDIR, Vec::new());
+					return (-errno::ENOTDIR, Vec::new());
 				}
 				(0, pod(&OpenOut { fh: header.nodeid, ..Default::default() }).to_vec())
 			},
 			FUSE_READ => {
 				let Some(path) = path else {
-					return (-ENOENT, Vec::new());
+					return (-errno::ENOENT, Vec::new());
 				};
 				let Some(input) = read_pod::<ReadIn>(request, std::mem::size_of::<InHeader>()) else {
-					return (-EINVAL, Vec::new());
+					return (-errno::EINVAL, Vec::new());
 				};
 				if input.fh != header.nodeid {
-					return (-EINVAL, Vec::new());
+					return (-errno::EINVAL, Vec::new());
 				}
 				let (file, _) = match open_confined(&self.root, &path) {
 					Ok(value) => value,
@@ -523,18 +510,18 @@ impl Fs {
 			FUSE_RELEASE | FUSE_RELEASEDIR => (0, Vec::new()),
 			FUSE_ACCESS => {
 				let Some(path) = path else {
-					return (-ENOENT, Vec::new());
+					return (-errno::ENOENT, Vec::new());
 				};
 				match open_confined(&self.root, &path) {
 					Ok(_) => (0, Vec::new()),
 					Err(error) => (-fuse_errno(&error), Vec::new()),
 				}
 			},
-			opcode if self.read_only && mutating_opcode(opcode) => (-EROFS, Vec::new()),
-			_ => (-ENOSYS, Vec::new()),
+			opcode if self.read_only && mutating_opcode(opcode) => (-errno::EROFS, Vec::new()),
+			_ => (-errno::ENOSYS, Vec::new()),
 		};
 		if result.1.len() > max_body {
-			(-EOVERFLOW, Vec::new())
+			(-errno::EOVERFLOW, Vec::new())
 		} else {
 			result
 		}
@@ -806,8 +793,8 @@ mod tests {
 
 		let mut malformed = request(FUSE_GETATTR, FUSE_ROOT_ID, &[]);
 		malformed[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-		assert_eq!(device.dispatch(&malformed, 0).0, -EINVAL);
-		assert_eq!(device.dispatch(&request(16, FUSE_ROOT_ID, &[]), 0).0, -EROFS);
-		assert_eq!(device.dispatch(&request(u32::MAX, FUSE_ROOT_ID, &[]), 0).0, -ENOSYS);
+		assert_eq!(device.dispatch(&malformed, 0).0, -errno::EINVAL);
+		assert_eq!(device.dispatch(&request(16, FUSE_ROOT_ID, &[]), 0).0, -errno::EROFS);
+		assert_eq!(device.dispatch(&request(u32::MAX, FUSE_ROOT_ID, &[]), 0).0, -errno::ENOSYS);
 	}
 }
