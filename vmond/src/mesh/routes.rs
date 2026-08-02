@@ -1139,12 +1139,6 @@ async fn mesh_migrate_receive(
 		migration_id.clone(),
 		record,
 	))?;
-	tracing::info!(
-		sid = %record.sid,
-		phase = "target_claim",
-		secrets_present = record.params.contains_key("secrets"),
-		"migration secret boundary"
-	);
 	state
 		.records
 		.notify_source_migration_claim(&record)
@@ -1234,12 +1228,6 @@ async fn mesh_migrate_receive(
 
 	let sid = record.sid.clone();
 	let adopt_params = migration_restore_params(&record.params);
-	tracing::info!(
-		sid = %sid,
-		phase = "direct_adopt",
-		secrets_present = adopt_params.contains_key("secrets"),
-		"migration secret boundary"
-	);
 	let lease_records = map_mesh(
 		state
 			.leases
@@ -2256,12 +2244,6 @@ pub(crate) async fn migrate_sandbox_to(
 		MeshRouteError::invalid("migration finalizer did not persist recovery journal")
 	})?;
 	record.params.clone_from(&fin.params);
-	tracing::info!(
-		sid = %sandbox_id,
-		phase = "source_finalize",
-		secrets_present = fin.params.contains_key("secrets"),
-		"migration secret boundary"
-	);
 	record
 		.params
 		.insert(MIGRATION_ID_FIELD.to_owned(), Value::String(migration_id.clone()));

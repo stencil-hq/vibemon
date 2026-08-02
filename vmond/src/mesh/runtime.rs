@@ -819,12 +819,6 @@ impl MeshRuntime {
 			.filter(|(key, _)| !key.starts_with("_mesh_migration_"))
 			.map(|(key, value)| (key.clone(), value.clone()))
 			.collect();
-		tracing::info!(
-			sid = %record.sid,
-			phase = "background_adopt",
-			secrets_present = params.contains_key("secrets"),
-			"migration secret boundary"
-		);
 		let acquired = leases
 			.acquire_writable_volume_leases(params.clone(), record.epoch)
 			.await?;
