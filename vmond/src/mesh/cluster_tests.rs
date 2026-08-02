@@ -618,6 +618,13 @@ mod tests {
 			!durable.params.contains_key("secrets"),
 			"process-local secrets must remain absent from PostgreSQL"
 		);
+		let sanitized_replay = MeshRecordStore::put(&*runtime_a, durable.clone())
+			.expect("replay sanitized migration record");
+		assert_eq!(
+			sanitized_replay.params.get("secrets"),
+			Some(&secrets),
+			"a durable-record replay must retain process-local secrets"
+		);
 		let sanitized_update = MeshRecordStore::update_exact(&*runtime_a, durable)
 			.expect("persist sanitized background retry");
 		assert_eq!(

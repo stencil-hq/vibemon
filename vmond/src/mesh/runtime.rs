@@ -2688,7 +2688,9 @@ impl MeshRecordStore for MeshRuntime {
 			let (params, secrets) = record::split_secrets(&record.params);
 			record.params = params;
 			let mut stored = store.record(&record).map_err(engine_to_mesh)?;
-			self.records.remember_secrets(&stored.sid, secrets);
+			if let Some(secrets) = secrets {
+				self.records.remember_secrets(&stored.sid, Some(secrets));
+			}
 			self.records.attach_secrets(&mut stored);
 			return Ok(record_wire(stored));
 		}
