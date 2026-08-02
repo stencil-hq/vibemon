@@ -3594,6 +3594,10 @@ impl reconciler::MeshReconcileState for MeshRuntime {
 		Ok(fenced)
 	}
 
+	fn migration_target_in_flight(&self, sid: &str) -> bool {
+		self.target_migrations.lock().contains(sid)
+	}
+
 	fn local_owner_epochs(&self, owned_ids: &[String]) -> Result<Vec<reconciler::LocalOwnerEpoch>> {
 		let mut local = Vec::new();
 		for sid in owned_ids {

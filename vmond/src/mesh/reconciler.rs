@@ -184,6 +184,16 @@ pub trait MeshReconcileState: Send + Sync {
 	fn note_event(&self, event: &str);
 	fn replica_targets(&self, sid: &str, replicas: usize) -> Vec<String>;
 	fn fenced_local_ids(&self, owned_ids: &[String]) -> Result<Vec<String>>;
+	/// Report whether this node currently holds an in-flight target-migration
+	/// guard for `sid`.
+	///
+	/// Such a candidate is deliberately paused and its ownership record is
+	/// mid-transfer, so a transiently stale owner view must never fence it —
+	/// tearing it down would discard the adopted runtime and the process-local
+	/// secrets that only exist in memory.
+	fn migration_target_in_flight(&self, _sid: &str) -> bool {
+		false
+	}
 	/// Return the exact ownership generations local routing adopted for these
 	/// running VMs. Missing entries must be fenced, never rebound implicitly.
 	fn local_owner_epochs(&self, owned_ids: &[String]) -> Result<Vec<LocalOwnerEpoch>>;
@@ -422,6 +432,7 @@ impl<'a> Reconciler<'a> {
 		fence.extend(self.mesh.renew_owner_leases(&local)?);
 		fence.sort();
 		fence.dedup();
+		fence.retain(|sid| !self.mesh.migration_target_in_flight(sid));
 		for sid in fence {
 			self.fence_local(&sid).await;
 		}
@@ -457,6 +468,7 @@ impl<'a> Reconciler<'a> {
 		}
 		fence.sort();
 		fence.dedup();
+		fence.retain(|sid| !self.mesh.migration_target_in_flight(sid));
 		for sid in fence {
 			self.fence_local(&sid).await;
 		}
@@ -1231,6 +1243,8 @@ mod tests {
 		retain_owner:    bool,
 		commit_failures: AtomicUsize,
 		commits:         AtomicUsize,
+		fenced:          Vec<String>,
+		migrating:       bool,
 	}
 
 	impl MeshReconcileState for Mesh {
@@ -1341,7 +1355,11 @@ mod tests {
 		}
 
 		fn fenced_local_ids(&self, _: &[String]) -> Result<Vec<String>> {
-			Ok(vec![])
+			Ok(self.fenced.clone())
+		}
+
+		fn migration_target_in_flight(&self, _: &str) -> bool {
+			self.migrating
 		}
 
 		fn local_owner_epochs(&self, _: &[String]) -> Result<Vec<LocalOwnerEpoch>> {
@@ -1917,6 +1935,47 @@ mod tests {
 		assert_eq!(second_engine.restores.load(Ordering::SeqCst), 0, "fenced loser must not launch");
 	}
 
+	/// Drive one lease-renewal cadence against a sandbox the mesh reports as
+	/// superseded, returning how many times it was torn down.
+	async fn fence_removals_for_superseded_sandbox(migrating: bool) -> usize {
+		let mesh = Mesh {
+			suspended: false,
+			retain_owner: false,
+			commit_failures: AtomicUsize::new(0),
+			commits: AtomicUsize::new(0),
+			fenced: vec!["sandbox".to_owned()],
+			migrating,
+		};
+		let engine = test_engine();
+		let records = Records;
+		let replicas = Replicas { held: false };
+		let leases = test_leases();
+		let client = Client::new();
+		Reconciler::new(test_config(), &mesh, &engine, &records, &replicas, &leases, &client)
+			.renew_owner_leases_once()
+			.await
+			.unwrap();
+		engine.removes.load(Ordering::SeqCst)
+	}
+
+	/// A stale owner view is expected mid-handoff: the record moves to the
+	/// target before its candidate is activated. Fencing then would delete the
+	/// adopted runtime along with the process-local secrets that only exist in
+	/// memory, so the migration guard must outrank the fence.
+	#[tokio::test]
+	async fn in_flight_migration_target_is_never_fenced_by_lease_reconciliation() {
+		assert_eq!(
+			fence_removals_for_superseded_sandbox(true).await,
+			0,
+			"an in-flight migration target must survive"
+		);
+		assert_eq!(
+			fence_removals_for_superseded_sandbox(false).await,
+			1,
+			"a genuinely superseded sandbox must still be fenced"
+		);
+	}
+
 	#[tokio::test]
 	async fn fence_loss_cleanup_removes_vm_and_releases_every_lease() {
 		let mesh = Mesh {
@@ -1924,6 +1983,8 @@ mod tests {
 			retain_owner:    false,
 			commit_failures: AtomicUsize::new(0),
 			commits:         AtomicUsize::new(0),
+			fenced:          Vec::new(),
+			migrating:       false,
 		};
 		let engine = test_engine();
 		let records = Records;
@@ -1963,6 +2024,8 @@ mod tests {
 			retain_owner:    false,
 			commit_failures: AtomicUsize::new(0),
 			commits:         AtomicUsize::new(0),
+			fenced:          Vec::new(),
+			migrating:       false,
 		};
 		let engine = test_engine();
 		let records = Records;
@@ -1997,6 +2060,8 @@ mod tests {
 			retain_owner:    true,
 			commit_failures: AtomicUsize::new(2),
 			commits:         AtomicUsize::new(0),
+			fenced:          Vec::new(),
+			migrating:       false,
 		};
 		let engine = test_engine();
 		let records = Records;
@@ -2034,6 +2099,8 @@ mod tests {
 			retain_owner:    true,
 			commit_failures: AtomicUsize::new(0),
 			commits:         AtomicUsize::new(0),
+			fenced:          Vec::new(),
+			migrating:       false,
 		};
 		let engine = test_engine();
 		engine.activation_failures.store(1, Ordering::SeqCst);
