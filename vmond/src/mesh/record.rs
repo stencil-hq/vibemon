@@ -202,10 +202,16 @@ pub struct RecordStore {
 	inner: RwLock<RecordInner>,
 }
 
+#[derive(Clone)]
+struct CachedSecrets {
+	incarnation_epoch: i64,
+	value:             JsonValue,
+}
+
 #[derive(Default)]
 struct RecordInner {
 	meta:    BTreeMap<String, CreateRecord>,
-	secrets: BTreeMap<String, JsonValue>,
+	secrets: BTreeMap<String, CachedSecrets>,
 }
 
 impl fmt::Debug for RecordStore {
@@ -270,7 +276,7 @@ impl RecordStore {
 		record.params = clean;
 		let mut inner = self.inner.write();
 		write_record(&self.root, &record.sid, &record.to_wire())?;
-		store_secrets(&mut inner, &record.sid, secrets);
+		store_secrets(&mut inner, &record, secrets);
 		inner.meta.insert(record.sid.clone(), record);
 		Ok(())
 	}
@@ -304,33 +310,27 @@ impl RecordStore {
 		let (params, secrets) = split_secrets(&record.params);
 		record.params = params;
 		self.persist_meta(&mut inner, &record)?;
-		if let Some(secrets) = secrets {
-			inner.secrets.insert(record.sid.clone(), secrets);
-		} else if !same_lineage {
-			inner.secrets.remove(&record.sid);
-		}
+		store_secrets(&mut inner, &record, secrets);
 		Ok(true)
 	}
 
 	/// Return a create record, reattaching in-memory secrets if still present.
 	pub fn get(&self, sid: &str) -> Option<CreateRecord> {
 		let inner = self.inner.read();
-		let mut record = inner.meta.get(sid)?.clone();
-		if let Some(secrets) = inner.secrets.get(sid) {
-			record.params.insert("secrets".to_owned(), secrets.clone());
-		}
-		Some(record)
+		let record = inner.meta.get(sid)?.clone();
+		Some(with_secrets(&inner, record))
 	}
 
 	/// Remember secret material for a durable record without writing it to disk.
-	pub(crate) fn remember_secrets(&self, sid: &str, secrets: Option<JsonValue>) {
-		store_secrets(&mut self.inner.write(), sid, secrets);
+	pub(crate) fn remember_secrets(&self, record: &CreateRecord, secrets: Option<JsonValue>) {
+		store_secrets(&mut self.inner.write(), record, secrets);
 	}
 
 	/// Reattach process-local secret material to a record loaded from durable
 	/// storage.
 	pub(crate) fn attach_secrets(&self, record: &mut CreateRecord) {
-		if let Some(secrets) = self.inner.read().secrets.get(&record.sid) {
+		let inner = self.inner.read();
+		if let Some(secrets) = secret_values(&inner, record) {
 			record.params.insert("secrets".to_owned(), secrets.clone());
 		}
 	}
@@ -446,7 +446,7 @@ impl RecordStore {
 		ha.clone_into(&mut record.ha);
 		restart_policy.clone_into(&mut record.restart_policy);
 		self.persist_meta(&mut inner, &record)?;
-		store_secrets(&mut inner, sid, secrets);
+		store_secrets(&mut inner, &record, secrets);
 		Ok(with_secrets(&inner, record))
 	}
 
@@ -616,10 +616,8 @@ impl RecordStore {
 		intent.params = params;
 		// A target may already hold process-local secrets replicated for the
 		// source generation. An intent without new secrets must not erase them.
-		if let Some(secrets) = secrets {
-			inner.secrets.insert(intent.sid.clone(), secrets);
-		}
 		self.persist_meta(&mut inner, &intent)?;
+		store_secrets(&mut inner, &intent, secrets);
 		Ok(with_secrets(&inner, intent))
 	}
 
@@ -798,18 +796,33 @@ fn clear_handoff(params: &mut Params) {
 	}
 }
 
+fn secret_values<'a>(inner: &'a RecordInner, record: &CreateRecord) -> Option<&'a JsonValue> {
+	inner
+		.secrets
+		.get(&record.sid)
+		.filter(|cached| cached.incarnation_epoch == record.incarnation_epoch)
+		.map(|cached| &cached.value)
+}
+
 fn with_secrets(inner: &RecordInner, mut record: CreateRecord) -> CreateRecord {
-	if let Some(secrets) = inner.secrets.get(&record.sid) {
+	if let Some(secrets) = secret_values(inner, &record) {
 		record.params.insert("secrets".to_owned(), secrets.clone());
 	}
 	record
 }
 
-fn store_secrets(inner: &mut RecordInner, sid: &str, secrets: Option<JsonValue>) {
-	if let Some(secrets) = secrets {
-		inner.secrets.insert(sid.to_owned(), secrets);
-	} else {
-		inner.secrets.remove(sid);
+fn store_secrets(inner: &mut RecordInner, record: &CreateRecord, secrets: Option<JsonValue>) {
+	if let Some(value) = secrets {
+		inner.secrets.insert(record.sid.clone(), CachedSecrets {
+			incarnation_epoch: record.incarnation_epoch,
+			value,
+		});
+	} else if inner
+		.secrets
+		.get(&record.sid)
+		.is_some_and(|cached| cached.incarnation_epoch != record.incarnation_epoch)
+	{
+		inner.secrets.remove(&record.sid);
 	}
 }
 
@@ -995,6 +1008,34 @@ mod tests {
 			.unwrap();
 
 		assert!(claimed.params.contains_key("secrets"));
+	}
+
+	#[test]
+	fn secret_cache_survives_owner_epochs_but_not_sid_recreation() {
+		let temp = tempfile::tempdir().unwrap();
+		let store = RecordStore::new(temp.path());
+		let secrets = serde_json::json!([{"name": "lineage", "values": {"TOKEN": "secret"}}]);
+		let mut source = source_record();
+		source.params.insert("secrets".to_owned(), secrets.clone());
+		store.put(source).unwrap();
+
+		let mut migrated = target_intent();
+		migrated.params.remove("secrets");
+		store.put(migrated).unwrap();
+		let migrated = store.get(SID).unwrap();
+		assert_eq!(migrated.params.get("secrets"), Some(&secrets));
+
+		let mut replicated = migrated;
+		replicated.params.remove("secrets");
+		replicated.epoch += 1;
+		assert!(store.put_if_newer(replicated).unwrap());
+		assert_eq!(store.get(SID).unwrap().params.get("secrets"), Some(&secrets));
+
+		let mut recreated = source_record();
+		recreated.epoch += 3;
+		recreated.incarnation_epoch = recreated.epoch;
+		store.put(recreated).unwrap();
+		assert!(!store.get(SID).unwrap().params.contains_key("secrets"));
 	}
 
 	#[test]

@@ -559,6 +559,7 @@ fn pending_record(delta_dir: &std::path::Path) -> CreateRecordWire {
 		params,
 		owner: "target".to_owned(),
 		epoch: 7,
+		incarnation_epoch: 7,
 		idempotency_key: "exact-token".to_owned(),
 		ha: "mesh".to_owned(),
 		restart_policy: "always".to_owned(),
@@ -1466,14 +1467,15 @@ async fn source_abort_replay_retries_failed_restore_without_second_handoff_cas()
 	let mut source_params = Map::new();
 	source_params.insert("volume".to_owned(), json!("data"));
 	let source = CreateRecordWire {
-		sid:             "sandbox-1".to_owned(),
-		params:          source_params,
-		owner:           "source".to_owned(),
-		epoch:           8,
-		idempotency_key: "exact-token".to_owned(),
-		ha:              "mesh".to_owned(),
-		restart_policy:  "always".to_owned(),
-		created_at:      0.0,
+		sid:               "sandbox-1".to_owned(),
+		params:            source_params,
+		owner:             "source".to_owned(),
+		epoch:             8,
+		incarnation_epoch: 8,
+		idempotency_key:   "exact-token".to_owned(),
+		ha:                "mesh".to_owned(),
+		restart_policy:    "always".to_owned(),
+		created_at:        0.0,
 	};
 	let mut restored = source.clone();
 	restored.epoch = 9;
@@ -1560,6 +1562,7 @@ async fn abort_replay_recovers_after_crash_between_cas_and_restore_journal() {
 		params,
 		owner: "source".to_owned(),
 		epoch: 8,
+		incarnation_epoch: 8,
 		idempotency_key: "exact-token".to_owned(),
 		ha: "mesh".to_owned(),
 		restart_policy: "always".to_owned(),
@@ -1625,6 +1628,7 @@ async fn complete_pending_replay_finishes_after_crash_before_journal_removal() {
 		params,
 		owner: "source".to_owned(),
 		epoch: 8,
+		incarnation_epoch: 8,
 		idempotency_key: "exact-token".to_owned(),
 		ha: "mesh".to_owned(),
 		restart_policy: "always".to_owned(),

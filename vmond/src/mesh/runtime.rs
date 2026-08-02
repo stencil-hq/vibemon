@@ -2688,9 +2688,7 @@ impl MeshRecordStore for MeshRuntime {
 			let (params, secrets) = record::split_secrets(&record.params);
 			record.params = params;
 			let mut stored = store.record(&record).map_err(engine_to_mesh)?;
-			if let Some(secrets) = secrets {
-				self.records.remember_secrets(&stored.sid, Some(secrets));
-			}
+			self.records.remember_secrets(&stored, secrets);
 			self.records.attach_secrets(&mut stored);
 			return Ok(record_wire(stored));
 		}
@@ -2720,9 +2718,7 @@ impl MeshRecordStore for MeshRuntime {
 			let (params, secrets) = record::split_secrets(&record.params);
 			record.params = params;
 			let mut updated = store.update_exact_record(&record).map_err(engine_to_mesh)?;
-			if let Some(secrets) = secrets {
-				self.records.remember_secrets(&updated.sid, Some(secrets));
-			}
+			self.records.remember_secrets(&updated, secrets);
 			self.records.attach_secrets(&mut updated);
 			return Ok(record_wire(updated));
 		}
@@ -2887,9 +2883,7 @@ impl MeshRecordStore for MeshRuntime {
 					&intent,
 				)
 				.map_err(engine_to_mesh)?;
-			if let Some(secrets) = secrets {
-				self.records.remember_secrets(&claimed.sid, Some(secrets));
-			}
+			self.records.remember_secrets(&claimed, secrets);
 			self.records.attach_secrets(&mut claimed);
 			Ok(record_wire(claimed))
 		} else {
@@ -5173,18 +5167,20 @@ fn lease_tuple(value: &Value) -> Option<(String, String, u64)> {
 
 fn record_wire(record: record::CreateRecord) -> CreateRecordWire {
 	CreateRecordWire {
-		sid:             record.sid,
-		params:          record.params,
-		owner:           record.owner,
-		epoch:           record.epoch,
-		idempotency_key: record.idempotency_key,
-		ha:              record.ha,
-		restart_policy:  record.restart_policy,
-		created_at:      record.created_at,
+		sid:               record.sid,
+		params:            record.params,
+		owner:             record.owner,
+		epoch:             record.epoch,
+		incarnation_epoch: record.incarnation_epoch,
+		idempotency_key:   record.idempotency_key,
+		ha:                record.ha,
+		restart_policy:    record.restart_policy,
+		created_at:        record.created_at,
 	}
 }
 
 fn create_record(record: CreateRecordWire) -> MeshResult<record::CreateRecord> {
+	let incarnation_epoch = record.incarnation_epoch;
 	record::CreateRecord::new(
 		record.sid,
 		record.params,
@@ -5195,6 +5191,10 @@ fn create_record(record: CreateRecordWire) -> MeshResult<record::CreateRecord> {
 		record.restart_policy,
 		record.created_at,
 	)
+	.map(|mut record| {
+		record.incarnation_epoch = incarnation_epoch;
+		record
+	})
 	.map_err(engine_to_mesh)
 }
 

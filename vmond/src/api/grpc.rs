@@ -3914,14 +3914,15 @@ mod tests {
 		let mut pending = serde_json::Map::new();
 		pending.insert("_mesh_restore_pending".to_owned(), json!({"kind": "replica"}));
 		let record = CreateRecordWire {
-			sid:             "sandbox".to_owned(),
-			params:          pending,
-			owner:           "candidate".to_owned(),
-			epoch:           1,
-			idempotency_key: "create".to_owned(),
-			ha:              "async".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "sandbox".to_owned(),
+			params:            pending,
+			owner:             "candidate".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "create".to_owned(),
+			ha:                "async".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 
 		let view = mesh_record_placeholder(&record, "default");

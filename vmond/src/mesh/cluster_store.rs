@@ -414,7 +414,7 @@ impl ProductionStore {
 
 	/// Insert or advance one sandbox ownership record transactionally.
 	pub(crate) fn record(&self, record: &CreateRecord) -> Result<CreateRecord> {
-		let record = record_without_secrets(record);
+		let mut record = record_without_secrets(record);
 		self.with_client(|client| {
 			let mut transaction = client.transaction().map_err(database_error)?;
 			advisory_lock(&mut transaction, &format!("sandbox:{}", record.sid))?;
@@ -462,6 +462,7 @@ impl ProductionStore {
 					transaction.commit().map_err(database_error)?;
 					return Ok(current);
 				}
+				record.incarnation_epoch = current.incarnation_epoch;
 				let params = serde_json::to_string(&record.params)?;
 				let idempotency_key = optional_key(&record.idempotency_key);
 				transaction
@@ -647,15 +648,15 @@ impl ProductionStore {
 	/// `record`, this never performs create/idempotency arbitration and never
 	/// advances or refreshes the owner lease.
 	pub(crate) fn update_exact_record(&self, record: &CreateRecord) -> Result<CreateRecord> {
-		let record = record_without_secrets(record);
+		let mut record = record_without_secrets(record);
 		self.with_client(|client| {
 			let mut transaction = client.transaction().map_err(database_error)?;
 			advisory_lock(&mut transaction, &format!("sandbox:{}", record.sid))?;
 			let current = transaction
 				.query_opt(
-					"SELECT owner, epoch FROM sandbox_ownership WHERE sid = $1 AND owner_lease_owner = \
-					 $2 AND owner_lease_epoch = $3 AND owner_lease_expires_at > EXTRACT(EPOCH FROM \
-					 clock_timestamp()) FOR UPDATE",
+					"SELECT owner, epoch, incarnation_epoch FROM sandbox_ownership WHERE sid = $1 AND \
+					 owner_lease_owner = $2 AND owner_lease_epoch = $3 AND owner_lease_expires_at > \
+					 EXTRACT(EPOCH FROM clock_timestamp()) FOR UPDATE",
 					&[&record.sid, &record.owner, &record.epoch],
 				)
 				.map_err(database_error)?
@@ -667,6 +668,7 @@ impl ProductionStore {
 				})?;
 			let current_owner = current.try_get::<_, String>(0).map_err(database_error)?;
 			let current_epoch = current.try_get::<_, i64>(1).map_err(database_error)?;
+			let current_incarnation = current.try_get::<_, i64>(2).map_err(database_error)?;
 			if current_owner != record.owner || current_epoch != record.epoch {
 				return Err(fencing_error(
 					&record.sid,
@@ -676,6 +678,7 @@ impl ProductionStore {
 					current_epoch,
 				));
 			}
+			record.incarnation_epoch = current_incarnation;
 			let params = serde_json::to_string(&record.params)?;
 			let changed = transaction
 				.execute(
@@ -871,16 +874,17 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION FROM sandbox_ownership WHERE sid = $1 AND \
+					 deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 				.ok_or_else(|| {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			if lease_expires_at > db_now {
 				return Err(EngineError::busy(format!(
@@ -926,9 +930,10 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION, lifecycle_state, suspend_point, suspend_generation FROM \
-					 sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION, lifecycle_state, suspend_point, \
+					 suspend_generation FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR \
+					 UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
@@ -936,13 +941,13 @@ impl ProductionStore {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
 			let mut record = record_from_row(&row)?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
-			let state = row.try_get::<_, String>(10).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
+			let state = row.try_get::<_, String>(11).map_err(database_error)?;
 			let point = row
-				.try_get::<_, Option<String>>(11)
+				.try_get::<_, Option<String>>(12)
 				.map_err(database_error)?;
-			let generation = row.try_get::<_, Option<i64>>(12).map_err(database_error)?;
+			let generation = row.try_get::<_, Option<i64>>(13).map_err(database_error)?;
 			if record.owner != expected_owner
 				|| record.epoch != expected_epoch
 				|| state != expected_state
@@ -1006,16 +1011,17 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION FROM sandbox_ownership WHERE sid = $1 AND \
+					 deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 				.ok_or_else(|| {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			if record.owner == new_owner
 				&& expected_epoch.checked_add(1) == Some(record.epoch)
@@ -1216,8 +1222,9 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, migration_target, migration_token, migration_claimed FROM \
-					 sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, migration_target, migration_token, \
+					 migration_claimed FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR \
+					 UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
@@ -1226,12 +1233,12 @@ impl ProductionStore {
 				})?;
 			let mut record = record_from_row(&row)?;
 			let marker_target = row
-				.try_get::<_, Option<String>>(8)
-				.map_err(database_error)?;
-			let marker_token = row
 				.try_get::<_, Option<String>>(9)
 				.map_err(database_error)?;
-			let marker_claimed = row.try_get::<_, bool>(10).map_err(database_error)?;
+			let marker_token = row
+				.try_get::<_, Option<String>>(10)
+				.map_err(database_error)?;
+			let marker_claimed = row.try_get::<_, bool>(11).map_err(database_error)?;
 			if record.owner == target
 				&& source_epoch.checked_add(1) == Some(record.epoch)
 				&& marker_target.as_deref() == Some(target)
@@ -1452,18 +1459,18 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION, lifecycle_state FROM sandbox_ownership WHERE sid = $1 AND deleting = \
-					 FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION, lifecycle_state FROM sandbox_ownership \
+					 WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 				.ok_or_else(|| {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
-			let lifecycle_state = row.try_get::<_, String>(10).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
+			let lifecycle_state = row.try_get::<_, String>(11).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			let existing_pending = record.params.get("_mesh_restore_pending");
 			if record.owner == new_owner && existing_pending == Some(pending) {
@@ -1558,18 +1565,18 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION, lifecycle_state FROM sandbox_ownership WHERE sid = $1 AND deleting = \
-					 FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION, lifecycle_state FROM sandbox_ownership \
+					 WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 				.ok_or_else(|| {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
-			let lifecycle_state = row.try_get::<_, String>(10).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
+			let lifecycle_state = row.try_get::<_, String>(11).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			if record.owner != expected_owner || record.epoch != expected_epoch {
 				return Err(fencing_error(
@@ -1651,16 +1658,17 @@ impl ProductionStore {
 			let row = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, owner_lease_expires_at, EXTRACT(EPOCH FROM clock_timestamp())::DOUBLE \
-					 PRECISION FROM sandbox_ownership WHERE sid = $1 AND deleting = FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, owner_lease_expires_at, EXTRACT(EPOCH FROM \
+					 clock_timestamp())::DOUBLE PRECISION FROM sandbox_ownership WHERE sid = $1 AND \
+					 deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 				.ok_or_else(|| {
 					EngineError::not_found(format!("sandbox {sid} has no ownership record"))
 				})?;
-			let lease_expires_at = row.try_get::<_, f64>(8).map_err(database_error)?;
-			let db_now = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let lease_expires_at = row.try_get::<_, f64>(9).map_err(database_error)?;
+			let db_now = row.try_get::<_, f64>(10).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			if record.owner != expected_owner || record.epoch != expected_epoch {
 				return Err(fencing_error(
@@ -1736,15 +1744,15 @@ impl ProductionStore {
 			let Some(row) = transaction
 				.query_opt(
 					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
-					 created_at, lifecycle_state FROM sandbox_ownership WHERE sid = $1 AND deleting = \
-					 FALSE FOR UPDATE",
+					 created_at, incarnation_epoch, lifecycle_state FROM sandbox_ownership WHERE sid = \
+					 $1 AND deleting = FALSE FOR UPDATE",
 					&[&sid],
 				)
 				.map_err(database_error)?
 			else {
 				return Err(EngineError::not_found(format!("sandbox {sid} has no ownership record")));
 			};
-			let lifecycle_state = row.try_get::<_, String>(8).map_err(database_error)?;
+			let lifecycle_state = row.try_get::<_, String>(9).map_err(database_error)?;
 			let mut record = record_from_row(&row)?;
 			if record.owner != owner || record.epoch != epoch {
 				transaction.commit().map_err(database_error)?;
@@ -1796,11 +1804,11 @@ impl ProductionStore {
 			advisory_lock(&mut transaction, &format!("sandbox:{sid}"))?;
 			let row = transaction
 				.query_opt(
-					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, created_at \
-					 FROM sandbox_ownership WHERE sid = $1 AND owner = $2 AND epoch = $3 AND \
-					 owner_lease_owner = $2 AND owner_lease_epoch = $3 AND owner_lease_expires_at > \
-					 EXTRACT(EPOCH FROM clock_timestamp()) AND lifecycle_state = 'rolling_back' AND \
-					 deleting = FALSE FOR UPDATE",
+					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
+					 created_at, incarnation_epoch FROM sandbox_ownership WHERE sid = $1 AND owner = \
+					 $2 AND epoch = $3 AND owner_lease_owner = $2 AND owner_lease_epoch = $3 AND \
+					 owner_lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp()) AND \
+					 lifecycle_state = 'rolling_back' AND deleting = FALSE FOR UPDATE",
 					&[&sid, &owner, &epoch],
 				)
 				.map_err(database_error)?
@@ -1852,11 +1860,12 @@ impl ProductionStore {
 			advisory_lock(&mut transaction, &format!("sandbox:{sid}"))?;
 			let row = transaction
 				.query_opt(
-					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, created_at \
-					 FROM sandbox_ownership WHERE sid = $1 AND owner = $2 AND epoch = $3 AND \
-					 owner_lease_owner = $2 AND owner_lease_epoch = $3 AND owner_lease_expires_at > \
-					 EXTRACT(EPOCH FROM clock_timestamp()) AND lifecycle_state = $4 AND suspend_point \
-					 = $5 AND suspend_generation = $6 AND deleting = FALSE FOR UPDATE",
+					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
+					 created_at, incarnation_epoch FROM sandbox_ownership WHERE sid = $1 AND owner = \
+					 $2 AND epoch = $3 AND owner_lease_owner = $2 AND owner_lease_epoch = $3 AND \
+					 owner_lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp()) AND \
+					 lifecycle_state = $4 AND suspend_point = $5 AND suspend_generation = $6 AND \
+					 deleting = FALSE FOR UPDATE",
 					&[&sid, &owner, &epoch, &state, &point, &generation],
 				)
 				.map_err(database_error)?
@@ -2593,8 +2602,9 @@ impl ProductionStore {
 		self.with_client(|client| {
 			client
 				.query(
-					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, created_at \
-					 FROM sandbox_ownership WHERE deleting = TRUE ORDER BY sid",
+					"SELECT sid, params, owner, epoch, idempotency_key, ha, restart_policy, \
+					 created_at, incarnation_epoch FROM sandbox_ownership WHERE deleting = TRUE ORDER \
+					 BY sid",
 					&[],
 				)
 				.map_err(database_error)?
@@ -3113,7 +3123,9 @@ fn record_from_row(row: &Row) -> Result<CreateRecord> {
 	})?;
 	let owner = row.try_get::<_, String>(2).map_err(database_error)?;
 	let epoch = row.try_get::<_, i64>(3).map_err(database_error)?;
-	let incarnation_epoch = row.try_get::<_, i64>("incarnation_epoch").unwrap_or(epoch);
+	let incarnation_epoch = row
+		.try_get::<_, i64>("incarnation_epoch")
+		.map_err(database_error)?;
 	let idempotency_key = row
 		.try_get::<_, Option<String>>(4)
 		.map_err(database_error)?

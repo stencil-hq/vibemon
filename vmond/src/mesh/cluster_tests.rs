@@ -443,6 +443,7 @@ mod tests {
 		record.epoch = store
 			.reserve_fixture_epoch(&record.sid, &record.owner, record.epoch, &record.idempotency_key)
 			.expect("reserve fixture ownership");
+		record.incarnation_epoch = record.epoch;
 		MeshRecordStore::put(runtime, record).expect("record fixture ownership")
 	}
 
@@ -487,14 +488,15 @@ mod tests {
 		}]);
 		record_1_params.insert("secrets".to_owned(), secrets.clone());
 		let record_1 = CreateRecordWire {
-			sid:             "sb-1".to_owned(),
-			params:          record_1_params,
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "idem-key-123".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      12345.0,
+			sid:               "sb-1".to_owned(),
+			params:            record_1_params,
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "idem-key-123".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        12345.0,
 		};
 
 		put_record(&rt_a, record_1.clone());
@@ -508,14 +510,15 @@ mod tests {
 		let mut record_2_params = serde_json::Map::new();
 		record_2_params.insert("image".to_owned(), serde_json::Value::String("ubuntu".to_owned()));
 		let record_2 = CreateRecordWire {
-			sid:             "sb-1".to_owned(),
-			params:          record_2_params,
-			owner:           "node-b".to_owned(),
-			epoch:           2,
-			idempotency_key: "idem-key-123".to_owned(), // same idempotency key
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      99999.0,
+			sid:               "sb-1".to_owned(),
+			params:            record_2_params,
+			owner:             "node-b".to_owned(),
+			epoch:             2,
+			incarnation_epoch: 2,
+			idempotency_key:   "idem-key-123".to_owned(), // same idempotency key
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        99999.0,
 		};
 
 		put_record(&rt_b, record_2.clone());
@@ -599,6 +602,7 @@ mod tests {
 			params,
 			owner: "node-target".to_owned(),
 			epoch: 1,
+			incarnation_epoch: 1,
 			idempotency_key: "background-migration-key".to_owned(),
 			ha: "off".to_owned(),
 			restart_policy: "none".to_owned(),
@@ -642,6 +646,104 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
+	async fn recreated_sid_cannot_reuse_predecessor_secrets_during_migration() {
+		if !require_test_database() {
+			return;
+		}
+		let _guard = pg::TEST_DATABASE_LOCK.lock().await;
+		reset_test_database();
+		let mock_s3 = MockS3::start();
+		let home_a = tempfile::tempdir().unwrap();
+		let home_b = tempfile::tempdir().unwrap();
+		let runtime_a = build_runtime(mock_s3.addr, &home_a);
+		let runtime_b = build_runtime(mock_s3.addr, &home_b);
+		let sid = "recreated-secret-cache";
+		let secrets = serde_json::json!([{
+			"name": "predecessor",
+			"values": {"TOKEN": "must-not-survive"},
+		}]);
+		let mut params = serde_json::Map::new();
+		params.insert("image".to_owned(), serde_json::json!("debian"));
+		params.insert("secrets".to_owned(), secrets.clone());
+		let original = put_record(&runtime_a, CreateRecordWire {
+			sid: sid.to_owned(),
+			params,
+			owner: "node-a".to_owned(),
+			epoch: 1,
+			incarnation_epoch: 1,
+			idempotency_key: "reused-create-key".to_owned(),
+			ha: "off".to_owned(),
+			restart_policy: "none".to_owned(),
+			created_at: 1.0,
+		});
+		let peer_original = MeshRecordStore::put(&*runtime_b, original.clone())
+			.expect("seed predecessor secret cache on peer");
+		assert_eq!(peer_original.params.get("secrets"), Some(&secrets));
+
+		let store = runtime_a.cluster_store.as_ref().unwrap();
+		store
+			.begin_delete(sid, &original.owner, original.epoch)
+			.unwrap();
+		store
+			.commit_delete(sid, &original.owner, original.epoch)
+			.unwrap();
+		let mut recreated = original.clone();
+		recreated.params.remove("secrets");
+		"node-b".clone_into(&mut recreated.owner);
+		recreated.epoch = 1;
+		recreated.incarnation_epoch = 1;
+		let recreated = put_record(&runtime_a, recreated);
+		assert!(recreated.incarnation_epoch > original.incarnation_epoch);
+		let replayed = MeshRecordStore::put(&*runtime_b, recreated.clone())
+			.expect("replicate recreated secretless sandbox");
+		assert!(!replayed.params.contains_key("secrets"));
+
+		let token = "recreated-migration-token";
+		MeshRecordStore::begin_migration_handoff(
+			&*runtime_b,
+			sid,
+			&replayed.owner,
+			replayed.epoch,
+			"node-c",
+			token,
+		)
+		.unwrap();
+		let mut intent = replayed.clone();
+		"node-c".clone_into(&mut intent.owner);
+		intent.epoch += 1;
+		intent
+			.params
+			.insert("_mesh_migration_token".to_owned(), serde_json::json!(token));
+		let claimed = MeshRecordStore::claim_migration_handoff(
+			&*runtime_b,
+			replayed.owner.clone(),
+			replayed.epoch,
+			token.to_owned(),
+			intent.clone(),
+		)
+		.expect("claim recreated sandbox migration");
+		assert_eq!(claimed.incarnation_epoch, recreated.incarnation_epoch);
+		assert!(!claimed.params.contains_key("secrets"));
+		let duplicate = MeshRecordStore::claim_migration_handoff(
+			&*runtime_b,
+			replayed.owner,
+			replayed.epoch,
+			token.to_owned(),
+			intent,
+		)
+		.expect("repeat exact migration claim");
+		assert_eq!(duplicate.incarnation_epoch, recreated.incarnation_epoch);
+		assert!(!duplicate.params.contains_key("secrets"));
+
+		tokio::task::spawn_blocking(move || {
+			drop(runtime_a);
+			drop(runtime_b);
+		})
+		.await
+		.unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
 	async fn test_portable_points_share_lifecycle_generation_but_fence_stale_owner() {
 		if !require_test_database() {
 			return;
@@ -654,14 +756,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		let record = CreateRecordWire {
-			sid:             "portable-sb".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-sb-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-sb".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-sb-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 		put_record(&runtime, record);
 		let mut config = test_config(mock_s3.addr);
@@ -733,14 +836,15 @@ mod tests {
 		// publication authority. Uploaded bytes remain unreferenced and cannot
 		// become a remotely restorable point.
 		let expired = CreateRecordWire {
-			sid:             "portable-expired".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-expired-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-expired".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-expired-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 		put_record(&runtime, expired);
 		store.expire_owner_for_test("portable-expired").unwrap();
@@ -775,14 +879,15 @@ mod tests {
 		// a valid pre-claim point, or a fenced stale commit—never a post-claim
 		// old-owner row.
 		let race = CreateRecordWire {
-			sid:             "portable-race".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-race-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-race".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-race-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 		put_record(&runtime, race);
 		store.expire_owner_for_test("portable-race").unwrap();
@@ -854,14 +959,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		put_record(&runtime, CreateRecordWire {
-			sid:             "portable-suspend-atomic".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-suspend-atomic-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-suspend-atomic".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-suspend-atomic-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		});
 		let mut config = test_config(mock_s3.addr);
 		config.portable_history_key_id = Some("cluster-recovery".to_owned());
@@ -996,14 +1102,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		let record = CreateRecordWire {
-			sid:             "portable-aba".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-aba-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-aba".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-aba-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 		put_record(&runtime, record.clone());
 		let mut config = test_config(mock_s3.addr);
@@ -1064,14 +1171,15 @@ mod tests {
 		store.clear_for_test().unwrap();
 		let sid = "portable-predecessor";
 		let original = CreateRecordWire {
-			sid:             sid.to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-predecessor-a".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               sid.to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-predecessor-a".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		};
 		put_record(&runtime, original.clone());
 		let mut config = test_config(mock_s3.addr);
@@ -1109,14 +1217,15 @@ mod tests {
 		store.begin_delete(sid, "node-a", 1).unwrap();
 		store.commit_delete(sid, "node-a", 1).unwrap();
 		put_record(&runtime, CreateRecordWire {
-			sid:             sid.to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-b".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-predecessor-b".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      2.0,
+			sid:               sid.to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-b".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-predecessor-b".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        2.0,
 		});
 		let recreated = store.resolve(sid).unwrap().unwrap();
 		assert!(recreated.epoch > old.owner_epoch);
@@ -1175,14 +1284,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		put_record(&runtime, CreateRecordWire {
-			sid:             "portable-migration-lineage".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-b".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-migration-lineage-b".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      100.0,
+			sid:               "portable-migration-lineage".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-b".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-migration-lineage-b".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        100.0,
 		});
 		let current = store
 			.resolve("portable-migration-lineage")
@@ -1256,14 +1366,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		put_record(&runtime, CreateRecordWire {
-			sid:             "portable-delete".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-delete-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-delete".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-delete-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		});
 		let mut config = test_config(mock_s3.addr);
 		config.portable_history_key_id = Some("cluster-recovery".to_owned());
@@ -1370,14 +1481,15 @@ mod tests {
 		let store = runtime.cluster_store.as_ref().unwrap();
 		store.clear_for_test().unwrap();
 		put_record(&runtime, CreateRecordWire {
-			sid:             "portable-slow".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "portable-slow-idem".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "portable-slow".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "portable-slow-idem".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		});
 		let mut config = test_config(mock_s3.addr);
 		config.portable_history_key_id = Some("cluster-recovery".to_owned());
@@ -1638,14 +1750,15 @@ mod tests {
 			.clear_for_test()
 			.unwrap();
 		let owner = put_record(&rt_a, CreateRecordWire {
-			sid:             "sb-replica-1".to_owned(),
-			params:          serde_json::Map::new(),
-			owner:           "node-a".to_owned(),
-			epoch:           1,
-			idempotency_key: "sb-replica-1".to_owned(),
-			ha:              "async".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1.0,
+			sid:               "sb-replica-1".to_owned(),
+			params:            serde_json::Map::new(),
+			owner:             "node-a".to_owned(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "sb-replica-1".to_owned(),
+			ha:                "async".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1.0,
 		});
 		assert_eq!(owner.epoch, 1);
 
@@ -1826,14 +1939,15 @@ mod tests {
 		params_a.insert("tags".to_owned(), serde_json::Value::Object(tags_a));
 
 		let record_a = CreateRecordWire {
-			sid:             "sb-prod-1".to_owned(),
-			params:          params_a,
-			owner:           node_id_a.clone(),
-			epoch:           1,
-			idempotency_key: "idem-prod-1".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      1000.0,
+			sid:               "sb-prod-1".to_owned(),
+			params:            params_a,
+			owner:             node_id_a.clone(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "idem-prod-1".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        1000.0,
 		};
 		put_record(&rt_a, record_a);
 
@@ -1844,14 +1958,15 @@ mod tests {
 		params_b.insert("tags".to_owned(), serde_json::Value::Object(tags_b));
 
 		let record_b = CreateRecordWire {
-			sid:             "sb-dev-2".to_owned(),
-			params:          params_b,
-			owner:           node_id_b.clone(),
-			epoch:           1,
-			idempotency_key: "idem-dev-2".to_owned(),
-			ha:              "off".to_owned(),
-			restart_policy:  "none".to_owned(),
-			created_at:      2000.0,
+			sid:               "sb-dev-2".to_owned(),
+			params:            params_b,
+			owner:             node_id_b.clone(),
+			epoch:             1,
+			incarnation_epoch: 1,
+			idempotency_key:   "idem-dev-2".to_owned(),
+			ha:                "off".to_owned(),
+			restart_policy:    "none".to_owned(),
+			created_at:        2000.0,
 		};
 		put_record(&rt_b, record_b);
 

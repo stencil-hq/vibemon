@@ -20,7 +20,7 @@ use axum::{
 	routing::{get, post},
 };
 use futures_util::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
@@ -104,16 +104,28 @@ pub struct MigrationCleanupWire {
 	pub phase:          String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CreateRecordWire {
-	pub sid:             String,
-	pub params:          JsonObject,
-	pub owner:           String,
-	pub epoch:           i64,
-	pub idempotency_key: String,
-	pub ha:              String,
-	pub restart_policy:  String,
-	pub created_at:      f64,
+	pub sid:               String,
+	pub params:            JsonObject,
+	pub owner:             String,
+	pub epoch:             i64,
+	/// Stable sandbox incarnation; owner epochs may advance independently.
+	pub incarnation_epoch: i64,
+	pub idempotency_key:   String,
+	pub ha:                String,
+	pub restart_policy:    String,
+	pub created_at:        f64,
+}
+
+impl<'de> Deserialize<'de> for CreateRecordWire {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let value = Value::deserialize(deserializer)?;
+		Self::from_value(value).map_err(serde::de::Error::custom)
+	}
 }
 
 impl CreateRecordWire {
@@ -142,11 +154,14 @@ impl CreateRecordWire {
 		}
 		let restart_policy = nonempty_string(data.remove("restart_policy"))
 			.unwrap_or_else(|| restart_policy_for_ha(&ha).to_owned());
+		let epoch = to_i64(data.remove("epoch")).unwrap_or(0);
+		let incarnation_epoch = to_i64(data.remove("incarnation_epoch")).unwrap_or(epoch);
 		Ok(Self {
 			sid,
 			params,
 			owner,
-			epoch: to_i64(data.remove("epoch")).unwrap_or(0),
+			epoch,
+			incarnation_epoch,
 			idempotency_key,
 			ha,
 			restart_policy,
@@ -160,6 +175,7 @@ impl CreateRecordWire {
 			"params": self.params,
 			"owner": self.owner,
 			"epoch": self.epoch,
+			"incarnation_epoch": self.incarnation_epoch,
 			"idempotency_key": self.idempotency_key,
 			"ha": self.ha,
 			"restart_policy": self.restart_policy,
@@ -2553,6 +2569,7 @@ fn make_create_record(
 		params,
 		owner,
 		epoch,
+		incarnation_epoch: epoch,
 		idempotency_key,
 		ha,
 		restart_policy,
@@ -2917,5 +2934,21 @@ mod tests {
 			7,
 			&changed_params,
 		));
+	}
+	#[test]
+	fn legacy_create_record_defaults_incarnation_to_owner_epoch() {
+		let record: CreateRecordWire = serde_json::from_value(json!({
+			"sid": "sandbox",
+			"params": {},
+			"owner": "node-a",
+			"epoch": 7,
+			"idempotency_key": "create-key",
+			"ha": "off",
+			"restart_policy": "none",
+			"created_at": 1.0,
+		}))
+		.unwrap();
+
+		assert_eq!(record.incarnation_epoch, 7);
 	}
 }
