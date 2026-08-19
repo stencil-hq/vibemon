@@ -4,6 +4,7 @@
 use std::{
 	collections::{BTreeSet, HashMap},
 	env, fs,
+	net::IpAddr,
 	path::PathBuf,
 };
 
@@ -142,6 +143,9 @@ pub struct ServeConfig {
 	pub orch_redis: Option<String>,
 	/// Advertised worker base URL for the orchestration layer.
 	pub orch_url: Option<String>,
+	/// Host IP that per-sandbox TCP tunnels bind; default loopback. Non-loopback
+	/// binds require each sandbox to set `inbound_cidr_allowlist`.
+	pub tunnel_bind: Option<String>,
 	/// Stable orchestration worker id override.
 	pub orch_id: Option<String>,
 	/// Orchestration heartbeat cadence in seconds.
@@ -267,6 +271,7 @@ impl Default for ServeConfig {
 			mesh_w_inflight: 80.0,
 			orch_redis: None,
 			orch_url: None,
+			tunnel_bind: None,
 			orch_id: None,
 			orch_heartbeat_sec: 1.0,
 			orch_dead_after_sec: 5.0,
@@ -325,6 +330,7 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"mesh_w_inflight",
 	"orch_redis",
 	"orch_url",
+	"tunnel_bind",
 	"orch_id",
 	"orch_heartbeat_sec",
 	"orch_dead_after_sec",
@@ -380,6 +386,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("mesh_w_inflight", "VMON_MESH_W_INFLIGHT"),
 	("orch_redis", "VMON_ORCH_REDIS"),
 	("orch_url", "VMON_ORCH_URL"),
+	("tunnel_bind", "VMON_TUNNEL_BIND"),
 	("orch_id", "VMON_ORCH_ID"),
 	("orch_heartbeat_sec", "VMON_ORCH_HEARTBEAT_SEC"),
 	("orch_dead_after_sec", "VMON_ORCH_DEAD_AFTER_SEC"),
@@ -435,6 +442,7 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("mesh_w_inflight", "--mesh-w-inflight"),
 	("orch_redis", "--orch-redis"),
 	("orch_url", "--orch-url"),
+	("tunnel_bind", "--tunnel-bind"),
 	("orch_id", "--orch-id"),
 	("orch_heartbeat_sec", "--orch-heartbeat-sec"),
 	("orch_dead_after_sec", "--orch-dead-after-sec"),
@@ -778,6 +786,15 @@ fn apply_value(
 		"mesh_w_inflight" => config.mesh_w_inflight = positive_float(key, value)?,
 		"orch_redis" => config.orch_redis = empty_string_as_none(key, value)?,
 		"orch_url" => config.orch_url = empty_string_as_none(key, value)?,
+		"tunnel_bind" => {
+			let tunnel_bind = empty_string_as_none(key, value)?;
+			if let Some(value) = tunnel_bind.as_deref() {
+				value
+					.parse::<IpAddr>()
+					.map_err(|_| EngineError::invalid("tunnel_bind must be a valid IP address"))?;
+			}
+			config.tunnel_bind = tunnel_bind;
+		},
 		"orch_id" => config.orch_id = empty_string_as_none(key, value)?,
 		"orch_heartbeat_sec" => config.orch_heartbeat_sec = positive_float(key, value)?,
 		"orch_dead_after_sec" => config.orch_dead_after_sec = positive_float(key, value)?,
@@ -1362,6 +1379,34 @@ mod tests {
 		assert_eq!(config.s3_secret_key.as_deref(), Some("secret"));
 		assert_eq!(config.portable_history_key_id.as_deref(), Some("cluster-recovery"));
 		assert_eq!(config.s3_prefix.as_deref(), Some("pre/"));
+	}
+
+	#[test]
+	fn tunnel_bind_defaults_overlays_and_validation() {
+		let _lock = test_home::lock();
+		let _env_guard = EnvGuard::clear();
+		let config = resolve_serve_config(&HashMap::new()).expect("default config");
+		assert_eq!(config.tunnel_bind, None);
+		assert_eq!(config.source("tunnel_bind"), Some(ConfigSource::Default));
+
+		EnvGuard::set("VMON_TUNNEL_BIND", "10.0.0.2");
+		let env_config = resolve_serve_config(&HashMap::new()).expect("env config");
+		assert_eq!(env_config.tunnel_bind.as_deref(), Some("10.0.0.2"));
+		assert_eq!(env_config.source("tunnel_bind"), Some(ConfigSource::Env));
+
+		let flag_config = resolve_serve_config(&HashMap::from([(
+			"tunnel_bind".to_owned(),
+			"2001:db8::2".to_owned(),
+		)]))
+		.expect("flag config");
+		assert_eq!(flag_config.tunnel_bind.as_deref(), Some("2001:db8::2"));
+		assert_eq!(flag_config.source("tunnel_bind"), Some(ConfigSource::Flag));
+
+		let error =
+			resolve_serve_config(&HashMap::from([("tunnel_bind".to_owned(), "not-an-ip".to_owned())]))
+				.expect_err("invalid bind IP");
+		assert_eq!(error.code.as_str(), "invalid");
+		assert_eq!(error.message, "tunnel_bind must be a valid IP address");
 	}
 
 	#[test]

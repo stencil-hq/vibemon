@@ -841,10 +841,11 @@ pub(super) mod linux {
 	use io_uring::{opcode, types};
 
 	use super::*;
+	use crate::os::libc_abi::IoctlRequest;
 
 	/// `FICLONE` ioctl: `_IOW(0x94, 9, int)`. Reflinks one file's extents into
 	/// another (instant copy-on-write on btrfs/XFS).
-	const FICLONE: libc::c_ulong = 0x4004_9409;
+	const FICLONE: IoctlRequest = 0x4004_9409;
 
 	pub(super) fn try_reflink(src: &File, dst: &File) -> Option<io::Error> {
 		// SAFETY: both fds are valid open files; FICLONE clones src's extents into dst.

@@ -681,7 +681,9 @@ fn set_times_fd(file: &File, sin: &FuseSetattrIn) -> std::io::Result<()> {
 	const UTIME_NOW: i64 = (1 << 30) - 1;
 	const UTIME_OMIT: i64 = (1 << 30) - 2;
 	let spec = |sel: u32, now: u32, sec: u64, nsec: u32| libc::timespec {
-		tv_sec:  sec as libc::time_t,
+		// Infer `tv_sec`'s width from the field: musl deprecates the `time_t`
+		// alias pending its 64-bit switch, and the two libcs disagree on it.
+		tv_sec:  sec as _,
 		tv_nsec: if sin.valid & now != 0 {
 			UTIME_NOW
 		} else if sin.valid & sel != 0 {

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::{config::SeccompAction, result::Result};
+use crate::{config::SeccompAction, os::libc_abi::RlimitResource, result::Result};
 #[derive(Clone, Debug, Default)]
 pub struct SandboxPaths {
 	/// Read-only individual files (kernel, initrd, firmware, snapshot inputs).
@@ -144,13 +144,13 @@ fn clamp_nofile() -> Result<()> {
 	set_rlimit(libc::RLIMIT_NOFILE, current, "setrlimit(RLIMIT_NOFILE)")
 }
 
-fn freeze_soft_limit(resource: libc::__rlimit_resource_t, context: &str) -> Result<()> {
+fn freeze_soft_limit(resource: RlimitResource, context: &str) -> Result<()> {
 	let current = get_limit(resource, context)?;
 	set_limit(resource, current.rlim_cur, current.rlim_cur, context)
 }
 
 fn set_limit(
-	resource: libc::__rlimit_resource_t,
+	resource: RlimitResource,
 	soft: libc::rlim_t,
 	hard: libc::rlim_t,
 	context: &str,
@@ -158,7 +158,7 @@ fn set_limit(
 	set_rlimit(resource, libc::rlimit { rlim_cur: soft, rlim_max: hard }, context)
 }
 
-fn get_limit(resource: libc::__rlimit_resource_t, context: &str) -> Result<libc::rlimit> {
+fn get_limit(resource: RlimitResource, context: &str) -> Result<libc::rlimit> {
 	let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 	// SAFETY: `limit` points to a valid `rlimit` for libc to fill.
 	let rc = unsafe { libc::getrlimit(resource, &mut limit) };
@@ -168,11 +168,7 @@ fn get_limit(resource: libc::__rlimit_resource_t, context: &str) -> Result<libc:
 	Ok(limit)
 }
 
-fn set_rlimit(
-	resource: libc::__rlimit_resource_t,
-	limit: libc::rlimit,
-	context: &str,
-) -> Result<()> {
+fn set_rlimit(resource: RlimitResource, limit: libc::rlimit, context: &str) -> Result<()> {
 	// SAFETY: `limit` points to a valid `rlimit`; libc copies it during the call.
 	let rc = unsafe { libc::setrlimit(resource, &limit) };
 	if rc != 0 {
@@ -271,6 +267,11 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 	let mut syscalls = BTreeSet::from([
 		libc::SYS_accept4,
 		libc::SYS_brk,
+		// glibc answers `clock_gettime` from the vDSO, so it never reaches the
+		// filter; static musl falls through to the real syscall. Without this a
+		// musl build takes EPERM on the first `Instant::now()` after the filter
+		// is installed, which `std` turns into a panic.
+		libc::SYS_clock_gettime,
 		libc::SYS_clock_nanosleep,
 		libc::SYS_clone,
 		libc::SYS_clone3,
@@ -348,6 +349,9 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		libc::SYS_socket,
 		libc::SYS_sigaltstack,
 		libc::SYS_statx,
+		// `PauseGate` kicks vCPUs out of `KVM_RUN` by kernel tid, so `tgkill`
+		// covers both C libraries; musl would otherwise need `tkill` too, via
+		// its `pthread_kill`.
 		libc::SYS_tgkill,
 		libc::SYS_unlinkat,
 		libc::SYS_wait4,

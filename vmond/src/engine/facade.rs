@@ -5,7 +5,7 @@ use std::{
 	fmt::Write as _,
 	fs::{self, OpenOptions},
 	io::{self, Read, Seek, SeekFrom, Write as _},
-	net::IpAddr,
+	net::{IpAddr, Ipv4Addr},
 	ops::Deref,
 	os::unix::fs::{OpenOptionsExt, PermissionsExt},
 	path::{Path, PathBuf},
@@ -2321,6 +2321,7 @@ impl Engine {
 						prefix,
 						&ports,
 						state.network_policy.inbound_cidr_allowlist.as_deref(),
+						self.tunnel_bind_ip()?,
 					))?
 				} else {
 					self.inner.net_runtime.block_on(net::setup_sandbox_network(
@@ -2329,6 +2330,7 @@ impl Engine {
 						state.network_policy.egress_allow.as_deref(),
 						state.network_policy.egress_allow_domains.as_deref(),
 						state.network_policy.inbound_cidr_allowlist.as_deref(),
+						self.tunnel_bind_ip()?,
 					))?
 				});
 			}
@@ -2522,6 +2524,35 @@ impl Engine {
 		Ok(())
 	}
 
+	fn tunnel_bind_ip(&self) -> Result<IpAddr> {
+		self
+			.inner
+			.config
+			.tunnel_bind
+			.as_deref()
+			.map(|value| {
+				value
+					.parse()
+					.map_err(|_| EngineError::invalid("tunnel_bind must be a valid IP address"))
+			})
+			.transpose()
+			.map(|value| value.unwrap_or_else(|| Ipv4Addr::LOCALHOST.into()))
+	}
+
+	fn validate_tunnel_bind(&self, params: &SandboxCreate) -> Result<()> {
+		if !self.tunnel_bind_ip()?.is_loopback()
+			&& params
+				.inbound_cidr_allowlist
+				.as_ref()
+				.is_none_or(Vec::is_empty)
+		{
+			return Err(EngineError::invalid(
+				"non-loopback tunnel_bind requires inbound_cidr_allowlist",
+			));
+		}
+		Ok(())
+	}
+
 	fn resolve_ha_encryption_key(&self, params: &mut SandboxCreate, ha: &str) -> Result<()> {
 		if let Some(key_id) = Self::resolve_ha_key_id(
 			&self.inner.config,
@@ -2577,6 +2608,7 @@ impl Engine {
 			.idle_timeout_secs
 			.get_or_insert(self.inner.config.idle_timeout);
 		Self::validate_create(&params)?;
+		self.validate_tunnel_bind(&params)?;
 		let sid = params
 			.name
 			.clone()
@@ -3637,6 +3669,7 @@ impl Engine {
 				prefix,
 				params.ports.as_deref().unwrap_or(&[]),
 				params.inbound_cidr_allowlist.as_deref(),
+				self.tunnel_bind_ip()?,
 			));
 			if network.is_err() {
 				let _ = self.inner.vpcs.release_sandbox(name);
@@ -3659,6 +3692,7 @@ impl Engine {
 			egress_allow,
 			egress_allow_domains,
 			params.inbound_cidr_allowlist.as_deref(),
+			self.tunnel_bind_ip()?,
 		))
 	}
 
@@ -12924,6 +12958,19 @@ mod tests {
 			"PID fencing must retain the paused candidate for reconciliation"
 		);
 	}
+	#[test]
+	fn non_loopback_tunnel_bind_requires_inbound_allowlist() {
+		let temp = TempDir::new().expect("temp");
+		let mut config = config_for(&temp);
+		config.tunnel_bind = Some("10.0.0.2".to_owned());
+		let (engine, _home) = Engine::new_test(config);
+		let error = engine
+			.create(valid_create())
+			.expect_err("non-loopback tunnel bind without allowlist");
+		assert_eq!(error.code.as_str(), "invalid");
+		assert_eq!(error.message, "non-loopback tunnel_bind requires inbound_cidr_allowlist");
+	}
+
 	#[test]
 	fn persistence_validation_rejects_invalid_sticky_priority() {
 		let temp = TempDir::new().expect("temp");

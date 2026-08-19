@@ -462,6 +462,9 @@ struct ServeArgs {
 	orch_redis: Option<String>,
 	#[arg(long)]
 	orch_url: Option<String>,
+	/// Host IP that per-sandbox TCP tunnels bind.
+	#[arg(long)]
+	tunnel_bind: Option<String>,
 	#[arg(long)]
 	orch_id: Option<String>,
 	#[arg(long)]
@@ -2561,6 +2564,7 @@ impl ServeArgs {
 		insert_override(&mut overrides, "mesh_w_inflight", self.mesh_w_inflight);
 		insert_override(&mut overrides, "orch_redis", self.orch_redis);
 		insert_override(&mut overrides, "orch_url", self.orch_url);
+		insert_override(&mut overrides, "tunnel_bind", self.tunnel_bind);
 		insert_override(&mut overrides, "orch_id", self.orch_id);
 		insert_override(&mut overrides, "orch_heartbeat_sec", self.orch_heartbeat_sec);
 		insert_override(&mut overrides, "orch_dead_after_sec", self.orch_dead_after_sec);

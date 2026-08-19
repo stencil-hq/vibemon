@@ -302,7 +302,7 @@ impl SandboxNetwork {
 	}
 }
 
-/// A set of loopback TCP tunnels into a guest.
+/// A set of host TCP tunnels into a guest.
 pub struct TunnelSet {
 	mapping:          BTreeMap<u16, (String, u16)>,
 	accept_tasks:     Vec<TokioJoinHandle<()>>,
@@ -310,11 +310,12 @@ pub struct TunnelSet {
 }
 
 impl TunnelSet {
-	/// Start loopback TCP proxies for the requested guest ports.
+	/// Start TCP proxies for the requested guest ports.
 	pub async fn new(
 		guest_ip: &str,
 		ports: &[u16],
 		inbound_cidr_allowlist: Option<&[String]>,
+		bind_ip: IpAddr,
 	) -> Result<Self> {
 		let guest_addr = parse_ip(guest_ip)?;
 		let allowed_nets = Arc::new(parse_cidr_allowlist(inbound_cidr_allowlist)?);
@@ -333,7 +334,7 @@ impl TunnelSet {
 		let mut accept_tasks = Vec::new();
 		let mut mapping = BTreeMap::new();
 		for guest_port in unique {
-			let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+			let listener = TcpListener::bind((bind_ip, 0)).await?;
 			let local = listener.local_addr()?;
 			mapping.insert(guest_port, (local.ip().to_string(), local.port()));
 			let task_allowed = Arc::clone(&allowed_nets);
@@ -347,7 +348,7 @@ impl TunnelSet {
 		Ok(Self { mapping, accept_tasks, connection_tasks })
 	}
 
-	/// Return guest-port to local loopback endpoint mappings.
+	/// Return guest-port to host endpoint mappings.
 	pub fn mapping(&self) -> BTreeMap<u16, (String, u16)> {
 		self.mapping.clone()
 	}
@@ -371,6 +372,7 @@ pub async fn setup_sandbox_network(
 	egress_allow: Option<&[String]>,
 	egress_allow_domains: Option<&[String]>,
 	inbound_cidr_allowlist: Option<&[String]>,
+	bind_ip: IpAddr,
 ) -> Result<SandboxNetwork> {
 	let config = allocate_guest_config(name)?;
 	let policy_result = policy::EgressPolicy::new(
@@ -411,21 +413,22 @@ pub async fn setup_sandbox_network(
 		},
 	};
 
-	let tunnels = match TunnelSet::new(&config.guest_ip, ports, inbound_cidr_allowlist).await {
-		Ok(tunnels) => tunnels,
-		Err(err) => {
-			let _ = teardown_tap(
-				&config.tap,
-				Some(&config.guest_ip),
-				Some(&config.host_ip),
-				config.prefix,
-				egress_allow,
-				egress_allow_domains,
-			);
-			let _ = release_guest_config(name);
-			return Err(err);
-		},
-	};
+	let tunnels =
+		match TunnelSet::new(&config.guest_ip, ports, inbound_cidr_allowlist, bind_ip).await {
+			Ok(tunnels) => tunnels,
+			Err(err) => {
+				let _ = teardown_tap(
+					&config.tap,
+					Some(&config.guest_ip),
+					Some(&config.host_ip),
+					config.prefix,
+					egress_allow,
+					egress_allow_domains,
+				);
+				let _ = release_guest_config(name);
+				return Err(err);
+			},
+		};
 	let guest_config = GuestNetworkConfig::from(&config);
 	Ok(SandboxNetwork {
 		name: name.to_owned(),
@@ -498,6 +501,7 @@ pub(crate) async fn setup_vpc_network(
 	prefix: u8,
 	ports: &[u16],
 	inbound_cidr_allowlist: Option<&[String]>,
+	bind_ip: IpAddr,
 ) -> Result<SandboxNetwork> {
 	setup_vpc_network_with_bridge(
 		&SystemVpcBridge,
@@ -508,6 +512,7 @@ pub(crate) async fn setup_vpc_network(
 		prefix,
 		ports,
 		inbound_cidr_allowlist,
+		bind_ip,
 	)
 	.await
 }
@@ -521,6 +526,7 @@ async fn setup_vpc_network_with_bridge(
 	prefix: u8,
 	ports: &[u16],
 	inbound_cidr_allowlist: Option<&[String]>,
+	bind_ip: IpAddr,
 ) -> Result<SandboxNetwork> {
 	if !cfg!(target_os = "linux") && !cfg!(test) {
 		return Err(EngineError::invalid("VPCs require a Linux host"));
@@ -529,7 +535,7 @@ async fn setup_vpc_network_with_bridge(
 	let tap_name = tap_name(name);
 	bridge_ops.ensure_bridge(&bridge, gateway, prefix)?;
 	bridge_ops.attach_tap(&bridge, &tap_name)?;
-	let tunnels = match TunnelSet::new(guest_ip, ports, inbound_cidr_allowlist).await {
+	let tunnels = match TunnelSet::new(guest_ip, ports, inbound_cidr_allowlist, bind_ip).await {
 		Ok(tunnels) => tunnels,
 		Err(error) => {
 			let _ = bridge_ops.detach_tap(&bridge, &tap_name);
@@ -2783,6 +2789,7 @@ mod tests {
 			24,
 			&[],
 			None,
+			Ipv4Addr::LOCALHOST.into(),
 		)
 		.await
 		.unwrap();

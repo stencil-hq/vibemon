@@ -23,16 +23,17 @@ mod platform {
 
 	use crate::{
 		bail,
+		os::libc_abi::IoctlRequest,
 		result::Result,
 		tap::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, VNET_HDR_SIZE},
 	};
 
 	// _IOW('T', 202, int)
-	const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+	const TUNSETIFF: IoctlRequest = 0x4004_54ca;
 	// _IOW('T', 208, unsigned int)
-	const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+	const TUNSETOFFLOAD: IoctlRequest = 0x4004_54d0;
 	// _IOW('T', 216, int)
-	const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
+	const TUNSETVNETHDRSZ: IoctlRequest = 0x4004_54d8;
 	// Linux UAPI flags not exposed by every libc target.
 	const IFF_VNET_HDR: libc::c_int = 0x4000;
 	// `struct ifreq` is 40 bytes; flags live as an i16 at offset 16.

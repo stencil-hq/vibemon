@@ -51,6 +51,8 @@ use windows_sys::Win32::{
 	},
 };
 
+#[cfg(target_os = "linux")]
+use crate::os::libc_abi::ThreadId;
 use crate::result::Result;
 #[cfg(unix)]
 use crate::result::err;
@@ -68,7 +70,7 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 pub mod pause_signal {
 	use parking_lot::Mutex;
 
-	use crate::result::Result;
+	use crate::{os::libc_abi::ThreadId, result::Result};
 
 	/// Real-time signal used to kick a vCPU out of `KVM_RUN`.
 	pub fn signal() -> i32 {
@@ -84,15 +86,11 @@ pub mod pause_signal {
 		Ok(())
 	}
 
-	/// `pthread_kill` every registered vCPU thread to interrupt `KVM_RUN`.
-	pub fn signal_threads(tids: &Mutex<Vec<Option<libc::pthread_t>>>) {
+	/// Signal every registered vCPU thread to interrupt `KVM_RUN`.
+	pub fn signal_threads(tids: &Mutex<Vec<Option<ThreadId>>>) {
 		for slot in tids.lock().iter() {
 			if let Some(tid) = *slot {
-				// SAFETY: `tid` came from `pthread_self` in the target thread;
-				// the return value (e.g. ESRCH) is intentionally ignored.
-				unsafe {
-					libc::pthread_kill(tid, signal());
-				}
+				tid.kill(signal());
 			}
 		}
 	}
@@ -132,7 +130,7 @@ pub struct PauseGate {
 	parked: Mutex<Vec<bool>>,
 	cpus:   u32,
 	#[cfg(target_os = "linux")]
-	tids:   Mutex<Vec<Option<libc::pthread_t>>>,
+	tids:   Mutex<Vec<Option<ThreadId>>>,
 	kicker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -197,8 +195,7 @@ impl PauseGate {
 	pub fn register_tid(&self, vcpu_id: usize) {
 		#[cfg(target_os = "linux")]
 		{
-			// SAFETY: `pthread_self` is always safe to call.
-			self.tids.lock()[vcpu_id] = Some(unsafe { libc::pthread_self() });
+			self.tids.lock()[vcpu_id] = Some(ThreadId::current());
 		}
 		#[cfg(not(target_os = "linux"))]
 		let _ = vcpu_id;

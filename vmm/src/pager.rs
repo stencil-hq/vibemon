@@ -28,6 +28,7 @@ mod linux {
 	use crate::{
 		control::{PauseGate, RunState},
 		memory::GuestMemoryMmap,
+		os::libc_abi::IoctlRequest,
 		result::{Result, err},
 	};
 
@@ -316,7 +317,7 @@ mod linux {
 			let rc = unsafe {
 				libc::ioctl(
 					fd.as_raw_fd(),
-					UFFDIO_API_IOCTL as libc::c_ulong,
+					UFFDIO_API_IOCTL as IoctlRequest,
 					&mut api as *mut UffdioApi,
 				)
 			};
@@ -403,7 +404,7 @@ mod linux {
 		// SAFETY: `uffd` is a userfaultfd, and `reg` points to initialized,
 		// writable storage matching the UFFDIO_REGISTER ABI.
 		let rc = unsafe {
-			libc::ioctl(uffd, UFFDIO_REGISTER_IOCTL as libc::c_ulong, &mut reg as *mut UffdioRegister)
+			libc::ioctl(uffd, UFFDIO_REGISTER_IOCTL as IoctlRequest, &mut reg as *mut UffdioRegister)
 		};
 		if rc < 0 {
 			return Err(err(format!("UFFDIO_REGISTER: {}", io::Error::last_os_error())));
@@ -420,7 +421,7 @@ mod linux {
 		// SAFETY: `uffd` is a userfaultfd; `copy` points to writable storage
 		// matching the UFFDIO_COPY ABI, and `src` names at least `len` bytes.
 		let rc = unsafe {
-			libc::ioctl(uffd, UFFDIO_COPY_IOCTL as libc::c_ulong, &mut copy as *mut UffdioCopy)
+			libc::ioctl(uffd, UFFDIO_COPY_IOCTL as IoctlRequest, &mut copy as *mut UffdioCopy)
 		};
 		if rc < 0 {
 			return Err(io::Error::last_os_error());
