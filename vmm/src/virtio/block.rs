@@ -12,7 +12,7 @@ use std::os::unix::io::AsRawFd;
 #[cfg(not(target_os = "windows"))]
 use std::{
 	fs,
-	os::unix::fs::{MetadataExt, OpenOptionsExt},
+	os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
 };
 use std::{
 	fs::{File, OpenOptions},
@@ -188,12 +188,89 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 	Ok(dst)
 }
 
-/// Copy `src` into `dst` skipping all-zero 64 KiB blocks (they become holes),
-/// then size `dst` to the full logical length.
+/// Copy `src` into `dst` without materializing holes, then size `dst` to the
+/// full logical length.
 #[cfg(not(target_os = "windows"))]
 fn sparse_copy(src: &mut File, dst: &File) -> io::Result<()> {
+	#[cfg(target_os = "linux")]
+	if sparse_copy_extents(src, dst)? {
+		return Ok(());
+	}
+	sparse_copy_by_scanning(src, dst)
+}
+
+/// Copy only filesystem-allocated extents. This keeps cloning a large sparse
+/// remote-rootfs overlay proportional to its dirtied data rather than its
+/// logical disk size.
+#[cfg(target_os = "linux")]
+fn sparse_copy_extents(src: &File, dst: &File) -> io::Result<bool> {
+	const BLOCK: usize = 1024 * 1024;
+	let logical_len = src.metadata()?.len();
+	let mut offset = 0u64;
+	let mut copied_extent = false;
+	let mut buf = vec![0u8; BLOCK];
+	while offset < logical_len {
+		let data = match seek_extent(src, offset, libc::SEEK_DATA) {
+			Ok(Some(data)) => data,
+			Ok(None) => break,
+			Err(e) if !copied_extent && extent_seeking_unsupported(&e) => return Ok(false),
+			Err(e) => return Err(e),
+		};
+		let hole = seek_extent(src, data, libc::SEEK_HOLE)?
+			.unwrap_or(logical_len)
+			.min(logical_len);
+		let mut at = data;
+		while at < hole {
+			let count = usize::try_from((hole - at).min(BLOCK as u64))
+				.map_err(|_| io::Error::other("sparse extent length exceeds usize"))?;
+			let mut filled = 0usize;
+			while filled < count {
+				let read = src.read_at(&mut buf[filled..count], at + filled as u64)?;
+				if read == 0 {
+					return Err(io::Error::new(
+						io::ErrorKind::UnexpectedEof,
+						"sparse extent ended before SEEK_HOLE",
+					));
+				}
+				filled += read;
+			}
+			dst.write_all_at(&buf[..count], at)?;
+			at += count as u64;
+		}
+		copied_extent = true;
+		offset = hole;
+	}
+	dst.set_len(logical_len)?;
+	Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn seek_extent(file: &File, offset: u64, whence: libc::c_int) -> io::Result<Option<u64>> {
+	let offset = libc::off_t::try_from(offset)
+		.map_err(|_| io::Error::other("sparse extent offset exceeds off_t"))?;
+	// SAFETY: `file` owns a valid descriptor and lseek does not dereference memory.
+	let result = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+	if result >= 0 {
+		return Ok(Some(result as u64));
+	}
+	let error = io::Error::last_os_error();
+	if error.raw_os_error() == Some(libc::ENXIO) {
+		Ok(None)
+	} else {
+		Err(error)
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn extent_seeking_unsupported(error: &io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP))
+}
+#[cfg(not(target_os = "windows"))]
+fn sparse_copy_by_scanning(src: &mut File, dst: &File) -> io::Result<()> {
 	use std::io::Read;
 	const BLOCK: usize = 64 * 1024;
+	src.seek(SeekFrom::Start(0))?;
+	dst.set_len(0)?;
 	let mut buf = vec![0u8; BLOCK];
 	let mut offset = 0u64;
 	loop {
@@ -209,7 +286,6 @@ fn sparse_copy(src: &mut File, dst: &File) -> io::Result<()> {
 			break;
 		}
 		if !crate::memory::is_zero(&buf[..filled]) {
-			use std::os::unix::fs::FileExt;
 			dst.write_all_at(&buf[..filled], offset)?;
 		}
 		offset += filled as u64;
@@ -1563,6 +1639,40 @@ mod tests {
 
 		assert_eq!(contents, b"base");
 		assert_eq!(std::fs::read(&base).expect("read base"), b"base");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn sparse_extent_copy_preserves_large_logical_holes_and_data() {
+		let tmp = TestDir::new();
+		let base_path = tmp.path().join("sparse-base.img");
+		let dest_path = tmp.path().join("sparse-overlay.img");
+		let base = File::create(&base_path).expect("create sparse base");
+		let logical_len = 8u64 << 30;
+		base.set_len(logical_len).expect("size sparse base");
+		base
+			.write_all_at(b"front", 4096)
+			.expect("write front extent");
+		base
+			.write_all_at(b"back", logical_len - 4096)
+			.expect("write back extent");
+		let dest = File::create(&dest_path).expect("create sparse destination");
+
+		assert!(
+			sparse_copy_extents(&base, &dest).expect("copy sparse extents"),
+			"test filesystem must support SEEK_DATA/SEEK_HOLE"
+		);
+		assert_eq!(dest.metadata().expect("stat destination").len(), logical_len);
+		let mut front = [0u8; 5];
+		let mut back = [0u8; 4];
+		dest
+			.read_exact_at(&mut front, 4096)
+			.expect("read front extent");
+		dest
+			.read_exact_at(&mut back, logical_len - 4096)
+			.expect("read back extent");
+		assert_eq!(&front, b"front");
+		assert_eq!(&back, b"back");
 	}
 
 	#[cfg(unix)]

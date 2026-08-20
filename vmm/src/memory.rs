@@ -404,6 +404,23 @@ mod tests {
 		}
 	}
 
+	#[cfg(not(target_os = "windows"))]
+	fn private_memory_fixture() -> (std::path::PathBuf, Vec<u8>) {
+		let path = std::env::temp_dir().join(format!(
+			"vmon-private-memory-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		let mut contents = vec![0u8; PAGE_SIZE * 2];
+		contents[..PAGE_SIZE].fill(0x35);
+		contents[PAGE_SIZE..].fill(0xca);
+		std::fs::write(&path, &contents).unwrap();
+		(path, contents)
+	}
+
 	#[test]
 	fn is_zero_handles_empty_and_nonzero_positions() {
 		assert!(is_zero(&[]));
@@ -429,6 +446,48 @@ mod tests {
 	fn create_guest_memory_rejects_unaligned_size() {
 		let err = result_err(create_guest_memory(PAGE_SIZE + 1));
 		assert!(err.contains("page-aligned"), "unexpected error: {err}");
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	#[test]
+	fn private_snapshot_mapping_faults_original_contents_on_first_touch() {
+		use vm_memory::Bytes;
+
+		let (path, expected) = private_memory_fixture();
+		let memory = create_guest_memory_private(&path, &[(0, expected.len() as u64, 0)])
+			.expect("private snapshot mapping");
+		let mut actual = vec![0u8; expected.len()];
+		memory
+			.read_slice(&mut actual, GuestAddress(0))
+			.expect("read lazily faulted snapshot contents");
+		let _ = std::fs::remove_file(path);
+		assert_eq!(actual, expected);
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	#[test]
+	fn private_snapshot_mappings_isolate_clone_writes() {
+		use vm_memory::Bytes;
+
+		let (path, expected) = private_memory_fixture();
+		let regions = [(0, expected.len() as u64, 0)];
+		let first =
+			create_guest_memory_private(&path, &regions).expect("first private snapshot mapping");
+		let second =
+			create_guest_memory_private(&path, &regions).expect("second private snapshot mapping");
+		let replacement = [0x7eu8; 32];
+		first
+			.write_slice(&replacement, GuestAddress(PAGE_SIZE as u64))
+			.expect("write first clone");
+
+		let mut sibling = [0u8; 32];
+		second
+			.read_slice(&mut sibling, GuestAddress(PAGE_SIZE as u64))
+			.expect("read sibling clone");
+		let base = std::fs::read(&path).expect("read snapshot base");
+		let _ = std::fs::remove_file(path);
+		assert_eq!(sibling, expected[PAGE_SIZE..PAGE_SIZE + sibling.len()]);
+		assert_eq!(base, expected);
 	}
 
 	#[cfg(not(target_os = "windows"))]

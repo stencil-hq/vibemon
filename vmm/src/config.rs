@@ -834,7 +834,9 @@ impl Config {
 		}
 		if mem_target_mib.is_some() && cli.fork_from.is_some() {
 			bail!(
-				"--mem-target-mib is not supported with --fork-from; forked clone RAM is copy-on-write"
+				"--mem-target-mib is not supported with --fork-from; fork RAM is already demand-paged \
+				 through a private file mapping, while pager eviction cannot preserve private dirty \
+				 pages"
 			);
 		}
 		if cli.remote_page_url.is_some() && cli.restore.is_none() {
