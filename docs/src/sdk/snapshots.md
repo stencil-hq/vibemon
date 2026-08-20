@@ -68,7 +68,7 @@ if err != nil {
 <div data-sdk-language="typescript">
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect();
 const sandbox = await client.sandboxes.create({ image: "alpine:latest" });

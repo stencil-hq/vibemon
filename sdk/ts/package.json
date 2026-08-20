@@ -1,28 +1,49 @@
 {
-  "name": "@vmon/sdk",
+  "name": "@stencil-hq/vibemon",
   "version": "0.2.0",
-  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "author": "Stencil Labs, Inc.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stencil-hq/vibemon.git",
+    "directory": "sdk/ts"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
   "type": "module",
+  "engines": {
+    "node": ">=18",
+    "bun": ">=1.2"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./freestyle": {
-      "types": "./src/freestyle.ts",
-      "import": "./src/freestyle.ts"
+      "types": "./dist/freestyle.d.ts",
+      "import": "./dist/freestyle.js"
     },
     "./functions": {
-      "types": "./src/functions.ts",
-      "import": "./src/functions.ts"
+      "types": "./dist/functions.d.ts",
+      "import": "./dist/functions.js"
     },
     "./function-values": {
-      "types": "./src/function-values.ts",
-      "import": "./src/function-values.ts"
+      "types": "./dist/function-values.d.ts",
+      "import": "./dist/function-values.js"
     }
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "bun run scripts/package.ts --build-only",
+    "package": "bun run scripts/package.ts",
     "test": "bun test",
     "lint": "biome lint .",
     "format": "biome format --write .",
@@ -32,6 +53,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.1",
     "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
     "typescript": "^5.6.3"
   },
   "dependencies": {

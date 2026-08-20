@@ -50,7 +50,7 @@ Remote methods take a `context.Context` and return an error. Check that error be
 `connect()` returns a `Client`. `close()` may be synchronous or asynchronous depending on the driver, so awaiting it is safe.
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect("https://vmon.example");
 try {

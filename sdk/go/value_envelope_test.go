@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"testing"
 
-	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
+	pb "github.com/stencil-hq/vibemon/sdk/go/internal/pb"
 )
 
 func TestPortableValueEnvelopeRoundTrips(t *testing.T) {

@@ -26,7 +26,7 @@ uv pip install vmon
 Add the Go module from an existing application module:
 
 ```sh
-go get github.com/can1357/vibemon/sdk/go
+go get github.com/stencil-hq/vibemon/sdk/go
 ```
 
 The SDK module declares Go 1.25. Check the application toolchain with `go version`.
@@ -37,7 +37,7 @@ The SDK module declares Go 1.25. Check the application toolchain with `go versio
 The TypeScript SDK targets ESM Bun applications. It is currently a private package in this repository, so add a local checkout:
 
 ```sh
-bun add @vmon/sdk@file:../vibevmm/sdk/ts
+bun add @stencil-hq/vibemon@file:../vibemon/sdk/ts
 bun add --dev typescript
 ```
 
@@ -69,7 +69,7 @@ import (
     "context"
     "time"
 
-    vmon "github.com/can1357/vibemon/sdk/go"
+    vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 func check() error {
@@ -90,7 +90,7 @@ func check() error {
 <div data-sdk-language="typescript">
 
 ```ts
-import { connect, type Client } from "@vmon/sdk";
+import { connect, type Client } from "@stencil-hq/vibemon";
 
 const client: Client = connect("https://vmon.example");
 try {
@@ -129,7 +129,7 @@ cd sdk/ts
 bun run typecheck
 ```
 
-Do not import implementation files such as `@vmon/sdk/src/client.ts`. The package exposes `@vmon/sdk`, `@vmon/sdk/functions`, and `@vmon/sdk/function-values`.
+Do not import implementation files such as `@stencil-hq/vibemon/src/client.ts`. The package exposes `@stencil-hq/vibemon`, `@stencil-hq/vibemon/functions`, and `@stencil-hq/vibemon/function-values`.
 
 </div>
 </div>

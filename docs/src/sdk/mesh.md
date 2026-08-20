@@ -54,7 +54,7 @@ for _, node := range nodes {
 <div data-sdk-language="typescript">
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect("vmon://node-a.example,node-b.example?discover=on");
 try {

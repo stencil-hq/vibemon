@@ -6,7 +6,13 @@ export type Resolver<T> = {
 };
 /** Create a deferred promise. */
 export function deferred<T>(): Resolver<T> {
-  return Promise.withResolvers<T>();
+  let resolve!: Resolver<T>["resolve"];
+  let reject!: Resolver<T>["reject"];
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 /** An unbounded async producer/consumer queue with terminal end/fail states. */

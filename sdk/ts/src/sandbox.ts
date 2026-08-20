@@ -7,6 +7,7 @@ import type {
   MessageShape,
 } from "@bufbuild/protobuf";
 import { base64Encode } from "@bufbuild/protobuf/wire";
+import { deferred } from "./async-queue";
 import type { Client } from "./client";
 import type { DriverRequestOptions, DriverResponse, RpcStream } from "./driver";
 import { APIError, apiError, ProtocolError, parseResponseJson } from "./errors";
@@ -744,7 +745,7 @@ function validatePort(port: number): void {
 }
 
 async function sleep(milliseconds: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   setTimeout(resolve, milliseconds);
   return promise;
 }

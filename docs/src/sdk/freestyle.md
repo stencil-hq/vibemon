@@ -1,6 +1,6 @@
 # Freestyle Compatibility
 
-The TypeScript `@vmon/sdk/freestyle`, Python `vmon.freestyle`, and Go `sdk/go/freestyle` packages provide a Freestyle-shaped facade over vmon. Existing code that uses the Freestyle VM surface can usually port by swapping its import while keeping the VM object model; this is a compatibility subset, not an implementation of every Freestyle service.
+The TypeScript `@stencil-hq/vibemon/freestyle`, Python `vmon.freestyle`, and Go `sdk/go/freestyle` packages provide a Freestyle-shaped facade over vmon. Existing code that uses the Freestyle VM surface can usually port by swapping its import while keeping the VM object model; this is a compatibility subset, not an implementation of every Freestyle service.
 
 ## Quickstart
 
@@ -39,7 +39,7 @@ import (
     "context"
     "log"
 
-    "github.com/can1357/vibemon/sdk/go/freestyle"
+    "github.com/stencil-hq/vibemon/sdk/go/freestyle"
 )
 
 func main() {
@@ -82,7 +82,7 @@ func main() {
 <div data-sdk-language="typescript">
 
 ```ts
-import { freestyle } from "@vmon/sdk/freestyle";
+import { freestyle } from "@stencil-hq/vibemon/freestyle";
 
 const { vm } = await freestyle.vms.create({ image: "alpine:latest" });
 try {
@@ -173,7 +173,7 @@ import (
     "log"
     "strings"
 
-    "github.com/can1357/vibemon/sdk/go/freestyle"
+    "github.com/stencil-hq/vibemon/sdk/go/freestyle"
 )
 
 func readLine(ctx context.Context, session *freestyle.PtySession) (string, error) {
@@ -249,7 +249,7 @@ func main() {
 <div data-sdk-language="typescript">
 
 ```ts
-import { freestyle } from "@vmon/sdk/freestyle";
+import { freestyle } from "@stencil-hq/vibemon/freestyle";
 
 function lineReader() {
   const decoder = new TextDecoder();

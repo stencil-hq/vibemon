@@ -3,7 +3,7 @@ package freestyle
 import (
 	"context"
 
-	vmon "github.com/can1357/vibemon/sdk/go"
+	vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 // Vpc provides routed private-network operations.

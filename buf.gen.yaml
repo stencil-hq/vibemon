@@ -4,10 +4,10 @@ inputs:
 plugins:
   - remote: buf.build/protocolbuffers/go
     out: sdk/go/internal
-    opt: module=github.com/can1357/vibemon/sdk/go/internal
+    opt: module=github.com/stencil-hq/vibemon/sdk/go/internal
   - remote: buf.build/grpc/go
     out: sdk/go/internal
-    opt: module=github.com/can1357/vibemon/sdk/go/internal
+    opt: module=github.com/stencil-hq/vibemon/sdk/go/internal
   - remote: buf.build/protocolbuffers/python
     out: sdk/py
   - remote: buf.build/grpc/python

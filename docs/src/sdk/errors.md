@@ -59,7 +59,7 @@ if errors.As(err, &api) {
 <div data-sdk-language="typescript">
 
 ```ts
-import { APIError } from "@vmon/sdk";
+import { APIError } from "@stencil-hq/vibemon";
 
 try {
   await client.health();
@@ -139,7 +139,7 @@ A gRPC cancellation or deadline remains the corresponding context error when no 
 `TransportError` represents connection, DNS, or transport-timeout failures eligible for mesh-driver failover. `ProtocolError` represents an invalid wire frame or malformed response payload. Both extend `Error`.
 
 ```ts
-import { APIError, ProtocolError, TransportError } from "@vmon/sdk";
+import { APIError, ProtocolError, TransportError } from "@stencil-hq/vibemon";
 
 function reportFailure(error: unknown): void {
   if (error instanceof TransportError) {
@@ -207,7 +207,7 @@ fmt.Println(value)
 `FunctionExecutionError` includes `code`, `remoteType`, `retryable`, `frames`, and `details` as `Readonly<Record<string, string>>`. Nested remote failures use the standard `Error.cause` chain.
 
 ```ts
-import { FunctionExecutionError } from "@vmon/sdk";
+import { FunctionExecutionError } from "@stencil-hq/vibemon";
 
 try {
   await call.get();

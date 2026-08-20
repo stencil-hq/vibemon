@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	vmon "github.com/can1357/vibemon/sdk/go"
+	vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 func main() {

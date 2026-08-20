@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	vmon "github.com/can1357/vibemon/sdk/go"
+	vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 // Vm is a Freestyle-shaped handle bound to one vmon sandbox.

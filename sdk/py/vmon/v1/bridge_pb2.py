@@ -24,14 +24,14 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14vmon/v1/bridge.proto\x12\x07vmon.v1\"\xc0\x01\n\x0b\x42ridgeFrame\x12)\n\x04\x63\x61ll\x18\x01 \x01(\x0b\x32\x13.vmon.v1.BridgeCallH\x00R\x04\x63\x61ll\x12\x1a\n\x07message\x18\x02 \x01(\x0cH\x00R\x07message\x12\x39\n\nhalf_close\x18\x03 \x01(\x0b\x32\x18.vmon.v1.BridgeHalfCloseH\x00R\thalfClose\x12&\n\x03\x65nd\x18\x04 \x01(\x0b\x32\x12.vmon.v1.BridgeEndH\x00R\x03\x65ndB\x07\n\x05\x66rame\"\xa0\x01\n\nBridgeCall\x12\x16\n\x06method\x18\x01 \x01(\tR\x06method\x12=\n\x08metadata\x18\x02 \x03(\x0b\x32!.vmon.v1.BridgeCall.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\"\x11\n\x0f\x42ridgeHalfClose\"\xb8\x01\n\tBridgeEnd\x12\x16\n\x06status\x18\x01 \x01(\x05R\x06status\x12\x18\n\x07message\x18\x02 \x01(\tR\x07message\x12<\n\x08trailers\x18\x03 \x03(\x0b\x32 .vmon.v1.BridgeEnd.TrailersEntryR\x08trailers\x1a;\n\rTrailersEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\x42/Z-github.com/can1357/vibemon/sdk/go/internal/pbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14vmon/v1/bridge.proto\x12\x07vmon.v1\"\xc0\x01\n\x0b\x42ridgeFrame\x12)\n\x04\x63\x61ll\x18\x01 \x01(\x0b\x32\x13.vmon.v1.BridgeCallH\x00R\x04\x63\x61ll\x12\x1a\n\x07message\x18\x02 \x01(\x0cH\x00R\x07message\x12\x39\n\nhalf_close\x18\x03 \x01(\x0b\x32\x18.vmon.v1.BridgeHalfCloseH\x00R\thalfClose\x12&\n\x03\x65nd\x18\x04 \x01(\x0b\x32\x12.vmon.v1.BridgeEndH\x00R\x03\x65ndB\x07\n\x05\x66rame\"\xa0\x01\n\nBridgeCall\x12\x16\n\x06method\x18\x01 \x01(\tR\x06method\x12=\n\x08metadata\x18\x02 \x03(\x0b\x32!.vmon.v1.BridgeCall.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\"\x11\n\x0f\x42ridgeHalfClose\"\xb8\x01\n\tBridgeEnd\x12\x16\n\x06status\x18\x01 \x01(\x05R\x06status\x12\x18\n\x07message\x18\x02 \x01(\tR\x07message\x12<\n\x08trailers\x18\x03 \x03(\x0b\x32 .vmon.v1.BridgeEnd.TrailersEntryR\x08trailers\x1a;\n\rTrailersEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\x42\x32Z0github.com/stencil-hq/vibemon/sdk/go/internal/pbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'vmon.v1.bridge_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
-  _globals['DESCRIPTOR']._serialized_options = b'Z-github.com/can1357/vibemon/sdk/go/internal/pb'
+  _globals['DESCRIPTOR']._serialized_options = b'Z0github.com/stencil-hq/vibemon/sdk/go/internal/pb'
   _globals['_BRIDGECALL_METADATAENTRY']._loaded_options = None
   _globals['_BRIDGECALL_METADATAENTRY']._serialized_options = b'8\001'
   _globals['_BRIDGEEND_TRAILERSENTRY']._loaded_options = None

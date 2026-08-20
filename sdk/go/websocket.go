@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"sync"
 
-	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	ws "github.com/coder/websocket"
+	pb "github.com/stencil-hq/vibemon/sdk/go/internal/pb"
 	"google.golang.org/grpc"
 )
 

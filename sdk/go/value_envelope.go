@@ -11,9 +11,9 @@ import (
 	"math"
 	"time"
 
-	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
+	pb "github.com/stencil-hq/vibemon/sdk/go/internal/pb"
 )
 
 // ValueCodec is a portable value serialization format.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	vmon "github.com/can1357/vibemon/sdk/go"
+	vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 // PtySessionInfo describes one persistent terminal session.

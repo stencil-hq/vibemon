@@ -62,7 +62,7 @@ Looking up “current” is a point-in-time resolution. Look it up again to use 
 TypeScript invokes functions already deployed to the daemon. It does not package or deploy TypeScript source and does not execute functions locally. `client.functions.fromName()` resolves the active revision by default or an explicitly requested immutable revision.
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect();
 const double = await client.functions.fromName("double", {
@@ -344,7 +344,7 @@ result, err := portable.Remote(ctx, Echo{Message: "compressed"})
 Values up to `inlineLimit` (256 KiB by default) remain inline; larger values are uploaded through the client-backed artifact store. Standalone `encodeValue` and `decodeValue` accept an explicit `ValueArtifactStore` for artifact-backed envelopes.
 
 ```ts
-import { decodeValue, encodeValue } from "@vmon/sdk";
+import { decodeValue, encodeValue } from "@stencil-hq/vibemon";
 
 const envelope = await encodeValue(
   { bytes: new Uint8Array([0, 1, 255]), wide: 2n ** 53n },

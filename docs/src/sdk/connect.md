@@ -42,7 +42,7 @@ import (
     "errors"
     "time"
 
-    vmon "github.com/can1357/vibemon/sdk/go"
+    vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 func check() error {
@@ -88,7 +88,7 @@ Do not issue operations after closing the client.
 Use `connect` to create the root client, and await `close()` when finished:
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect("vmons://vmon-a.example,vmon-b.example?timeout=20");
 try {
@@ -232,7 +232,7 @@ const client = connect("https://vmon.example", {
 When an application owns driver construction, pass a `MeshDriver` or another exported `Driver` implementation directly to `Client`:
 
 ```ts
-import { Client, MeshDriver } from "@vmon/sdk";
+import { Client, MeshDriver } from "@stencil-hq/vibemon";
 
 const driver = new MeshDriver("https://vmon.example", { discover: false });
 const client = new Client(driver);

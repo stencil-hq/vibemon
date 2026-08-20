@@ -25,7 +25,7 @@ import vmon
 The Go module declares Go 1.25. Import its root package rather than internal generated packages:
 
 ```go
-import vmon "github.com/can1357/vibemon/sdk/go"
+import     vmon "github.com/stencil-hq/vibemon/sdk/go"
 ```
 
 </div>
@@ -34,10 +34,10 @@ import vmon "github.com/can1357/vibemon/sdk/go"
 The ESM-only package targets Bun and browser applications that can reach the daemon:
 
 ```ts
-import { connect, type Client } from "@vmon/sdk";
+import { connect, type Client } from "@stencil-hq/vibemon";
 ```
 
-The root entry point exports `connect`, `Client`, `MeshDriver`, resource classes, models, driver and DSN types, and errors. Durable-function helpers are available from `@vmon/sdk/functions`, and function value codecs from `@vmon/sdk/function-values`.
+The root entry point exports `connect`, `Client`, `MeshDriver`, resource classes, models, driver and DSN types, and errors. Durable-function helpers are available from `@stencil-hq/vibemon/functions`, and function value codecs from `@stencil-hq/vibemon/function-values`.
 
 </div>
 </div>
@@ -75,7 +75,7 @@ import (
     "context"
     "log"
 
-    vmon "github.com/can1357/vibemon/sdk/go"
+    vmon "github.com/stencil-hq/vibemon/sdk/go"
 )
 
 func main() {
@@ -114,7 +114,7 @@ Pass a `context.Context` to remote calls and blocking reads. Reuse a request or 
 <div data-sdk-language="typescript">
 
 ```ts
-import { connect, type Client } from "@vmon/sdk";
+import { connect, type Client } from "@stencil-hq/vibemon";
 
 const client: Client = connect("https://vmon.example");
 try {

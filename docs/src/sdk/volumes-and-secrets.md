@@ -55,7 +55,7 @@ if err := client.Volumes.Delete(ctx, "build-cache"); err != nil {
 `Volume` is the TypeScript value type. `client.volumes.create()` and `list()` return `Volume` objects; `new Volume(name)` rejects an empty name.
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect();
 const volume = await client.volumes.create("build-cache");
@@ -208,7 +208,7 @@ fmt.Println(sandbox.ID)
 TypeScript accepts either the URI shorthand or a structured `S3MountSpec`.
 
 ```ts
-import type { S3MountSpec } from "@vmon/sdk";
+import type { S3MountSpec } from "@stencil-hq/vibemon";
 
 const buildInput: S3MountSpec = {
   uri: "s3://example-builds/input",
@@ -343,7 +343,7 @@ fmt.Println(sandbox.ID)
 Use `Secret.fromDict(values, name?)` or `Secret.fromEnv(names, name?)`. `fromEnv` reads the Node/Bun process environment when `process` is available; it does not read a browser environment. `SecretInput` also accepts a `SecretWire` or plain dictionary. A bare dictionary is normalized under the name `"secret"`.
 
 ```ts
-import { Secret, type SecretWire } from "@vmon/sdk";
+import { Secret, type SecretWire } from "@stencil-hq/vibemon";
 
 const credentials = Secret.fromDict(
   { API_TOKEN: "token-from-a-secure-source" },

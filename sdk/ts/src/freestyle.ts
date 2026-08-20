@@ -7,7 +7,7 @@
  * every published declaration — see the divergence list below.
  *
  * ```ts
- * import { freestyle } from "@vmon/sdk/freestyle";
+ * import { freestyle } from "@stencil-hq/vibemon/freestyle";
  *
  * const { vm, vmId } = await freestyle.vms.create();
  * const result = await vm.exec("echo 'hello from vibemon'");

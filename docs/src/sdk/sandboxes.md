@@ -73,7 +73,7 @@ All Go operations take a `context.Context`. Cancellation or expiry ends the in-f
 TypeScript sends a `SandboxCreateRequestWithSecrets`. It accepts fields including `image`, `command`, `env`, `workdir`, resource values, `ports`, `volumes`, `credentials`, tags, and creation-time network fields such as `block_network`, `egress_allow`, and `egress_allow_domains`.
 
 ```ts
-import { connect } from "@vmon/sdk";
+import { connect } from "@stencil-hq/vibemon";
 
 const client = connect("vmon://127.0.0.1:7777");
 const sandbox = await client.sandboxes.create({

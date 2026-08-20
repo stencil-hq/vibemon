@@ -1,4 +1,4 @@
-import { BatchCall, FunctionCall, connect, type PortableValue } from "@vmon/sdk";
+import { BatchCall, FunctionCall, connect, type PortableValue } from "@stencil-hq/vibemon";
 
 const BATCH_SIZE = 12;
 

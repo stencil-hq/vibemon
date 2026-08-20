@@ -15,7 +15,7 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "verbatimModuleSyntax": true,
-    "types": ["bun-types"]
+    "types": ["bun-types", "node"]
   },
   "include": ["src", "test"]
 }

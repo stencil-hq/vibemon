@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/can1357/vibemon/sdk/go/internal/pb"
+	pb "github.com/stencil-hq/vibemon/sdk/go/internal/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"

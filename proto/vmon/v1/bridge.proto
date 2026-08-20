@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vmon.v1;
 
-option go_package = "github.com/can1357/vibemon/sdk/go/internal/pb";
+option go_package = "github.com/stencil-hq/vibemon/sdk/go/internal/pb";
 
 // gRPC-over-WebSocket bridge for clients without native HTTP/2 (browsers).
 //

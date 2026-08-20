@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vmon.v1;
 
-option go_package = "github.com/can1357/vibemon/sdk/go/internal/pb";
+option go_package = "github.com/stencil-hq/vibemon/sdk/go/internal/pb";
 
 // gRPC surface of the vmon v1 API — the ONLY API. All clients speak gRPC:
 // native HTTP/2 (h2c over TCP or UDS) for CLI/Python/Go, and a
