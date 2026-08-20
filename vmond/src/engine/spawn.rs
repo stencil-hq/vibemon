@@ -691,11 +691,14 @@ pub fn build_launch_args(spec: &LaunchSpec) -> Vec<String> {
 		LaunchMode::Fork { snapshot } => {
 			push_arg(&mut args, "--fork-from", snapshot);
 			push_arg(&mut args, "--api-sock", &spec.api_sock);
+			// Fork shares immutable guest memory, not per-child host devices.
+			// Rebind networking and filesystem shares exactly as restore does.
+			append_network_args(&mut args, spec);
 			append_rootfs_args(&mut args, spec, false);
 			append_after_disk_args(&mut args, spec, AfterDiskFlags {
 				agent:  true,
 				rng:    false,
-				fs:     false,
+				fs:     true,
 				remote: false,
 			});
 			append_start_paused_arg(&mut args, spec);
@@ -1700,6 +1703,61 @@ mod tests {
 				"start-paused launch must emit --start-paused"
 			);
 		}
+	}
+
+	#[test]
+	fn cached_template_fork_emits_private_remote_overlay_and_network_args() {
+		let spec = LaunchSpec::fork_from("/vm/api.sock", snapshot("template"))
+			.with_tap("tap7")
+			.with_disk_overlay("/templates/base/rootfs.img", "/vms/child/rootfs.img")
+			.with_remote_rootfs(
+				"https://storage.googleapis.com/rootfs",
+				"/state/cache/rootfs.cache",
+				"/state/cache/rootfs.index.json",
+				64 * 1024 * 1024 * 1024,
+				Some("token".to_owned()),
+			)
+			.with_agent_sock("/vms/child/agent.sock")
+			.with_console_agent();
+		assert_eq!(build_launch_args(&spec), [
+			"--fork-from",
+			"/state/snapshots/template",
+			"--api-sock",
+			"/vm/api.sock",
+			"--tap",
+			"tap7",
+			"--disk-overlay-of",
+			"/templates/base/rootfs.img",
+			"--rootfs",
+			"/vms/child/rootfs.img",
+			"--rootfs-remote-url",
+			"https://storage.googleapis.com/rootfs",
+			"--rootfs-remote-cache",
+			"/state/cache/rootfs.cache",
+			"--rootfs-remote-index",
+			"/state/cache/rootfs.index.json",
+			"--rootfs-remote-size",
+			"68719476736",
+			"--rootfs-remote-bearer",
+			"token",
+			"--agent-sock",
+			"/vms/child/agent.sock",
+			"--console-agent",
+		]);
+	}
+
+	#[test]
+	fn persisted_sandbox_resume_emits_restore_not_fork() {
+		let spec = LaunchSpec::restore("/vm/api.sock", snapshot("sandbox-recovery"))
+			.with_disk_overlay("/recovery/rootfs.img", "/vms/sandbox/rootfs.img");
+		let args = build_launch_args(&spec);
+		assert_eq!(&args[..4], [
+			"--restore",
+			"/state/snapshots/sandbox-recovery",
+			"--api-sock",
+			"/vm/api.sock",
+		]);
+		assert!(!args.iter().any(|arg| arg == "--fork-from"));
 	}
 	#[test]
 	fn restore_launch_timeout_scales_with_snapshot_memory() {

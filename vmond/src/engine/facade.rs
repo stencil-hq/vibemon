@@ -581,6 +581,141 @@ struct CreatePlan {
 	networked_warm_linux: bool,
 	relaunch_params:      SandboxCreate,
 	retained_rootfs:      bool,
+	/// Ordinary cached templates fork, while migration/recovery checkpoints must
+	/// be copied into independent restore memory before their source is
+	/// released.
+	snapshot_launch_mode: SnapshotLaunchMode,
+}
+
+/// Rolls back a VM from the instant its runtime launch is attempted until the
+/// launch helper can hand ownership to the create transaction.
+struct LaunchRollback<'a> {
+	engine:        &'a Engine,
+	vm:            &'a SandboxVm,
+	runtime:       &'a mut RuntimeState,
+	retain_vm_dir: bool,
+	armed:         bool,
+}
+
+impl<'a> LaunchRollback<'a> {
+	const fn new(
+		engine: &'a Engine,
+		vm: &'a SandboxVm,
+		runtime: &'a mut RuntimeState,
+		retain_vm_dir: bool,
+	) -> Self {
+		Self { engine, vm, runtime, retain_vm_dir, armed: true }
+	}
+
+	const fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for LaunchRollback<'_> {
+	fn drop(&mut self) {
+		if self.armed {
+			self
+				.engine
+				.rollback_uncommitted_runtime(self.vm, self.runtime, self.retain_vm_dir);
+		}
+	}
+}
+
+/// Owns a launched VM until every fallible create step has committed. The
+/// runtime may move into the engine map before the guard is disarmed; rollback
+/// retrieves it from there so later errors cannot leak either resource owner.
+struct CreateRollback {
+	engine:        Engine,
+	sid:           String,
+	vm:            SandboxVm,
+	runtime:       Option<RuntimeState>,
+	retain_vm_dir: bool,
+	remove_record: bool,
+	armed:         bool,
+}
+
+impl CreateRollback {
+	fn new(
+		engine: &Engine,
+		sid: String,
+		vm: SandboxVm,
+		runtime: RuntimeState,
+		retain_vm_dir: bool,
+	) -> Self {
+		Self {
+			engine: engine.clone(),
+			sid,
+			vm,
+			runtime: Some(runtime),
+			retain_vm_dir,
+			remove_record: false,
+			armed: true,
+		}
+	}
+
+	const fn vm(&self) -> &SandboxVm {
+		&self.vm
+	}
+
+	fn runtime(&self) -> &RuntimeState {
+		self
+			.runtime
+			.as_ref()
+			.expect("create runtime remains guarded until publication")
+	}
+
+	fn runtime_mut(&mut self) -> &mut RuntimeState {
+		self
+			.runtime
+			.as_mut()
+			.expect("create runtime remains guarded until publication")
+	}
+
+	const fn remove_record_on_failure(&mut self) {
+		self.remove_record = true;
+	}
+
+	fn publish_runtime(&mut self) {
+		if let Some(runtime) = self.runtime.take() {
+			self
+				.engine
+				.inner
+				.runtimes
+				.lock()
+				.insert(self.sid.clone(), runtime);
+		}
+	}
+
+	const fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for CreateRollback {
+	fn drop(&mut self) {
+		if !self.armed {
+			return;
+		}
+		let mut runtime = self
+			.runtime
+			.take()
+			.or_else(|| self.engine.inner.runtimes.lock().remove(&self.sid))
+			.unwrap_or_default();
+		self
+			.engine
+			.rollback_uncommitted_runtime(&self.vm, &mut runtime, self.retain_vm_dir);
+		self
+			.engine
+			.inner
+			.launch_cancellations
+			.lock()
+			.remove(&self.sid);
+		if self.remove_record {
+			self.engine.inner.relaunch_recipes.lock().remove(&self.sid);
+			self.engine.inner.registry.remove(&self.sid);
+		}
+	}
 }
 
 /// Identity of a memoized image-template resolution. The boot-verify timeout
@@ -663,6 +798,51 @@ struct ResolvedSnapshotOptions {
 enum SnapshotLaunchMode {
 	Restore,
 	Fork,
+}
+
+impl SnapshotLaunchMode {
+	/// Select the launch path for a template-backed create. Lazy remote pages
+	/// reconstruct a recovery point and therefore require copy restore.
+	const fn for_template(has_remote_pages: bool) -> Self {
+		if has_remote_pages {
+			Self::Restore
+		} else {
+			Self::Fork
+		}
+	}
+
+	fn launch_spec(self, api_sock: impl Into<PathBuf>, snapshot: impl Into<PathBuf>) -> LaunchSpec {
+		match self {
+			Self::Restore => LaunchSpec::restore(api_sock, snapshot),
+			Self::Fork => LaunchSpec::fork_from(api_sock, snapshot),
+		}
+	}
+
+	const fn name(self) -> &'static str {
+		match self {
+			Self::Restore => "restore",
+			Self::Fork => "fork",
+		}
+	}
+}
+
+/// Warm snapshot launches need the console channel whenever orchestration will
+/// contact the guest agent. That requirement is independent of whether memory
+/// is copied for recovery or mapped copy-on-write from an immutable template.
+fn snapshot_launch_spec(
+	mode: SnapshotLaunchMode,
+	api_sock: impl Into<PathBuf>,
+	snapshot: impl Into<PathBuf>,
+	agent_sock: impl Into<PathBuf>,
+	needs_agent: bool,
+) -> LaunchSpec {
+	let mut spec = mode
+		.launch_spec(api_sock, snapshot)
+		.with_agent_sock(agent_sock);
+	if needs_agent {
+		spec = spec.with_console_agent();
+	}
+	spec
 }
 
 struct ResolvedVolume {
@@ -1841,6 +2021,27 @@ impl Engine {
 		}
 		let generation = transition.generation;
 		let vm = self.sandbox(&record.name);
+		if lifecycle.desired == LifecyclePhase::Running && !pid_alive {
+			if let Some(mut runtime) = self.inner.runtimes.lock().remove(&record.id) {
+				self.rollback_uncommitted_runtime(&vm, &mut runtime, true);
+			} else {
+				teardown_network(&record.name);
+				let _ = self.inner.vpcs.release_sandbox(&record.name);
+			}
+			let reason = "sandbox process disappeared and no live runtime could be revived";
+			self.inner.registry.cancel_transition(
+				self.home(),
+				&record.id,
+				generation,
+				LifecyclePhase::Terminated,
+				reason,
+			)?;
+			tracing::error!(
+				sandbox = %record.id,
+				"lost sandbox process; lifecycle transitioned to terminated"
+			);
+			return Ok(());
+		}
 		let outcome = match lifecycle.desired {
 			LifecyclePhase::Paused if pid_alive => {
 				control_for_vm(&vm)?.pause()?;
@@ -2628,6 +2829,9 @@ impl Engine {
 		};
 		let restart_policy = restart_policy_for_ha(&ha).to_owned();
 		self.resolve_ha_encryption_key(&mut params, &ha)?;
+		// Ordinary immutable cached templates use CoW; lazy pages reconstruct a
+		// specific recovery point and are supported only by copy restore.
+		let snapshot_launch_mode = SnapshotLaunchMode::for_template(params.remote_page_url.is_some());
 		let relaunch_params = params.clone();
 		let tags = params.tags.clone().unwrap_or_default();
 		let secrets = parse_secrets(params.secrets.take())?;
@@ -2721,6 +2925,7 @@ impl Engine {
 			s3_specs,
 			relaunch_params,
 			retained_rootfs: false,
+			snapshot_launch_mode,
 		})
 	}
 
@@ -2770,6 +2975,7 @@ impl Engine {
 			networked_warm_linux: false,
 			relaunch_params,
 			retained_rootfs: true,
+			snapshot_launch_mode: SnapshotLaunchMode::Restore,
 		})
 	}
 
@@ -2788,7 +2994,18 @@ impl Engine {
 			} else {
 				self.home().templates_dir().join(template)
 			};
-			return Ok((template_dir, None, Some(template.clone()), template.clone()));
+			let identity = format!("template:{}", template_dir.to_string_lossy());
+			let pool_key = template_key(
+				&identity,
+				u64::from(params.disk_mb),
+				u64::from(params.memory),
+				u64::from(params.cpus),
+				fs_slots,
+				host_slot,
+				nic_slot,
+				tap_slot,
+			);
+			return Ok((template_dir, None, Some(template.clone()), pool_key));
 		}
 		let memo_key = params.dockerfile.is_none().then(|| TemplateMemoKey {
 			image: params.image.clone(),
@@ -3171,11 +3388,7 @@ impl Engine {
 		Ok(())
 	}
 
-	fn launch_create(
-		&self,
-		plan: &mut CreatePlan,
-		start_paused: bool,
-	) -> Result<(SandboxVm, RuntimeState)> {
+	fn launch_create(&self, plan: &mut CreatePlan, start_paused: bool) -> Result<CreateRollback> {
 		let cancellation = self.launch_cancellation(&plan.sid);
 		Self::ensure_launch_not_cancelled(cancellation.as_deref())?;
 		let mut runtime = RuntimeState {
@@ -3198,15 +3411,16 @@ impl Engine {
 			identity_complete: true,
 			..RuntimeState::default()
 		};
+		let sid = plan.sid.clone();
 		let vm = self.claim_or_launch_vm(plan, &mut runtime, start_paused)?;
+		let mut rollback = CreateRollback::new(self, sid, vm, runtime, plan.retained_rootfs);
+		let vm = rollback.vm().clone();
+		let runtime = rollback.runtime_mut();
 		// A lease-loss callback can install its signal while the runtime is
 		// creating VM state. Re-read after claim so that post-spawn window is
 		// fenced before any agent/network/volume registration.
 		let cancellation = self.launch_cancellation(&plan.sid).or(cancellation);
-		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
-			return Err(error);
-		}
+		Self::ensure_launch_not_cancelled(cancellation.as_deref())?;
 		// Heartbeats use canonical resource keys after a worker restart; VMM
 		// metadata calls memory `mem`, and paused candidates return before setup.
 		let resource_meta = Map::from_iter([
@@ -3214,10 +3428,7 @@ impl Engine {
 			("memory".to_owned(), json!(plan.params.memory)),
 			("disk_mb".to_owned(), json!(plan.params.disk_mb)),
 		]);
-		if let Err(error) = vm.save_meta(resource_meta) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
-			return Err(error);
-		}
+		vm.save_meta(resource_meta)?;
 		runtime.volume_locks = plan
 			.volume_specs
 			.iter_mut()
@@ -3257,10 +3468,11 @@ impl Engine {
 				networked_warm_linux: false,
 				relaunch_params:      SandboxCreate::default(),
 				retained_rootfs:      false,
+				snapshot_launch_mode: SnapshotLaunchMode::Fork,
 			})));
-			return Ok((vm, runtime));
+			return Ok(rollback);
 		}
-		let setup_result = (|| {
+		let setup_result: Result<()> = (|| {
 			let agent =
 				Self::agent_for_vm_cancellable(&vm, AGENT_CONNECT_TIMEOUT, cancellation.as_deref())?;
 			if let Some(timeout_secs) = plan.timeout_secs
@@ -3374,15 +3586,9 @@ impl Engine {
 			vm.save_meta(meta)?;
 			Ok(())
 		})();
-		if let Err(error) = setup_result {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
-			return Err(error);
-		}
-		if let Err(error) = Self::ensure_launch_not_cancelled(cancellation.as_deref()) {
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, plan.retained_rootfs);
-			return Err(error);
-		}
-		Ok((vm, runtime))
+		setup_result?;
+		Self::ensure_launch_not_cancelled(cancellation.as_deref())?;
+		Ok(rollback)
 	}
 
 	fn claim_or_launch_vm(
@@ -3402,7 +3608,8 @@ impl Engine {
 		if plan.retained_rootfs {
 			return self.launch_cold_vm(plan, runtime, start_paused);
 		}
-		if (plan.params.block_network || plan.networked_warm)
+		if matches!(plan.snapshot_launch_mode, SnapshotLaunchMode::Fork)
+			&& (plan.params.block_network || plan.networked_warm)
 			&& plan.volume_specs.is_empty()
 			&& plan.s3_specs.is_empty()
 			&& plan.params.fs_dir.is_none()
@@ -3425,8 +3632,9 @@ impl Engine {
 			if let Some(pool) = self.inner.pools.get(&plan.pool_key)
 				&& let Some(vm) = pool.claim(Some(&plan.sid), start_paused)?
 			{
+				let mut rollback = LaunchRollback::new(self, &vm, runtime, false);
 				if plan.networked_warm {
-					runtime.network_spec = Some(json!({
+					rollback.runtime.network_spec = Some(json!({
 						"flavor": "user",
 						"guest_config": user_net_guest_config(),
 						"ports": [],
@@ -3436,12 +3644,14 @@ impl Engine {
 				}
 				if let Some(secs) = plan.timeout_secs {
 					let _ = control_for_vm(&vm)?.extend(secs);
-					runtime.timeout_stop = Some(start_timeout_watchdog(
+					rollback.runtime.timeout_stop = Some(start_timeout_watchdog(
 						vm.name().to_owned(),
 						secs,
 						Arc::clone(&self.inner.sandbox_runtime),
 					));
 				}
+				rollback.disarm();
+				drop(rollback);
 				return Ok(vm);
 			}
 		}
@@ -3452,10 +3662,10 @@ impl Engine {
 			&& !credentials_requested(&plan.params)
 			&& snapshot_state_present(&plan.template_dir)
 		{
-			return self.launch_restore_vm(plan, None, runtime, start_paused);
+			return self.launch_template_snapshot_vm(plan, None, runtime, start_paused);
 		}
 		if plan.warm_volumes || plan.host_slot || plan.networked_warm {
-			return self.launch_restore_vm(plan, None, runtime, start_paused);
+			return self.launch_template_snapshot_vm(plan, None, runtime, start_paused);
 		}
 		if (plan.networked_warm_linux
 			|| (network_required(&plan.params)
@@ -3472,7 +3682,7 @@ impl Engine {
 				.map_err(|_| EngineError::engine("allocated host gateway is not an IP address"))?;
 			runtime.network = Some(network);
 			self.start_credential_gateway(plan, runtime, host_ip, host_ip)?;
-			return self.launch_restore_vm(plan, Some(tap), runtime, start_paused);
+			return self.launch_template_snapshot_vm(plan, Some(tap), runtime, start_paused);
 		}
 		if network_required(&plan.params)
 			&& plan.s3_specs.is_empty()
@@ -3480,12 +3690,12 @@ impl Engine {
 			&& snapshot_state_present(&plan.template_dir)
 		{
 			reject_macos_host_network_features(&plan.params)?;
-			return self.launch_restore_vm(plan, None, runtime, start_paused);
+			return self.launch_template_snapshot_vm(plan, None, runtime, start_paused);
 		}
 		self.launch_cold_vm(plan, runtime, start_paused)
 	}
 
-	fn launch_restore_vm(
+	fn launch_template_snapshot_vm(
 		&self,
 		plan: &CreatePlan,
 		tap: Option<String>,
@@ -3493,15 +3703,18 @@ impl Engine {
 		start_paused: bool,
 	) -> Result<SandboxVm> {
 		let vm = self.sandbox(&plan.sid);
-		let mut spec = LaunchSpec::restore(vm.api_sock(), &plan.template_dir)
-			.with_agent_sock(vm.dir().join("agent.sock"))
-			.with_mem_mib(u64::from(plan.params.memory))
-			.with_cpus(u64::from(plan.params.cpus));
-		// The restored VM must own its disk: overlay the template's image so
-		// guest writes land in a per-VM file (checkpointable, migratable)
-		// instead of the shared absolute path recorded in the snapshot's
-		// block-device hint — a path that does not even exist on a peer node
-		// restoring a pulled checkpoint.
+		let mut spec = snapshot_launch_spec(
+			plan.snapshot_launch_mode,
+			vm.api_sock(),
+			&plan.template_dir,
+			vm.dir().join("agent.sock"),
+			true,
+		)
+		.with_mem_mib(u64::from(plan.params.memory))
+		.with_cpus(u64::from(plan.params.cpus));
+		// Every launch must own its writable overlay. The template's sparse
+		// overlay remains immutable and may itself reference a shared remote base;
+		// guest writes land only in this VM's checkpointable rootfs.img.
 		let base_disk = plan.template_dir.join("rootfs.img");
 		if base_disk.is_file() {
 			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
@@ -3557,11 +3770,12 @@ impl Engine {
 			spec = spec.with_start_paused();
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
+		let mut rollback = LaunchRollback::new(self, &vm, runtime, plan.retained_rootfs);
 		self.launch_sandbox(&vm, &spec)?;
 		copy_agent_marker(&plan.template_dir, vm.dir())?;
-		runtime.s3_proxy = s3_proxy;
-		if network_required(&plan.params) && runtime.network.is_none() {
-			runtime.network_spec = Some(json!({
+		rollback.runtime.s3_proxy = s3_proxy;
+		if network_required(&plan.params) && rollback.runtime.network.is_none() {
+			rollback.runtime.network_spec = Some(json!({
 				"flavor": "user",
 				"guest_config": user_net_guest_config(),
 				"ports": [],
@@ -3569,6 +3783,8 @@ impl Engine {
 				"policy": {},
 			}));
 		}
+		rollback.disarm();
+		drop(rollback);
 		Ok(vm)
 	}
 
@@ -3661,9 +3877,12 @@ impl Engine {
 			spec = spec.with_start_paused();
 		}
 		let (spec, s3_proxy) = self.with_s3_proxy(&vm, spec, &plan.s3_specs)?;
+		let mut rollback = LaunchRollback::new(self, &vm, runtime, plan.retained_rootfs);
 		self.launch_sandbox(&vm, &spec)?;
 		copy_agent_marker(&plan.template_dir, vm.dir())?;
-		runtime.s3_proxy = s3_proxy;
+		rollback.runtime.s3_proxy = s3_proxy;
+		rollback.disarm();
+		drop(rollback);
 		Ok(vm)
 	}
 
@@ -4989,11 +5208,21 @@ impl Engine {
 				encryption_key_id: options.encryption_key_id.clone(),
 				..SandboxCreate::default()
 			};
-			let mut spec = match mode {
-				SnapshotLaunchMode::Restore => LaunchSpec::restore(vm.api_sock(), snapshot_dir),
-				SnapshotLaunchMode::Fork => LaunchSpec::fork_from(vm.api_sock(), snapshot_dir),
-			}
-			.with_agent_sock(vm.dir().join("agent.sock"));
+			let needs_agent = options.agent
+				|| !s3_mounts.is_empty()
+				|| !options.credentials.is_empty()
+				|| options.readiness_probe.is_some()
+				|| options
+					.command
+					.as_ref()
+					.is_some_and(|command| !command.is_empty());
+			let mut spec = snapshot_launch_spec(
+				mode,
+				vm.api_sock(),
+				snapshot_dir,
+				vm.dir().join("agent.sock"),
+				needs_agent,
+			);
 			let base_disk = snapshot_dir.join("rootfs.img");
 			if base_disk.is_file() {
 				spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
@@ -5050,17 +5279,6 @@ impl Engine {
 					)?;
 					spec = spec.with_tap(tap);
 				}
-			}
-			let needs_agent = options.agent
-				|| !s3_mounts.is_empty()
-				|| !options.credentials.is_empty()
-				|| options.readiness_probe.is_some()
-				|| options
-					.command
-					.as_ref()
-					.is_some_and(|command| !command.is_empty());
-			if matches!(mode, SnapshotLaunchMode::Restore) && needs_agent {
-				spec = spec.with_console_agent();
 			}
 			if let Some(timeout_secs) = options.timeout_secs {
 				spec = spec.with_timeout_secs(timeout_secs);
@@ -5127,10 +5345,7 @@ impl Engine {
 				&runtime,
 				std::iter::empty(),
 				options.timeout_secs.map(|secs| secs as f64),
-				Some(format!("{}:{snapshot}", match mode {
-					SnapshotLaunchMode::Restore => "restore",
-					SnapshotLaunchMode::Fork => "fork",
-				})),
+				Some(format!("{}:{snapshot}", mode.name())),
 				Some(snapshot_dir.to_string_lossy().into_owned()),
 			);
 			self.inner.runtimes.lock().insert(name.clone(), runtime);
@@ -5150,10 +5365,7 @@ impl Engine {
 					.get("pid")
 					.and_then(Value::as_i64)
 					.and_then(|pid| i32::try_from(pid).ok()),
-				source: Some(format!("{}:{snapshot}", match mode {
-					SnapshotLaunchMode::Restore => "restore",
-					SnapshotLaunchMode::Fork => "fork",
-				})),
+				source: Some(format!("{}:{snapshot}", mode.name())),
 				incarnation_epoch: detail
 					.get("incarnation_epoch")
 					.and_then(Value::as_i64)
@@ -5669,6 +5881,9 @@ impl Engine {
 		let mut request = crate::mesh::runtime::sandbox_create_from_mesh_params(params)?;
 		request.s3_restore_tags = s3_restore_tags;
 		let mut plan = self.prepare_create(request)?;
+		// This candidate is a specific sandbox recovery point. It must own a
+		// fully restored memory image because migration may release its source.
+		plan.snapshot_launch_mode = SnapshotLaunchMode::Restore;
 		let sid = plan.sid.clone();
 		let source = plan
 			.params
@@ -5679,8 +5894,8 @@ impl Engine {
 			.ok()
 			.and_then(|value| value.as_object().cloned())
 			.unwrap_or_default();
-		let (vm, runtime) = self.launch_create(&mut plan, true)?;
-		let meta = vm.meta()?;
+		let mut rollback = self.launch_create(&mut plan, true)?;
+		let meta = rollback.vm().meta()?;
 		let now = unix_time();
 		let record = VmRecord {
 			id: sid.clone(),
@@ -5713,16 +5928,13 @@ impl Engine {
 			},
 			runtime_identity: SafeRuntimeIdentity::default(),
 		};
-		if let Err(error) = self
+		self
 			.inner
 			.registry
-			.insert_persisted(self.home(), record.clone())
-		{
-			let mut runtime = runtime;
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, false);
-			return Err(error);
-		}
-		self.inner.runtimes.lock().insert(sid, runtime);
+			.insert_persisted(self.home(), record.clone())?;
+		rollback.remove_record_on_failure();
+		rollback.publish_runtime();
+		rollback.disarm();
 		Ok(record.view())
 	}
 
@@ -6907,7 +7119,7 @@ impl Engine {
 			return Ok(self.get_record(id, false)?.view());
 		}
 		let generation = transition.generation;
-		let (vm, runtime) = match self.launch_create(&mut plan, false) {
+		let mut rollback = match self.launch_create(&mut plan, false) {
 			Ok(launched) => launched,
 			Err(error) => {
 				self.fail_state_transition(id, generation, &error);
@@ -6915,13 +7127,11 @@ impl Engine {
 			},
 		};
 		if let Err(error) = self.persist_status(id, "running", None, None) {
-			let mut runtime = runtime;
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, true);
 			self.fail_state_transition(id, generation, &error);
 			return Err(error);
 		}
-		self.inner.runtimes.lock().insert(record.name, runtime);
-		if let Ok(meta) = vm.meta() {
+		rollback.publish_runtime();
+		if let Ok(meta) = rollback.vm().meta() {
 			let pid = meta
 				.get("pid")
 				.and_then(Value::as_i64)
@@ -6938,6 +7148,7 @@ impl Engine {
 		}
 		let record = self.get_record(id, false)?;
 		self.publish_record_event("resumed", &record);
+		rollback.disarm();
 		Ok(record.view())
 	}
 
@@ -7185,7 +7396,7 @@ impl EngineApi for Engine {
 				("tags".to_owned(), json!(plan.tags)),
 			]),
 		);
-		let (vm, runtime) = match self.launch_create(&mut plan, false) {
+		let mut rollback = match self.launch_create(&mut plan, false) {
 			Ok(result) => result,
 			Err(err) => {
 				self.publish_create_failure(&plan.sid, &err);
@@ -7194,7 +7405,7 @@ impl EngineApi for Engine {
 			},
 		};
 		let now = unix_time();
-		let meta = vm.meta()?;
+		let meta = rollback.vm().meta()?;
 		let mut detail = meta.clone();
 		detail.insert("image".to_owned(), json!(plan.params.image));
 		detail.insert(
@@ -7239,8 +7450,10 @@ impl EngineApi for Engine {
 		detail
 			.insert("cold_start_requires_process_secrets".to_owned(), json!(requires_process_secrets));
 		let mut recipe_params = plan.relaunch_params.clone();
-		recipe_params.env = Some(runtime.env.clone().into_iter().collect());
-		recipe_params.workdir.clone_from(&runtime.workdir);
+		recipe_params.env = Some(rollback.runtime().env.clone().into_iter().collect());
+		recipe_params
+			.workdir
+			.clone_from(&rollback.runtime().workdir);
 		let recipe = RelaunchRecipe {
 			params:       recipe_params,
 			template_dir: plan.template_dir.clone(),
@@ -7271,10 +7484,10 @@ impl EngineApi for Engine {
 			detail.insert("idempotency_key".to_owned(), json!(key));
 			let mut update = Map::new();
 			update.insert("idempotency_key".to_owned(), json!(key));
-			let _ = vm.save_meta(update);
+			let _ = rollback.vm().save_meta(update);
 		}
 		let runtime_identity = safe_runtime_identity(
-			&runtime,
+			rollback.runtime(),
 			plan.secrets.iter().map(|secret| secret.name.clone()),
 			plan.timeout_secs.map(|secs| secs as f64),
 			plan
@@ -7319,16 +7532,12 @@ impl EngineApi for Engine {
 			},
 			runtime_identity,
 		};
-		if let Err(error) = self
+		self
 			.inner
 			.registry
-			.insert_persisted(self.home(), record.clone())
-		{
-			let mut runtime = runtime;
-			self.rollback_uncommitted_runtime(&vm, &mut runtime, false);
-			return Err(error);
-		}
-		self.inner.runtimes.lock().insert(plan.sid.clone(), runtime);
+			.insert_persisted(self.home(), record.clone())?;
+		rollback.remove_record_on_failure();
+		rollback.publish_runtime();
 		self.wake_maintenance();
 		self
 			.inner
@@ -7343,6 +7552,14 @@ impl EngineApi for Engine {
 		{
 			self.inner.registry.record_idempotency(&plan.sid, key);
 		}
+		if let Some(command) = plan
+			.params
+			.command
+			.clone()
+			.filter(|command| !command.is_empty())
+		{
+			self.start_entry_command(plan.sid.clone(), command)?;
+		}
 		self.inc_counter("created");
 		{
 			let mut latency = self.inner.latency.lock();
@@ -7354,14 +7571,7 @@ impl EngineApi for Engine {
 		}
 		self.publish_record_event("created", &record);
 		self.publish_record_event("ready", &record);
-		if let Some(command) = plan
-			.params
-			.command
-			.clone()
-			.filter(|command| !command.is_empty())
-		{
-			self.start_entry_command(plan.sid.clone(), command)?;
-		}
+		rollback.disarm();
 		Ok(record.view())
 	}
 
@@ -9376,7 +9586,7 @@ impl EngineApi for Engine {
 			snapshot,
 			&source.path,
 			name,
-			SnapshotLaunchMode::Restore,
+			SnapshotLaunchMode::for_template(false),
 			&options,
 			&s3_mounts,
 			source.guard,
@@ -11159,8 +11369,14 @@ fn reject_macos_host_network_features(params: &SandboxCreate) -> Result<()> {
 }
 
 fn template_key_for_cached(cached: &CachedTemplate) -> String {
+	let digest = if cached.digest.is_empty() {
+		&cached.image_digest
+	} else {
+		&cached.digest
+	};
+	let identity = format!("{}@{digest}", cached.spec.reference);
 	template_key(
-		&cached.spec.reference,
+		&identity,
 		cached.disk_mb,
 		cached.memory,
 		cached.cpus,
@@ -11463,6 +11679,52 @@ mod tests {
 		config.home = temp.path().to_path_buf();
 		config.warm_images = Vec::new();
 		config
+	}
+
+	#[test]
+	fn ordinary_template_selection_forks_while_remote_page_recovery_restores() {
+		for (has_remote_pages, launch_flag) in [(false, "--fork-from"), (true, "--restore")] {
+			let spec = snapshot_launch_spec(
+				SnapshotLaunchMode::for_template(has_remote_pages),
+				"/vms/child/api.sock",
+				"/templates/base",
+				"/vms/child/agent.sock",
+				false,
+			);
+			let args = crate::engine::spawn::build_launch_args(&spec);
+			assert_eq!(args.first().map(String::as_str), Some(launch_flag));
+		}
+	}
+
+	#[test]
+	fn snapshot_console_agent_gate_depends_on_agent_need_not_launch_mode() {
+		for (mode, launch_flag) in
+			[(SnapshotLaunchMode::Fork, "--fork-from"), (SnapshotLaunchMode::Restore, "--restore")]
+		{
+			let spec = snapshot_launch_spec(
+				mode,
+				"/vms/child/api.sock",
+				"/templates/base",
+				"/vms/child/agent.sock",
+				true,
+			);
+			let args = crate::engine::spawn::build_launch_args(&spec);
+			assert_eq!(args.first().map(String::as_str), Some(launch_flag));
+			assert!(args.iter().any(|arg| arg == "--console-agent"));
+		}
+
+		let spec = snapshot_launch_spec(
+			SnapshotLaunchMode::Fork,
+			"/vms/child/api.sock",
+			"/templates/base",
+			"/vms/child/agent.sock",
+			false,
+		);
+		assert!(
+			!crate::engine::spawn::build_launch_args(&spec)
+				.iter()
+				.any(|arg| arg == "--console-agent")
+		);
 	}
 
 	#[test]
@@ -12004,9 +12266,10 @@ mod tests {
 	}
 
 	struct SnapshotRuntime {
-		launches: std::sync::atomic::AtomicUsize,
-		fail_at:  usize,
-		names:    Mutex<Vec<String>>,
+		launches:    std::sync::atomic::AtomicUsize,
+		fail_at:     usize,
+		names:       Mutex<Vec<String>>,
+		poison_meta: AtomicBool,
 	}
 
 	impl SnapshotRuntime {
@@ -12015,11 +12278,16 @@ mod tests {
 				launches: std::sync::atomic::AtomicUsize::new(0),
 				fail_at,
 				names: Mutex::new(Vec::new()),
+				poison_meta: AtomicBool::new(false),
 			})
 		}
 
 		fn names(&self) -> Vec<String> {
 			self.names.lock().clone()
+		}
+
+		fn poison_metadata_writes(&self) {
+			self.poison_meta.store(true, Ordering::Relaxed);
 		}
 	}
 
@@ -12035,7 +12303,12 @@ mod tests {
 			if attempt == self.fail_at {
 				return Err(EngineError::engine("injected snapshot launch failure"));
 			}
-			vm.save_meta(Map::from_iter([("pid".to_owned(), json!(1000 + attempt))]))
+			if self.poison_meta.load(Ordering::Relaxed) {
+				fs::create_dir(vm.meta_path())?;
+				Ok(())
+			} else {
+				vm.save_meta(Map::from_iter([("pid".to_owned(), json!(1000 + attempt))]))
+			}
 		}
 
 		fn stop(&self, _vm: &SandboxVm, _wait: bool) -> Result<()> {
@@ -12064,6 +12337,199 @@ mod tests {
 		let engine =
 			Engine::with_runtime(config_for(temp), runtime.clone()).expect("snapshot engine");
 		(engine, runtime, home)
+	}
+
+	fn pool_test_plan(engine: &Engine, template: &Path, name: &str, memory: u32) -> CreatePlan {
+		engine
+			.prepare_create(SandboxCreate {
+				template: Some(template.to_string_lossy().into_owned()),
+				name: Some(name.to_owned()),
+				memory,
+				timeout_secs: Some(0),
+				..valid_create()
+			})
+			.expect("prepare pool-backed create")
+	}
+
+	fn install_test_pool(
+		engine: &Engine,
+		runtime: &Arc<SnapshotRuntime>,
+		template: &Path,
+		key: &str,
+	) -> Arc<WarmPool> {
+		let backend: Arc<dyn SandboxRuntime> = runtime.clone();
+		let pool =
+			WarmPool::with_runtime_options(template, 1, true, false, false, Duration::ZERO, backend)
+				.expect("start pool");
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while pool.stats().ready == 0 && Instant::now() < deadline {
+			thread::sleep(Duration::from_millis(1));
+		}
+		assert_eq!(pool.stats().ready, 1, "pool refiller did not publish a member");
+		engine.inner.pools.set(key.to_owned(), Arc::clone(&pool));
+		pool
+	}
+
+	#[test]
+	fn failed_create_after_runtime_spawn_removes_vm_and_lifecycle() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let template = checkpoint_fixture(&temp, "create-failure-template");
+		fs::write(template.join("current-generation"), b"1\n").expect("generation");
+		runtime.poison_metadata_writes();
+
+		let error = engine
+			.create(SandboxCreate {
+				template: Some(template.to_string_lossy().into_owned()),
+				name: Some("failed-create".to_owned()),
+				..valid_create()
+			})
+			.expect_err("metadata failure must abort create");
+
+		assert_eq!(error.code.as_str(), "engine_error");
+		assert!(!engine.sandbox("failed-create").dir().exists());
+		assert!(
+			!engine
+				.sandbox_is_running(&engine.sandbox("failed-create"))
+				.expect("liveness")
+		);
+		assert!(engine.inner.registry.get("failed-create").is_none());
+		assert!(
+			engine
+				.inner
+				.registry
+				.list()
+				.iter()
+				.all(|record| record.lifecycle.is_converged()
+					|| matches!(
+						record.lifecycle.observed,
+						LifecyclePhase::Stopped | LifecyclePhase::Suspended | LifecyclePhase::Terminated
+					))
+		);
+	}
+
+	#[test]
+	fn matching_template_shape_claims_warm_member() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let template = checkpoint_fixture(&temp, "matching-pool-template");
+		fs::write(template.join("current-generation"), b"1\n").expect("generation");
+		let plan = pool_test_plan(&engine, &template, "matched", 512);
+		let pool = install_test_pool(&engine, &runtime, &template, &plan.pool_key);
+		let mut state = RuntimeState::default();
+
+		let vm = engine
+			.claim_or_launch_vm(&plan, &mut state, false)
+			.expect("matching pool claim");
+		pool.resize(0);
+
+		assert_eq!(vm.name(), "matched");
+		assert_eq!(pool.stats().hits, 1);
+		assert!(
+			!runtime.names().iter().any(|name| name == "matched"),
+			"matching claim must rename an already-launched member"
+		);
+		engine.remove_sandbox(&vm).expect("remove claimed VM");
+		pool.shutdown();
+	}
+
+	#[test]
+	fn mismatched_shape_does_not_claim_warm_member() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let template = checkpoint_fixture(&temp, "mismatched-pool-template");
+		fs::write(template.join("current-generation"), b"1\n").expect("generation");
+		let matching = pool_test_plan(&engine, &template, "matching-shape", 512);
+		let pool = install_test_pool(&engine, &runtime, &template, &matching.pool_key);
+		let mismatched = pool_test_plan(&engine, &template, "wrong-shape", 1024);
+		let mut state = RuntimeState::default();
+
+		let vm = engine
+			.claim_or_launch_vm(&mismatched, &mut state, false)
+			.expect("shape mismatch falls back");
+
+		assert_eq!(pool.stats().ready, 1);
+		assert_eq!(pool.stats().hits, 0);
+		assert!(runtime.names().iter().any(|name| name == "wrong-shape"));
+		engine.remove_sandbox(&vm).expect("remove fallback VM");
+		pool.shutdown();
+	}
+
+	#[test]
+	fn exhausted_pool_falls_back_to_template_fork() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, runtime, _home) = snapshot_engine(&temp, usize::MAX);
+		let template = checkpoint_fixture(&temp, "exhausted-pool-template");
+		fs::write(template.join("current-generation"), b"1\n").expect("generation");
+		let first = pool_test_plan(&engine, &template, "first-claim", 512);
+		let pool = install_test_pool(&engine, &runtime, &template, &first.pool_key);
+		let mut first_state = RuntimeState::default();
+		let first_vm = engine
+			.claim_or_launch_vm(&first, &mut first_state, false)
+			.expect("first pool claim");
+		pool.resize(0);
+		let second = pool_test_plan(&engine, &template, "fallback-claim", 512);
+		let mut second_state = RuntimeState::default();
+
+		let second_vm = engine
+			.claim_or_launch_vm(&second, &mut second_state, false)
+			.expect("empty pool fallback");
+
+		assert_eq!(pool.stats().misses, 1);
+		assert!(runtime.names().iter().any(|name| name == "fallback-claim"));
+		engine.remove_sandbox(&first_vm).expect("remove first VM");
+		engine
+			.remove_sandbox(&second_vm)
+			.expect("remove fallback VM");
+		pool.shutdown();
+	}
+
+	#[test]
+	fn reconciler_terminalizes_missing_running_process() {
+		let temp = TempDir::new().expect("temp");
+		let (engine, _home) = Engine::new_test(config_for(&temp));
+		let vm = engine.sandbox("lost-running");
+		fs::create_dir_all(vm.dir()).expect("VM directory");
+		let mut record = VmRecord::new("lost-running", "lost-running", "stopped");
+		record.status = "running".to_owned();
+		record.lifecycle = LifecycleState {
+			desired:    LifecyclePhase::Running,
+			observed:   LifecyclePhase::Stopped,
+			generation: StateGeneration(1),
+			operation:  None,
+			failure:    None,
+		};
+		engine
+			.inner
+			.registry
+			.insert_persisted(engine.home(), record.clone())
+			.expect("persist pending lifecycle");
+
+		engine
+			.reconcile_lifecycle_transition(record.clone(), record.lifecycle, false)
+			.expect("terminalize missing process");
+
+		let terminal = engine
+			.inner
+			.registry
+			.get("lost-running")
+			.expect("terminal record");
+		assert_eq!(terminal.status, "terminated");
+		assert_eq!(terminal.lifecycle.desired, LifecyclePhase::Terminated);
+		assert_eq!(terminal.lifecycle.observed, LifecyclePhase::Terminated);
+		assert!(terminal.lifecycle.is_converged());
+		assert_eq!(
+			terminal.error.as_deref(),
+			Some("sandbox process disappeared and no live runtime could be revived")
+		);
+		assert!(
+			engine
+				.inner
+				.registry
+				.startup_reconciliation_inputs()
+				.is_empty(),
+			"terminal record must not be retried on the next maintenance tick"
+		);
 	}
 
 	#[test]
@@ -12322,7 +12788,7 @@ mod tests {
 		assert_eq!(view["id"], "restored");
 		assert_eq!(view["name"], "restored");
 		assert_eq!(view["status"], "running");
-		assert_eq!(view["source"], "restore:base");
+		assert_eq!(view["source"], "fork:base");
 		assert!(
 			view["created_at"]
 				.as_f64()
@@ -12534,7 +13000,7 @@ mod tests {
 		assert_eq!(name.as_deref(), Some("tpl-memo"));
 		assert_eq!(
 			pool_key,
-			template_key("memo/unresolvable:1", 1024, 512, 1, 0, false, false, false)
+			template_key("memo/unresolvable:1@sha256:0", 1024, 512, 1, 0, false, false, false)
 		);
 		// An invalidated on-disk snapshot drops out of the memo.
 		fs::remove_file(tpl_dir.join("current-generation")).expect("invalidate template");
