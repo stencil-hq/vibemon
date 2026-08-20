@@ -380,7 +380,7 @@ fn is_query_token_websocket_path(path: &str) -> bool {
 	)
 }
 
-fn query_token(query: Option<&str>) -> Option<String> {
+pub fn query_token(query: Option<&str>) -> Option<String> {
 	for pair in query?.split('&') {
 		let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
 		if matches!(key, "token" | "access_token") && !value.is_empty() {

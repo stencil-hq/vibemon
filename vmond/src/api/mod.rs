@@ -4,13 +4,13 @@
 //! `/grpc` WebSocket bridge, plus the kept HTTP surface — healthz, metrics,
 //! ports proxy, and the static web UI. Port of python/vmon/server/.
 
-mod bridge;
+pub(crate) mod bridge;
 mod error;
 mod grpc;
 mod routes;
 mod sandbox_stream;
 mod server;
-mod state;
+pub(crate) mod state;
 mod validation;
 mod ws;
 

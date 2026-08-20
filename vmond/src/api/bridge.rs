@@ -47,7 +47,7 @@ const RESTRICTED_METADATA: &[&str] =
 
 type BodyChunk = Result<Bytes, Infallible>;
 
-pub(super) async fn serve_bridge(routes: Routes, principal: Principal, socket: WebSocket) {
+pub async fn serve_bridge(routes: Routes, principal: Principal, socket: WebSocket) {
 	let (sender, receiver) = socket.split();
 	let (out_tx, out_rx) = mpsc::channel::<pb::BridgeFrame>(16);
 	let writer = write_frames(sender, out_rx);

@@ -22,9 +22,10 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{
 	Json, Router,
 	body::Body,
+	extract::ws::WebSocketUpgrade,
 	http::{Method, Request, header},
 	middleware::{self, Next},
-	response::Response,
+	response::{IntoResponse, Response},
 	routing::get,
 };
 use tokio::{net::TcpListener, sync::broadcast, time::Instant};
@@ -40,7 +41,7 @@ use super::{
 	sched::{SchedCore, SchedGrpc, SchedGrpcOptions},
 	table::{TableConfig, WorkerTable},
 };
-use crate::{EngineError, Result};
+use crate::{EngineError, Result, security::Principal};
 
 /// Mirror of the API layer's uniform message cap.
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
@@ -262,8 +263,10 @@ fn validate_auth(options: &SchedulerOptions) -> Result<()> {
 	}
 }
 
-fn router(grpc: SchedGrpc, token: Option<String>, redis: Redis) -> Router {
-	let grpc_router = Routes::default()
+/// Build the tonic service set. The same [`Routes`] shape backs both the
+/// native h2c router and each `/grpc` WebSocket bridge upgrade.
+fn grpc_routes(grpc: SchedGrpc) -> Routes {
+	Routes::default()
 		.add_service(
 			pb::sandbox_service_server::SandboxServiceServer::new(grpc.clone())
 				.max_decoding_message_size(MAX_MESSAGE_SIZE)
@@ -279,10 +282,35 @@ fn router(grpc: SchedGrpc, token: Option<String>, redis: Redis) -> Router {
 				.max_decoding_message_size(MAX_MESSAGE_SIZE)
 				.max_encoding_message_size(MAX_MESSAGE_SIZE),
 		)
-		.prepare()
-		.into_axum_router();
+}
+
+/// gRPC-over-WebSocket bridge (`GET /grpc`), mirroring `vmon serve`.
+///
+/// Clients that cannot speak native h2c — browsers, and the JS SDK's mesh
+/// driver, which only implements this bridge — reach the scheduler here.
+/// [`require_bearer`] has already authenticated the upgrade, and the
+/// scheduler has no tenant model, so the bridge runs as the local admin.
+fn bridge_ws(ws: WebSocketUpgrade, grpc: SchedGrpc) -> Response {
+	ws.max_message_size(MAX_MESSAGE_SIZE + 1024)
+		.max_frame_size(MAX_MESSAGE_SIZE + 1024)
+		.on_upgrade(move |socket| {
+			crate::api::bridge::serve_bridge(grpc_routes(grpc), Principal::local_admin(), socket)
+		})
+		.into_response()
+}
+
+fn router(grpc: SchedGrpc, token: Option<String>, redis: Redis) -> Router {
+	let grpc_router = grpc_routes(grpc.clone()).prepare().into_axum_router();
+	let bridge_grpc = grpc;
 	Router::new()
 		.route("/healthz", get(healthz))
+		.route(
+			"/grpc",
+			get(move |ws| {
+				let grpc = bridge_grpc.clone();
+				async move { bridge_ws(ws, grpc) }
+			}),
+		)
 		.merge(dashboard::router(redis))
 		.merge(grpc_router)
 		.layer(middleware::from_fn_with_state(Arc::new(token), require_bearer))
@@ -315,8 +343,10 @@ async fn require_bearer(
 		.headers()
 		.get(header::AUTHORIZATION)
 		.and_then(|value| value.to_str().ok())
-		.and_then(|value| value.strip_prefix("Bearer "));
-	if supplied == Some(expected.as_str()) {
+		.and_then(|value| value.strip_prefix("Bearer "))
+		.map(ToOwned::to_owned)
+		.or_else(|| bridge_query_token(&request));
+	if supplied.as_deref() == Some(expected.as_str()) {
 		return next.run(request).await;
 	}
 	let mut response = Response::new(Body::empty());
@@ -327,6 +357,26 @@ async fn require_bearer(
 	headers.insert("vmon-code", header::HeaderValue::from_static("unauthorized"));
 	headers.insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
 	response
+}
+
+/// Token supplied as `?token=` on the `/grpc` upgrade.
+///
+/// Browsers cannot set an `Authorization` header on a WebSocket handshake, so
+/// the bridge accepts the token in the query string — but only for a GET that
+/// is actually an upgrade, so a bare URL can never authenticate an RPC.
+fn bridge_query_token(request: &Request<Body>) -> Option<String> {
+	if request.method() != Method::GET || request.uri().path() != "/grpc" {
+		return None;
+	}
+	let upgrading = request
+		.headers()
+		.get(header::UPGRADE)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+	if !upgrading {
+		return None;
+	}
+	crate::api::state::query_token(request.uri().query())
 }
 
 /// Seed the table from every live self-expiring worker key.
@@ -444,5 +494,49 @@ mod tests {
 			..SchedulerOptions::default()
 		};
 		assert!(validate_auth(&with_token).is_ok());
+	}
+
+	fn upgrade_request(method: Method, uri: &str, upgrading: bool) -> Request<Body> {
+		let mut builder = Request::builder().method(method).uri(uri);
+		if upgrading {
+			builder = builder.header(header::UPGRADE, "websocket");
+		}
+		builder.body(Body::empty()).expect("request builds")
+	}
+
+	/// The `?token=` escape hatch exists only because browsers cannot set an
+	/// `Authorization` header on a WebSocket handshake. It must therefore stay
+	/// confined to a genuine `GET /grpc` upgrade, or a token pasted into a URL
+	/// would authenticate ordinary RPCs (and leak through logs and referrers).
+	#[test]
+	fn bridge_query_tokens_are_limited_to_grpc_upgrades() {
+		assert_eq!(
+			bridge_query_token(&upgrade_request(Method::GET, "/grpc?token=a%20b", true)).as_deref(),
+			Some("a b"),
+			"percent-decoded token on a real upgrade"
+		);
+		assert_eq!(
+			bridge_query_token(&upgrade_request(Method::GET, "/grpc?access_token=t", true)).as_deref(),
+			Some("t")
+		);
+		assert_eq!(
+			bridge_query_token(&upgrade_request(Method::GET, "/grpc?token=t", false)),
+			None,
+			"a non-upgrade GET must not authenticate from the query string"
+		);
+		assert_eq!(
+			bridge_query_token(&upgrade_request(Method::POST, "/grpc?token=t", true)),
+			None,
+			"only GET upgrades carry a query token"
+		);
+		assert_eq!(
+			bridge_query_token(&upgrade_request(
+				Method::GET,
+				"/vmon.v1.SystemService/Info?token=t",
+				true
+			)),
+			None,
+			"query tokens never reach the native h2c RPC paths"
+		);
 	}
 }
