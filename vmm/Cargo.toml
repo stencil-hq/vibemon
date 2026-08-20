@@ -35,6 +35,7 @@ flume = { version = "0.11", default-features = false }
 vmon-agent = { path = "../agent" }
 zstd = "0.13"
 vmon-cloud = { path = "../cloud" }
+url = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

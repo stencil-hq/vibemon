@@ -987,39 +987,36 @@ mod tests {
 
 	#[test]
 	fn http_fetcher_requires_immutable_etag_and_secure_workload_transport() {
-		let missing = match HttpRangeFetcher::new(
+		let Err(missing) = HttpRangeFetcher::new(
 			"https://example.com/rootfs".to_owned(),
 			None,
 			ObjectAuth::None,
 			None,
 			None,
-		) {
-			Ok(_) => panic!("missing ETag must fail"),
-			Err(error) => error,
+		) else {
+			panic!("missing ETag must fail")
 		};
 		assert!(missing.to_string().contains("requires an immutable ETag"));
 
-		let weak = match HttpRangeFetcher::new(
+		let Err(weak) = HttpRangeFetcher::new(
 			"https://example.com/rootfs".to_owned(),
 			None,
 			ObjectAuth::None,
 			None,
 			Some("W/\"mutable\"".to_owned()),
-		) {
-			Ok(_) => panic!("weak ETag must fail"),
-			Err(error) => error,
+		) else {
+			panic!("weak ETag must fail")
 		};
 		assert!(weak.to_string().contains("quoted strong entity-tag"));
 
-		let insecure = match HttpRangeFetcher::new(
+		let Err(insecure) = HttpRangeFetcher::new(
 			"http://storage.googleapis.com/rootfs".to_owned(),
 			None,
 			ObjectAuth::Google,
 			None,
 			Some("\"immutable\"".to_owned()),
-		) {
-			Ok(_) => panic!("workload auth over HTTP must fail"),
-			Err(error) => error,
+		) else {
+			panic!("workload auth over HTTP must fail")
 		};
 		assert!(insecure.to_string().contains("requires an https:// URL"));
 	}

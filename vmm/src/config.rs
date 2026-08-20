@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, error::ErrorKind};
+use url::Url;
 use vmon_cloud::ObjectAuth;
 
 use crate::{
@@ -603,8 +604,7 @@ impl Config {
 			.rootfs_remote_url
 			.as_deref()
 			.map(|url| {
-				reqwest::Url::parse(url)
-					.map_err(|error| err(format!("invalid --rootfs-remote-url: {error}")))
+				Url::parse(url).map_err(|error| err(format!("invalid --rootfs-remote-url: {error}")))
 			})
 			.transpose()?;
 		if parsed_rootfs_remote_url
@@ -1232,11 +1232,7 @@ fn is_valid_volume_tag(tag: &str) -> bool {
 			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-fn validate_remote_workload_url(
-	url: &reqwest::Url,
-	auth: ObjectAuth,
-	region: Option<&str>,
-) -> Result<()> {
+fn validate_remote_workload_url(url: &Url, auth: ObjectAuth, region: Option<&str>) -> Result<()> {
 	match auth {
 		ObjectAuth::None => Ok(()),
 		ObjectAuth::Google => {
@@ -1267,7 +1263,7 @@ fn validate_remote_workload_url(
 	}
 }
 
-fn has_query_identity(url: &reqwest::Url, name: &str, valid: impl FnOnce(&str) -> bool) -> bool {
+fn has_query_identity(url: &Url, name: &str, valid: impl FnOnce(&str) -> bool) -> bool {
 	let mut values = url.query_pairs().filter(|(key, _)| key == name);
 	let Some((_, value)) = values.next() else {
 		return false;
@@ -1275,7 +1271,7 @@ fn has_query_identity(url: &reqwest::Url, name: &str, valid: impl FnOnce(&str) -
 	values.next().is_none() && valid(&value)
 }
 
-fn is_trusted_aws_object_origin(url: &reqwest::Url, region: &str) -> bool {
+fn is_trusted_aws_object_origin(url: &Url, region: &str) -> bool {
 	let Some(host) = url.host_str() else {
 		return false;
 	};
@@ -1298,7 +1294,7 @@ fn is_trusted_aws_object_origin(url: &reqwest::Url, region: &str) -> bool {
 				.ok()
 				.filter(|value| !value.trim().is_empty())
 		})
-		.and_then(|endpoint| reqwest::Url::parse(&endpoint).ok())
+		.and_then(|endpoint| Url::parse(&endpoint).ok())
 		.is_some_and(|endpoint| {
 			endpoint.scheme() == url.scheme()
 				&& endpoint.host_str() == url.host_str()
