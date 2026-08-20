@@ -6,7 +6,9 @@
 //! 64 handles.
 
 pub mod block;
-#[cfg(any(target_os = "linux", test))]
+// The backend serves Linux guests only; its positional file I/O is unix-only,
+// so Windows test builds must not pull it in.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 mod block_remote;
 pub mod console;
 #[cfg(not(target_os = "windows"))]
