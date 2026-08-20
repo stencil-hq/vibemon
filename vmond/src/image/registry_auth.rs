@@ -116,11 +116,10 @@ fn parse_ecr_registry(host: &str) -> Option<EcrRegistry> {
 	} else if let Some(prefix) = host.strip_suffix(".amazonaws.com") {
 		let (account, region) = prefix.split_once(".dkr.ecr.")?;
 		(account, region, format!("ecr.{region}.amazonaws.com"))
-	} else if let Some(prefix) = host.strip_suffix(".on.aws") {
+	} else {
+		let prefix = host.strip_suffix(".on.aws")?;
 		let (account, region) = prefix.split_once(".dkr-ecr.")?;
 		(account, region, format!("ecr.{region}.api.aws"))
-	} else {
-		return None;
 	};
 	if account.len() != 12
 		|| !account.bytes().all(|byte| byte.is_ascii_digit())

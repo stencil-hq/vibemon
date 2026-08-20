@@ -539,7 +539,7 @@ impl AwsStore {
 			.credentials
 			.credentials()
 			.map_err(|error| EngineError::unauthorized(error.to_string()))?;
-		let query = version_query(version_id);
+		let query = version_id.map(version_query);
 		let query = query.as_ref().map_or(&[][..], |query| query.as_slice());
 		let (url, canonical_uri, canonical_query) =
 			request_url_for(&self.bucket, &self.region, self.endpoint.as_deref(), key, query)
@@ -590,7 +590,7 @@ impl AwsStore {
 	}
 
 	fn object_url(&self, location: &ObjectLocation, metadata: &ObjectMetadata) -> Result<String> {
-		let query = version_query(metadata.version_id.as_deref());
+		let query = metadata.version_id.as_deref().map(version_query);
 		let query = query.as_ref().map_or(&[][..], |query| query.as_slice());
 		let (url, ..) = request_url_for(
 			&self.bucket,
@@ -658,13 +658,11 @@ impl AwsStore {
 		let produced = producer
 			.join()
 			.map_err(|_| EngineError::engine("S3 upload reader panicked"))?;
-		match upload {
-			Err(error) => Err(EngineError::engine(format!("uploading S3 rootfs: {error}"))),
-			Ok(()) => {
-				produced?;
-				Ok(())
-			},
+		if let Err(error) = upload {
+			return Err(EngineError::engine(format!("uploading S3 rootfs: {error}")));
 		}
+		produced?;
+		Ok(())
 	}
 
 	fn put_json<T: Serialize>(&mut self, location: &ObjectLocation, value: &T) -> Result<()> {
@@ -812,8 +810,9 @@ fn is_valid_aws_region(region: &str) -> bool {
 		&& !region.contains("--")
 }
 
-fn version_query(version_id: Option<&str>) -> Option<[(String, String); 1]> {
-	version_id.map(|version| [("versionId".to_owned(), version.to_owned())])
+/// Build the `versionId` query that pins one immutable S3 object version.
+fn version_query(version_id: &str) -> [(String, String); 1] {
+	[("versionId".to_owned(), version_id.to_owned())]
 }
 
 fn canonical_http_etag(value: &str, provider: &str) -> Result<String> {
@@ -1053,11 +1052,10 @@ mod tests {
 
 	#[test]
 	fn s3_version_query_pins_a_specific_object_version() {
-		assert!(version_query(None).is_none());
-		assert_eq!(
-			version_query(Some("3/L4kqtJlcpXroDTDmJ+3Dc8kN2gPHrb")),
-			Some([("versionId".to_owned(), "3/L4kqtJlcpXroDTDmJ+3Dc8kN2gPHrb".to_owned())])
-		);
+		assert_eq!(version_query("3/L4kqtJlcpXroDTDmJ+3Dc8kN2gPHrb"), [(
+			"versionId".to_owned(),
+			"3/L4kqtJlcpXroDTDmJ+3Dc8kN2gPHrb".to_owned()
+		)]);
 	}
 
 	#[test]
