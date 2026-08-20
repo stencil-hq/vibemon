@@ -51,7 +51,7 @@ release:
 
 # Resolve the host path to the vmon binary for a profile (debug|release).
 _bin prof:
-    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | uv run --no-project python -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
+    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(dirname "$(cargo locate-project --workspace --message-format plain)")/target}" "{{prof}}"
 
 # Print the path to the built vmon binary (honors `profile`).
 bin:
@@ -287,7 +287,7 @@ agent-musl:
     else
         cargo build --release -p vmon-agent --target "$triple"
     fi
-    target_dir="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | uv run --no-project python -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}"
+    target_dir="${CARGO_TARGET_DIR:-$(dirname "$(cargo locate-project --workspace --message-format plain)")/target}"
     dest="{{justfile_directory()}}/target/test-assets"
     mkdir -p "$dest"
     cp "$target_dir/$triple/release/vmon-agent" "$dest/vmon-agent-$arch"
