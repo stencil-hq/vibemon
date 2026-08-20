@@ -3462,6 +3462,7 @@ dependencies = [
  "vm-superio",
  "vmm-sys-util",
  "vmon-agent",
+ "vmon-cloud",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -3512,6 +3513,20 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "vmon-cloud"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
 ]
 
 [[package]]
@@ -3569,6 +3584,7 @@ dependencies = [
  "uuid",
  "vmm",
  "vmon-agent",
+ "vmon-cloud",
  "vmon-proto",
  "zeroize",
  "zstd",

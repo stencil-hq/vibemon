@@ -1,0 +1,110 @@
+VIBEMON THIRD-PARTY NOTICES
+============================
+
+This file is a self-contained release notice payload compiled from locked
+dependency graphs and tracked component notices in deterministic path and
+package order.
+
+LICENSE SCOPE
+-------------
+
+Unless a package says otherwise, first-party Vibemon runtime and internal code
+is licensed under the MIT license in the companion LICENSE file, copyright
+2026 Stencil Labs, Inc. The protocol, generated API types, and Python,
+TypeScript, and Go SDKs are offered under MIT OR Apache-2.0. The complete
+Apache-2.0 text is included below.
+
+This aggregate preserves notices and license texts; it does not replace,
+restrict, expand, or supersede any applicable terms. Third-party names, logos,
+guest images, kernels, BusyBox builds, and firmware are not covered by the
+project's first-party licenses.
+
+DEPENDENCY POLICY
+-----------------
+
+cargo-deny 0.20.2 evaluates the locked Rust workspace with all features and all
+target-specific, build, and development edges. Unknown registries, unknown
+licenses, restricted/source-available licenses, and unapproved copyleft terms
+fail closed. about.toml records the selected branch for OR expressions; every
+term of an AND expression is retained. Package-scoped exceptions, if present,
+are visible in both about.toml and deny.toml.
+
+The JavaScript, Python, and Go lists below record distribution roles and exact
+locked direct dependencies. Changes to any list fail the repository check until
+reviewed. Dependencies of separately delivered SDKs are not represented as
+statically embedded in the vmon host binaries.
+
+SHIPPED WEB UI RUNTIME
+----------------------
+
+The production UI is built into vmond/web and embedded in the vmon server
+binary. Its locked runtime graph is:
+
+- @bufbuild/protobuf 2.12.1 (Apache-2.0 AND BSD-3-Clause)
+- @connectrpc/connect 2.1.2 (Apache-2.0)
+- @xterm/addon-fit 0.10.0 (MIT)
+- @xterm/xterm 5.5.0 (MIT)
+- js-tokens 4.0.0 (MIT)
+- loose-envify 1.4.0 (MIT)
+- react 18.3.1 (MIT)
+- react-dom 18.3.1 (MIT)
+- scheduler 0.23.2 (MIT)
+
+The complete UI attribution and applicable texts are preserved in the tracked
+vmond/web/THIRD-PARTY-NOTICES.txt notice concatenated below.
+
+NATIVE AND VENDORED COMPONENTS
+------------------------------
+
+- vm-memory 0.17.1 is vendored Rust source; its tracked notice and license
+  payload are concatenated below.
+- libslirp 4.3.2 and libslirp-sys 4.2.1 are vendored Rust wrapper crates under
+  MIT; their tracked notices are concatenated below.
+- The native libslirp library is BSD-3-Clause and is supplied dynamically by the
+  operating environment. It is not LGPL and is not bundled in release archives.
+
+SEPARATELY DELIVERED SDK DEPENDENCIES
+-------------------------------------
+
+Python SDK runtime requirements (resolved versions in uv.lock):
+- cbor2 6.1.4 (MIT)
+- cloudpickle 3.1.2 (BSD-3-Clause)
+- grpcio 1.83.0 (Apache-2.0)
+- httpx 0.28.1 (BSD-3-Clause)
+- protobuf 7.36.0 (BSD-3-Clause)
+- zstandard 0.25.0 (BSD-3-Clause)
+These are package-manager requirements, not files embedded in the vmon wheel or
+sdist.
+
+TypeScript SDK runtime requirements (resolved versions in sdk/ts/bun.lock):
+- @bufbuild/protobuf 2.12.1 (Apache-2.0 AND BSD-3-Clause)
+- @connectrpc/connect 2.1.2 (Apache-2.0)
+These are package-manager requirements, not files embedded in the SDK package.
+
+Go SDK module requirements (versions in sdk/go/go.mod):
+- github.com/coder/websocket v1.8.14 (ISC)
+- github.com/fxamacker/cbor/v2 v2.9.0 (MIT)
+- github.com/klauspost/compress v1.19.0 (Apache-2.0)
+- google.golang.org/grpc v1.82.0 (Apache-2.0)
+- google.golang.org/protobuf v1.36.11 (BSD-3-Clause)
+- github.com/x448/float16 v0.8.4 (MIT; indirect)
+- golang.org/x/net v0.53.0 (BSD-3-Clause; indirect)
+- golang.org/x/sys v0.43.0 (BSD-3-Clause; indirect)
+- golang.org/x/text v0.36.0 (BSD-3-Clause; indirect)
+- google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 (Apache-2.0; indirect)
+Go module dependencies are resolved by consumers and are not embedded in the
+source module archive.
+
+EXTERNAL TEST AND GUEST ASSETS
+------------------------------
+
+Guest kernels, images, BusyBox, firmware, and other downloaded assets are test
+or guest payloads rather than host-binary dependencies. Their sources, hashes,
+and terms are recorded in demo/ASSET-PROVENANCE.txt, concatenated below. Their
+licenses do not apply to first-party Vibemon code.
+
+TRACKED COMPONENT NOTICES
+-------------------------
+
+The following adjacent notices are concatenated verbatim. Their source paths
+identify the affected shipped, vendored, documentation, or guest material.

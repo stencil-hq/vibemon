@@ -1,0 +1,22 @@
+RUST DEPENDENCY LICENSES
+=========================
+
+Generated from the complete Cargo.lock dependency graph by cargo-about 0.8.2
+with workspace, all-feature, all-target, build, and development dependencies.
+For an OR expression, cargo-about selects the first satisfiable branch listed
+in about.toml. Every term in an AND expression is retained. cargo-deny
+independently enforces the approved branch policy.
+
+{{#each licenses}}
+-------------------------------------------------------------------------------
+License: {{name}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{else}} (https://crates.io/crates/{{crate.name}}/{{crate.version}}){{/if}}
+{{/each}}
+
+Full license text:
+
+{{text}}
+{{/each}}

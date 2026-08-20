@@ -51,7 +51,7 @@ release:
 
 # Resolve the host path to the vmon binary for a profile (debug|release).
 _bin prof:
-    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
+    @printf '%s/%s/vmon\n' "${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | uv run --no-project python -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}" "{{prof}}"
 
 # Print the path to the built vmon binary (honors `profile`).
 bin:
@@ -287,7 +287,7 @@ agent-musl:
     else
         cargo build --release -p vmon-agent --target "$triple"
     fi
-    target_dir="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}"
+    target_dir="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 | uv run --no-project python -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')}"
     dest="{{justfile_directory()}}/target/test-assets"
     mkdir -p "$dest"
     cp "$target_dir/$triple/release/vmon-agent" "$dest/vmon-agent-$arch"
@@ -348,12 +348,21 @@ lima-seccomp-audit:
 lima-shell: _lima-check
     @exec limactl shell '{{lima_vm}}'
 
+# Check the locked, all-feature/all-target license policy.
+license-check:
+    cargo deny check licenses
+
 # Validate systemd, Compose, Helm templates, and Kubernetes schemas.
 validate-deploy:
     shellcheck deploy/single-node/*.sh
     VMON_API_TOKEN=validation-token-000000000000 docker compose -f deploy/single-node/docker-compose.yml config --quiet
     docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 lint /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml
     docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 template vmon /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml | docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary
+
+# Package every local release artifact for an explicit Linux musl target.
+# This builds and smoke-checks binaries but never uploads or publishes.
+local-release target:
+    ./scripts/package-local-release.sh --target "{{target}}"
 
 # Package the deployment assets into a release tarball
 package-deploy:

@@ -1,0 +1,35 @@
+# cargo-about 0.8.2 selects the first satisfiable branch of OR expressions in
+# this order. AND expressions retain every term. Non-standard approvals must be
+# package-scoped here and in deny.toml; unknown licenses fail generation.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MIT-0",
+]
+
+# The vendored wrappers omit Cargo.toml license fields; their exact, unmodified
+# MIT files are checksum-pinned. The dynamically supplied native libslirp is
+# covered separately by its BSD-3-Clause component notice.
+[libslirp.clarify]
+license = "MIT"
+
+[[libslirp.clarify.files]]
+path = "LICENSE"
+checksum = "6cd7501b9a94bf246f15c3db84a40e164958cc0b878d7e4c080807992ed92a0b"
+
+[libslirp-sys.clarify]
+license = "MIT"
+
+[[libslirp-sys.clarify.files]]
+path = "LICENSE"
+checksum = "6cd7501b9a94bf246f15c3db84a40e164958cc0b878d7e4c080807992ed92a0b"

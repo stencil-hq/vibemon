@@ -3,6 +3,9 @@ name = "vmon-proto"
 version = "0.1.0"
 edition = "2024"
 description = "Generated protobuf types for the vmon v1 WebSocket transport"
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

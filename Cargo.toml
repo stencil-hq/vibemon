@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Vibemon — small KVM/HVF-based Linux microVM monitor"
 readme = "README.md"
+license = "MIT"
+authors = ["Stencil Labs, Inc."]
+repository = "https://github.com/stencil-hq/vibemon"
 
 [[bin]]
 name = "vmon"
@@ -12,8 +15,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[workspace.package]
+license = "MIT"
+authors = ["Stencil Labs, Inc."]
+repository = "https://github.com/stencil-hq/vibemon"
+
 [workspace]
-members = ["vmm", "agent", "vmond", "proto"]
+members = ["vmm", "agent", "vmond", "proto", "cloud"]
 resolver = "3"
 
 [workspace.lints.rust]

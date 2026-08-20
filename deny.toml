@@ -1,0 +1,36 @@
+# cargo-deny 0.20.2 policy. An empty target list evaluates every
+# target-specific dependency in Cargo.lock; all-features covers optional edges.
+[graph]
+targets = []
+all-features = true
+
+[licenses]
+include-dev = true
+include-build = true
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Windows support uses this exact upstream Git source, revision-locked in
+# Cargo.lock. Every other Git or unknown source is denied.
+allow-git = [
+    "https://github.com/insula-rs/libwhp",
+]

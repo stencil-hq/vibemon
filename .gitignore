@@ -34,6 +34,7 @@ sdk/py/build
 # Release staging artifacts; CI publishes these rather than committing them.
 /dist/
 sdk/py/dist/
+sdk/ts/dist/
 
 # Python tooling caches and virtualenvs
 .pytest_cache/
@@ -47,3 +48,5 @@ AGENTS.local.md
 
 # Generated mdBook site
 docs/book/
+
+deploy/gcp/Pulumi.*
