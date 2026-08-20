@@ -264,7 +264,7 @@ fn seek_extent(file: &File, offset: u64, whence: libc::c_int) -> io::Result<Opti
 
 #[cfg(target_os = "linux")]
 fn extent_seeking_unsupported(error: &io::Error) -> bool {
-	matches!(error.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP))
+	matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP))
 }
 #[cfg(not(target_os = "windows"))]
 fn sparse_copy_by_scanning(src: &mut File, dst: &File) -> io::Result<()> {
@@ -506,7 +506,7 @@ impl Block {
 		#[cfg(target_os = "linux")]
 		{
 			let io = Self::create_linux_io()?;
-			return Ok(Self::from_file_with_capacity(disk, read_only, len, None, io));
+			Ok(Self::from_file_with_capacity(disk, read_only, len, None, io))
 		}
 		#[cfg(not(target_os = "linux"))]
 		Ok(Self::from_file_with_capacity(disk, read_only, len))
