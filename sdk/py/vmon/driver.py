@@ -548,7 +548,7 @@ class MeshDriver:
                     raise ProtocolError("mesh status returned a malformed response")
                 discovered = roster_from_status(value)
                 self._merge_discovered(discovered)
-            except (APIError, ProtocolError, TransportError, ValueError):
+            except APIError, ProtocolError, TransportError, ValueError:
                 pass
         finally:
             with self._lock:

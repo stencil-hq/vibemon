@@ -111,7 +111,7 @@ def encode_value(
     if codec == "auto":
         try:
             raw = _encode_json(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             chosen = ValueCodec.CBOR
             raw = _encode_cbor(value)
         else:

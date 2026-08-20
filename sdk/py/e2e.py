@@ -227,7 +227,7 @@ def hypervisor_present() -> bool:
                 check=False,
             )
             return out.stdout.strip() == "1"
-        except (OSError, subprocess.SubprocessError):
+        except OSError, subprocess.SubprocessError:
             return False
     return False
 
@@ -455,7 +455,7 @@ def net_admin() -> bool:
             if line.startswith("CapEff:"):
                 mask = int(line.split()[1], 16)
                 return bool(mask & (1 << 12))  # CAP_NET_ADMIN
-    except (OSError, ValueError, IndexError):
+    except OSError, ValueError, IndexError:
         return False
     return False
 

@@ -1,12 +1,19 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmon"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Thin Python SDK for the Rust vmon API"
-requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+authors = [
+    { name = "Stencil Labs, Inc." },
+]
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+requires-python = ">=3.14"
+
 dependencies = [
     "cbor2>=5.7",
     "cloudpickle>=3.1",
@@ -15,6 +22,10 @@ dependencies = [
     "protobuf>=7.35.1",
     "zstandard>=0.23",
 ]
+
+[project.urls]
+Homepage = "https://github.com/stencil-hq/vibemon"
+Repository = "https://github.com/stencil-hq/vibemon"
 
 [project.optional-dependencies]
 test = [
@@ -32,12 +43,16 @@ dev = [
 [tool.setuptools]
 packages = ["vmon", "vmon.v1"]
 
+[tool.setuptools.dynamic]
+version = { attr = "vmon.__version__" }
+
 [tool.setuptools.package-data]
 vmon = ["py.typed"]
+"vmon.v1" = ["*.pyi"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py314"
 extend-exclude = ["vmon/v1"]
 
 [tool.ruff.lint]
@@ -52,7 +67,7 @@ ignore = [
 
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 files = ["vmon", "tests/typing_remote.py"]
 exclude = ["^e2e\\.py$"]
 ignore_missing_imports = true

@@ -4,11 +4,39 @@ Thin Python client SDK for the Rust `vmon` API. The Rust `vmon` binary owns the 
 
 ## Install
 
+For development from the repository root:
+
 ```sh
-uv sync
+uv sync --project sdk/py --python 3.14
 ```
 
-Python 3.14+ is required. The SDK expects a running Rust daemon/server. By default it talks to the local Unix socket at `$VMON_HOME/vmond.sock` (or `~/.vmon/vmond.sock`). Named remote contexts are stored under `$VMON_HOME/contexts.json`, and bearer tokens can come from `VMON_API_TOKEN` or `$VMON_HOME/credentials/<context>.token`.
+The `vmon` distribution supports Python 3.14 and newer. The SDK expects a running Rust daemon/server. By default it talks to the local Unix socket at `$VMON_HOME/vmond.sock` (or `~/.vmon/vmond.sock`). Named remote contexts are stored under `$VMON_HOME/contexts.json`, and bearer tokens can come from `VMON_API_TOKEN` or `$VMON_HOME/credentials/<context>.token`.
+
+## Local release package
+
+From the repository root, build and validate the wheel and source distribution:
+
+```sh
+./scripts/package-python-sdk.sh
+```
+
+The script cleans `sdk/py/dist/`, builds `vmon` with Python 3.14, checks both distributions' metadata, installs the wheel and its dependencies into an isolated Python 3.14 environment, and verifies that `import vmon` resolves from that environment's installed wheel with a package version matching the distribution metadata. It does not publish or read upload credentials.
+
+The publishable wheel and source distribution remain in `sdk/py/dist/`. The script also creates the deterministic release bundle and checksum consumed by the release workflow:
+
+```text
+dist/vmon-python-sdk-<version>.tar.gz
+dist/vmon-python-sdk-<version>.tar.gz.sha256
+```
+
+To inspect or install the locally built wheel:
+
+```sh
+uvx --python 3.14 twine check sdk/py/dist/*
+uv pip install --python 3.14 sdk/py/dist/vmon-*.whl
+```
+
+Publishing to a package index is outside this local packaging workflow. The script does not invoke an upload command or read upload credentials.
 
 ## Quick start
 
@@ -72,5 +100,5 @@ assert resumed.observed_state == restored.observed_state == "running"
 From the repository root, after building the Rust binary and enabling real-VM e2e prerequisites:
 
 ```sh
-VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run python sdk/py/e2e.py
+VMON_BIN=$PWD/target/debug/vmon VMON_E2E=1 uv run --python 3.14 python sdk/py/e2e.py
 ```

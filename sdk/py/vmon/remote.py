@@ -1403,7 +1403,7 @@ class _AsyncBatchCall(Generic[R]):
                         yield cast(R, terminal_error)
                         return
                     raise terminal_error
-        except (asyncio.CancelledError, GeneratorExit):
+        except asyncio.CancelledError, GeneratorExit:
             await asyncio.shield(self.cancel("async batch result consumer closed"))
             raise
 

@@ -110,7 +110,7 @@ class ContextStore:
         try:
             with self._path.open(encoding="utf-8") as file:
                 data = json.load(file)
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             return
 
         if not isinstance(data, Mapping):
@@ -212,7 +212,7 @@ class ContextStore:
         """Return a saved context token, or None when absent/empty/unreadable."""
         try:
             token = self.token_path(name).read_text(encoding="utf-8").strip()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return None
         return token or None
 
@@ -224,7 +224,7 @@ class ContextStore:
         """Delete a saved token file, tolerating missing files and unsafe names."""
         try:
             self.token_path(name).unlink()
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError, ValueError:
             pass
 
     def resolve_token(self, name: str) -> str | None:
