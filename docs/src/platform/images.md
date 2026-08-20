@@ -35,6 +35,96 @@ The ext4 disk-size request defaults to 1024 MiB in the image pipeline. It is a
 capacity choice for the generated root filesystem; ensure it can hold the
 unpacked image plus the injected agent.
 
+## Cloud disk exports
+
+Cloud disk exports are explicit image inputs, not OCI transports. Publish an
+export once on a host with the provider workload identity and the e2fsprogs
+tools, then use the original URI for sandbox creation:
+
+```sh
+vmon image publish-rootfs gs://bucket/exports/ubuntu.tar.gz
+vmon image publish-rootfs s3://bucket/exports/ubuntu.vhd
+vmon run gs://bucket/exports/ubuntu.tar.gz -- echo hello
+vmon run s3://bucket/exports/ubuntu.vhd -- echo hello
+```
+
+Both `gs://` and `s3://` accept the same export formats:
+
+- a gzip-compressed tar (`.tar.gz` or `.tgz`) whose first member is
+  `disk.raw`;
+- a raw GPT disk (`.raw` or `.img`); or
+- a fixed VHD containing a GPT disk (`.vhd`).
+
+QCOW2, dynamic VHD, MBR-only disks, LVM roots, and non-ext4 roots are not
+supported. The publisher selects the largest partition that actually contains
+an ext4 superblock, injects `/.vmon/agent`, minimizes the filesystem, and
+uploads independent 1 MiB zstd frames plus a JSON sidecar beside the source.
+Gzip-tar input is scanned as a forward-only stream, including when a larger
+non-ext4 partition precedes or follows the root; direct raw and fixed-VHD input
+uses range reads to probe partitions and copy only the selected root.
+
+Publication reads one immutable source identity, uploads the derived rootfs
+first, re-reads its stored identity, and writes the sidecar last. The sidecar
+records the source and derived object identities, the extracted and compressed
+rootfs sizes, frame index, compressed SHA-256, and guest-agent SHA-256. A later sandbox request starts from the
+original cloud URI, validates that sidecar against the current source and
+derived objects, and range-reads only the published zstd frames; it never
+reconverts the export. A missing sidecar or any source, derived-object, size,
+digest, version, or index mismatch is rejected with instructions to rerun
+`vmon image publish-rootfs`.
+
+GCS lazy reads require both a positive object generation and an ETag, and pin
+every request to that identity. S3 lazy reads require both a non-null
+`x-amz-version-id` and a strong quoted ETag; every range request specifies the
+discovered `versionId` and uses `If-Match`. Enable S3 bucket versioning before
+uploading the source export. An object whose version ID is absent or `null` is
+rejected, even if it has an ETag.
+
+GCS metadata OAuth tokens and dynamic AWS workload credentials (ECS task role,
+EC2 instance role, or other provider workload credentials) are sent only to
+provider-trusted HTTPS object endpoints. S3 requests use Signature Version 4.
+`VMON_S3_ENDPOINT` may select an S3-compatible service, but it does not waive
+the immutable-identity requirement: that service must return a non-null
+version ID and a strong quoted ETag and honor version-pinned, conditional range
+reads. Configure credentials and trust for a non-provider endpoint explicitly;
+workload credentials are not forwarded to it.
+
+Private OCI pulls use the same workload identity boundary: Google Artifact
+Registry receives a short-lived metadata OAuth token, and Amazon ECR receives
+a short-lived authorization token obtained with a signed ECR request. Set
+`VMON_REGISTRY_AUTH_FILE` when an operator-managed Docker auth file is required
+for another registry.
+
+### Deployment identity and prefix policy
+
+The Pulumi stacks do not create or configure the source bucket or registry
+repository. Before an AWS deployment, enable versioning on the referenced
+bucket and ensure each existing source export has a non-null version ID (copy
+or upload it again after enabling versioning if necessary). GCS supplies each
+object with a positive generation; ensure the source object's metadata also
+includes an ETag. Configure `rootfsS3Prefix` in `deploy/aws` as
+`s3://bucket/prefix/`, or
+`rootfsGcsPrefix` in `deploy/gcp` as `gs://bucket/prefix/`; the trailing slash
+is required. The source export must be below that prefix because the derived
+rootfs and sidecar are written beside it.
+
+The AWS worker role is limited to `s3:GetObject`, `s3:PutObject`, and
+`s3:AbortMultipartUpload` on the configured prefix, plus
+prefix-conditioned `s3:ListBucket` so missing-artifact probes return `404`.
+The GCP worker service
+account receives prefix-conditioned object-user access; the publish path
+requires `storage.objects.get`, `storage.objects.create`, and
+`storage.objects.delete`. An operator who publishes from another host must
+grant its workload identity the same provider-specific operations. S3 buckets
+should also abort abandoned multipart uploads with a bucket lifecycle rule.
+
+Private cloud-registry IAM is opt-in. Set `ecrRepositoryArn` in `deploy/aws` to
+a full ECR repository ARN, or `artifactRegistryRepository` in `deploy/gcp` to
+the full
+`projects/PROJECT/locations/LOCATION/repositories/REPOSITORY` resource name.
+Omitting those keys grants no ECR or Artifact Registry access. Other private
+registries continue to use the operator-managed `VMON_REGISTRY_AUTH_FILE`.
+
 ## Dockerfile builds
 
 Dockerfile builds require `buildctl` and an isolated BuildKit endpoint in `VMON_BUILDKIT_ADDR`. Vibemon does not invoke Docker, Buildah, a shell, or an inherited host environment.

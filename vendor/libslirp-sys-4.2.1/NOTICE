@@ -1,0 +1,17 @@
+libslirp-sys Rust FFI wrapper 4.2.1
+
+Vendored from: https://gitlab.freedesktop.org/slirp/libslirp-rs
+License: MIT
+Copyright (c) 2019-2020 Red Hat, Inc.
+
+The complete upstream MIT license is retained in LICENSE in this directory.
+This crate contains Rust FFI declarations and build discovery logic, not the
+native libslirp implementation.
+
+On non-Windows targets build.rs uses pkg-config to require a separately
+supplied native libslirp version 4.2.0 or newer. On Windows it links a native
+`slirp` library, optionally discovered through VCPKG_ROOT. That native library
+is not vendored here and is not relicensed under MIT by this wrapper.
+Upstream native libslirp source:
+https://gitlab.freedesktop.org/slirp/libslirp
+Native libslirp license: BSD-3-Clause.

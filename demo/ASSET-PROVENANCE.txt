@@ -1,0 +1,105 @@
+EXTERNAL GUEST-ASSET PROVENANCE
+
+Scope
+-----
+The assets below are fetched or supplied on demand for demos and end-to-end
+tests. They are written to ignored target/test-assets/ or temporary demo work
+directories; they are not tracked source, are not embedded in the host vmon
+binary, and are not relicensed by the host binary's MIT license. Generated
+guest initramfs/rootfs images contain their guest components and remain subject
+to those components' own terms.
+
+Pinned integration-test assets (demo/fetch-test-assets.sh)
+---------------------------------------------------------
+Linux x86_64 kernel image
+- Version/source release: Cloud Hypervisor Linux release
+  ch-release-v6.12.8-20250613, bzImage-x86_64
+- URL: https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.12.8-20250613/bzImage-x86_64
+- SHA-256: d4af401aa859e4659d4b08a153ac608eb6a315c6918e567daa46981af5d2e5ef
+- Upstream project: https://kernel.org/
+- License: Linux kernel GPL-2.0-only, with the Linux-syscall-note applying to
+  the UAPI headers. This is an external guest kernel, not a host dependency.
+
+Linux aarch64 kernel image
+- Version/source release: Cloud Hypervisor Linux release
+  ch-release-v6.16.9-20260508, Image-arm64
+- URL: https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/Image-arm64
+- SHA-256: 69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010
+- Upstream project and license: Linux, GPL-2.0-only (same UAPI note above).
+
+BusyBox x86_64 binary
+- Version: 1.35.0, x86_64-linux-musl build published by BusyBox.
+- URL: https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
+- SHA-256: 6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348
+- Source/terms: https://busybox.net/downloads/ and
+  https://busybox.net/license.html
+- License: GPL-2.0-only. The binary is copied into generated test guest images;
+  it is not linked into or distributed as part of the host binary.
+
+Alpine aarch64 minirootfs
+- Version: Alpine 3.20.3 aarch64 minirootfs.
+- URL: https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz
+- SHA-256: 041fa34a81788242df9e78fa69b97ab45b8ec47ddbf88864755610414a7bf3de
+- Source/package metadata: https://www.alpinelinux.org/downloads/ and
+  https://pkgs.alpinelinux.org/
+- The script extracts BusyBox (GPL-2.0-only) and the musl loader (MIT). The
+  archive is an aggregate of packages under their package-specific licenses;
+  this inventory does not apply one blanket license to the archive.
+
+EDK2/OVMF prebuilt firmware
+- Release: rust-osdev ovmf-prebuilt edk2-stable202511-r1.
+- URL: https://github.com/rust-osdev/ovmf-prebuilt/releases/download/edk2-stable202511-r1/edk2-stable202511-r1-bin.tar.xz
+- SHA-256: 79841c5dcac6d4bb71ead5edb6ca2a251237330be3c0b166bdc8a8fec0ce760d
+- Extracted files: OVMF_CODE.fd, OVMF_VARS.fd, and QEMU_EFI.fd.
+- Firmware upstream: https://github.com/tianocore/edk2
+- EDK2 license: BSD-2-Clause-Patent. The prebuilt release may include firmware
+  modules with additional notices retained by its upstream distribution.
+
+Optional Ubuntu 20.04 UEFI fixtures (only with VMON_UEFI_IMAGES=1)
+- Snapshot: focal release-20230209 from cloud-images-archive.ubuntu.com.
+- amd64 URL: http://cloud-images-archive.ubuntu.com/releases/focal/release-20230209/ubuntu-20.04-server-cloudimg-amd64.img
+  SHA-256: eb20cd25da5d2193283951953f6a0f5bdbd57474ac19fd1c36b9b77e6b68bbfc
+- arm64 URL: http://cloud-images-archive.ubuntu.com/releases/focal/release-20230209/ubuntu-20.04-server-cloudimg-arm64.img
+  SHA-256: f607f625568e004831fe7daf799bdd50def22d83e87d82a40f717a09c11a772c
+- Ubuntu image licensing is package-specific; image packages include their own
+  copyright data under /usr/share/doc. No blanket MIT license applies.
+
+Demo-only guest assets
+----------------------
+Ubuntu 24.04 Noble cloud images (demo/run-uefi-ubuntu.sh)
+- Immutable snapshot: release-20260615.
+- Base URL: https://cloud-images.ubuntu.com/releases/noble/release-20260615
+- amd64 file: ubuntu-24.04-server-cloudimg-amd64.img
+  SHA-256: 5fa5b05e5ec239858c4531485d6023b0896448c2df7c63b34f8dae6ea6051a44
+- arm64 file: ubuntu-24.04-server-cloudimg-arm64.img
+  SHA-256: cafa1a965b591b7c4184b484ffd8e625981a79d48f9b4ae8a4adf7b4c5ade927
+- Package-specific licenses and copyright data are carried inside the images.
+
+Ubuntu Base arm64 (demo/run-arm64-ubuntu.sh)
+- Source index: https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/
+- The script selects the first matching ubuntu-base-24.04*-base-arm64.tar.gz at
+  download time and does not pin a filename or checksum. Record and verify the
+  selected upstream artifact before redistributing a generated guest image.
+- Package-specific licenses and /usr/share/doc copyright data apply.
+
+Fallback EDK2 nightlies (demo/run-uefi-ubuntu.sh)
+- x86_64: https://retrage.github.io/edk2-nightly/bin/RELEASEX64_OVMF.fd
+- aarch64: https://retrage.github.io/edk2-nightly/bin/RELEASEAARCH64_QEMU_EFI.fd
+- These unofficial fallbacks are deliberately unpinned and used only when no
+  explicit or distro firmware file is available. The script prints the fetched
+  checksum; it does not claim verification against an upstream digest.
+- Firmware terms derive from EDK2 (BSD-2-Clause-Patent) and any included module
+  notices.
+
+OCI/demo container inputs
+- demo/build-oci-rootfs.sh accepts any caller-supplied OCI image and defaults to
+  the mutable docker://busybox reference; its example uses docker://alpine:3.20.
+- demo/guest-workloads/Dockerfile builds from the mutable alpine:3.22 tag.
+- Registry manifests and package metadata at fetch time determine exact source,
+  versions, and licenses. A generated filesystem must preserve the selected
+  image's package notices; these inputs are not covered by the host MIT license.
+
+Ubuntu, Alpine, Linux, BusyBox, and EDK2 names and logos, if shown in demo
+output or upstream images, remain the property of their respective owners.
+This provenance inventory identifies compatibility and origin only; it grants
+no trademark rights and implies no sponsorship or endorsement.

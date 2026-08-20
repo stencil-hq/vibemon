@@ -1,0 +1,17 @@
+THIRD-PARTY AND TRADEMARK NOTICE FOR THE DOCUMENTATION THEME
+
+The files icons/python.svg, icons/go.svg, icons/typescript.svg and the matching
+symbols in sdk-icons.svg use SVG path data from Simple Icons:
+https://github.com/simple-icons/simple-icons. Simple Icons makes its icon data
+available under CC0-1.0, whose terms expressly do not waive or license
+trademark rights.
+
+These files depict the Python, Go, and TypeScript technology marks solely to
+identify the language of an SDK example. Python, Go, and TypeScript names and
+logos are marks of their respective owners. Their presence does not imply
+sponsorship or endorsement. Neither CC0, the Vibemon MIT license, nor this
+notice grants permission to use any third-party trademark.
+
+The remaining files in this directory are project-authored theme overrides.
+Generated mdBook runtime files, fonts, and mdBook-provided icons are inventoried
+separately in ../book/THIRD-PARTY-NOTICES.txt.

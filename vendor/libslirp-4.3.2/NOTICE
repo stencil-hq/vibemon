@@ -1,0 +1,16 @@
+libslirp Rust wrapper 4.3.2
+
+Vendored from: https://gitlab.freedesktop.org/slirp/libslirp-rs
+License: MIT
+Copyright (c) 2019-2020 Red Hat, Inc.
+
+The complete upstream MIT license is retained in LICENSE in this directory.
+This crate is a Rust wrapper. It does not contain the native libslirp
+implementation.
+
+At build time libslirp-sys discovers a separately supplied native libslirp
+version 4.2.0 or newer (or a native Windows library supplied through vcpkg) and
+links it as `slirp`. Native libslirp is not vendored in this directory and is
+not relicensed under MIT by this wrapper. Upstream native libslirp source:
+https://gitlab.freedesktop.org/slirp/libslirp
+Native libslirp license: BSD-3-Clause.

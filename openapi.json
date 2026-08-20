@@ -4,7 +4,8 @@
     "title": "vmond",
     "description": "Vibemon server core: engine, image pipeline, v1 HTTP API, mesh",
     "license": {
-      "name": ""
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
     },
     "version": "0.1.0"
   },

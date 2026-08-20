@@ -71,6 +71,29 @@ These variables are read by the Python, Go, and TypeScript DSN resolvers. They d
 
 Python and Go default to `vmon+unix://$VMON_HOME/vmond.sock`; TypeScript instead defaults to an HTTP(S) browser origin or `http://127.0.0.1:8000`. TypeScript browser builds do not support UDS. The exact DSN grammar, query parameter precedence, and context-token order are in the [DSN Reference](dsn.md).
 
+## Cloud image and registry credentials
+
+These variables are consumed by cloud disk publication, lazy remote rootfs
+reads, and automatic private-registry authentication. They are not persisted
+in image sidecars or passed as command-line arguments.
+
+| Variable | Effect |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Standard static or temporary AWS credentials; used before the workload metadata chain. |
+| `VMON_S3_ACCESS_KEY` / `VMON_S3_SECRET_KEY` | S3-compatible static credentials when standard AWS names are unavailable. |
+| `AWS_SESSION_TOKEN` / `VMON_S3_SESSION_TOKEN` | Optional session token paired with the corresponding credential names. |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` / `VMON_S3_REGION` | AWS signing region; metadata identity is used when none is set. |
+| `AWS_ENDPOINT_URL_S3` / `VMON_S3_ENDPOINT` | Optional S3-compatible endpoint; requests use path-style addressing. It does not relax lazy-rootfs identity checks: objects still require a non-null version ID and a strong quoted ETag. |
+| `GCE_METADATA_HOST` | Optional Google metadata host override for workload OAuth tokens; remote token-bearing requests are restricted to provider-trusted HTTPS GCS object endpoints. |
+| `VMON_REGISTRY_AUTH_FILE` | Operator-managed Docker auth file passed to `skopeo`; otherwise GCR/Artifact Registry and ECR use short-lived provider tokens. |
+
+AWS lazy rootfs requires S3 bucket versioning and object metadata containing
+both a non-null `x-amz-version-id` and a strong quoted ETag. Enabling a generic
+S3-compatible endpoint does not waive either requirement. GCS lazy rootfs
+requires both a positive object generation and an ETag. Dynamic AWS workload
+credentials and GCS metadata OAuth tokens are sent only to provider-trusted
+HTTPS object endpoints; configure credentials explicitly for other endpoints.
+
 ## Development and test fixtures
 
 These documented variables are for explicitly supplied UEFI assets or the optional fixture-download script. They are not `vmon serve` configuration and are not sent to a client or guest automatically.

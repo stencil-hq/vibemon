@@ -1,0 +1,22 @@
+vm-memory 0.17.1
+
+Vendored from: https://github.com/rust-vmm/vm-memory
+Crate license expression: Apache-2.0 OR BSD-3-Clause
+Upstream author recorded by the crate: Liu Jiang <gerry@linux.alibaba.com>
+
+Copyright and attribution notices retained in the vendored source include:
+
+- Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
+- Portions Copyright 2018 Amazon.com, Inc. or its affiliates.
+- Portions Copyright 2017 The Chromium OS Authors.
+- Portions Copyright 2019 Red Hat, Inc.
+- Copyright (C) 2020 Red Hat, Inc.
+- Copyright 2020, 2021, and 2023 Amazon.com, Inc. or its affiliates.
+- Copyright (C) 2019 CrowdStrike, Inc.
+- Copyright 2023 Linaro Ltd.; Viresh Kumar <viresh.kumar@linaro.org>.
+
+The file-level copyright and SPDX headers are authoritative and are preserved
+in src/. This notice summarizes them; it does not replace them or broaden the
+license of any file. The Apache-2.0 and BSD-3-Clause alternatives are the
+upstream terms for this vendored crate, not the MIT license of the host
+project.

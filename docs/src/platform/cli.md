@@ -27,6 +27,8 @@ The primary commands are:
 
 `vmon deploy TARGET` packages, registers, and activates a durable application. `vmon function ls|shell REF` handles function revisions; `vmon call get ID` retrieves a durable call and `vmon call logs ID --follow` follows its reconnectable logs.
 
+`vmon image publish-rootfs gs://bucket/export.tar.gz` or `vmon image publish-rootfs s3://bucket/export.raw` converts a cloud disk export into a lazily consumed rootfs artifact. See [OCI Images](images.md#cloud-disk-exports) for supported formats and workload-identity requirements.
+
 ## Contexts
 
 A context records an endpoint roster, optional region, and update time in the state directory's `contexts.json`. Add one from a gateway URL (a scheme is optional and defaults to `http://`):

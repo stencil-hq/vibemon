@@ -86,6 +86,61 @@ codesign --sign - --entitlements hvf.entitlements --force target/release/vmon
 
 `--net user` works on macOS/HVF without `com.apple.vm.networking`; `--tap` still requires host vmnet-style networking support and fails clearly on the ad-hoc-signed binary.
 
+## Local release packaging
+
+The local release entry point builds all consumable release artifacts without
+uploading them or publishing to GitHub, npm, or PyPI. Select the Linux musl
+platform explicitly:
+
+```sh
+just local-release x86_64-unknown-linux-musl
+# or
+just local-release aarch64-unknown-linux-musl
+```
+
+The equivalent script interface is:
+
+```sh
+./scripts/package-local-release.sh --target x86_64-unknown-linux-musl
+```
+
+It composes the same component packagers used by the release workflow:
+
+```sh
+./scripts/package-rust-release.sh --target <triple>
+./scripts/package-guest-assets.sh --target <triple>
+./scripts/package-python-sdk.sh
+(cd sdk/ts && bun run package)
+./scripts/package-release.sh
+```
+
+Install the locked TypeScript dependencies with
+`cd sdk/ts && bun install --frozen-lockfile` before running the local entry
+point. Rust cross-compilation also requires the configured Rust target, Zig,
+and `cargo-zigbuild`; Python packaging and deterministic archives require
+`uv`. The binary packager executes both `vmon` and `vmon-agent` rather than
+only checking that they link. A Linux host can execute its native architecture
+directly. Cross-architecture Linux packaging requires `qemu-x86_64` or
+`qemu-aarch64` (or `VMON_RELEASE_RUNNER`); non-Linux hosts must set
+`VMON_RELEASE_RUNNER`. Packaging fails explicitly if the selected target
+cannot be executed.
+
+A successful run produces:
+
+| Component | Local artifacts |
+| --- | --- |
+| Rust binaries | `dist/vmon-<triple>.tar.gz`, `dist/vmon-<triple>.tar.gz.sha256` |
+| Guest kernel and agent | `dist/vmon-assets-<arch>.tar.gz`, `dist/vmon-assets-<arch>.tar.gz.sha256` |
+| Python SDK | wheel and sdist in `sdk/py/dist/`; `dist/vmon-python-sdk-<version>.tar.gz`, `dist/vmon-python-sdk-<version>.tar.gz.sha256` |
+| TypeScript SDK | `sdk/ts/dist/package/stencil-hq-vibemon-<version>.tgz` containing built JavaScript and declarations |
+| Deployment files | `dist/vmon-deploy-assets.tar.gz`, `dist/SHA256SUMS-deploy.txt` |
+
+Pushing a `v*` tag starts `.github/workflows/release.yml`, which runs these
+same local packaging interfaces on Linux (using QEMU for the cross-architecture
+smoke), uploads their outputs as workflow artifacts, and attaches them to the
+tagged GitHub release. A manual workflow dispatch only builds workflow
+artifacts. Neither path publishes an SDK to a package registry.
+
 ## Low-level VMM commands
 
 Boot a Linux kernel with an initramfs:
@@ -296,7 +351,7 @@ Exposed ports are available through each sandbox's `tunnels` and `ports` APIs. R
 
 Durable functions are server-native calls recorded before execution, with stable call IDs, resumable events/results, server-owned retries, and at-least-once attempt semantics. Python packages source-aware `@vmon.function` definitions and applications through `vmon.App`; TypeScript resolves pinned deployments through `client.functions.fromName()` and `client.apps.fromName()`; Go uses `vmon.LookupFunction` and reconstructs calls with `vmon.FunctionCallFromID`. Portable inputs and results use checksummed JSON or CBOR envelopes, while Python additionally supports explicitly trusted Python serialization.
 
-The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for its live API smoke. The Go SDK lives in `sdk/go` as module `github.com/can1357/vibemon/sdk/go`; run `just sdk-go` for its gRPC, HTTP, and WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
+The TypeScript SDK lives in `sdk/ts` and uses bun. Run `just sdk-ts` for install and type checking, and `just sdk-ts-smoke` for its live API smoke. The Go SDK lives in `sdk/go` as module `github.com/stencil-hq/vibemon/sdk/go`; run `just sdk-go` for its gRPC, HTTP, and WebSocket tests. Real-VM remote-function tests require the language-specific smoke environment variables documented in each package.
 
 ## Cluster
 
@@ -518,3 +573,16 @@ demo/run-uefi-ubuntu.sh
 Treat guests, guest-controlled virtqueue data, and restored snapshot files as untrusted. Treat kernel/initrd/rootfs images and host paths supplied by an operator as trusted configuration. On Linux, keep the default Stage-B filters enabled and use `--jail` for production namespace, cgroup, pivot-root, and uid/gid isolation. Unix control and agent sockets are operator-owned, mode `0600`, live in private parent directories, and on Linux accept only root or the launch uid. Windows uses local named pipes with remote-client rejection.
 
 Do not expose vmon control sockets, host filesystem shares, TAP devices, vmnet attachments, or user-mode forwarded ports across trust boundaries without the jail and external host network policy. See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting policy.
+
+## License
+
+Copyright © 2026 Stencil Labs, Inc.
+
+| Scope | License |
+| --- | --- |
+| `vmon`, `vmm`, `vmond`, `vmon-agent`, `vmon-cloud`, the web UI, deployment stacks, documentation, demos, and scripts | [MIT](LICENSE) |
+| `vmon-proto`, `proto/vmon/v1/*.proto`, `openapi.json`, the Python, TypeScript, and Go SDKs, and their generated bindings | [MIT](LICENSE) OR [Apache-2.0](LICENSE-APACHE), at your option |
+
+This licensing applies only to first-party Vibemon work in the scopes above. Third-party dependencies, vendored code, logos, assets, guest kernels, images, BusyBox, firmware, and other separately licensed material remain under their respective terms. See [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) for attribution and source details.
+
+Contributions are accepted under the license of the affected package; see [CONTRIBUTING.md](CONTRIBUTING.md).
