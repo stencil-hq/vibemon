@@ -172,8 +172,8 @@ enum FunctionCommands {
 
 fn cmd_image(command: ImageCommands) -> Result<i32> {
 	match command {
-		ImageCommands::PublishGceRootfs { reference } => {
-			let published = vmond::image::publish_gce_rootfs(&reference)?;
+		ImageCommands::PublishRootfs { reference } => {
+			let published = vmond::image::publish_rootfs(&reference)?;
 			let action = if published.skipped {
 				"reused"
 			} else {
@@ -196,8 +196,8 @@ fn cmd_image(command: ImageCommands) -> Result<i32> {
 
 #[derive(Subcommand)]
 enum ImageCommands {
-	/// Publish a GCE export's ext4 root as a range-addressable GCS object.
-	PublishGceRootfs { reference: String },
+	/// Publish a cloud disk export as a range-addressable root filesystem.
+	PublishRootfs { reference: String },
 }
 
 #[derive(Subcommand)]
@@ -2995,14 +2995,14 @@ mod durable_cli_tests {
 			Cli::try_parse_from([
 				"vmon",
 				"image",
-				"publish-gce-rootfs",
-				"gs://bucket/image.tar.gz",
+				"publish-rootfs",
+				"s3://bucket/image.raw",
 			])
 			.unwrap()
 			.command,
 			Commands::Image {
-				command: ImageCommands::PublishGceRootfs { reference }
-			} if reference == "gs://bucket/image.tar.gz"
+				command: ImageCommands::PublishRootfs { reference }
+			} if reference == "s3://bucket/image.raw"
 		));
 		assert!(matches!(
 			Cli::try_parse_from(["vmon", "call", "get", "call-1"]).unwrap().command,
