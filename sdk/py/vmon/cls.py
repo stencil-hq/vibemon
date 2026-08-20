@@ -8,7 +8,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Generic, TypeVar, overload
+from typing import Any, overload
 
 from .errors import ActorLostError
 from .options import ConcurrencyPolicy, FunctionOptions
@@ -16,10 +16,8 @@ from .remote import FunctionCall, RemoteFunction, _arguments
 from .v1 import api_pb2
 from .values import encode_value
 
-R = TypeVar("R")
 
-
-def method(fn: Callable[..., R]) -> Callable[..., R]:
+def method[R](fn: Callable[..., R]) -> Callable[..., R]:
     """Export one class method for remote actor or service dispatch."""
 
     fn.__vmon_method__ = True  # type: ignore[attr-defined]
@@ -382,7 +380,7 @@ class RemoteObject:
             raise ActorLostError(self.id, status)
 
 
-class _BoundRemoteMethod(Generic[R]):
+class _BoundRemoteMethod[R]:
     """One exported method bound to a durable actor or scalable service."""
 
     def __init__(self, obj: RemoteObject, name: str) -> None:

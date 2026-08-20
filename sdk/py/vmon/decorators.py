@@ -71,7 +71,7 @@ def _definition_options(target: Any) -> FunctionOptions:
     return value
 
 
-def _set_definition_options(target: F, options: FunctionOptions) -> F:
+def _set_definition_options[F: Callable[..., Any]](target: F, options: FunctionOptions) -> F:
     with_options = getattr(target, "with_options", None)
     if callable(with_options):
         try:
