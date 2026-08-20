@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, error::ErrorKind};
+use vmon_cloud::ObjectAuth;
 
 use crate::{
 	bail,
@@ -102,6 +103,12 @@ pub struct Config {
 	pub rootfs_remote_size: Option<u64>,
 	/// Optional bearer credential sent only to the remote root-disk endpoint.
 	pub rootfs_remote_bearer: Option<String>,
+	/// Workload-identity scheme used to authenticate remote root-disk requests.
+	pub rootfs_remote_auth: ObjectAuth,
+	/// AWS signing region required by [`ObjectAuth::Aws`].
+	pub rootfs_remote_region: Option<String>,
+	/// Immutable object `ETag` enforced on every remote range request.
+	pub rootfs_remote_etag: Option<String>,
 	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
 	pub ksm: bool,
 	pub cpus: u8,
@@ -293,6 +300,18 @@ struct CliArgs {
 	/// Optional bearer token for the remote root-disk endpoint
 	#[arg(long, value_name = "TOKEN")]
 	rootfs_remote_bearer: Option<String>,
+
+	/// Workload auth for the remote object: none, google, or aws
+	#[arg(long, value_name = "PROVIDER")]
+	rootfs_remote_auth: Option<ObjectAuth>,
+
+	/// AWS region used to sign remote S3 range requests
+	#[arg(long, value_name = "REGION")]
+	rootfs_remote_region: Option<String>,
+
+	/// Immutable object ETag required on every remote range request
+	#[arg(long, value_name = "ETAG")]
+	rootfs_remote_etag: Option<String>,
 
 	/// Open the rootfs read-only
 	#[arg(long)]
@@ -569,7 +588,10 @@ impl Config {
 			|| cli.rootfs_remote_cache.is_some()
 			|| cli.rootfs_remote_index.is_some()
 			|| cli.rootfs_remote_size.is_some()
-			|| cli.rootfs_remote_bearer.is_some();
+			|| cli.rootfs_remote_bearer.is_some()
+			|| cli.rootfs_remote_auth.is_some()
+			|| cli.rootfs_remote_region.is_some()
+			|| cli.rootfs_remote_etag.is_some();
 		if cli
 			.rootfs_remote_url
 			.as_deref()
@@ -577,11 +599,24 @@ impl Config {
 		{
 			bail!("--rootfs-remote-url must not be empty");
 		}
-		if let Some(url) = &cli.rootfs_remote_url
-			&& !url.starts_with("http://")
-			&& !url.starts_with("https://")
+		let parsed_rootfs_remote_url = cli
+			.rootfs_remote_url
+			.as_deref()
+			.map(|url| {
+				reqwest::Url::parse(url)
+					.map_err(|error| err(format!("invalid --rootfs-remote-url: {error}")))
+			})
+			.transpose()?;
+		if parsed_rootfs_remote_url
+			.as_ref()
+			.is_some_and(|url| !matches!(url.scheme(), "http" | "https"))
 		{
 			bail!("--rootfs-remote-url must use http:// or https://");
+		}
+		if parsed_rootfs_remote_url.as_ref().is_some_and(|url| {
+			!url.username().is_empty() || url.password().is_some() || url.fragment().is_some()
+		}) {
+			bail!("--rootfs-remote-url must not contain credentials or a fragment");
 		}
 		if cli
 			.rootfs_remote_cache
@@ -604,10 +639,47 @@ impl Config {
 		{
 			bail!("--rootfs-remote-bearer must not be empty");
 		}
+		if cli
+			.rootfs_remote_region
+			.as_deref()
+			.is_some_and(|region| region.trim().is_empty())
+		{
+			bail!("--rootfs-remote-region must not be empty");
+		}
+		if cli
+			.rootfs_remote_etag
+			.as_deref()
+			.is_some_and(|etag| !is_strong_etag(etag))
+		{
+			bail!("--rootfs-remote-etag must be a quoted strong entity-tag");
+		}
+		let rootfs_remote_auth = cli.rootfs_remote_auth.unwrap_or_default();
+		if (rootfs_remote_auth != ObjectAuth::None || cli.rootfs_remote_bearer.is_some())
+			&& parsed_rootfs_remote_url
+				.as_ref()
+				.is_some_and(|url| url.scheme() != "https")
+		{
+			bail!("remote rootfs authentication requires an https:// --rootfs-remote-url");
+		}
+		if cli.rootfs_remote_bearer.is_some() && rootfs_remote_auth != ObjectAuth::None {
+			bail!("--rootfs-remote-bearer cannot be combined with provider workload auth");
+		}
+		if rootfs_remote_auth == ObjectAuth::Aws
+			&& cli
+				.rootfs_remote_region
+				.as_deref()
+				.is_none_or(|region| !is_valid_aws_region(region))
+		{
+			bail!("--rootfs-remote-auth aws requires --rootfs-remote-region with a valid AWS region");
+		}
+		if rootfs_remote_auth != ObjectAuth::Aws && cli.rootfs_remote_region.is_some() {
+			bail!("--rootfs-remote-region requires --rootfs-remote-auth aws");
+		}
 		if remote_rootfs && cli.rootfs_remote_url.is_none() {
 			bail!(
 				"--rootfs-remote-cache/--rootfs-remote-index/--rootfs-remote-size/\
-				 --rootfs-remote-bearer require --rootfs-remote-url"
+				 --rootfs-remote-bearer/--rootfs-remote-auth/--rootfs-remote-region/\
+				 --rootfs-remote-etag require --rootfs-remote-url"
 			);
 		}
 		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_cache.is_none() {
@@ -619,14 +691,37 @@ impl Config {
 		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_size.is_none() {
 			bail!("--rootfs-remote-url requires --rootfs-remote-size");
 		}
-		if cli.rootfs_remote_size == Some(0) {
-			bail!("--rootfs-remote-size must be greater than zero");
+		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_etag.is_none() {
+			bail!("--rootfs-remote-url requires --rootfs-remote-etag");
+		}
+		if let Some(url) = &parsed_rootfs_remote_url {
+			validate_remote_workload_url(
+				url,
+				rootfs_remote_auth,
+				cli.rootfs_remote_region.as_deref(),
+			)?;
+		}
+		if cli
+			.rootfs_remote_size
+			.is_some_and(|size| size == 0 || !size.is_multiple_of(512))
+		{
+			bail!("--rootfs-remote-size must be a nonzero multiple of 512 bytes");
 		}
 		if cli.rootfs_remote_url.is_some() && cli.rootfs.is_none() {
 			bail!("--rootfs-remote-url requires --rootfs as the private writable overlay");
 		}
 		if cli.rootfs_remote_url.is_some() && cli.rootfs_ro {
 			bail!("--rootfs-remote-url cannot be combined with --rootfs-ro");
+		}
+		if let (Some(cache), Some(index)) = (&cli.rootfs_remote_cache, &cli.rootfs_remote_index)
+			&& cache == index
+		{
+			bail!("--rootfs-remote-cache must differ from --rootfs-remote-index");
+		}
+		if let (Some(index), Some(overlay)) = (&cli.rootfs_remote_index, &cli.rootfs)
+			&& index == overlay
+		{
+			bail!("--rootfs-remote-index must differ from --rootfs");
 		}
 		if let (Some(cache), Some(overlay)) = (&cli.rootfs_remote_cache, &cli.rootfs)
 			&& cache == overlay
@@ -894,6 +989,9 @@ impl Config {
 			rootfs_remote_index: cli.rootfs_remote_index,
 			rootfs_remote_size: cli.rootfs_remote_size,
 			rootfs_remote_bearer: cli.rootfs_remote_bearer,
+			rootfs_remote_auth,
+			rootfs_remote_region: cli.rootfs_remote_region,
+			rootfs_remote_etag: cli.rootfs_remote_etag,
 			ksm: cli.ksm,
 			cpus: cpus as u8,
 			rootfs: cli.rootfs,
@@ -1134,6 +1232,101 @@ fn is_valid_volume_tag(tag: &str) -> bool {
 			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+fn validate_remote_workload_url(
+	url: &reqwest::Url,
+	auth: ObjectAuth,
+	region: Option<&str>,
+) -> Result<()> {
+	match auth {
+		ObjectAuth::None => Ok(()),
+		ObjectAuth::Google => {
+			if url.host_str() != Some("storage.googleapis.com")
+				|| url.port_or_known_default() != Some(443)
+				|| !has_query_identity(url, "generation", |value| {
+					value.parse::<u64>().is_ok_and(|generation| generation != 0)
+				}) {
+				bail!(
+					"--rootfs-remote-auth google requires storage.googleapis.com and a positive \
+					 generation query"
+				);
+			}
+			Ok(())
+		},
+		ObjectAuth::Aws => {
+			let region = region
+				.ok_or_else(|| err("--rootfs-remote-auth aws requires --rootfs-remote-region"))?;
+			if !is_trusted_aws_object_origin(url, region)
+				|| !has_query_identity(url, "versionId", |value| !value.is_empty() && value != "null")
+			{
+				bail!(
+					"--rootfs-remote-auth aws requires the configured S3 origin and a versionId query"
+				);
+			}
+			Ok(())
+		},
+	}
+}
+
+fn has_query_identity(url: &reqwest::Url, name: &str, valid: impl FnOnce(&str) -> bool) -> bool {
+	let mut values = url.query_pairs().filter(|(key, _)| key == name);
+	let Some((_, value)) = values.next() else {
+		return false;
+	};
+	values.next().is_none() && valid(&value)
+}
+
+fn is_trusted_aws_object_origin(url: &reqwest::Url, region: &str) -> bool {
+	let Some(host) = url.host_str() else {
+		return false;
+	};
+	let standard_suffix = if region.starts_with("cn-") {
+		format!(".s3.{region}.amazonaws.com.cn")
+	} else {
+		format!(".s3.{region}.amazonaws.com")
+	};
+	let path_style_host = standard_suffix.trim_start_matches('.');
+	if (host == path_style_host
+		|| (host.ends_with(&standard_suffix) && host.len() > standard_suffix.len()))
+		&& url.port_or_known_default() == Some(443)
+	{
+		return true;
+	}
+	["AWS_ENDPOINT_URL_S3", "VMON_S3_ENDPOINT"]
+		.into_iter()
+		.find_map(|name| {
+			std::env::var(name)
+				.ok()
+				.filter(|value| !value.trim().is_empty())
+		})
+		.and_then(|endpoint| reqwest::Url::parse(&endpoint).ok())
+		.is_some_and(|endpoint| {
+			endpoint.scheme() == url.scheme()
+				&& endpoint.host_str() == url.host_str()
+				&& endpoint.port_or_known_default() == url.port_or_known_default()
+		})
+}
+
+fn is_valid_aws_region(region: &str) -> bool {
+	let bytes = region.as_bytes();
+	(3..=64).contains(&bytes.len())
+		&& bytes.first().is_some_and(u8::is_ascii_lowercase)
+		&& bytes.last().is_some_and(u8::is_ascii_digit)
+		&& bytes
+			.iter()
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+		&& !region.contains("--")
+}
+
+fn is_strong_etag(etag: &str) -> bool {
+	let bytes = etag.as_bytes();
+	bytes.len() > 2
+		&& bytes.first() == Some(&b'"')
+		&& bytes.last() == Some(&b'"')
+		&& bytes[1..bytes.len() - 1]
+			.iter()
+			.all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte))
+}
+
 fn validate_id(id: &str) -> Result<()> {
 	if id.is_empty()
 		|| id.len() > 64
@@ -1272,6 +1465,8 @@ mod tests {
 			"68719476736",
 			"--rootfs-remote-bearer",
 			"secret",
+			"--rootfs-remote-etag",
+			"\"immutable\"",
 			"--no-sandbox",
 		])
 		.expect("remote rootfs flags");
@@ -1280,6 +1475,122 @@ mod tests {
 		assert_eq!(cfg.rootfs_remote_index.as_deref(), Some(Path::new("/tmp/index.json")));
 		assert_eq!(cfg.rootfs_remote_size, Some(68_719_476_736));
 		assert_eq!(cfg.rootfs_remote_bearer.as_deref(), Some("secret"));
+		assert_eq!(cfg.rootfs_remote_etag.as_deref(), Some("\"immutable\""));
+	}
+
+	#[test]
+	fn remote_rootfs_rejects_insecure_or_mutable_contracts() {
+		let base = [
+			"vmon",
+			"--kernel",
+			"k",
+			"--rootfs",
+			"/tmp/overlay",
+			"--rootfs-remote-url",
+			"https://storage.googleapis.com/rootfs",
+			"--rootfs-remote-cache",
+			"/tmp/cache",
+			"--rootfs-remote-index",
+			"/tmp/index.json",
+			"--rootfs-remote-size",
+			"512",
+		];
+
+		let mut missing_etag = base.to_vec();
+		missing_etag.extend(["--rootfs-remote-auth", "google", "--no-sandbox"]);
+		assert_config_err_contains(&missing_etag, "requires --rootfs-remote-etag");
+
+		let mut weak_etag = base.to_vec();
+		weak_etag.extend([
+			"--rootfs-remote-auth",
+			"google",
+			"--rootfs-remote-etag",
+			"W/\"mutable\"",
+			"--no-sandbox",
+		]);
+		assert_config_err_contains(&weak_etag, "quoted strong entity-tag");
+
+		let mut insecure = base.to_vec();
+		insecure[6] = "http://storage.googleapis.com/rootfs";
+		insecure.extend([
+			"--rootfs-remote-auth",
+			"google",
+			"--rootfs-remote-etag",
+			"\"immutable\"",
+			"--no-sandbox",
+		]);
+		assert_config_err_contains(&insecure, "requires an https://");
+
+		let mut unpinned = base.to_vec();
+		unpinned.extend([
+			"--rootfs-remote-auth",
+			"google",
+			"--rootfs-remote-etag",
+			"\"immutable\"",
+			"--no-sandbox",
+		]);
+		assert_config_err_contains(&unpinned, "positive generation query");
+
+		let mut malformed_url = base.to_vec();
+		malformed_url[6] = "https://[invalid";
+		malformed_url.extend(["--rootfs-remote-etag", "\"immutable\"", "--no-sandbox"]);
+		assert_config_err_contains(&malformed_url, "invalid --rootfs-remote-url");
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn parses_aws_remote_rootfs_contract() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--rootfs",
+			"/tmp/overlay",
+			"--rootfs-remote-url",
+			"https://images.s3.us-west-2.amazonaws.com/rootfs?versionId=version-7",
+			"--rootfs-remote-cache",
+			"/tmp/cache",
+			"--rootfs-remote-index",
+			"/tmp/index.json",
+			"--rootfs-remote-size",
+			"68719476736",
+			"--rootfs-remote-auth",
+			"aws",
+			"--rootfs-remote-region",
+			"us-west-2",
+			"--rootfs-remote-etag",
+			"\"immutable\"",
+			"--no-sandbox",
+		])
+		.expect("AWS remote rootfs flags");
+		assert_eq!(cfg.rootfs_remote_auth, ObjectAuth::Aws);
+		assert_eq!(cfg.rootfs_remote_region.as_deref(), Some("us-west-2"));
+		assert_eq!(cfg.rootfs_remote_etag.as_deref(), Some("\"immutable\""));
+		assert!(cfg.rootfs_remote_bearer.is_none());
+	}
+
+	#[test]
+	fn aws_remote_rootfs_requires_a_region() {
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--rootfs",
+				"/tmp/overlay",
+				"--rootfs-remote-url",
+				"https://images.s3.us-west-2.amazonaws.com/rootfs?versionId=version-7",
+				"--rootfs-remote-cache",
+				"/tmp/cache",
+				"--rootfs-remote-index",
+				"/tmp/index.json",
+				"--rootfs-remote-size",
+				"512",
+				"--rootfs-remote-auth",
+				"aws",
+			],
+			"requires --rootfs-remote-region",
+		);
 	}
 
 	#[test]

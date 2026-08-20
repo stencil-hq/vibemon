@@ -36,6 +36,7 @@ use virtio_bindings::{
 };
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
+use vmon_cloud::ObjectAuth;
 
 #[cfg(target_os = "linux")]
 use super::block_remote::RemoteBlockSource;
@@ -521,6 +522,9 @@ impl Block {
 		overlay_path: &Path,
 		logical_size: u64,
 		bearer: Option<String>,
+		auth: ObjectAuth,
+		region: Option<String>,
+		etag: Option<String>,
 		preopened_overlay: Option<File>,
 	) -> Result<Self> {
 		let source = if let Some(overlay) = preopened_overlay {
@@ -531,9 +535,22 @@ impl Block {
 				overlay,
 				logical_size,
 				bearer,
+				auth,
+				region,
+				etag,
 			)?
 		} else {
-			RemoteBlockSource::new(url, cache_path, index_path, overlay_path, logical_size, bearer)?
+			RemoteBlockSource::new(
+				url,
+				cache_path,
+				index_path,
+				overlay_path,
+				logical_size,
+				bearer,
+				auth,
+				region,
+				etag,
+			)?
 		};
 		let len = source.image_len();
 		let disk = source
@@ -553,6 +570,9 @@ impl Block {
 		_overlay_path: &Path,
 		_logical_size: u64,
 		_bearer: Option<String>,
+		_auth: ObjectAuth,
+		_region: Option<String>,
+		_etag: Option<String>,
 		_preopened_overlay: Option<File>,
 	) -> Result<Self> {
 		Err(err("remote rootfs requires Linux"))

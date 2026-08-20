@@ -3,6 +3,9 @@ name = "vmm"
 version = "0.1.0"
 edition = "2024"
 description = "Vibemon per-VM monitor core (KVM/HVF/WHP microVM)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 
@@ -31,6 +34,7 @@ rayon = "1"
 flume = { version = "0.11", default-features = false }
 vmon-agent = { path = "../agent" }
 zstd = "0.13"
+vmon-cloud = { path = "../cloud" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

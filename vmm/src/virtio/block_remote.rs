@@ -17,8 +17,9 @@ use std::{
 	time::Duration,
 };
 
-use reqwest::{StatusCode, blocking::Client, header};
+use reqwest::{StatusCode, Url, blocking::Client, header};
 use serde::Deserialize;
+use vmon_cloud::{ObjectAuth, aws, google};
 
 use crate::result::{Result, err};
 
@@ -35,22 +36,43 @@ const MAX_ATTEMPTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INDEX_VERSION: u32 = 3;
+const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_COMPRESSED_BLOCK_SIZE: u64 = REMOTE_CHUNK_SIZE * 2;
 
 #[derive(Deserialize)]
 struct RemoteIndex {
 	version:           u32,
 	compressed_size:   u64,
 	uncompressed_size: u64,
-	#[serde(rename = "original_size")]
-	_original_size:    u64,
+	original_size:     u64,
 	block_size:        u64,
 	blocks:            Vec<(u64, u64)>,
 }
 
 impl RemoteIndex {
 	fn load(path: &Path, logical_size: u64) -> Result<Self> {
-		let bytes = std::fs::read(path)
+		let file = File::open(path)
+			.map_err(|e| err(format!("opening remote block index {}: {e}", path.display())))?;
+		let metadata = file
+			.metadata()
+			.map_err(|e| err(format!("inspecting remote block index {}: {e}", path.display())))?;
+		if metadata.len() > MAX_INDEX_BYTES {
+			return Err(err(format!(
+				"remote block index {} exceeds the {MAX_INDEX_BYTES}-byte limit",
+				path.display()
+			)));
+		}
+		let mut bytes = Vec::with_capacity(metadata.len() as usize);
+		file
+			.take(MAX_INDEX_BYTES + 1)
+			.read_to_end(&mut bytes)
 			.map_err(|e| err(format!("reading remote block index {}: {e}", path.display())))?;
+		if bytes.len() as u64 > MAX_INDEX_BYTES {
+			return Err(err(format!(
+				"remote block index {} exceeds the {MAX_INDEX_BYTES}-byte limit",
+				path.display()
+			)));
+		}
 		let index: Self = serde_json::from_slice(&bytes)
 			.map_err(|e| err(format!("parsing remote block index {}: {e}", path.display())))?;
 		index.validate(logical_size)?;
@@ -88,18 +110,34 @@ impl RemoteIndex {
 		if self.compressed_size == 0 {
 			return Err(err("remote block index compressed_size must be greater than zero"));
 		}
+		if self.original_size < self.uncompressed_size {
+			return Err(err(
+				"remote block index original_size must not be smaller than uncompressed_size",
+			));
+		}
+		let mut expected_offset = 0_u64;
 		for (block, &(offset, length)) in self.blocks.iter().enumerate() {
-			let valid = length != 0
+			let valid = offset == expected_offset
+				&& length != 0
+				&& length <= MAX_COMPRESSED_BLOCK_SIZE
 				&& offset
 					.checked_add(length)
 					.is_some_and(|end| end <= self.compressed_size);
 			if !valid {
 				return Err(err(format!(
-					"remote block index block {block} range [{offset}, {}) exceeds compressed_size {}",
+					"remote block index block {block} range [{offset}, {}) is not the next contiguous \
+					 range within compressed_size {}",
 					offset.saturating_add(length),
 					self.compressed_size
 				)));
 			}
+			expected_offset += length;
+		}
+		if expected_offset != self.compressed_size {
+			return Err(err(format!(
+				"remote block index covers {expected_offset} compressed bytes, expected {}",
+				self.compressed_size
+			)));
 		}
 		Ok(())
 	}
@@ -121,43 +159,200 @@ trait RangeFetcher: Send {
 	fn fetch(&mut self, start: u64, end: u64) -> std::result::Result<FetchResponse, FetchFailure>;
 }
 
+enum HttpAuth {
+	None,
+	Bearer(String),
+	Google(google::TokenProvider),
+	Aws { provider: aws::CredentialProvider, region: String },
+}
+
+impl HttpAuth {
+	fn invalidate(&mut self) -> bool {
+		match self {
+			Self::Google(provider) => {
+				provider.invalidate();
+				true
+			},
+			Self::Aws { provider, .. } => {
+				provider.invalidate();
+				true
+			},
+			Self::None | Self::Bearer(_) => false,
+		}
+	}
+}
+
 struct HttpRangeFetcher {
 	client: Client,
-	url:    String,
-	bearer: Option<String>,
+	url:    Url,
+	auth:   HttpAuth,
+	etag:   String,
 }
 
 impl HttpRangeFetcher {
-	fn new(url: String, bearer: Option<String>) -> Result<Self> {
+	fn new(
+		url: String,
+		bearer: Option<String>,
+		auth: ObjectAuth,
+		region: Option<String>,
+		etag: Option<String>,
+	) -> Result<Self> {
 		let client = Client::builder()
 			.connect_timeout(CONNECT_TIMEOUT)
 			.timeout(REQUEST_TIMEOUT)
 			.build()
 			.map_err(|e| err(format!("building remote block HTTP client: {e}")))?;
-		Ok(Self { client, url, bearer })
+		let url = Url::parse(&url).map_err(|e| err(format!("invalid remote block URL: {e}")))?;
+		if !matches!(url.scheme(), "http" | "https") {
+			return Err(err("remote block URL must use http:// or https://"));
+		}
+		if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+			return Err(err("remote block URL must not contain credentials or a fragment"));
+		}
+		if (auth != ObjectAuth::None || bearer.is_some()) && url.scheme() != "https" {
+			return Err(err("remote block authentication requires an https:// URL"));
+		}
+		if bearer.as_deref().is_some_and(str::is_empty) {
+			return Err(err("remote block bearer must not be empty"));
+		}
+		if auth != ObjectAuth::Aws && region.is_some() {
+			return Err(err("remote block region requires AWS workload auth"));
+		}
+		if auth == ObjectAuth::Aws
+			&& region
+				.as_deref()
+				.is_none_or(|region| !is_valid_aws_region(region))
+		{
+			return Err(err("AWS remote block auth requires a valid region"));
+		}
+		validate_workload_url(&url, auth, region.as_deref())?;
+		let etag = etag.ok_or_else(|| err("remote block requires an immutable ETag"))?;
+		if !is_strong_etag(&etag) {
+			return Err(err("remote block ETag must be a quoted strong entity-tag"));
+		}
+		let auth = match (auth, bearer) {
+			(ObjectAuth::None, None) => HttpAuth::None,
+			(ObjectAuth::None, Some(token)) => HttpAuth::Bearer(token),
+			(ObjectAuth::Google, None) => HttpAuth::Google(
+				google::TokenProvider::new()
+					.map_err(|e| err(format!("building Google workload auth: {e}")))?,
+			),
+			(ObjectAuth::Aws, None) => HttpAuth::Aws {
+				provider: aws::CredentialProvider::new()
+					.map_err(|e| err(format!("building AWS workload auth: {e}")))?,
+				region:   region.ok_or_else(|| err("AWS remote block auth requires a region"))?,
+			},
+			(ObjectAuth::Google | ObjectAuth::Aws, Some(_)) => {
+				return Err(err("remote block bearer cannot be combined with workload auth"));
+			},
+		};
+		Ok(Self { client, url, auth, etag })
 	}
 }
 
 impl RangeFetcher for HttpRangeFetcher {
 	fn fetch(&mut self, start: u64, end: u64) -> std::result::Result<FetchResponse, FetchFailure> {
+		let range = format!("bytes={start}-{}", end - 1);
 		let mut request = self
 			.client
-			.get(&self.url)
-			.header(header::RANGE, format!("bytes={start}-{}", end - 1));
-		if let Some(token) = &self.bearer {
-			request = request.bearer_auth(token);
+			.get(self.url.clone())
+			.header(header::RANGE, &range)
+			.header(header::IF_MATCH, &self.etag);
+		match &mut self.auth {
+			HttpAuth::None => {},
+			HttpAuth::Bearer(token) => request = request.bearer_auth(token),
+			HttpAuth::Google(provider) => {
+				let token = provider.token().map_err(|e| FetchFailure {
+					message:   format!("Google workload auth failed: {e}"),
+					transient: true,
+				})?;
+				request = request.bearer_auth(token);
+			},
+			HttpAuth::Aws { provider, region } => {
+				let credentials = provider.credentials().map_err(|e| FetchFailure {
+					message:   format!("AWS workload auth failed: {e}"),
+					transient: true,
+				})?;
+				let (canonical_uri, canonical_query, host) =
+					aws::canonical_url(&self.url).map_err(|e| FetchFailure {
+						message:   format!("AWS request URL is invalid: {e}"),
+						transient: false,
+					})?;
+				let mut headers = vec![
+					("host".to_owned(), host.clone()),
+					("range".to_owned(), range),
+					("x-amz-content-sha256".to_owned(), "UNSIGNED-PAYLOAD".to_owned()),
+					("if-match".to_owned(), self.etag.clone()),
+				];
+				if let Some(token) = &credentials.session_token {
+					headers.push(("x-amz-security-token".to_owned(), token.clone()));
+				}
+				let signed = aws::authorization_now(
+					"GET",
+					&canonical_uri,
+					&canonical_query,
+					&headers,
+					"UNSIGNED-PAYLOAD",
+					region,
+					"s3",
+					&credentials.access_key,
+					&credentials.secret_key,
+				);
+				request = request
+					.header("host", host)
+					.header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+					.header("x-amz-date", signed.date)
+					.header("authorization", signed.authorization);
+				if let Some(token) = &credentials.session_token {
+					request = request.header("x-amz-security-token", token);
+				}
+			},
 		}
-		let response = request.send().map_err(|e| FetchFailure {
+		let mut response = request.send().map_err(|e| FetchFailure {
 			message:   format!("request failed: {e}"),
 			transient: e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
 		})?;
 		let status = response.status();
 		if status != StatusCode::PARTIAL_CONTENT {
+			let refreshable_auth_failure =
+				matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+					|| (status == StatusCode::BAD_REQUEST
+						&& matches!(&self.auth, HttpAuth::Aws { .. })
+						&& {
+							let mut body = String::new();
+							(&mut response).take(4096).read_to_string(&mut body).is_ok()
+								&& is_refreshable_aws_auth_error(&body)
+						});
+			let refreshed = refreshable_auth_failure && self.auth.invalidate();
 			return Err(FetchFailure {
 				message:   format!("server returned HTTP {status}, expected 206 Partial Content"),
-				transient: status == StatusCode::REQUEST_TIMEOUT
+				transient: refreshed
+					|| status == StatusCode::REQUEST_TIMEOUT
 					|| status == StatusCode::TOO_MANY_REQUESTS
 					|| status.is_server_error(),
+			});
+		}
+		let expected_length = end - start;
+		if response.content_length() != Some(expected_length) {
+			return Err(FetchFailure {
+				message:   format!(
+					"range response Content-Length {:?} does not match requested {expected_length}",
+					response.content_length()
+				),
+				transient: false,
+			});
+		}
+		let response_etag = response
+			.headers()
+			.get(header::ETAG)
+			.and_then(|value| value.to_str().ok());
+		if response_etag != Some(self.etag.as_str()) {
+			return Err(FetchFailure {
+				message:   format!(
+					"response ETag {:?} does not match immutable object ETag {:?}",
+					response_etag, self.etag
+				),
+				transient: false,
 			});
 		}
 		let content_range = response
@@ -185,6 +380,107 @@ impl RangeFetcher for HttpRangeFetcher {
 		}
 		Ok(FetchResponse { bytes: bytes.to_vec(), total_len })
 	}
+}
+
+fn is_refreshable_aws_auth_error(body: &str) -> bool {
+	[
+		"<Code>ExpiredToken</Code>",
+		"<Code>InvalidToken</Code>",
+		"<Code>RequestExpired</Code>",
+		"<Code>TokenRefreshRequired</Code>",
+	]
+	.iter()
+	.any(|code| body.contains(code))
+}
+
+fn validate_workload_url(url: &Url, auth: ObjectAuth, region: Option<&str>) -> Result<()> {
+	match auth {
+		ObjectAuth::None => Ok(()),
+		ObjectAuth::Google => {
+			if url.host_str() != Some("storage.googleapis.com")
+				|| url.port_or_known_default() != Some(443)
+				|| !has_query_identity(url, "generation", |value| {
+					value.parse::<u64>().is_ok_and(|generation| generation != 0)
+				}) {
+				return Err(err(
+					"Google remote block URL must target storage.googleapis.com with a positive \
+					 generation",
+				));
+			}
+			Ok(())
+		},
+		ObjectAuth::Aws => {
+			let region = region.ok_or_else(|| err("AWS remote block auth requires a region"))?;
+			if !is_trusted_aws_object_origin(url, region)
+				|| !has_query_identity(url, "versionId", |value| !value.is_empty() && value != "null")
+			{
+				return Err(err(
+					"AWS remote block URL must target the configured S3 origin with a versionId",
+				));
+			}
+			Ok(())
+		},
+	}
+}
+
+fn has_query_identity(url: &Url, name: &str, valid: impl FnOnce(&str) -> bool) -> bool {
+	let mut values = url.query_pairs().filter(|(key, _)| key == name);
+	let Some((_, value)) = values.next() else {
+		return false;
+	};
+	values.next().is_none() && valid(&value)
+}
+
+fn is_trusted_aws_object_origin(url: &Url, region: &str) -> bool {
+	let Some(host) = url.host_str() else {
+		return false;
+	};
+	let standard_suffix = if region.starts_with("cn-") {
+		format!(".s3.{region}.amazonaws.com.cn")
+	} else {
+		format!(".s3.{region}.amazonaws.com")
+	};
+	let path_style_host = standard_suffix.trim_start_matches('.');
+	if (host == path_style_host
+		|| (host.ends_with(&standard_suffix) && host.len() > standard_suffix.len()))
+		&& url.port_or_known_default() == Some(443)
+	{
+		return true;
+	}
+	["AWS_ENDPOINT_URL_S3", "VMON_S3_ENDPOINT"]
+		.into_iter()
+		.find_map(|name| {
+			std::env::var(name)
+				.ok()
+				.filter(|value| !value.trim().is_empty())
+		})
+		.and_then(|endpoint| Url::parse(&endpoint).ok())
+		.is_some_and(|endpoint| {
+			endpoint.scheme() == url.scheme()
+				&& endpoint.host_str() == url.host_str()
+				&& endpoint.port_or_known_default() == url.port_or_known_default()
+		})
+}
+
+fn is_valid_aws_region(region: &str) -> bool {
+	let bytes = region.as_bytes();
+	(3..=64).contains(&bytes.len())
+		&& bytes.first().is_some_and(u8::is_ascii_lowercase)
+		&& bytes.last().is_some_and(u8::is_ascii_digit)
+		&& bytes
+			.iter()
+			.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+		&& !region.contains("--")
+}
+
+fn is_strong_etag(etag: &str) -> bool {
+	let bytes = etag.as_bytes();
+	bytes.len() > 2
+		&& bytes.first() == Some(&b'"')
+		&& bytes.last() == Some(&b'"')
+		&& bytes[1..bytes.len() - 1]
+			.iter()
+			.all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte))
 }
 
 fn parse_content_range(
@@ -391,9 +687,12 @@ impl RemoteBlockSource {
 		overlay_path: &Path,
 		logical_size: u64,
 		bearer: Option<String>,
+		auth: ObjectAuth,
+		region: Option<String>,
+		etag: Option<String>,
 	) -> Result<Self> {
 		let index = RemoteIndex::load(index_path, logical_size)?;
-		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer)?);
+		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer, auth, region, etag)?);
 		Self::with_index(cache_path, overlay_path, index, logical_size, fetcher)
 	}
 
@@ -404,9 +703,12 @@ impl RemoteBlockSource {
 		overlay: File,
 		logical_size: u64,
 		bearer: Option<String>,
+		auth: ObjectAuth,
+		region: Option<String>,
+		etag: Option<String>,
 	) -> Result<Self> {
 		let index = RemoteIndex::load(index_path, logical_size)?;
-		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer)?);
+		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer, auth, region, etag)?);
 		Self::with_fetcher_and_overlay(cache_path, overlay, index, logical_size, fetcher)
 	}
 
@@ -667,11 +969,59 @@ mod tests {
 			version: INDEX_VERSION,
 			compressed_size: compressed.len() as u64,
 			uncompressed_size,
-			_original_size: uncompressed_size,
+			original_size: uncompressed_size,
 			block_size: REMOTE_CHUNK_SIZE,
 			blocks: ranges,
 		};
 		(compressed, index)
+	}
+
+	#[test]
+	fn expired_aws_credentials_are_classified_for_refresh() {
+		assert!(is_refreshable_aws_auth_error(
+			"<Error><Code>ExpiredToken</Code><Message>expired</Message></Error>"
+		));
+		assert!(is_refreshable_aws_auth_error("<Error><Code>TokenRefreshRequired</Code></Error>"));
+		assert!(!is_refreshable_aws_auth_error("<Error><Code>AccessDenied</Code></Error>"));
+	}
+
+	#[test]
+	fn http_fetcher_requires_immutable_etag_and_secure_workload_transport() {
+		let missing = match HttpRangeFetcher::new(
+			"https://example.com/rootfs".to_owned(),
+			None,
+			ObjectAuth::None,
+			None,
+			None,
+		) {
+			Ok(_) => panic!("missing ETag must fail"),
+			Err(error) => error,
+		};
+		assert!(missing.to_string().contains("requires an immutable ETag"));
+
+		let weak = match HttpRangeFetcher::new(
+			"https://example.com/rootfs".to_owned(),
+			None,
+			ObjectAuth::None,
+			None,
+			Some("W/\"mutable\"".to_owned()),
+		) {
+			Ok(_) => panic!("weak ETag must fail"),
+			Err(error) => error,
+		};
+		assert!(weak.to_string().contains("quoted strong entity-tag"));
+
+		let insecure = match HttpRangeFetcher::new(
+			"http://storage.googleapis.com/rootfs".to_owned(),
+			None,
+			ObjectAuth::Google,
+			None,
+			Some("\"immutable\"".to_owned()),
+		) {
+			Ok(_) => panic!("workload auth over HTTP must fail"),
+			Err(error) => error,
+		};
+		assert!(insecure.to_string().contains("requires an https:// URL"));
 	}
 
 	#[test]

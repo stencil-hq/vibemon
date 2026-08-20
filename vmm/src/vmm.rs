@@ -1325,6 +1325,9 @@ fn open_configured_block(config: &Config, path: &Path, read_only: bool) -> Resul
 			path,
 			size,
 			config.rootfs_remote_bearer.clone(),
+			config.rootfs_remote_auth,
+			config.rootfs_remote_region.clone(),
+			config.rootfs_remote_etag.clone(),
 			overlay,
 		);
 	}
@@ -4699,6 +4702,8 @@ mod backend_restore_tests {
 			index.to_str().expect("index path"),
 			"--rootfs-remote-size",
 			"512",
+			"--rootfs-remote-etag",
+			"\"immutable\"",
 			"--no-sandbox",
 		];
 		let template_config = Config::from_args(
