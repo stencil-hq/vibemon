@@ -53,6 +53,11 @@ pulumi config set gcp:project my-project
 pulumi config set gcp:region  europe-west4
 pulumi config set binaryUrl   https://…/vmon-x86_64-unknown-linux-musl
 pulumi config set assetsUrl   https://…/vmon-assets-x86_64.tar.gz    # optional: kernel + agent
+# Or use IAM-authenticated GCS artifacts and private image sources:
+# pulumi config set binaryGcsUri gs://artifacts/vmon-x86_64-unknown-linux-musl
+# pulumi config set assetsGcsUri gs://artifacts/vmon-assets-x86_64.tar.gz
+# pulumi config set rootfsGcsPrefix gs://disk-exports/published/
+# pulumi config set artifactRegistryRepository projects/my-project/locations/us-central1/repositories/vmon-images
 pulumi config set allowedCidr 203.0.113.7/32                         # your egress IP; default 0.0.0.0/0
 pulumi config set workerMin 1
 pulumi config set workerMax 4
@@ -62,8 +67,10 @@ pulumi up
 | Key | Default | Meaning |
 |---|---|---|
 | `binaryUrl` | — (required) | musl `vmon` binary URL, must match `arch` |
-| `binaryGcsUri` | none | `gs://` alternative; grants the fleet SA bucket read |
-| `assetsUrl` / `assetsGcsUri` | none | tarball extracted to `/var/lib/vmon/assets` |
+| `binaryGcsUri` | none | `gs://` alternative; grants the worker and scheduler identities read access to that object only |
+| `assetsUrl` / `assetsGcsUri` | none | tarball extracted to `/var/lib/vmon/assets`; a GCS URI grants the worker identity read access to that object only |
+| `rootfsGcsPrefix` | none | `gs://bucket/prefix/` for cloud disk sources and published rootfs objects; grants workers publish and read access only below that prefix |
+| `artifactRegistryRepository` | none | full `projects/PROJECT/locations/LOCATION/repositories/REPOSITORY` resource name for private pulls; omitted means no Artifact Registry grant |
 | `arch` | `x86_64` | `x86_64` or `arm64`; `arm64` demands a `-metal` worker type |
 | `workerMin` / `workerMax` | 1 / 4 | MIG bounds; the vmon autoscaler moves target size within them |
 | `workerMachineType` | `n2-standard-32` | **must support nested virt** (Intel) or be `-metal` |
@@ -84,8 +91,45 @@ every sandbox its configured guest RAM, so idle forked sandboxes can share pages
 hiding memory dirtied under load.
 
 The scheduler's service account carries a custom role with exactly the
-resize/delete permissions, and GCS artifact access is a per-bucket
-`objectViewer` grant — no broad `instanceAdmin`/`storage.admin` roles.
+resize/delete permissions. Launch artifact grants are conditioned to the
+configured object rather than its entire bucket.
+
+## Cloud image permissions
+
+`rootfsGcsPrefix` must end in `/`; `gs://bucket/` deliberately selects the
+whole bucket. Before deployment, create the bucket and verify that each source
+export's metadata has a positive object generation and an ETag; lazy rootfs
+requires both and pins reads to that identity. These are account-controlled
+prerequisites. The referenced bucket and objects are not created or relocated
+by this stack and may use any GCS location.
+
+When configured, the deployment grants the generated worker service account
+`roles/storage.objectUser` on the bucket with an IAM condition matching only
+`projects/_/buckets/<bucket>/objects/<prefix>`. That supplies the
+`storage.objects.get`, `storage.objects.create`, and
+`storage.objects.delete` operations required to inspect the source and
+sidecar, read the published rootfs, and create or replace the rootfs and
+sidecar. Prefix-conditioned object listing is neither granted nor needed.
+GCS resumable publication uses `storage.objects.create`; it does not use the
+XML multipart API or require a separate multipart-abort permission.
+
+If `vmon image publish-rootfs` runs somewhere other than a deployed worker,
+grant its Google identity those same three object permissions below the same
+prefix. The deployment identity running `pulumi up` needs
+`storage.buckets.getIamPolicy` and `storage.buckets.setIamPolicy` on each
+referenced bucket. Those deployment-generated IAM bindings do not create the
+bucket or source objects. Metadata OAuth credentials used for remote reads are
+sent only to provider-trusted HTTPS GCS object endpoints.
+
+`artifactRegistryRepository` is opt-in and includes the repository's project
+and location, so regional and multi-region repository resources are not
+guessed from `gcp:region`. Configuring it grants
+`roles/artifactregistry.reader` on that repository to the worker service
+account. Omitting it grants no Artifact Registry access. The deployment
+identity needs `artifactregistry.repositories.getIamPolicy` and
+`artifactregistry.repositories.setIamPolicy` on that repository, including
+when it belongs to another project. Registry creation and cross-project
+network policy are intentionally outside this stack.
 
 ## Connect
 

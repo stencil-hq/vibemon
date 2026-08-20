@@ -1,5 +1,12 @@
 {
 	"name": "vibevmm-orch-aws",
+	"license": "MIT",
+	"author": "Stencil Labs, Inc.",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/stencil-hq/vibemon.git",
+		"directory": "deploy/aws"
+	},
 	"private": true,
 	"main": "index.ts",
 	"dependencies": {

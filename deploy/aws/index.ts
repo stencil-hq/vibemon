@@ -38,6 +38,10 @@ const binaryUrl = binaryS3Uri ? undefined : config.require("binaryUrl");
 const assetsS3Uri = config.get("assetsS3Uri");
 /** HTTPS fallback for deployments that host assets outside S3. */
 const assetsUrl = assetsS3Uri ? undefined : config.get("assetsUrl");
+/** Optional S3 key prefix containing cloud disk exports and derived rootfs objects. */
+const rootfsS3Prefix = config.get("rootfsS3Prefix");
+/** Optional ECR repository ARN permitted for private OCI pulls. */
+const ecrRepositoryArn = config.get("ecrRepositoryArn");
 /** CIDR allowed to reach schedulers (and worker endpoints for direct dials). */
 const allowedCidr = config.get("allowedCidr") ?? "0.0.0.0/0";
 /** Worker fleet bounds; the vmon autoscaler moves desired capacity in [min, max]. */
@@ -68,40 +72,147 @@ const workerPort = 8000;
 const schedPort = 8100;
 const dashboardPort = 8080;
 
-function s3ObjectArn(uri: string): string {
-  const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
-  if (!match) {
-    throw new Error(`invalid S3 artifact URI: ${uri}`);
-  }
-  return `arn:aws:s3:::${match[1]}/${match[2]}`;
+type S3Location = { bucket: string; key: string };
+
+function validS3Bucket(bucket: string): boolean {
+  return (
+    bucket.length >= 3 &&
+    bucket.length <= 63 &&
+    /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(bucket) &&
+    !bucket.includes("..") &&
+    !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(bucket)
+  );
 }
 
-function artifactReadPolicy(resources: string[]): string {
+function parseS3ObjectUri(uri: string): S3Location {
+  const match = /^s3:\/\/([^/]+)\/(.+)$/.exec(uri);
+  if (
+    !match ||
+    !validS3Bucket(match[1]) ||
+    /[*?]/.test(match[2])
+  ) {
+    throw new Error(`invalid S3 object URI: ${uri}`);
+  }
+  return { bucket: match[1], key: match[2] };
+}
+
+function parseS3Prefix(uri: string): S3Location {
+  const match = /^s3:\/\/([^/]+)\/(.*)$/.exec(uri);
+  if (
+    !match ||
+    !validS3Bucket(match[1]) ||
+    /[*?]/.test(match[2]) ||
+    (match[2] !== "" && !match[2].endsWith("/"))
+  ) {
+    throw new Error(`rootfsS3Prefix must use s3://bucket/prefix/ (got ${uri})`);
+  }
+  return { bucket: match[1], key: match[2] };
+}
+
+function s3BucketArn(partition: string, bucket: string): string {
+  return `arn:${partition}:s3:::${bucket}`;
+}
+
+function s3ObjectArn(partition: string, location: S3Location): string {
+  return `${s3BucketArn(partition, location.bucket)}/${location.key}`;
+}
+
+function artifactReadPolicy(partition: string, locations: S3Location[]): string {
   return JSON.stringify({
     Version: "2012-10-17",
     Statement: [
-      { Effect: "Allow", Action: "s3:GetObject", Resource: resources },
+      {
+        Effect: "Allow",
+        Action: "s3:GetObject",
+        Resource: locations.map((location) => s3ObjectArn(partition, location)),
+      },
     ],
   });
 }
 
-const ec2AssumeRolePolicy = JSON.stringify({
-  Version: "2012-10-17",
-  Statement: [
-    {
+function validateEcrRepositoryArn(arn: string, partition: string): string {
+  const match =
+    /^arn:([a-z0-9-]+):ecr:([a-z0-9-]+):([0-9]{12}):repository\/[a-z0-9]+(?:[._/-][a-z0-9]+)*$/.exec(
+      arn,
+    );
+  if (!match || match[1] !== partition) {
+    throw new Error(
+      `ecrRepositoryArn must be a repository ARN in AWS partition ${partition} (got ${arn})`,
+    );
+  }
+  return arn;
+}
+
+function buildWorkerCloudPolicy(
+  artifactLocations: S3Location[],
+  rootfsLocation: S3Location | undefined,
+  partition: string,
+): string {
+  const statements: Array<Record<string, unknown>> = [];
+  if (artifactLocations.length > 0) {
+    statements.push({
       Effect: "Allow",
-      Principal: { Service: "ec2.amazonaws.com" },
-      Action: "sts:AssumeRole",
-    },
-  ],
-});
-const workerArtifactArns: string[] = [];
+      Action: "s3:GetObject",
+      Resource: artifactLocations.map((location) => s3ObjectArn(partition, location)),
+    });
+  }
+  if (rootfsLocation) {
+    statements.push(
+      {
+        Effect: "Allow",
+        Action: ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
+        Resource: `${s3ObjectArn(partition, rootfsLocation)}*`,
+      },
+      {
+        Effect: "Allow",
+        Action: "s3:ListBucket",
+        Resource: s3BucketArn(partition, rootfsLocation.bucket),
+        Condition: {
+          StringLike: { "s3:prefix": `${rootfsLocation.key}*` },
+        },
+      },
+    );
+  }
+  if (ecrRepositoryArn) {
+    statements.push(
+      {
+        Effect: "Allow",
+        Action: [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ],
+        Resource: validateEcrRepositoryArn(ecrRepositoryArn, partition),
+      },
+      { Effect: "Allow", Action: "ecr:GetAuthorizationToken", Resource: "*" },
+    );
+  }
+  return JSON.stringify({ Version: "2012-10-17", Statement: statements });
+}
+
+const awsPartition = aws.getPartitionOutput();
+const ec2AssumeRolePolicy = awsPartition.dnsSuffix.apply((dnsSuffix) =>
+  JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Effect: "Allow",
+        Principal: { Service: `ec2.${dnsSuffix}` },
+        Action: "sts:AssumeRole",
+      },
+    ],
+  }),
+);
+const workerArtifactLocations: S3Location[] = [];
 if (binaryS3Uri) {
-  workerArtifactArns.push(s3ObjectArn(binaryS3Uri));
+  workerArtifactLocations.push(parseS3ObjectUri(binaryS3Uri));
 }
 if (assetsS3Uri) {
-  workerArtifactArns.push(s3ObjectArn(assetsS3Uri));
+  workerArtifactLocations.push(parseS3ObjectUri(assetsS3Uri));
 }
+const rootfsS3Location = rootfsS3Prefix
+  ? parseS3Prefix(rootfsS3Prefix)
+  : undefined;
 
 const region = aws.getRegionOutput().name;
 const ami = aws.ssm.getParameterOutput({
@@ -285,7 +396,7 @@ const workerUserData = pulumi.interpolate`#!/bin/bash
 set -euxo pipefail
 # \`nftables\` carries the \`nft\` binary the network broker invokes;
 # \`iptables-nft\` only supplies the iptables compatibility wrappers.
-dnf install -y iptables-nft nftables
+dnf install -y iptables-nft nftables awscli-2
 
 getent group vmon >/dev/null || groupadd --system vmon
 if ! id -u vmon >/dev/null 2>&1; then
@@ -394,21 +505,28 @@ systemctl enable --now vmon-netbroker
 systemctl enable --now vmon-worker
 `;
 
-const workerRole =
-  workerArtifactArns.length > 0
-    ? new aws.iam.Role("worker-artifacts", {
-        assumeRolePolicy: ec2AssumeRolePolicy,
-      })
-    : undefined;
+const needsWorkerProfile =
+  workerArtifactLocations.length > 0 ||
+  rootfsS3Location !== undefined ||
+  ecrRepositoryArn !== undefined;
+const workerRole = needsWorkerProfile
+  ? new aws.iam.Role("worker-artifacts", { assumeRolePolicy: ec2AssumeRolePolicy })
+  : undefined;
 if (workerRole) {
-  new aws.iam.RolePolicy("worker-artifacts", {
+  new aws.iam.RolePolicy("worker-cloud-access", {
     role: workerRole.id,
-    policy: artifactReadPolicy(workerArtifactArns),
+    policy: awsPartition.partition.apply((partition) =>
+      buildWorkerCloudPolicy(
+        workerArtifactLocations,
+        rootfsS3Location,
+        partition,
+      ),
+    ),
   });
 }
 const workerProfile = workerRole
-  ? new aws.iam.InstanceProfile("worker-artifacts", { role: workerRole.name })
-  : undefined;
+	? new aws.iam.InstanceProfile("worker-artifacts", { role: workerRole.name })
+	: undefined;
 
 const workerLaunchTemplate = new aws.ec2.LaunchTemplate("worker", {
   imageId: ami,
@@ -490,9 +608,12 @@ new aws.iam.RolePolicy("sched-scaling", {
   ),
 });
 if (binaryS3Uri) {
-  new aws.iam.RolePolicy("sched-artifacts", {
+  const binaryLocation = parseS3ObjectUri(binaryS3Uri);
+  new aws.iam.RolePolicy("sched-artifact", {
     role: schedRole.id,
-    policy: artifactReadPolicy([s3ObjectArn(binaryS3Uri)]),
+    policy: awsPartition.partition.apply((partition) =>
+      artifactReadPolicy(partition, [binaryLocation]),
+    ),
   });
 }
 const schedProfile = new aws.iam.InstanceProfile("sched", {
@@ -505,6 +626,9 @@ const schedUserData = pulumi
   .apply(
     ([redis, api, worker, asgName, awsRegion]) => `#!/bin/bash
 set -euxo pipefail
+# The scheduler hooks and optional S3 artifact download use the AWS CLI;
+# instance-profile credentials remain in IMDS and never enter user data.
+dnf install -y awscli-2
 ${binaryInstall}
 chmod +x /usr/local/bin/vmon
 mkdir -p /opt/vmon /etc/vmon

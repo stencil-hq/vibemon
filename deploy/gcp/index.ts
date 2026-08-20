@@ -45,6 +45,10 @@ const binaryUrl = binaryGcsUri ? undefined : config.require("binaryUrl");
 const assetsGcsUri = config.get("assetsGcsUri");
 /** HTTPS fallback for deployments that host assets outside GCS. */
 const assetsUrl = assetsGcsUri ? undefined : config.get("assetsUrl");
+/** Optional GCS URI prefix containing cloud disk exports and derived rootfs objects. */
+const rootfsGcsPrefix = config.get("rootfsGcsPrefix");
+/** Optional full Artifact Registry repository resource name for private OCI pulls. */
+const artifactRegistryRepository = config.get("artifactRegistryRepository");
 /** CIDR allowed to reach schedulers (and worker endpoints for direct dials). */
 const allowedCidr = config.get("allowedCidr") ?? "0.0.0.0/0";
 /** Worker fleet bounds; the vmon autoscaler moves the MIG target size in [min, max]. */
@@ -98,12 +102,55 @@ const image = gcp.compute.getImageOutput({
   project: "debian-cloud",
 }).selfLink;
 
+function validGcsBucket(bucket: string): boolean {
+  return (
+    bucket.length >= 3 &&
+    bucket.length <= 222 &&
+    /^[a-z0-9][a-z0-9._-]*[a-z0-9]$/.test(bucket) &&
+    !bucket.includes("..") &&
+    !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(bucket)
+  );
+}
+
 function parseGcsUri(uri: string): { bucket: string; object: string } {
   const match = /^gs:\/\/([^/]+)\/(.+)$/.exec(uri);
-  if (!match) {
-    throw new Error(`invalid GCS artifact URI: ${uri}`);
+  if (!match || !validGcsBucket(match[1])) {
+    throw new Error(`invalid GCS object URI: ${uri}`);
   }
   return { bucket: match[1], object: match[2] };
+}
+
+function parseGcsPrefix(uri: string): { bucket: string; objectPrefix: string } {
+  const match = /^gs:\/\/([^/]+)\/(.*)$/.exec(uri);
+  if (
+    !match ||
+    !validGcsBucket(match[1]) ||
+    (match[2] !== "" && !match[2].endsWith("/"))
+  ) {
+    throw new Error(`rootfsGcsPrefix must use gs://bucket/prefix/ (got ${uri})`);
+  }
+  return { bucket: match[1], objectPrefix: match[2] };
+}
+
+function gcsObjectResource(bucket: string, object: string): string {
+  return `projects/_/buckets/${bucket}/objects/${object}`;
+}
+
+function parseArtifactRegistryRepository(resource: string): {
+  project: string;
+  location: string;
+  repository: string;
+} {
+  const match =
+    /^projects\/([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\/locations\/([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\/repositories\/([a-z](?:[a-z0-9-]*[a-z0-9])?)$/.exec(
+      resource,
+    );
+  if (!match) {
+    throw new Error(
+      "artifactRegistryRepository must use projects/PROJECT/locations/LOCATION/repositories/REPOSITORY",
+    );
+  }
+  return { project: match[1], location: match[2], repository: match[3] };
 }
 
 /**
@@ -202,25 +249,59 @@ const stateSa = new gcp.serviceaccount.Account("state", {
   displayName: "vibevmm state VM",
 });
 
-const artifactBuckets = new Set<string>();
-if (binaryGcsUri) {
-  artifactBuckets.add(parseGcsUri(binaryGcsUri).bucket);
-}
-if (assetsGcsUri) {
-  artifactBuckets.add(parseGcsUri(assetsGcsUri).bucket);
-}
-for (const bucket of artifactBuckets) {
-  new gcp.storage.BucketIAMMember(`worker-artifacts-${bucket}`, {
+const workerArtifacts = [binaryGcsUri, assetsGcsUri].filter(
+  (uri): uri is string => uri !== undefined,
+);
+for (const [index, uri] of workerArtifacts.entries()) {
+  const { bucket, object } = parseGcsUri(uri);
+  const resource = gcsObjectResource(bucket, object);
+  new gcp.storage.BucketIAMMember(`worker-artifact-${index}`, {
     bucket,
     role: "roles/storage.objectViewer",
     member: pulumi.interpolate`serviceAccount:${workerSa.email}`,
+    condition: {
+      title: `read-vibevmm-artifact-${index}`,
+      description: "Read only the configured vibevmm launch artifact",
+      expression: `resource.name == ${JSON.stringify(resource)}`,
+    },
+  });
+}
+if (rootfsGcsPrefix) {
+  const { bucket, objectPrefix } = parseGcsPrefix(rootfsGcsPrefix);
+  const resourcePrefix = gcsObjectResource(bucket, objectPrefix);
+  new gcp.storage.BucketIAMMember("worker-rootfs", {
+    bucket,
+    role: "roles/storage.objectUser",
+    member: pulumi.interpolate`serviceAccount:${workerSa.email}`,
+    condition: {
+      title: "publish-and-read-vibevmm-rootfs",
+      description: "Publish and read rootfs objects only below the configured prefix",
+      expression: `resource.name.startsWith(${JSON.stringify(resourcePrefix)})`,
+    },
   });
 }
 if (binaryGcsUri) {
-  new gcp.storage.BucketIAMMember("sched-artifacts", {
-    bucket: parseGcsUri(binaryGcsUri).bucket,
+  const { bucket, object } = parseGcsUri(binaryGcsUri);
+  const resource = gcsObjectResource(bucket, object);
+  new gcp.storage.BucketIAMMember("sched-artifact", {
+    bucket,
     role: "roles/storage.objectViewer",
     member: pulumi.interpolate`serviceAccount:${schedSa.email}`,
+    condition: {
+      title: "read-vibevmm-binary",
+      description: "Read only the configured vibevmm binary",
+      expression: `resource.name == ${JSON.stringify(resource)}`,
+    },
+  });
+}
+if (artifactRegistryRepository) {
+  const repository = parseArtifactRegistryRepository(artifactRegistryRepository);
+  new gcp.artifactregistry.RepositoryIamMember("worker-artifact-registry", {
+    project: repository.project,
+    location: repository.location,
+    repository: repository.repository,
+    role: "roles/artifactregistry.reader",
+    member: pulumi.interpolate`serviceAccount:${workerSa.email}`,
   });
 }
 

@@ -1,7 +1,7 @@
 [Unit]
 Description=Vibemon Daemon (vmon serve)
 After=network.target
-Documentation=https://github.com/vibevmm/vibemon
+Documentation=https://github.com/stencil-hq/vibemon
 
 [Service]
 Type=simple
