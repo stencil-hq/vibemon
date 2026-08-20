@@ -152,11 +152,13 @@ impl AgentConn {
 			.name("vmon-agent-reader".to_string())
 			.spawn(move || reader_loop(reader_inner, stream))?;
 		let conn = Self { inner };
-		// The epoch handshake is mandatory: it fences PTY sink bindings from
-		// stale connections, so a guest that cannot echo it is unusable. Bound
-		// the exchange separately from the (potentially long) boot timeout, and
-		// tear the reader down on every failure path.
-		let handshake_timeout = connect_timeout.min(Duration::from_secs(5));
+		// The host-side virtio-console socket accepts connections as soon as the
+		// VMM starts, before the guest has paged in and launched its agent. The
+		// mandatory epoch exchange is therefore part of connection readiness and
+		// must share the caller's remaining boot budget rather than an unrelated
+		// fixed cap. This keeps cold remote-image boots configurable through their
+		// template timeout while still fencing stale PTY sink bindings.
+		let handshake_timeout = deadline.saturating_duration_since(Instant::now());
 		let hello = conn
 			.request(proto::OP_HELLO, json!({ "epoch": conn.inner.epoch }), handshake_timeout)
 			.inspect_err(|_| conn.close())?;

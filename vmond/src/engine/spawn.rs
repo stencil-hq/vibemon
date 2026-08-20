@@ -27,7 +27,11 @@ const DEFAULT_CPUS: u64 = 1;
 pub(crate) const MAX_CPUS: u64 = 64;
 pub(crate) const MAX_MEM_MIB: u64 = 64 * 1024;
 const MAX_TIMEOUT_SECS: u64 = 86_400;
-const DEFAULT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+const LAUNCH_BASE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Restore readiness includes reading guest memory before the control socket
+/// exists. Budgeting at 128 MiB/s covers ordinary persistent disks without
+/// penalizing fresh boots, whose control plane starts before guest boot.
+const RESTORE_MEMORY_MIB_PER_SEC: u64 = 128;
 const STOP_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
 const READY_SLEEP: Duration = Duration::from_millis(2);
@@ -271,6 +275,16 @@ pub struct LaunchSpec {
 	pub disk_overlay_of: Option<PathBuf>,
 	/// Whether direct rootfs boots add `--rootfs-ro`.
 	pub rootfs_read_only: bool,
+	/// Range-addressable immutable rootfs base URL.
+	pub rootfs_remote_url: Option<String>,
+	/// Shared sparse cache for fetched rootfs blocks.
+	pub rootfs_remote_cache: Option<PathBuf>,
+	/// Local seek index for independently compressed rootfs blocks.
+	pub rootfs_remote_index: Option<PathBuf>,
+	/// Guest-visible byte capacity, including the zero-filled tail.
+	pub rootfs_remote_size: Option<u64>,
+	/// Optional OAuth bearer used by remote rootfs range requests.
+	pub rootfs_remote_bearer: Option<String>,
 	/// Memory size in MiB.
 	pub mem_mib: Option<u64>,
 	/// vCPU count.
@@ -332,6 +346,11 @@ impl LaunchSpec {
 			rootfs: Some(rootfs.into()),
 			disk_overlay_of: None,
 			rootfs_read_only: false,
+			rootfs_remote_url: None,
+			rootfs_remote_cache: None,
+			rootfs_remote_index: None,
+			rootfs_remote_size: None,
+			rootfs_remote_bearer: None,
 			mem_mib: Some(DEFAULT_MEM_MIB),
 			cpus: Some(DEFAULT_CPUS),
 			agent_sock: None,
@@ -374,6 +393,11 @@ impl LaunchSpec {
 			rootfs: None,
 			disk_overlay_of: None,
 			rootfs_read_only: false,
+			rootfs_remote_url: None,
+			rootfs_remote_cache: None,
+			rootfs_remote_index: None,
+			rootfs_remote_size: None,
+			rootfs_remote_bearer: None,
 			mem_mib: None,
 			cpus: None,
 			agent_sock: None,
@@ -431,6 +455,23 @@ impl LaunchSpec {
 	) -> Self {
 		self.disk_overlay_of = Some(base.into());
 		self.rootfs = Some(rootfs.into());
+		self
+	}
+
+	/// Attach an immutable HTTP base beneath the private rootfs overlay.
+	pub fn with_remote_rootfs(
+		mut self,
+		url: impl Into<String>,
+		cache: impl Into<PathBuf>,
+		index: impl Into<PathBuf>,
+		size: u64,
+		bearer: Option<String>,
+	) -> Self {
+		self.rootfs_remote_url = Some(url.into());
+		self.rootfs_remote_cache = Some(cache.into());
+		self.rootfs_remote_index = Some(index.into());
+		self.rootfs_remote_size = Some(size);
+		self.rootfs_remote_bearer = bearer;
 		self
 	}
 
@@ -540,6 +581,22 @@ impl LaunchSpec {
 		}
 		if self.disk_overlay_of.is_some() && self.rootfs.is_none() {
 			return Err(EngineError::invalid("disk overlay requires a rootfs path"));
+		}
+		let remote_rootfs_any = self.rootfs_remote_url.is_some()
+			|| self.rootfs_remote_cache.is_some()
+			|| self.rootfs_remote_index.is_some()
+			|| self.rootfs_remote_size.is_some();
+		let remote_rootfs_complete = self.rootfs_remote_url.is_some()
+			&& self.rootfs_remote_cache.is_some()
+			&& self.rootfs_remote_index.is_some()
+			&& self.rootfs_remote_size.is_some();
+		if remote_rootfs_any && !remote_rootfs_complete {
+			return Err(EngineError::invalid(
+				"remote rootfs requires URL, cache path, seek index, and logical size",
+			));
+		}
+		if self.rootfs_remote_bearer.is_some() && self.rootfs_remote_url.is_none() {
+			return Err(EngineError::invalid("remote rootfs bearer requires a URL"));
 		}
 		if self.remote_page_url.is_some() && !matches!(self.mode, LaunchMode::Restore { .. }) {
 			return Err(EngineError::invalid("remote page restore requires --restore"));
@@ -675,6 +732,21 @@ fn append_rootfs_args(args: &mut Vec<String>, spec: &LaunchSpec, allow_direct_re
 			}
 		},
 		_ => {},
+	}
+	if let Some(url) = &spec.rootfs_remote_url {
+		push_arg(args, "--rootfs-remote-url", url);
+	}
+	if let Some(cache) = &spec.rootfs_remote_cache {
+		push_arg(args, "--rootfs-remote-cache", cache);
+	}
+	if let Some(index) = &spec.rootfs_remote_index {
+		push_arg(args, "--rootfs-remote-index", index);
+	}
+	if let Some(size) = spec.rootfs_remote_size {
+		push_arg(args, "--rootfs-remote-size", size.to_string());
+	}
+	if let Some(bearer) = &spec.rootfs_remote_bearer {
+		push_arg(args, "--rootfs-remote-bearer", bearer);
 	}
 }
 
@@ -1013,9 +1085,11 @@ impl SandboxVm {
 			.unwrap_or_default()
 	}
 
-	/// Spawn the current executable as `vmm` and wait for the control socket.
+	/// Spawn the current executable and wait for its control socket. Restores
+	/// receive a memory-proportional budget because the VMM cannot expose that
+	/// socket until snapshot memory has been loaded.
 	pub fn launch(&self, spec: &LaunchSpec) -> Result<()> {
-		self.launch_with_timeout(spec, DEFAULT_LAUNCH_TIMEOUT)
+		self.launch_with_timeout(spec, launch_ready_timeout(spec))
 	}
 
 	/// Spawn with an explicit readiness timeout.
@@ -1238,7 +1312,9 @@ impl SandboxVm {
 		Self::list_in(state_dir().join("vms"))
 	}
 
-	fn log_tail(&self, lines: usize) -> String {
+	/// Return a bounded console tail so callers can preserve boot diagnostics
+	/// before transient VM cleanup removes the runtime directory.
+	pub(crate) fn log_tail(&self, lines: usize) -> String {
 		let logs = self.logs();
 		let mut tail = logs.lines().rev().take(lines).collect::<Vec<_>>();
 		tail.reverse();
@@ -1528,6 +1604,17 @@ fn contains_flag(args: &[String], flag: &str) -> bool {
 	args.iter().any(|arg| arg == flag)
 }
 
+fn launch_ready_timeout(spec: &LaunchSpec) -> Duration {
+	let memory_secs = match &spec.mode {
+		LaunchMode::Restore { .. } | LaunchMode::Fork { .. } => spec
+			.mem_mib
+			.unwrap_or(DEFAULT_MEM_MIB)
+			.div_ceil(RESTORE_MEMORY_MIB_PER_SEC),
+		LaunchMode::Boot => 0,
+	};
+	LAUNCH_BASE_TIMEOUT.saturating_add(Duration::from_secs(memory_secs))
+}
+
 fn no_sandbox_requested() -> bool {
 	std::env::var("VMON_NO_SANDBOX").is_ok_and(|value| !matches!(value.as_str(), "" | "0"))
 }
@@ -1614,6 +1701,16 @@ mod tests {
 			);
 		}
 	}
+	#[test]
+	fn restore_launch_timeout_scales_with_snapshot_memory() {
+		let boot =
+			LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/rootfs.img").with_mem_mib(32 * 1024);
+		let restore = LaunchSpec::restore("/vm/api.sock", snapshot("snap")).with_mem_mib(32 * 1024);
+
+		assert_eq!(launch_ready_timeout(&boot), Duration::from_secs(15));
+		assert_eq!(launch_ready_timeout(&restore), Duration::from_secs(271));
+	}
+
 	#[test]
 	fn spawn_restore_rejects_invalid_resource_args_before_launch() {
 		assert!(
@@ -1762,6 +1859,42 @@ mod tests {
 			"--rootfs",
 			"/vm/rootfs.img"
 		]);
+	}
+
+	#[test]
+	fn spawn_passes_all_remote_rootfs_flags() {
+		let spec = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
+			.with_remote_rootfs(
+				"https://storage.googleapis.com/rootfs",
+				"/state/images/remote-rootfs/abc.cache",
+				"/state/images/remote-rootfs/abc.index.json",
+				64 * 1024 * 1024 * 1024,
+				Some("token".to_owned()),
+			);
+		let args = build_launch_args(&spec);
+		let idx = args
+			.iter()
+			.position(|arg| arg == "--rootfs-remote-url")
+			.expect("remote URL");
+		assert_eq!(&args[idx..idx + 10], [
+			"--rootfs-remote-url",
+			"https://storage.googleapis.com/rootfs",
+			"--rootfs-remote-cache",
+			"/state/images/remote-rootfs/abc.cache",
+			"--rootfs-remote-index",
+			"/state/images/remote-rootfs/abc.index.json",
+			"--rootfs-remote-size",
+			"68719476736",
+			"--rootfs-remote-bearer",
+			"token",
+		]);
+	}
+
+	#[test]
+	fn partial_remote_rootfs_configuration_is_rejected() {
+		let mut spec = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img");
+		spec.rootfs_remote_cache = Some("/state/images/remote-rootfs/abc.cache".into());
+		assert!(spec.validate().is_err());
 	}
 
 	#[test]

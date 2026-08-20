@@ -5,7 +5,8 @@
 pub mod assets;
 pub mod build;
 pub mod cas;
-
+mod disk_image;
+pub mod registry_auth;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
@@ -19,15 +20,26 @@ use std::{
 	time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use disk_image::{PublishedRootfs, RemoteRootfs};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::error::{EngineError, Result};
+use crate::{
+	error::{EngineError, Result},
+	image::registry_auth::AuthFile,
+};
 
-const IMAGE_TRANSPORT_PREFIXES: &[&str] =
-	&["docker://", "oci:", "dir:", "docker-archive:", "oci-archive:", "containers-storage:"];
+const IMAGE_TRANSPORT_PREFIXES: &[&str] = &[
+	"docker://",
+	"gs://",
+	"oci:",
+	"dir:",
+	"docker-archive:",
+	"oci-archive:",
+	"containers-storage:",
+];
 
 const E2FSPROGS_DIRS: &[&str] = &[
 	"/opt/homebrew/opt/e2fsprogs/sbin",
@@ -54,7 +66,7 @@ const STATIC_AGENT_HINT: &str =
 	"Build and bundle it with `just agent-musl`, or set VMON_AGENT=/path/to/static-agent.";
 const AGENT_BUILD_TIMEOUT_SECS: u64 = 120;
 
-/// The OCI image config fields needed for sandbox default commands.
+/// Image execution defaults needed by sandbox commands.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ImageConfig {
 	pub reference:  String,
@@ -172,6 +184,8 @@ pub struct TemplateSpec {
 	pub user_net:      bool,
 	pub tap_slot:      bool,
 	pub rng:           bool,
+	/// Range-addressable base used when this template comes from a GCE export.
+	pub remote_rootfs: Option<RemoteRootfs>,
 }
 
 /// Engine seam for booting a prepared rootfs and snapshotting it as a template.
@@ -187,12 +201,16 @@ pub struct ImageTools {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedImage {
-	reference:     String,
-	transport_ref: String,
-	spec:          ImageConfig,
-	digest:        String,
-	tools:         ImageTools,
-	arch:          String,
+	reference: String,
+	spec:      ImageConfig,
+	digest:    String,
+	source:    PreparedImageSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedImageSource {
+	Oci { transport_ref: String, tools: ImageTools, arch: String },
+	GceDisk(Box<disk_image::PreparedDiskImage>),
 }
 /// Immutable OCI identity returned by the registry resolver.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,11 +229,21 @@ pub struct ResolvedOciImage {
 pub fn resolve_oci_reference(reference: &str, arch: Option<&str>) -> Result<ResolvedOciImage> {
 	let reference = parse_reference(Some(reference))?
 		.ok_or_else(|| EngineError::invalid("OCI image reference is required"))?;
+	if is_gce_disk_image_reference(&reference) {
+		return Err(EngineError::invalid("gs:// references are GCE disk images, not OCI images"));
+	}
 	let tools = detect_image_tools()?;
 	let arch = skopeo_arch(arch);
-	let stdout = run_stdout(&skopeo_inspect_digest_args(&tools.skopeo, &reference, &arch)).map_err(
-		|error| EngineError::engine(format!("failed to resolve OCI image for linux/{arch}: {error}")),
-	)?;
+	let auth = registry_auth::auth_file_for(&reference);
+	let stdout = run_stdout(&skopeo_inspect_digest_args(
+		&tools.skopeo,
+		&reference,
+		&arch,
+		auth.as_ref().map(AuthFile::path),
+	))
+	.map_err(|error| {
+		EngineError::engine(format!("failed to resolve OCI image for linux/{arch}: {error}"))
+	})?;
 	let info: Value = serde_json::from_str(&stdout)?;
 	let digest = info
 		.get("Digest")
@@ -342,6 +370,86 @@ pub fn parse_reference(reference: Option<&str>) -> Result<Option<String>> {
 	}
 	Ok(Some(reference.to_owned()))
 }
+/// Return whether a reference names a GCE-exported disk archive in GCS.
+///
+/// Keeping this transport explicit prevents an opaque `gs://` URI from ever
+/// reaching skopeo's OCI transport parser.
+pub fn is_gce_disk_image_reference(reference: &str) -> bool {
+	reference.starts_with(disk_image::GCS_PREFIX)
+}
+
+/// Publish a GCE export's root partition as a range-addressable GCS object.
+///
+/// Conversion is explicit because it reads the entire compressed export; normal
+/// sandbox creation only consumes an artifact already published by this call.
+pub fn publish_gce_rootfs(reference: &str) -> Result<PublishedRootfs> {
+	let agent = ensure_agent(None)?;
+	disk_image::publish(reference, &agent)
+}
+
+/// Read the lazy rootfs descriptor persisted alongside a template snapshot.
+pub fn template_remote_rootfs(template_dir: &Path) -> Result<Option<RemoteRootfs>> {
+	let path = template_dir.join("remote-rootfs.json");
+	match fs::read(&path) {
+		Ok(bytes) => serde_json::from_slice(&bytes)
+			.map(Some)
+			.map_err(|error| EngineError::engine(format!("invalid {}: {error}", path.display()))),
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error.into()),
+	}
+}
+
+/// Shared per-worker block cache for one immutable published rootfs digest.
+pub fn remote_rootfs_cache_path(remote: &RemoteRootfs) -> PathBuf {
+	crate::home::state_dir()
+		.join("images")
+		.join("remote-rootfs")
+		.join(format!("{}.cache", remote.sha256))
+}
+
+#[derive(Serialize)]
+struct RemoteRootfsIndex<'a> {
+	version:           u32,
+	compressed_size:   u64,
+	uncompressed_size: u64,
+	original_size:     u64,
+	block_size:        u64,
+	blocks:            &'a [[u64; 2]],
+}
+
+/// Persist the compact seek index separately so the VMM need not fetch a
+/// second authenticated object before it can service the first block read.
+pub fn ensure_remote_rootfs_index(remote: &RemoteRootfs) -> Result<PathBuf> {
+	let dir = crate::home::state_dir()
+		.join("images")
+		.join("remote-rootfs");
+	let path = dir.join(format!("{}.index.json", remote.sha256));
+	let index = RemoteRootfsIndex {
+		version:           3,
+		compressed_size:   remote.compressed_size,
+		uncompressed_size: remote.uncompressed_size,
+		original_size:     remote.original_size,
+		block_size:        remote.block_size,
+		blocks:            &remote.blocks,
+	};
+	let contents = serde_json::to_vec(&index)?;
+	if fs::read(&path).is_ok_and(|current| current == contents) {
+		return Ok(path);
+	}
+	let temporary = temp_file_in(&dir, ".remote-index-")?;
+	fs::write(&temporary, contents)?;
+	fs::rename(&temporary, &path)?;
+	Ok(path)
+}
+
+/// Mint a fresh metadata-server token for a GCS block request.
+pub(crate) fn gcs_access_token() -> Result<String> {
+	registry_auth::metadata_access_token().ok_or_else(|| {
+		EngineError::unauthorized(
+			"failed to obtain a GCE metadata-server OAuth token for the remote rootfs",
+		)
+	})
+}
 
 /// Return daemonless OCI image tools required by image-backed sandboxes.
 pub fn detect_image_tools() -> Result<ImageTools> {
@@ -381,6 +489,9 @@ pub fn manifest_arches(reference: &str) -> Option<Vec<String>> {
 	let Ok(Some(reference)) = parse_reference(Some(reference)) else {
 		return None;
 	};
+	if is_gce_disk_image_reference(&reference) {
+		return None;
+	}
 	let skopeo = find_tool("skopeo")?;
 	let transport_ref = image_transport_ref(&reference);
 	let mut inspect_info = None;
@@ -473,9 +584,18 @@ pub fn cached_template(
 ) -> Result<CachedTemplate> {
 	validate_template_request(request)?;
 	let prepared =
-		prepare_oci_image(request.image.as_deref(), request.dockerfile.as_deref(), &request.context)?;
+		prepare_image(request.image.as_deref(), request.dockerfile.as_deref(), &request.context)?;
 	let agent = ensure_agent(None)?;
 	let agent_digest = sha256_file(&agent)?;
+	if let PreparedImageSource::GceDisk(image) = &prepared.source
+		&& image.remote.agent_sha256 != agent_digest
+	{
+		return Err(EngineError::invalid(format!(
+			"published rootfs agent does not match this vmon build; run `vmon image \
+			 publish-gce-rootfs {}`",
+			image.reference
+		)));
+	}
 	let image_digest = prepared.digest.clone();
 	let image_key = image_cache_key(&image_digest, request.disk_mb, &agent_digest);
 	let tpl_name = template_name(
@@ -528,14 +648,31 @@ fn materialize_template(
 	let rootfs_ext4 = image_dir.join("rootfs.ext4");
 	let spec_path = image_dir.join("spec.json");
 	fs::create_dir_all(&image_dir)?;
+	let mut remote_rootfs = match &prepared.source {
+		PreparedImageSource::GceDisk(image) => Some(image.remote.clone()),
+		PreparedImageSource::Oci { .. } => None,
+	};
+	if let Some(remote) = &mut remote_rootfs {
+		let logical_size = request
+			.disk_mb
+			.checked_mul(1024 * 1024)
+			.ok_or_else(|| EngineError::invalid("disk_mb is too large"))?;
+		if logical_size < remote.uncompressed_size {
+			return Err(EngineError::invalid(format!(
+				"requested disk is {} bytes but the minimized rootfs needs {} bytes",
+				logical_size, remote.uncompressed_size
+			)));
+		}
+		remote.logical_size = logical_size;
+	}
 
-	if !rootfs_ext4.is_file() {
+	if remote_rootfs.is_none() && !rootfs_ext4.is_file() {
 		let tmp = TempDir::new("vmon-image-")?;
+		let tmp_ext4 = temp_file_in(&image_dir, ".rootfs.ext4.tmp-")?;
 		let rootfs = tmp.path().join("rootfs");
 		fs::create_dir(&rootfs)?;
 		export_oci_image(prepared, &rootfs, tmp.path())?;
 		inject_agent(&rootfs, agent)?;
-		let tmp_ext4 = temp_file_in(&image_dir, ".rootfs.ext4.tmp-")?;
 		let build_result = mkfs_ext4(&rootfs, &tmp_ext4, request.disk_mb);
 		if build_result.is_ok() {
 			fs::rename(&tmp_ext4, &rootfs_ext4)?;
@@ -563,8 +700,12 @@ fn materialize_template(
 	let kernel = assets::default_kernel()?;
 	let kernel_sha = sha256_file(&kernel)?;
 	let marker = tpl_dir.join("agent-ready.json");
+	let cached_remote_matches = remote_rootfs.as_ref().is_none_or(|remote| {
+		template_remote_rootfs(&tpl_dir).is_ok_and(|value| value.as_ref() == Some(remote))
+	});
 	if snapshot_state_present(&tpl_dir)
 		&& tpl_dir.join("rootfs.img").is_file()
+		&& cached_remote_matches
 		&& template_marker_current(
 			&marker,
 			&kernel_sha,
@@ -579,6 +720,9 @@ fn materialize_template(
 	}
 	if tpl_dir.exists() {
 		fs::remove_dir_all(&tpl_dir)?;
+	}
+	if remote_rootfs.is_some() {
+		let _ = fs::remove_file(&rootfs_ext4);
 	}
 	let vm_name = template_vm_name(tpl_name);
 	let slot_void = state_dir.join("slot-void");
@@ -605,9 +749,13 @@ fn materialize_template(
 		user_net: request.nic_slot,
 		tap_slot: request.tap_slot,
 		rng: true,
+		remote_rootfs: remote_rootfs.clone(),
 	};
 	booter.boot_verify_and_snapshot(&boot_spec)?;
 	fs::create_dir_all(&tpl_dir)?;
+	if let Some(remote) = &remote_rootfs {
+		fs::write(tpl_dir.join("remote-rootfs.json"), serde_json::to_vec_pretty(remote)?)?;
+	}
 	write_marker(
 		&marker,
 		&spec.reference,
@@ -629,9 +777,22 @@ fn materialize_template(
 	Ok(template)
 }
 
+/// Append `--authfile` when credentials were resolved for this registry.
+fn push_authfile(args: &mut Vec<String>, authfile: Option<&Path>) {
+	if let Some(path) = authfile {
+		args.push("--authfile".to_owned());
+		args.push(path_string(path));
+	}
+}
+
 /// Return skopeo inspect --config argv.
-pub fn skopeo_inspect_config_args(skopeo: &Path, reference: &str, arch: &str) -> Vec<String> {
-	vec![
+pub fn skopeo_inspect_config_args(
+	skopeo: &Path,
+	reference: &str,
+	arch: &str,
+	authfile: Option<&Path>,
+) -> Vec<String> {
+	let mut args = vec![
 		path_string(skopeo),
 		"inspect".to_owned(),
 		"--config".to_owned(),
@@ -639,13 +800,20 @@ pub fn skopeo_inspect_config_args(skopeo: &Path, reference: &str, arch: &str) ->
 		"linux".to_owned(),
 		"--override-arch".to_owned(),
 		skopeo_arch(Some(arch)),
-		image_transport_ref(reference),
-	]
+	];
+	push_authfile(&mut args, authfile);
+	args.push(image_transport_ref(reference));
+	args
 }
 
 /// Return skopeo inspect --no-tags argv for digest resolution.
-pub fn skopeo_inspect_digest_args(skopeo: &Path, reference: &str, arch: &str) -> Vec<String> {
-	vec![
+pub fn skopeo_inspect_digest_args(
+	skopeo: &Path,
+	reference: &str,
+	arch: &str,
+	authfile: Option<&Path>,
+) -> Vec<String> {
+	let mut args = vec![
 		path_string(skopeo),
 		"inspect".to_owned(),
 		"--no-tags".to_owned(),
@@ -653,8 +821,10 @@ pub fn skopeo_inspect_digest_args(skopeo: &Path, reference: &str, arch: &str) ->
 		"linux".to_owned(),
 		"--override-arch".to_owned(),
 		skopeo_arch(Some(arch)),
-		image_transport_ref(reference),
-	]
+	];
+	push_authfile(&mut args, authfile);
+	args.push(image_transport_ref(reference));
+	args
 }
 
 /// Return skopeo copy argv for exporting an OCI image.
@@ -663,17 +833,20 @@ pub fn skopeo_copy_args(
 	arch: &str,
 	transport_ref: &str,
 	oci_dir: &Path,
+	authfile: Option<&Path>,
 ) -> Vec<String> {
-	vec![
+	let mut args = vec![
 		path_string(skopeo),
 		"copy".to_owned(),
 		"--override-os".to_owned(),
 		"linux".to_owned(),
 		"--override-arch".to_owned(),
 		skopeo_arch(Some(arch)),
-		transport_ref.to_owned(),
-		format!("oci:{}:latest", path_string(oci_dir)),
-	]
+	];
+	push_authfile(&mut args, authfile);
+	args.push(transport_ref.to_owned());
+	args.push(format!("oci:{}:latest", path_string(oci_dir)));
+	args
 }
 
 /// Return umoci unpack argv.
@@ -821,7 +994,7 @@ fn validate_template_request(request: &TemplateRequest) -> Result<()> {
 	Ok(())
 }
 
-fn prepare_oci_image(
+fn prepare_image(
 	reference: Option<&str>,
 	dockerfile: Option<&Path>,
 	context: &Path,
@@ -829,11 +1002,25 @@ fn prepare_oci_image(
 	let built = dockerfile.is_some();
 	let reference = if let Some(dockerfile) = dockerfile {
 		let tag = parse_reference(reference)?.unwrap_or_else(|| "vmon-build:latest".to_owned());
+		if tag.starts_with(disk_image::GCS_PREFIX) {
+			return Err(EngineError::invalid(
+				"a Dockerfile build cannot use a gs:// disk image reference",
+			));
+		}
 		build::build_image(dockerfile, context, &tag, None)?
 	} else {
 		parse_reference(reference)?
 			.ok_or_else(|| EngineError::invalid("provide an image reference"))?
 	};
+	if is_gce_disk_image_reference(&reference) {
+		let image = disk_image::prepare(&reference)?;
+		return Ok(PreparedImage {
+			reference,
+			spec: image.spec.clone(),
+			digest: image.digest.clone(),
+			source: PreparedImageSource::GceDisk(Box::new(image)),
+		});
+	}
 	let tools = detect_image_tools()?;
 	let arch = skopeo_arch(None);
 	if !built && is_registry_reference(&reference) {
@@ -867,12 +1054,14 @@ fn inspect_prepared_image(
 	let spec = inspect_oci(&tools, &reference, &arch)?;
 	let digest = image_digest_oci(&tools, &reference, &arch)?;
 	Ok(PreparedImage {
-		transport_ref: image_transport_ref(&reference),
+		source: PreparedImageSource::Oci {
+			transport_ref: image_transport_ref(&reference),
+			tools,
+			arch,
+		},
 		reference,
 		spec,
 		digest,
-		tools,
-		arch,
 	})
 }
 
@@ -886,7 +1075,13 @@ pub fn is_registry_reference(reference: &str) -> bool {
 }
 
 fn inspect_oci(tools: &ImageTools, reference: &str, arch: &str) -> Result<ImageConfig> {
-	let stdout = run_stdout(&skopeo_inspect_config_args(&tools.skopeo, reference, arch))?;
+	let auth = registry_auth::auth_file_for(reference);
+	let stdout = run_stdout(&skopeo_inspect_config_args(
+		&tools.skopeo,
+		reference,
+		arch,
+		auth.as_ref().map(AuthFile::path),
+	))?;
 	let config: Value = serde_json::from_str(&stdout)?;
 	let cfg = config
 		.get("config")
@@ -913,7 +1108,13 @@ fn inspect_oci(tools: &ImageTools, reference: &str, arch: &str) -> Result<ImageC
 }
 
 fn image_digest_oci(tools: &ImageTools, reference: &str, arch: &str) -> Result<String> {
-	let stdout = run_stdout(&skopeo_inspect_digest_args(&tools.skopeo, reference, arch))?;
+	let auth = registry_auth::auth_file_for(reference);
+	let stdout = run_stdout(&skopeo_inspect_digest_args(
+		&tools.skopeo,
+		reference,
+		arch,
+		auth.as_ref().map(AuthFile::path),
+	))?;
 	let info: Value = serde_json::from_str(&stdout)?;
 	let digest = info
 		.get("Digest")
@@ -923,15 +1124,20 @@ fn image_digest_oci(tools: &ImageTools, reference: &str, arch: &str) -> Result<S
 }
 
 fn export_oci_image(image: &PreparedImage, rootfs: &Path, work: &Path) -> Result<()> {
+	let PreparedImageSource::Oci { transport_ref, tools, arch } = &image.source else {
+		return Err(EngineError::engine("attempted to export a non-OCI image with skopeo"));
+	};
 	let oci_dir = work.join("oci");
 	let bundle = work.join("bundle");
+	let auth = registry_auth::auth_file_for(transport_ref);
 	run_inherited(&skopeo_copy_args(
-		&image.tools.skopeo,
-		&image.arch,
-		&image.transport_ref,
+		&tools.skopeo,
+		arch,
+		transport_ref,
 		&oci_dir,
+		auth.as_ref().map(AuthFile::path),
 	))?;
-	run_inherited(&umoci_unpack_args(&image.tools.umoci, &oci_dir, &bundle, !is_root()))?;
+	run_inherited(&umoci_unpack_args(&tools.umoci, &oci_dir, &bundle, !is_root()))?;
 	let unpacked_rootfs = bundle.join("rootfs");
 	if !unpacked_rootfs.is_dir() {
 		return Err(EngineError::engine(format!(
@@ -1769,7 +1975,7 @@ mod tests {
 	#[test]
 	fn image_tool_argv_matches_python() {
 		assert_eq!(
-			skopeo_inspect_config_args(Path::new("skopeo"), "alpine:latest", "aarch64"),
+			skopeo_inspect_config_args(Path::new("skopeo"), "alpine:latest", "aarch64", None),
 			vec![
 				"skopeo",
 				"inspect",
@@ -1786,7 +1992,8 @@ mod tests {
 				Path::new("/bin/skopeo"),
 				"amd64",
 				"docker://alpine",
-				Path::new("/tmp/oci")
+				Path::new("/tmp/oci"),
+				None
 			),
 			vec![
 				"/bin/skopeo",
@@ -1815,6 +2022,20 @@ mod tests {
 		assert!(!is_registry_reference("oci:/tmp/layout:latest"));
 		assert!(!is_registry_reference("dir:/tmp/image"));
 		assert!(!is_registry_reference("containers-storage:vmon:latest"));
+		assert!(!is_registry_reference("gs://sandbox-images/export.tar.gz"));
+		assert!(is_gce_disk_image_reference("gs://sandbox-images/export.tar.gz"));
+		assert!(!is_gce_disk_image_reference("oci:/tmp/layout:latest"));
+		assert!(!is_gce_disk_image_reference("alpine:latest"));
+	}
+
+	#[test]
+	fn gce_disk_references_never_reach_oci_inspection() {
+		let reference = "gs://sandbox-images/export.tar.gz";
+		assert_eq!(
+			resolve_oci_reference(reference, None).unwrap_err().message,
+			"gs:// references are GCE disk images, not OCI images"
+		);
+		assert_eq!(manifest_arches(reference), None);
 	}
 
 	#[test]

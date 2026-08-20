@@ -7,7 +7,10 @@ use std::{
 	io::{self, Read, Seek, SeekFrom, Write as _},
 	net::{IpAddr, Ipv4Addr},
 	ops::Deref,
-	os::unix::fs::{OpenOptionsExt, PermissionsExt},
+	os::{
+		fd::AsRawFd,
+		unix::fs::{FileExt, OpenOptionsExt, PermissionsExt},
+	},
 	path::{Path, PathBuf},
 	process::Command,
 	sync::{
@@ -3503,6 +3506,20 @@ impl Engine {
 		if base_disk.is_file() {
 			spec = spec.with_disk_overlay(base_disk, vm.dir().join("rootfs.img"));
 		}
+		if let Some(remote) = image::template_remote_rootfs(&plan.template_dir)? {
+			let cache = image::remote_rootfs_cache_path(&remote);
+			let index = image::ensure_remote_rootfs_index(&remote)?;
+			if let Some(parent) = cache.parent() {
+				fs::create_dir_all(parent)?;
+			}
+			spec = spec.with_remote_rootfs(
+				remote.url,
+				cache,
+				index,
+				remote.logical_size,
+				Some(image::gcs_access_token()?),
+			);
+		}
 		if let Some(secs) = plan.timeout_secs {
 			spec = spec.with_timeout_secs(secs);
 		}
@@ -3564,6 +3581,7 @@ impl Engine {
 		let vm = self.sandbox(&plan.sid);
 		let base_disk = plan.template_dir.join("rootfs.img");
 		let rootfs = vm.dir().join("rootfs.img");
+		let remote = image::template_remote_rootfs(&plan.template_dir)?;
 		if plan.retained_rootfs {
 			if !rootfs.is_file() {
 				return Err(EngineError::not_found(format!(
@@ -3571,7 +3589,7 @@ impl Engine {
 					plan.sid
 				)));
 			}
-		} else if !base_disk.is_file() {
+		} else if remote.is_none() && !base_disk.is_file() {
 			return Err(EngineError::engine(format!(
 				"template {} has no rootfs.img; fresh-boot sandboxes require a disk-backed template",
 				plan.template_dir.display()
@@ -3580,8 +3598,22 @@ impl Engine {
 		let kernel = image::assets::default_kernel()?;
 		let mut spec = LaunchSpec::boot_rootfs(vm.api_sock(), kernel, &rootfs)
 			.with_agent_sock(vm.dir().join("agent.sock"));
-		if !plan.retained_rootfs {
+		if !plan.retained_rootfs && remote.is_none() {
 			spec = spec.with_disk_overlay(base_disk, &rootfs);
+		}
+		if let Some(remote) = remote {
+			let cache = image::remote_rootfs_cache_path(&remote);
+			let index = image::ensure_remote_rootfs_index(&remote)?;
+			if let Some(parent) = cache.parent() {
+				fs::create_dir_all(parent)?;
+			}
+			spec = spec.with_remote_rootfs(
+				remote.url,
+				cache,
+				index,
+				remote.logical_size,
+				Some(image::gcs_access_token()?),
+			);
 		}
 		spec = spec
 			.with_mem_mib(u64::from(plan.params.memory))
@@ -5216,7 +5248,7 @@ impl Engine {
 		let snapshot_result = snapshot_result.and_then(|_| {
 			if let Some(disk_src) = disk_src.filter(|path| path.is_file()) {
 				fs::create_dir_all(&dir)?;
-				fs::copy(disk_src, dir.join("rootfs.img"))?;
+				copy_sparse_file(disk_src, &dir.join("rootfs.img"))?;
 			}
 			while_paused(&dir)?;
 			Ok(Value::Null)
@@ -7010,6 +7042,20 @@ impl TemplateBooter for Engine {
 			.with_cpus(spec.cpus)
 			.with_rng()
 			.with_snapshot_root(&spec.snapshot_root);
+			if let Some(remote) = &spec.remote_rootfs {
+				let cache = image::remote_rootfs_cache_path(remote);
+				let index = image::ensure_remote_rootfs_index(remote)?;
+				if let Some(parent) = cache.parent() {
+					fs::create_dir_all(parent)?;
+				}
+				launch = launch.with_remote_rootfs(
+					remote.url.clone(),
+					cache,
+					index,
+					remote.logical_size,
+					Some(image::gcs_access_token()?),
+				);
+			}
 			if spec.user_net {
 				launch = launch.with_user_net();
 			}
@@ -7024,8 +7070,47 @@ impl TemplateBooter for Engine {
 					launch.with_volume(VolumeMount::new(&volume.tag, &volume.dir, volume.readonly)?);
 			}
 			self.launch_sandbox(&vm, &launch)?;
-			Self::agent_for_vm(&vm, Duration::from_secs(spec.timeout))?
-				.ping(Duration::from_secs(spec.timeout))?;
+			let agent = Self::agent_for_vm(&vm, Duration::from_secs(spec.timeout))?;
+			let timeout = Duration::from_secs(spec.timeout);
+			agent.ping(timeout)?;
+			if spec.remote_rootfs.is_some() {
+				let session = agent.exec(
+					&["/usr/sbin/resize2fs", "/dev/vda"],
+					None,
+					None,
+					false,
+					Some(timeout),
+				)?;
+				let stdout: Vec<u8> = session.stdout.iter().flatten().collect();
+				let stderr: Vec<u8> = session.stderr.iter().flatten().collect();
+				let exit = session.wait(Some(timeout))?;
+				if exit != 0 {
+					let detail = [stdout, stderr].concat();
+					return Err(EngineError::engine(format!(
+						"guest resize2fs /dev/vda failed with exit code {exit}: {}",
+						String::from_utf8_lossy(&detail).trim()
+					)));
+				}
+				agent.fs_sync(timeout)?;
+				// Online expansion leaves ext4's journal and lazy group
+				// initialization tied to the current mount. Reboot the transient
+				// guest before snapshotting so the template captures a cleanly
+				// remounted filesystem rather than resize-time in-memory state.
+				drop(agent);
+				self.stop_sandbox(&vm, true)?;
+				self.launch_sandbox(&vm, &launch)?;
+				let agent = Self::agent_for_vm(&vm, timeout)?;
+				agent.ping(timeout)?;
+				let session =
+					agent.exec(&["/bin/sh", "-c", "true"], None, None, false, Some(timeout))?;
+				let exit = session.wait(Some(timeout))?;
+				if exit != 0 {
+					return Err(EngineError::engine(format!(
+						"guest shell verification failed after rootfs expansion with exit code {exit}"
+					)));
+				}
+				agent.fs_sync(timeout)?;
+			}
 			self.snapshot_machine(
 				&vm,
 				&spec.template_name,
@@ -7036,6 +7121,16 @@ impl TemplateBooter for Engine {
 			)?;
 			Ok(())
 		})();
+		let launch_result = launch_result.map_err(|error| {
+			let error = template_boot_error(&vm, error);
+			tracing::error!(
+				vm = %spec.vm_name,
+				image = %spec.image,
+				error = %error,
+				"template boot verification failed"
+			);
+			error
+		});
 		let _ = self.remove_sandbox(&vm);
 		if let Some(config) = guest_config {
 			let _ = net::teardown_tap(
@@ -7330,10 +7425,33 @@ impl EngineApi for Engine {
 		let capture_lock = self.capture_lock(id);
 		let _capture_guard = capture_lock.acquire();
 		let record = self.get_record(id, true)?;
-		let returncode = self.teardown(&record)?;
+		// Terminate must drive the durable lifecycle state machine, exactly as
+		// `stop_locked` does. Tearing the VM down while leaving `desired` at
+		// `Running` leaves the reconciler trying to resurrect a sandbox whose
+		// process is already gone ("cannot converge desired lifecycle state
+		// running without a live sandbox"), and leaves every observer — the SDK
+		// reads `observed_state` — reporting the sandbox as still running.
+		let transition = self.begin_state_transition(id, LifecyclePhase::Terminated)?;
+		if transition.disposition != TransitionDisposition::Acquired {
+			return Ok(self.get_record(id, false)?.view());
+		}
+		let generation = transition.generation;
+		let returncode = match self.teardown(&record) {
+			Ok(code) => code,
+			Err(error) => {
+				self.fail_state_transition(id, generation, &error);
+				return Err(error);
+			},
+		};
 		let terminated_at = unix_time();
-		self.persist_status(id, "terminated", returncode, Some(terminated_at))?;
-		self.inner.vpcs.release_sandbox(id)?;
+		if let Err(error) = self.persist_status(id, "terminated", returncode, Some(terminated_at)) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
+		if let Err(error) = self.inner.vpcs.release_sandbox(id) {
+			self.fail_state_transition(id, generation, &error);
+			return Err(error);
+		}
 		let oom = detect_oom(id);
 		let actual_reason = if oom { "oom" } else { reason };
 		let _ = self
@@ -7343,6 +7461,7 @@ impl EngineApi for Engine {
 				detail.insert("terminated_reason".to_owned(), json!(actual_reason));
 				detail.insert("oom".to_owned(), json!(oom));
 			});
+		self.complete_state_transition(id, generation, LifecyclePhase::Terminated)?;
 		let record = self
 			.inner
 			.registry
@@ -10605,6 +10724,67 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
 	Ok(())
 }
 
+/// Copy allocated extents without materializing holes.
+///
+/// A remote rootfs uses holes in its local file as "read this block from the
+/// immutable remote base." `fs::copy` turns those holes into allocated zeroes,
+/// masking remote filesystem data and producing a corrupt restored guest.
+fn copy_sparse_file(source: &Path, destination: &Path) -> Result<()> {
+	const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+
+	let source_file = fs::File::open(source)?;
+	let metadata = source_file.metadata()?;
+	let logical = metadata.len();
+	let logical_i64 =
+		i64::try_from(logical).map_err(|_| EngineError::invalid("sparse file length exceeds i64"))?;
+	let destination_file = OpenOptions::new()
+		.create(true)
+		.truncate(true)
+		.write(true)
+		.mode(metadata.permissions().mode())
+		.open(destination)?;
+	destination_file.set_permissions(metadata.permissions())?;
+	destination_file.set_len(logical)?;
+
+	let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+	let mut offset = 0_i64;
+	while offset < logical_i64 {
+		// SAFETY: `source_file` owns a valid fd and `offset` is non-negative.
+		let data = unsafe { libc::lseek(source_file.as_raw_fd(), offset, libc::SEEK_DATA) };
+		if data < 0 {
+			let error = io::Error::last_os_error();
+			if error.raw_os_error() == Some(libc::ENXIO) {
+				break;
+			}
+			return Err(EngineError::engine(format!(
+				"enumerating sparse data in {}: {error}",
+				source.display()
+			)));
+		}
+		// SAFETY: `data` came from `SEEK_DATA` on the same valid fd.
+		let hole = unsafe { libc::lseek(source_file.as_raw_fd(), data, libc::SEEK_HOLE) };
+		if hole < 0 {
+			return Err(EngineError::engine(format!(
+				"enumerating sparse hole in {}: {}",
+				source.display(),
+				io::Error::last_os_error()
+			)));
+		}
+		let end = hole.min(logical_i64);
+		let mut at = data as u64;
+		while at < end as u64 {
+			let take = usize::try_from((end as u64 - at).min(buffer.len() as u64))
+				.expect("bounded by copy buffer");
+			source_file.read_exact_at(&mut buffer[..take], at)?;
+			destination_file.write_all_at(&buffer[..take], at)?;
+			at += take as u64;
+		}
+		offset = hole.max(data + 1);
+	}
+	destination_file.sync_all()?;
+	Ok(())
+}
+
 fn move_or_copy_regular_file(source: &Path, destination: &Path) -> Result<()> {
 	require_regular_file(source, "capture source")?;
 	match fs::rename(source, destination) {
@@ -11025,6 +11205,23 @@ fn template_request_from_pool(reference: &str, extra: &HashMap<String, Value>) -
 	}
 }
 
+/// Attach the transient guest's bounded console tail before cleanup removes
+/// its directory. Template failures otherwise lose the only guest-side cause.
+fn template_boot_error(vm: &SandboxVm, error: EngineError) -> EngineError {
+	const CONSOLE_TAIL_LINES: usize = 40;
+
+	let tail = vm.log_tail(CONSOLE_TAIL_LINES);
+	let console = if tail.trim().is_empty() {
+		format!("guest console {} was empty or unavailable", vm.log_path().display())
+	} else {
+		format!(
+			"guest console tail (last {CONSOLE_TAIL_LINES} lines from {}):\n{tail}",
+			vm.log_path().display()
+		)
+	};
+	EngineError::new(error.code, format!("template boot failed: {error}\n{console}"))
+}
+
 fn control_for_vm(vm: &SandboxVm) -> Result<ControlClient> {
 	ControlClient::connect(vm.control_sock()?, CONTROL_TIMEOUT)
 }
@@ -11266,6 +11463,62 @@ mod tests {
 		config.home = temp.path().to_path_buf();
 		config.warm_images = Vec::new();
 		config
+	}
+
+	#[test]
+	fn template_boot_error_preserves_console_context_before_cleanup() {
+		let temp = TempDir::new().expect("temp");
+		let vm = SandboxVm::from_dir("template", temp.path().join("template"));
+		fs::create_dir_all(vm.dir()).expect("vm dir");
+		let console = (1..=45)
+			.map(|line| format!("guest boot line {line}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		fs::write(vm.log_path(), console).expect("console log");
+
+		let source = EngineError::invalid("agent handshake failed");
+		let error = template_boot_error(&vm, source.clone());
+		vm.remove().expect("cleanup");
+
+		assert_eq!(error.code, source.code);
+		assert!(error.message.contains("agent handshake failed"));
+		assert!(error.message.contains("guest boot line 45"));
+		assert!(!error.message.contains("guest boot line 5\n"));
+		assert!(!vm.dir().exists());
+	}
+
+	#[test]
+	fn snapshot_disk_copy_preserves_remote_backing_holes() {
+		#[cfg(target_os = "linux")]
+		use std::os::unix::fs::MetadataExt;
+
+		let temp = TempDir::new().expect("temp");
+		let source = temp.path().join("source.img");
+		let destination = temp.path().join("destination.img");
+		let mut file = fs::File::create(&source).expect("source");
+		file.write_all(b"local-head").expect("head extent");
+		file.seek(SeekFrom::Start(4 * 1024 * 1024)).expect("seek");
+		file.write_all(b"local-tail").expect("tail extent");
+		file.set_len(8 * 1024 * 1024).expect("logical length");
+		drop(file);
+
+		copy_sparse_file(&source, &destination).expect("sparse copy");
+
+		let copied = fs::File::open(&destination).expect("destination");
+		let mut head = [0_u8; 10];
+		copied.read_exact_at(&mut head, 0).expect("head");
+		let mut tail = [0_u8; 10];
+		copied
+			.read_exact_at(&mut tail, 4 * 1024 * 1024)
+			.expect("tail");
+		assert_eq!(&head, b"local-head");
+		assert_eq!(&tail, b"local-tail");
+		assert_eq!(copied.metadata().expect("metadata").len(), 8 * 1024 * 1024);
+		#[cfg(target_os = "linux")]
+		assert!(
+			copied.metadata().expect("metadata").blocks() * 512 < 1024 * 1024,
+			"copy must not allocate the remote-backed hole"
+		);
 	}
 
 	#[test]
