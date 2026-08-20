@@ -33,6 +33,14 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Install pinned license tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just@1.58.0,cargo-deny@0.20.2
+
+      - name: Check license policy
+        run: just license-check
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
