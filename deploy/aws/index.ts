@@ -283,7 +283,9 @@ curl -fsSL "${assetsUrl}" | tar -xz -C /var/lib/vmon/assets`
 
 const workerUserData = pulumi.interpolate`#!/bin/bash
 set -euxo pipefail
-dnf install -y iptables-nft
+# \`nftables\` carries the \`nft\` binary the network broker invokes;
+# \`iptables-nft\` only supplies the iptables compatibility wrappers.
+dnf install -y iptables-nft nftables
 
 getent group vmon >/dev/null || groupadd --system vmon
 if ! id -u vmon >/dev/null 2>&1; then

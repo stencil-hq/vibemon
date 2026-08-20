@@ -55,7 +55,7 @@ const arch = config.get("arch") ?? "x86_64";
 /** Intel series get /dev/kvm via the nested-virtualization flag; Arm needs metal. */
 const workerMachineType =
   config.get("workerMachineType") ??
-  (arch === "arm64" ? undefined : "n2-standard-8");
+  (arch === "arm64" ? undefined : "n2-standard-32");
 if (!workerMachineType) {
   throw new Error(
     "arm64 workers need an explicit workerMachineType: GCE has no Arm nested virtualization, so only `-metal` machine types expose /dev/kvm",
@@ -67,6 +67,8 @@ if (arch === "arm64" && !workerIsMetal) {
     `arm64 worker machine type must be bare metal (got ${workerMachineType}): Arm series have no nested virtualization`,
   );
 }
+/** Worker boot disk capacity in GiB. */
+const workerDiskGb = config.getNumber("workerDiskGb") ?? 500;
 const schedulerMachineType =
   config.get("schedulerMachineType") ??
   (arch === "arm64" ? "t2a-standard-1" : "e2-small");
@@ -75,7 +77,7 @@ const stateMachineType =
   (arch === "arm64" ? "t2a-standard-1" : "e2-small");
 const schedulerCount = config.getNumber("schedulerCount") ?? 1;
 /** Per-worker admission cap (0 = memory-bound only). */
-const maxSandboxesPerWorker = config.getNumber("maxSandboxesPerWorker") ?? 0;
+const maxSandboxesPerWorker = config.getNumber("maxSandboxesPerWorker") ?? 3;
 /** Preallocated per-worker TAP/network slots for create-path admission. */
 const netSlots = config.getNumber("netSlots") ?? 256;
 /** Autoscaler target memory utilization (0, 1]. */
@@ -292,7 +294,10 @@ set -euxo pipefail
 [ -f /var/lib/vibevmm-init-done ] && exit 0
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y curl iptables
+# nftables provides the \`nft\` binary the network broker shells out to; Debian's
+# \`iptables\` package does not ship it. Without it slot preallocation falls back
+# to per-create networking and sandbox teardown cannot release its slot.
+apt-get install -y curl iptables nftables
 
 getent group vmon >/dev/null || groupadd --system vmon
 if ! id -u vmon >/dev/null 2>&1; then
@@ -410,7 +415,7 @@ const workerTemplate = new gcp.compute.InstanceTemplate("worker", {
       sourceImage: image,
       autoDelete: true,
       boot: true,
-      diskSizeGb: 100,
+      diskSizeGb: workerDiskGb,
       diskType: "pd-balanced",
     },
   ],
