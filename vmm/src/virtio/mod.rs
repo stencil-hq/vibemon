@@ -6,6 +6,8 @@
 //! 64 handles.
 
 pub mod block;
+#[cfg(any(target_os = "linux", test))]
+mod block_remote;
 pub mod console;
 #[cfg(not(target_os = "windows"))]
 pub mod fs;

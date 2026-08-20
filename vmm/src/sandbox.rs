@@ -381,6 +381,17 @@ fn allowlisted_syscalls() -> BTreeSet<i64> {
 		syscalls.insert(libc::SYS_rename);
 		syscalls.insert(libc::SYS_unlink);
 		syscalls.insert(libc::SYS_rmdir);
+		// musl goes further than glibc here: on x86_64 it prefers the legacy
+		// syscall whenever one exists, so `open`/`stat`/`lstat` are issued where
+		// glibc always emits `openat`/`newfstatat`. These grant nothing the
+		// *at-variants above do not already allow — same operations, older
+		// calling convention — but without them a musl build takes EPERM on the
+		// first cold template build (`current-generation`) and on the VM socket
+		// probes. aarch64 has no such syscalls, so this gap is x86_64-only and
+		// invisible to arm64 testing.
+		syscalls.insert(libc::SYS_open);
+		syscalls.insert(libc::SYS_stat);
+		syscalls.insert(libc::SYS_lstat);
 	}
 	syscalls
 }

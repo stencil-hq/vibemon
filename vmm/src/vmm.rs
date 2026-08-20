@@ -1246,6 +1246,12 @@ fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> 
 			paths.rw.push(path.clone());
 		}
 	}
+	if let Some(path) = &config.rootfs_remote_cache {
+		paths.rw.push(path.clone());
+	}
+	if let Some(path) = &config.rootfs_remote_index {
+		paths.ro.push(path.clone());
+	}
 	if let Some(path) = &config.restore {
 		paths.ro_dirs.push(path.clone());
 	}
@@ -1288,6 +1294,46 @@ fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> 
 		}
 	}
 	Ok(paths)
+}
+/// Opens one block backend from the current launch configuration.
+///
+/// Both cold build and snapshot restore must use this function: a remote
+/// overlay is sparse by design and opening it as a standalone local file would
+/// silently serve holes as zeroes instead of consulting the remote base.
+fn open_configured_block(config: &Config, path: &Path, read_only: bool) -> Result<Block> {
+	if let Some(url) = &config.rootfs_remote_url {
+		let cache = config
+			.rootfs_remote_cache
+			.as_deref()
+			.ok_or_else(|| err("--rootfs-remote-url requires --rootfs-remote-cache"))?;
+		let index = config
+			.rootfs_remote_index
+			.as_deref()
+			.ok_or_else(|| err("--rootfs-remote-url requires --rootfs-remote-index"))?;
+		let size = config
+			.rootfs_remote_size
+			.ok_or_else(|| err("--rootfs-remote-url requires --rootfs-remote-size"))?;
+		let overlay = config
+			.disk_overlay_of
+			.as_ref()
+			.map(|base| crate::virtio::block::create_cow_overlay(base, path))
+			.transpose()?;
+		return Block::new_remote(
+			url.clone(),
+			cache,
+			index,
+			path,
+			size,
+			config.rootfs_remote_bearer.clone(),
+			overlay,
+		);
+	}
+	if let Some(base) = &config.disk_overlay_of {
+		let overlay = crate::virtio::block::create_cow_overlay(base, path)?;
+		Block::from_file(overlay, read_only)
+	} else {
+		Block::new(path, read_only)
+	}
 }
 
 fn machine_info(vmm: &Vmm) -> MachineInfo {
@@ -1829,14 +1875,7 @@ impl Vmm {
 		let mut console_output = None;
 
 		if let Some(path) = &config.rootfs {
-			// --disk-overlay-of <base>: create the rootfs path as a private CoW
-			// copy and keep the exclusive no-follow fd for the block backend.
-			let block = if let Some(base) = &config.disk_overlay_of {
-				let overlay = crate::virtio::block::create_cow_overlay(base, path)?;
-				Block::from_file(overlay, config.rootfs_read_only)?
-			} else {
-				Block::new(path, config.rootfs_read_only)?
-			};
+			let block = open_configured_block(&config, path, config.rootfs_read_only)?;
 			let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(block));
 			let backend = BackendHint::Block {
 				path:      path.to_string_lossy().into_owned(),
@@ -2500,14 +2539,7 @@ impl Vmm {
 			let mut fs_handle = None;
 			let device: Arc<Mutex<dyn VirtioDevice>> = match &backend {
 				BackendHint::Block { path, read_only } => {
-					// --disk-overlay-of <base>: create this child overlay with an
-					// exclusive no-follow fd and hand that fd to virtio-blk.
-					let block = if let Some(base) = &config.disk_overlay_of {
-						let overlay = crate::virtio::block::create_cow_overlay(base, Path::new(path))?;
-						Block::from_file(overlay, *read_only)?
-					} else {
-						Block::new(Path::new(path), *read_only)?
-					};
+					let block = open_configured_block(config, Path::new(path), *read_only)?;
 					Arc::new(Mutex::new(block))
 				},
 				BackendHint::Net { .. } | BackendHint::UserNet { .. } => open_net_device(
@@ -4641,6 +4673,68 @@ mod backend_restore_tests {
 				.map(str::to_owned),
 		)
 		.expect("restore config")
+	}
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn restored_remote_block_keeps_remote_base_instead_of_serving_sparse_holes() {
+		let dir =
+			std::env::temp_dir().join(format!("vmon-restore-remote-block-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir(&dir).expect("create remote restore test dir");
+		let cache = dir.join("base.cache");
+		let index = dir.join("base.index.json");
+		let template_overlay = dir.join("template.img");
+		let child_overlay = dir.join("child.img");
+		std::fs::write(
+			&index,
+			br#"{"version":3,"compressed_size":1,"uncompressed_size":512,"original_size":512,"block_size":1048576,"blocks":[[0,1]]}"#,
+		)
+		.expect("write remote index");
+		let common = [
+			"--rootfs-remote-url",
+			"http://127.0.0.1/object",
+			"--rootfs-remote-cache",
+			cache.to_str().expect("cache path"),
+			"--rootfs-remote-index",
+			index.to_str().expect("index path"),
+			"--rootfs-remote-size",
+			"512",
+			"--no-sandbox",
+		];
+		let template_config = Config::from_args(
+			["--restore", "/snapshot", "--rootfs", template_overlay.to_str().expect("template path")]
+				.into_iter()
+				.chain(common)
+				.map(str::to_owned),
+		)
+		.expect("template config");
+		let template =
+			open_configured_block(&template_config, &template_overlay, false).expect("template block");
+		assert!(template.is_remote_backed_for_test());
+		drop(template);
+
+		let child_config = Config::from_args(
+			[
+				"--restore",
+				"/snapshot",
+				"--rootfs",
+				child_overlay.to_str().expect("child path"),
+				"--disk-overlay-of",
+				template_overlay.to_str().expect("template path"),
+			]
+			.into_iter()
+			.chain(common)
+			.map(str::to_owned),
+		)
+		.expect("child restore config");
+		let child =
+			open_configured_block(&child_config, &child_overlay, false).expect("restored child block");
+		assert!(
+			child.is_remote_backed_for_test(),
+			"snapshot restore must not open the sparse overlay as a standalone local disk"
+		);
+		drop(child);
+		std::fs::remove_dir_all(dir).expect("remove remote restore test dir");
 	}
 
 	fn device(kind: DeviceKind, backend: BackendHint) -> DeviceState {

@@ -90,6 +90,18 @@ pub struct Config {
 	pub zram_swap_file: Option<PathBuf>,
 	/// HTTP page source for lazy snapshot restore; token comes from process env.
 	pub remote_page_url: Option<String>,
+	/// HTTP(S) object containing independently framed zstd root-disk blocks.
+	pub rootfs_remote_url: Option<String>,
+	/// Persistent sparse local cache for decompressed blocks fetched from
+	/// `rootfs_remote_url`.
+	pub rootfs_remote_cache: Option<PathBuf>,
+	/// Local seek-index JSON needed to map uncompressed blocks to zstd frames.
+	pub rootfs_remote_index: Option<PathBuf>,
+	/// Guest-visible byte capacity when the remote object is a minimized
+	/// filesystem.
+	pub rootfs_remote_size: Option<u64>,
+	/// Optional bearer credential sent only to the remote root-disk endpoint.
+	pub rootfs_remote_bearer: Option<String>,
 	/// Hint host KSM to merge identical guest RAM pages across co-resident VMs.
 	pub ksm: bool,
 	pub cpus: u8,
@@ -262,7 +274,25 @@ struct CliArgs {
 
 	/// Disk image exposed as virtio-blk /dev/vda
 	#[arg(long, value_name = "PATH")]
-	rootfs: Option<PathBuf>,
+	rootfs:            Option<PathBuf>,
+	/// Independently zstd-framed root disk served with HTTP Range requests
+	#[arg(long, value_name = "URL")]
+	rootfs_remote_url: Option<String>,
+
+	/// Persistent sparse cache for lazily decompressed root-disk chunks
+	#[arg(long, value_name = "PATH")]
+	rootfs_remote_cache: Option<PathBuf>,
+	/// Local v3 JSON seek index for the independently framed zstd object
+	#[arg(long, value_name = "PATH")]
+	rootfs_remote_index: Option<PathBuf>,
+
+	/// Guest-visible capacity in bytes (must cover the uncompressed filesystem)
+	#[arg(long, value_name = "BYTES")]
+	rootfs_remote_size: Option<u64>,
+
+	/// Optional bearer token for the remote root-disk endpoint
+	#[arg(long, value_name = "TOKEN")]
+	rootfs_remote_bearer: Option<String>,
 
 	/// Open the rootfs read-only
 	#[arg(long)]
@@ -535,6 +565,78 @@ impl Config {
 		if cli.remote_page_url.is_some() && mem_target_mib.is_some() {
 			bail!("--remote-page-url cannot be combined with --mem-target-mib");
 		}
+		let remote_rootfs = cli.rootfs_remote_url.is_some()
+			|| cli.rootfs_remote_cache.is_some()
+			|| cli.rootfs_remote_index.is_some()
+			|| cli.rootfs_remote_size.is_some()
+			|| cli.rootfs_remote_bearer.is_some();
+		if cli
+			.rootfs_remote_url
+			.as_deref()
+			.is_some_and(|url| url.trim().is_empty())
+		{
+			bail!("--rootfs-remote-url must not be empty");
+		}
+		if let Some(url) = &cli.rootfs_remote_url
+			&& !url.starts_with("http://")
+			&& !url.starts_with("https://")
+		{
+			bail!("--rootfs-remote-url must use http:// or https://");
+		}
+		if cli
+			.rootfs_remote_cache
+			.as_ref()
+			.is_some_and(|path| path.as_os_str().is_empty())
+		{
+			bail!("--rootfs-remote-cache must not be empty");
+		}
+		if cli
+			.rootfs_remote_index
+			.as_ref()
+			.is_some_and(|path| path.as_os_str().is_empty())
+		{
+			bail!("--rootfs-remote-index must not be empty");
+		}
+		if cli
+			.rootfs_remote_bearer
+			.as_deref()
+			.is_some_and(|token| token.is_empty())
+		{
+			bail!("--rootfs-remote-bearer must not be empty");
+		}
+		if remote_rootfs && cli.rootfs_remote_url.is_none() {
+			bail!(
+				"--rootfs-remote-cache/--rootfs-remote-index/--rootfs-remote-size/\
+				 --rootfs-remote-bearer require --rootfs-remote-url"
+			);
+		}
+		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_cache.is_none() {
+			bail!("--rootfs-remote-url requires --rootfs-remote-cache");
+		}
+		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_index.is_none() {
+			bail!("--rootfs-remote-url requires --rootfs-remote-index");
+		}
+		if cli.rootfs_remote_url.is_some() && cli.rootfs_remote_size.is_none() {
+			bail!("--rootfs-remote-url requires --rootfs-remote-size");
+		}
+		if cli.rootfs_remote_size == Some(0) {
+			bail!("--rootfs-remote-size must be greater than zero");
+		}
+		if cli.rootfs_remote_url.is_some() && cli.rootfs.is_none() {
+			bail!("--rootfs-remote-url requires --rootfs as the private writable overlay");
+		}
+		if cli.rootfs_remote_url.is_some() && cli.rootfs_ro {
+			bail!("--rootfs-remote-url cannot be combined with --rootfs-ro");
+		}
+		if let (Some(cache), Some(overlay)) = (&cli.rootfs_remote_cache, &cli.rootfs)
+			&& cache == overlay
+		{
+			bail!("--rootfs-remote-cache must differ from --rootfs");
+		}
+		#[cfg(not(target_os = "linux"))]
+		if remote_rootfs {
+			bail!("--rootfs-remote-url requires a Linux host");
+		}
 		if let Some(n) = cli.timeout_secs
 			&& !(1..=86_400).contains(&n)
 		{
@@ -785,6 +887,11 @@ impl Config {
 			zram_store_max_mib: cli.zram_store_max_mib.map(|v| v as usize),
 			zram_swap_file: cli.zram_swap_file,
 			remote_page_url: cli.remote_page_url,
+			rootfs_remote_url: cli.rootfs_remote_url,
+			rootfs_remote_cache: cli.rootfs_remote_cache,
+			rootfs_remote_index: cli.rootfs_remote_index,
+			rootfs_remote_size: cli.rootfs_remote_size,
+			rootfs_remote_bearer: cli.rootfs_remote_bearer,
 			ksm: cli.ksm,
 			cpus: cpus as u8,
 			rootfs: cli.rootfs,
@@ -1117,6 +1224,60 @@ mod tests {
 	fn assert_config_err_contains(args: &[&str], expected: &str) {
 		let err = config_err(args);
 		assert!(err.contains(expected), "expected error containing {expected}, got {err}");
+	}
+	#[test]
+	fn remote_rootfs_flags_require_complete_nonempty_group() {
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--rootfs-remote-url", "https://example/image"],
+			"requires --rootfs-remote-cache",
+		);
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--rootfs-remote-cache", "/tmp/cache"],
+			"require --rootfs-remote-url",
+		);
+		assert_config_err_contains(
+			&[
+				"vmon",
+				"--kernel",
+				"k",
+				"--rootfs",
+				"/tmp/root",
+				"--rootfs-remote-url",
+				"",
+				"--rootfs-remote-cache",
+				"/tmp/cache",
+			],
+			"must not be empty",
+		);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn parses_remote_rootfs_contract() {
+		let cfg = parse_config(&[
+			"vmon",
+			"--kernel",
+			"k",
+			"--rootfs",
+			"/tmp/overlay",
+			"--rootfs-remote-url",
+			"https://example/image",
+			"--rootfs-remote-cache",
+			"/tmp/cache",
+			"--rootfs-remote-index",
+			"/tmp/index.json",
+			"--rootfs-remote-size",
+			"68719476736",
+			"--rootfs-remote-bearer",
+			"secret",
+			"--no-sandbox",
+		])
+		.expect("remote rootfs flags");
+		assert_eq!(cfg.rootfs_remote_url.as_deref(), Some("https://example/image"));
+		assert_eq!(cfg.rootfs_remote_cache.as_deref(), Some(Path::new("/tmp/cache")));
+		assert_eq!(cfg.rootfs_remote_index.as_deref(), Some(Path::new("/tmp/index.json")));
+		assert_eq!(cfg.rootfs_remote_size, Some(68_719_476_736));
+		assert_eq!(cfg.rootfs_remote_bearer.as_deref(), Some("secret"));
 	}
 
 	#[test]

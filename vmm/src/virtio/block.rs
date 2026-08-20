@@ -38,6 +38,8 @@ use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
 
 #[cfg(target_os = "linux")]
+use super::block_remote::RemoteBlockSource;
+#[cfg(target_os = "linux")]
 use crate::os::EventFd;
 use crate::{
 	memory::GuestMemoryMmap,
@@ -384,6 +386,8 @@ enum Outcome {
 pub struct Block {
 	disk:             File,
 	capacity_sectors: u64,
+	#[cfg(target_os = "linux")]
+	remote:           Option<RemoteBlockSource>,
 	read_only:        bool,
 	features:         u64,
 	acked_features:   u64,
@@ -422,6 +426,83 @@ impl Block {
 
 	pub fn from_file(disk: File, read_only: bool) -> Result<Self> {
 		let len = disk.metadata()?.len();
+		#[cfg(target_os = "linux")]
+		{
+			let io = Self::create_linux_io()?;
+			return Ok(Self::from_file_with_capacity(disk, read_only, len, None, io));
+		}
+		#[cfg(not(target_os = "linux"))]
+		Ok(Self::from_file_with_capacity(disk, read_only, len))
+	}
+
+	/// Builds a lazy immutable remote base plus private overlay so guest writes
+	/// never mutate either the shared object or its persistent chunk cache.
+	#[cfg(target_os = "linux")]
+	pub fn new_remote(
+		url: String,
+		cache_path: &Path,
+		index_path: &Path,
+		overlay_path: &Path,
+		logical_size: u64,
+		bearer: Option<String>,
+		preopened_overlay: Option<File>,
+	) -> Result<Self> {
+		let source = if let Some(overlay) = preopened_overlay {
+			RemoteBlockSource::new_with_overlay(
+				url,
+				cache_path,
+				index_path,
+				overlay,
+				logical_size,
+				bearer,
+			)?
+		} else {
+			RemoteBlockSource::new(url, cache_path, index_path, overlay_path, logical_size, bearer)?
+		};
+		let len = source.image_len();
+		let disk = source
+			.overlay()
+			.try_clone()
+			.map_err(|e| err(format!("cloning remote block overlay descriptor: {e}")))?;
+		let io = Self::create_linux_io()?;
+		Ok(Self::from_file_with_capacity(disk, false, len, Some(source), io))
+	}
+
+	/// Rejects remote block construction on hosts without the Linux data path.
+	#[cfg(not(target_os = "linux"))]
+	pub fn new_remote(
+		_url: String,
+		_cache_path: &Path,
+		_index_path: &Path,
+		_overlay_path: &Path,
+		_logical_size: u64,
+		_bearer: Option<String>,
+		_preopened_overlay: Option<File>,
+	) -> Result<Self> {
+		Err(err("remote rootfs requires Linux"))
+	}
+
+	#[cfg(target_os = "linux")]
+	fn create_linux_io() -> Result<(IoUring, EventFd)> {
+		// Build the ring eagerly and register its completion eventfd now: the
+		// worker thread reads `worker_fds()` before the guest driver ever
+		// activates the device, so the fd has to exist already or completions
+		// would never be polled.
+		let ring = IoUring::new(RING_ENTRIES)?;
+		let io_uring_evt = EventFd::new(libc::EFD_NONBLOCK)?;
+		ring
+			.submitter()
+			.register_eventfd(io_uring_evt.as_raw_fd())?;
+		Ok((ring, io_uring_evt))
+	}
+
+	fn from_file_with_capacity(
+		disk: File,
+		read_only: bool,
+		len: u64,
+		#[cfg(target_os = "linux")] remote: Option<RemoteBlockSource>,
+		#[cfg(target_os = "linux")] io: (IoUring, EventFd),
+	) -> Self {
 		let capacity_sectors = len / SECTOR_SIZE;
 
 		let mut features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
@@ -433,21 +514,11 @@ impl Block {
 		config[..8].copy_from_slice(&capacity_sectors.to_le_bytes());
 
 		#[cfg(target_os = "linux")]
-		let (ring, io_uring_evt) = {
-			// Build the ring eagerly and register its completion eventfd now: the
-			// worker thread reads `worker_fds()` before the guest driver ever
-			// activates the device, so the fd has to exist already or completions
-			// would never be polled.
-			let ring = IoUring::new(RING_ENTRIES)?;
-			let io_uring_evt = EventFd::new(libc::EFD_NONBLOCK)?;
-			ring
-				.submitter()
-				.register_eventfd(io_uring_evt.as_raw_fd())?;
-			(ring, io_uring_evt)
-		};
-
-		Ok(Self {
+		let (ring, io_uring_evt) = io;
+		Self {
 			disk,
+			#[cfg(target_os = "linux")]
+			remote,
 			capacity_sectors,
 			read_only,
 			features,
@@ -465,7 +536,12 @@ impl Block {
 			mem: None,
 			interrupt: None,
 			queue: None,
-		})
+		}
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(crate) const fn is_remote_backed_for_test(&self) -> bool {
+		self.remote.is_some()
 	}
 }
 
@@ -678,35 +754,52 @@ impl VirtioDevice for Block {
 
 		#[cfg(target_os = "linux")]
 		{
-			// Disjoint field borrows: backend/config fields vs. queue/ring/pending.
-			let ring = &mut self.ring;
-			let pending = &mut self.pending;
-			let next_token = &mut self.next_token;
-
-			let mut any_submitted = false;
-			let mut sync_used = false;
-			while budget != 0 {
-				let Some(chain) = queue.pop_descriptor_chain(&mem) else {
-					break;
-				};
-				budget -= 1;
-				match linux::process_chain(
-					disk, capacity, read_only, &mem, queue, ring, pending, next_token, chain,
-				)? {
-					Outcome::Submitted => any_submitted = true,
-					Outcome::Synchronous => sync_used = true,
+			if let Some(remote) = self.remote.as_mut() {
+				let mut sync_used = false;
+				while budget != 0 {
+					let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+						break;
+					};
+					budget -= 1;
+					match sync_io::process_remote_chain(remote, capacity, &mem, queue, chain)? {
+						Outcome::Synchronous => sync_used = true,
+						Outcome::Submitted => unreachable!("remote block requests finish synchronously"),
+					}
 				}
-			}
-			// Kick the kernel once for everything pushed this batch.
-			if any_submitted {
-				ring
-					.submit()
-					.map_err(|e| err(format!("virtio-blk submit failed: {e}")))?;
-			}
-			// Inline completions (errors, flush, get-id, unsupported) need their own
-			// IRQ; asynchronous ones are signalled from `process_worker_source`.
-			if sync_used {
-				interrupt.signal_used_queue()?;
+				if sync_used {
+					interrupt.signal_used_queue()?;
+				}
+			} else {
+				// Disjoint field borrows: backend/config fields vs. queue/ring/pending.
+				let ring = &mut self.ring;
+				let pending = &mut self.pending;
+				let next_token = &mut self.next_token;
+
+				let mut any_submitted = false;
+				let mut sync_used = false;
+				while budget != 0 {
+					let Some(chain) = queue.pop_descriptor_chain(&mem) else {
+						break;
+					};
+					budget -= 1;
+					match linux::process_chain(
+						disk, capacity, read_only, &mem, queue, ring, pending, next_token, chain,
+					)? {
+						Outcome::Submitted => any_submitted = true,
+						Outcome::Synchronous => sync_used = true,
+					}
+				}
+				// Kick the kernel once for everything pushed this batch.
+				if any_submitted {
+					ring
+						.submit()
+						.map_err(|e| err(format!("virtio-blk submit failed: {e}")))?;
+				}
+				// Inline completions (errors, flush, get-id, unsupported) need their own
+				// IRQ; asynchronous ones are signalled from `process_worker_source`.
+				if sync_used {
+					interrupt.signal_used_queue()?;
+				}
 			}
 		}
 
@@ -768,10 +861,23 @@ impl VirtioDevice for Block {
 		// Repeat the drain here so this primitive remains safe if it is used by
 		// a future control path that has acquired the device lock directly.
 		self.drain()?;
+		#[cfg(target_os = "linux")]
+		if let Some(remote) = &self.remote {
+			remote
+				.sync_all()
+				.map_err(|e| err(format!("syncing remote virtio-block disk: {e}")))?;
+		} else {
+			self.disk.sync_all().map_err(|e| {
+				err(format!("syncing active virtio-block disk before recovery capture: {e}"))
+			})?;
+		}
+		#[cfg(not(target_os = "linux"))]
 		self.disk.sync_all().map_err(|e| {
 			err(format!("syncing active virtio-block disk before recovery capture: {e}"))
 		})?;
-		clone_open_disk(&self.disk, destination)
+		let mut capture = clone_open_disk(&self.disk, destination)?;
+		capture.bytes = self.capacity_sectors * SECTOR_SIZE;
+		Ok(capture)
 	}
 }
 
@@ -1078,7 +1184,7 @@ pub(super) mod linux {
 	}
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(super) mod sync_io {
 	#[cfg(target_os = "macos")]
 	use std::os::unix::fs::FileExt;
@@ -1087,9 +1193,71 @@ pub(super) mod sync_io {
 
 	use super::*;
 
-	/// Process one virtio-blk request chain.
+	trait Backend {
+		fn read(&mut self, dst: &mut [u8], offset: u64) -> bool;
+		fn write(&mut self, src: &[u8], offset: u64) -> bool;
+		fn sync(&mut self) -> bool;
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	struct LocalBackend<'a>(&'a File);
+
+	#[cfg(not(target_os = "linux"))]
+	impl Backend for LocalBackend<'_> {
+		fn read(&mut self, dst: &mut [u8], offset: u64) -> bool {
+			read_exact_at(self.0, dst, offset).is_ok()
+		}
+
+		fn write(&mut self, src: &[u8], offset: u64) -> bool {
+			write_all_at(self.0, src, offset).is_ok()
+		}
+
+		fn sync(&mut self) -> bool {
+			self.0.sync_all().is_ok()
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	impl Backend for RemoteBlockSource {
+		fn read(&mut self, dst: &mut [u8], offset: u64) -> bool {
+			self.read_exact_at(dst, offset).is_ok()
+		}
+
+		fn write(&mut self, src: &[u8], offset: u64) -> bool {
+			self.write_all_at(src, offset).is_ok()
+		}
+
+		fn sync(&mut self) -> bool {
+			self.sync_all().is_ok()
+		}
+	}
+
+	/// Process one local-file virtio-blk request chain.
+	#[cfg(not(target_os = "linux"))]
 	pub(super) fn process_chain(
 		disk: &File,
+		capacity_sectors: u64,
+		read_only: bool,
+		mem: &GuestMemoryMmap,
+		queue: &mut Queue,
+		chain: DescriptorChain<&GuestMemoryMmap>,
+	) -> Result<Outcome> {
+		process_chain_backend(&mut LocalBackend(disk), capacity_sectors, read_only, mem, queue, chain)
+	}
+
+	#[cfg(target_os = "linux")]
+	pub(super) fn process_remote_chain(
+		remote: &mut RemoteBlockSource,
+		capacity_sectors: u64,
+		mem: &GuestMemoryMmap,
+		queue: &mut Queue,
+		chain: DescriptorChain<&GuestMemoryMmap>,
+	) -> Result<Outcome> {
+		process_chain_backend(remote, capacity_sectors, false, mem, queue, chain)
+	}
+
+	fn process_chain_backend(
+		backend: &mut impl Backend,
 		capacity_sectors: u64,
 		read_only: bool,
 		mem: &GuestMemoryMmap,
@@ -1156,12 +1324,12 @@ pub(super) mod sync_io {
 						// SAFETY: descriptor validation above proved this guest-memory range exists
 						// and is writable by the device for a read request.
 						let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-						read_exact_at(disk, dst, file_offset).is_ok()
+						backend.read(dst, file_offset)
 					} else {
 						// SAFETY: descriptor validation above proved this guest-memory range exists
 						// and is readable by the device for a write request.
 						let src = unsafe { std::slice::from_raw_parts(ptr, len) };
-						write_all_at(disk, src, file_offset).is_ok()
+						backend.write(src, file_offset)
 					};
 					if !ok {
 						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
@@ -1181,7 +1349,7 @@ pub(super) mod sync_io {
 				if !data_descs.is_empty() {
 					return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 				}
-				let status = io_status(disk.sync_all().is_ok());
+				let status = io_status(backend.sync());
 				complete_sync(queue, mem, head, status_addr, status, 0)
 			},
 			VIRTIO_BLK_T_GET_ID => {
@@ -1214,6 +1382,7 @@ pub(super) mod sync_io {
 		}
 	}
 
+	#[cfg(not(target_os = "linux"))]
 	fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
 		while !buf.is_empty() {
 			match positioned_read(file, buf, offset) {
@@ -1230,6 +1399,7 @@ pub(super) mod sync_io {
 		Ok(())
 	}
 
+	#[cfg(not(target_os = "linux"))]
 	fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
 		while !buf.is_empty() {
 			match positioned_write(file, buf, offset) {

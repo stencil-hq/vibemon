@@ -303,9 +303,19 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 		create_dir(snapshot_root, 0o700)?;
 		bind_path(chroot, snapshot_root, false)?;
 	}
+	if let Some(cache) = &config.rootfs_remote_cache {
+		if cache.exists() {
+			bind_path(chroot, cache, false)?;
+		} else {
+			ensure_target_parent(chroot, cache)?;
+		}
+	}
+	bind_optional(chroot, config.rootfs_remote_index.as_deref(), true)?;
 
 	if let Some(rootfs) = &config.rootfs {
-		if config.disk_overlay_of.is_some() && !rootfs.exists() {
+		if (config.disk_overlay_of.is_some() || config.rootfs_remote_url.is_some())
+			&& !rootfs.exists()
+		{
 			ensure_target_parent(chroot, rootfs)?;
 		} else {
 			bind_path(chroot, rootfs, config.rootfs_read_only)?;
