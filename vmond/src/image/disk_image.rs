@@ -1,9 +1,8 @@
-//! GCE-exported disk publication and lazy-consumption metadata.
+//! Cloud disk publication and lazy-consumption metadata.
 //!
-//! A GCE export is a non-seekable `disk.raw` inside a gzip-compressed tar. The
-//! explicit publisher extracts its ext4 root partition once, provisions the
-//! guest agent, and uploads independently compressed, indexed blocks. Workers
-//! only inspect the small sidecar and let the VMM range-fetch touched frames.
+//! Gzip-tar, raw, and fixed-VHD cloud exports are normalized to one
+//! ext4 root partition, provisioned with the guest agent, and uploaded beside
+//! the source as independently compressed, indexed blocks.
 
 use std::{
 	fs::{self, File},
@@ -12,34 +11,30 @@ use std::{
 	process::{Command, Stdio},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use flate2::read::MultiGzDecoder;
-use md5::Md5;
-use reqwest::{
-	StatusCode,
-	blocking::{Body, Client, Response},
-	header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tar::Archive;
+use vmon_cloud::ObjectAuth;
 
-use super::{ImageConfig, find_tool, registry_auth, run_inherited};
-use crate::error::{EngineError, Result};
+use super::{
+	ImageConfig, find_tool,
+	object_store::{ObjectLocation, ObjectMetadata, ObjectStore, is_cloud_reference},
+	run_inherited,
+};
+use crate::error::{EngineError, ErrorCode, Result};
 
-pub(super) const GCS_PREFIX: &str = "gs://";
-pub(super) const UNSUPPORTED_LAYOUT_ERROR: &str = "unsupported GCE disk layout: no ext4 root \
+pub(super) const UNSUPPORTED_LAYOUT_ERROR: &str = "unsupported cloud disk layout: no ext4 root \
                                                    partition found (LVM and non-ext4 roots are \
                                                    not supported)";
 const SECTOR_SIZE: u64 = 512;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xef];
+const EXT4_MAGIC_OFFSET: u64 = 1024 + 56;
 const COPY_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const ROOTFS_BLOCK_SIZE: u64 = 1024 * 1024;
 const ZSTD_LEVEL: i32 = 3;
-const GCS_UPLOAD_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
-const GCS_UPLOAD_RETRIES: usize = 5;
 const PHASE_PROGRESS_BYTES: u64 = 1024 * 1024 * 1024;
-const UPLOAD_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
+const SIDECAR_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PreparedDiskImage {
@@ -54,8 +49,11 @@ pub(super) struct PreparedDiskImage {
 pub struct RemoteRootfs {
 	pub source:            String,
 	pub object:            String,
-	pub generation:        String,
+	pub version:           String,
 	pub url:               String,
+	pub auth:              ObjectAuth,
+	pub region:            Option<String>,
+	pub etag:              Option<String>,
 	pub compressed_size:   u64,
 	pub uncompressed_size: u64,
 	pub original_size:     u64,
@@ -66,7 +64,8 @@ pub struct RemoteRootfs {
 	pub logical_size:      u64,
 }
 
-/// Result of deliberately publishing one range-addressable GCE root filesystem.
+/// Result of deliberately publishing one range-addressable cloud root
+/// filesystem.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedRootfs {
 	pub object:            String,
@@ -78,30 +77,21 @@ pub struct PublishedRootfs {
 	pub skipped:           bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ObjectMetadata {
-	generation: String,
-	#[serde(default)]
-	size:       String,
-	md5_hash:   Option<String>,
-	crc32c:     Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DerivedSidecar {
 	version:           u32,
 	source:            String,
-	source_generation: String,
+	source_version:    String,
 	source_digest:     String,
 	object:            String,
+	object_version:    String,
+	object_digest:     String,
 	compressed_size:   u64,
 	uncompressed_size: u64,
 	original_size:     u64,
 	block_size:        u64,
 	blocks:            Vec<[u64; 2]>,
 	sha256:            String,
-	md5_base64:        String,
 	agent_sha256:      String,
 }
 
@@ -111,37 +101,62 @@ struct Partition {
 	length: u64,
 }
 
-/// Publish the ext4 root partition next to a GCE `.tar.gz` export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiskFormat {
+	GzipTar,
+	Raw,
+}
+
+/// Publish the ext4 root partition beside a cloud disk export.
 ///
-/// This is intentionally explicit because conversion reads the complete export.
-/// The tar member is consumed as a stream; the 100 GB `disk.raw` is never
-/// stored.
+/// Conversion is explicit because it reads the complete source. Gzip-tar
+/// exports are consumed as streams; raw and fixed-VHD exports range-read only
+/// the selected root partition.
 pub fn publish(reference: &str, agent: &Path) -> Result<PublishedRootfs> {
-	let (bucket, source_object) = parse_reference(reference)?;
-	let (derived_object, sidecar_object) = derived_names(&source_object)?;
-	let token = access_token()?;
-	let client = gcs_client()?;
-	let source_metadata =
-		object_metadata(&client, &token, &bucket, &source_object)?.ok_or_else(|| {
-			EngineError::not_found(format!("GCS disk image does not exist: {reference}"))
-		})?;
-	let source_digest = metadata_digest(&source_metadata)?;
+	let (mut store, source) = ObjectStore::open(reference)?;
+	let format = disk_format(&source.key)?;
+	let (derived_key, sidecar_key) = derived_names(&source.key)?;
+	let derived = source.with_key(derived_key);
+	let sidecar_location = source.with_key(sidecar_key);
+	let source_metadata = store.metadata(&source)?.ok_or_else(|| {
+		EngineError::not_found(format!("cloud disk image does not exist: {reference}"))
+	})?;
 	let agent_sha256 = sha256_file(agent)?;
-	if let (Some(derived), Some(sidecar)) = (
-		object_metadata(&client, &token, &bucket, &derived_object)?,
-		download_sidecar(&client, &token, &bucket, &sidecar_object)?,
-	) && sidecar_matches(
-		&sidecar,
-		reference,
-		&source_metadata.generation,
-		&source_digest,
-		&derived_object,
-		&derived,
-		&agent_sha256,
-	) {
+	let existing_sidecar = match store.read_json_bytes(&sidecar_location) {
+		Ok(Some(bytes)) => match serde_json::from_slice::<DerivedSidecar>(&bytes) {
+			Ok(sidecar) => Some(sidecar),
+			Err(error) => {
+				tracing::warn!(
+					%error,
+					sidecar = %sidecar_location.reference,
+					"ignoring malformed published rootfs sidecar during regeneration"
+				);
+				None
+			},
+		},
+		Ok(None) => None,
+		Err(error) if error.code == ErrorCode::Invalid => {
+			tracing::warn!(
+				%error,
+				sidecar = %sidecar_location.reference,
+				"ignoring invalid published rootfs sidecar during regeneration"
+			);
+			None
+		},
+		Err(error) => return Err(error),
+	};
+	if let (Some(derived_metadata), Some(sidecar)) = (store.metadata(&derived)?, existing_sidecar)
+		&& sidecar_matches(
+			&sidecar,
+			reference,
+			&source_metadata,
+			&derived,
+			&derived_metadata,
+			&agent_sha256,
+		) {
 		return Ok(PublishedRootfs {
-			object:            format!("gs://{bucket}/{derived_object}"),
-			sidecar:           format!("gs://{bucket}/{sidecar_object}"),
+			object:            derived.reference,
+			sidecar:           sidecar_location.reference,
 			compressed_size:   sidecar.compressed_size,
 			uncompressed_size: sidecar.uncompressed_size,
 			original_size:     sidecar.original_size,
@@ -151,25 +166,14 @@ pub fn publish(reference: &str, agent: &Path) -> Result<PublishedRootfs> {
 	}
 
 	let work = tempfile::Builder::new()
-		.prefix("vmon-gce-publish-")
+		.prefix("vmon-cloud-publish-")
 		.tempdir()?;
 	let rootfs = work.path().join("rootfs.ext4");
-	let compressed_size = source_metadata
-		.size
-		.parse::<u64>()
-		.map_err(|error| EngineError::engine(format!("invalid GCS object size: {error}")))?;
 	eprintln!(
-		"vmon: extracting root filesystem from {reference} ({compressed_size} compressed bytes)"
+		"vmon: extracting root filesystem from {reference} ({} source bytes)",
+		source_metadata.size
 	);
-	let original_size = download_rootfs(
-		&client,
-		&token,
-		&bucket,
-		&source_object,
-		&source_metadata.generation,
-		compressed_size,
-		&rootfs,
-	)?;
+	let original_size = download_rootfs(&mut store, &source, &source_metadata, format, &rootfs)?;
 	eprintln!("vmon: extracted {original_size} root filesystem bytes");
 	eprintln!("vmon: provisioning guest agent in extracted root filesystem");
 	inject_agent(&rootfs, agent, work.path())?;
@@ -180,29 +184,39 @@ pub fn publish(reference: &str, agent: &Path) -> Result<PublishedRootfs> {
 	let compressed = work.path().join("rootfs.ext4.zst");
 	eprintln!("vmon: compressing root filesystem into independent 1 MiB zstd frames");
 	let blocks = compress_indexed(&rootfs, &compressed)?;
-	let (sha256, md5_base64) = content_digests(&compressed)?;
+	let sha256 = sha256_file(&compressed)?;
 	let compressed_size = compressed.metadata()?.len();
-	eprintln!("vmon: compressed root filesystem to {compressed_size} bytes; uploading to GCS");
-	upload_file(&client, &token, &bucket, &derived_object, &compressed)?;
+	eprintln!(
+		"vmon: compressed root filesystem to {compressed_size} bytes; uploading to {}",
+		store.scheme()
+	);
+	store.put_file(&derived, &compressed)?;
+	let derived_metadata = store.metadata(&derived)?.ok_or_else(|| {
+		EngineError::engine(format!(
+			"uploaded root filesystem is not visible at {}",
+			derived.reference
+		))
+	})?;
 	let sidecar = DerivedSidecar {
-		version: 3,
+		version: SIDECAR_VERSION,
 		source: reference.to_owned(),
-		source_generation: source_metadata.generation,
-		source_digest,
-		object: derived_object.clone(),
+		source_version: source_metadata.version,
+		source_digest: source_metadata.digest,
+		object: derived.key.clone(),
+		object_version: derived_metadata.version,
+		object_digest: derived_metadata.digest,
 		compressed_size,
 		uncompressed_size,
 		original_size,
 		block_size: ROOTFS_BLOCK_SIZE,
 		blocks,
 		sha256: sha256.clone(),
-		md5_base64,
 		agent_sha256,
 	};
-	upload_json(&client, &token, &bucket, &sidecar_object, &sidecar)?;
+	store.put_json(&sidecar_location, &sidecar)?;
 	Ok(PublishedRootfs {
-		object: format!("gs://{bucket}/{derived_object}"),
-		sidecar: format!("gs://{bucket}/{sidecar_object}"),
+		object: derived.reference,
+		sidecar: sidecar_location.reference,
 		compressed_size,
 		uncompressed_size,
 		original_size,
@@ -211,44 +225,53 @@ pub fn publish(reference: &str, agent: &Path) -> Result<PublishedRootfs> {
 	})
 }
 
-/// Resolve a `gs://` export to its already-published lazy root filesystem.
+/// Resolve a cloud disk export to its already-published lazy root filesystem.
 pub(super) fn prepare(reference: &str) -> Result<PreparedDiskImage> {
-	let (bucket, source_object) = parse_reference(reference)?;
-	let (derived_object, sidecar_object) = derived_names(&source_object)?;
-	let token = access_token()?;
-	let client = gcs_client()?;
-	let source_metadata =
-		object_metadata(&client, &token, &bucket, &source_object)?.ok_or_else(|| {
-			EngineError::not_found(format!("GCS disk image does not exist: {reference}"))
-		})?;
-	let source_digest = metadata_digest(&source_metadata)?;
-	let derived_metadata = object_metadata(&client, &token, &bucket, &derived_object)?
-		.ok_or_else(|| missing_derived(reference, &derived_object))?;
-	let sidecar = download_sidecar(&client, &token, &bucket, &sidecar_object)?
-		.ok_or_else(|| missing_derived(reference, &derived_object))?;
+	let (mut store, source) = ObjectStore::open(reference)?;
+	let _ = disk_format(&source.key)?;
+	let (derived_key, sidecar_key) = derived_names(&source.key)?;
+	let derived = source.with_key(derived_key);
+	let sidecar_location = source.with_key(sidecar_key);
+	let source_metadata = store.metadata(&source)?.ok_or_else(|| {
+		EngineError::not_found(format!("cloud disk image does not exist: {reference}"))
+	})?;
+	let derived_metadata = store
+		.metadata(&derived)?
+		.ok_or_else(|| missing_derived(reference, &derived.reference))?;
+	let sidecar_bytes = store
+		.read_json_bytes(&sidecar_location)?
+		.ok_or_else(|| missing_derived(reference, &derived.reference))?;
+	let sidecar: DerivedSidecar = serde_json::from_slice(&sidecar_bytes).map_err(|error| {
+		EngineError::invalid(format!(
+			"published rootfs metadata is malformed for {reference}: {error}; run `vmon image \
+			 publish-rootfs {reference}`"
+		))
+	})?;
 	if !sidecar_matches(
 		&sidecar,
 		reference,
-		&source_metadata.generation,
-		&source_digest,
-		&derived_object,
+		&source_metadata,
+		&derived,
 		&derived_metadata,
 		&sidecar.agent_sha256,
 	) {
 		return Err(EngineError::invalid(format!(
 			"published rootfs metadata is stale or inconsistent for {reference}; run `vmon image \
-			 publish-gce-rootfs {reference}`"
+			 publish-rootfs {reference}`"
 		)));
 	}
-	let url = media_url(&bucket, &derived_object, &derived_metadata.generation);
+	let url = store.object_url(&derived, &derived_metadata)?;
 	Ok(PreparedDiskImage {
 		reference: reference.to_owned(),
-		digest:    format!("gcs-sha256-{}", sidecar.sha256),
+		digest:    format!("{}-sha256-{}", store.scheme(), sidecar.sha256),
 		remote:    RemoteRootfs {
 			source: reference.to_owned(),
-			object: format!("gs://{bucket}/{derived_object}"),
-			generation: derived_metadata.generation,
+			object: derived.reference,
+			version: derived_metadata.version,
 			url,
+			auth: store.auth(),
+			region: store.region(),
+			etag: derived_metadata.etag,
 			compressed_size: sidecar.compressed_size,
 			uncompressed_size: sidecar.uncompressed_size,
 			original_size: sidecar.original_size,
@@ -271,124 +294,73 @@ pub(super) fn prepare(reference: &str) -> Result<PreparedDiskImage> {
 	})
 }
 
+pub(super) fn is_reference(reference: &str) -> bool {
+	is_cloud_reference(reference)
+}
+
 fn missing_derived(reference: &str, object: &str) -> EngineError {
 	EngineError::not_found(format!(
-		"GCE disk image {reference} has no published lazy rootfs ({object}); run `vmon image \
-		 publish-gce-rootfs {reference}`"
+		"cloud disk image {reference} has no published lazy rootfs ({object}); run `vmon image \
+		 publish-rootfs {reference}`"
 	))
 }
 
-fn derived_names(source_object: &str) -> Result<(String, String)> {
-	let stem = source_object
-		.strip_suffix(".tar.gz")
-		.ok_or_else(|| EngineError::invalid("GCE disk image references must end in .tar.gz"))?;
+fn disk_format(value: &str) -> Result<DiskFormat> {
+	let value = value.to_ascii_lowercase();
+	if value.strip_suffix(".tar.gz").is_some() || value.strip_suffix(".tgz").is_some() {
+		Ok(DiskFormat::GzipTar)
+	} else if value.strip_suffix(".raw").is_some()
+		|| value.strip_suffix(".img").is_some()
+		|| value.strip_suffix(".vhd").is_some()
+	{
+		Ok(DiskFormat::Raw)
+	} else {
+		Err(EngineError::invalid("cloud disk images must end in .tar.gz, .tgz, .raw, .img, or .vhd"))
+	}
+}
+
+fn derived_names(source_key: &str) -> Result<(String, String)> {
+	let lowercase = source_key.to_ascii_lowercase();
+	let stem = [".tar.gz", ".tgz", ".raw", ".img", ".vhd"]
+		.into_iter()
+		.find(|suffix| lowercase.ends_with(suffix))
+		.and_then(|suffix| source_key.get(..source_key.len().saturating_sub(suffix.len())))
+		.ok_or_else(|| {
+			EngineError::invalid("cloud disk images must end in .tar.gz, .tgz, .raw, .img, or .vhd")
+		})?;
 	let object = format!("{stem}.rootfs.ext4.zst");
 	let sidecar = format!("{object}.json");
 	Ok((object, sidecar))
 }
 
-fn parse_reference(reference: &str) -> Result<(String, String)> {
-	let rest = reference
-		.strip_prefix(GCS_PREFIX)
-		.ok_or_else(|| EngineError::invalid("GCE disk images must use gs://bucket/object.tar.gz"))?;
-	let (bucket, object) = rest
-		.split_once('/')
-		.filter(|(bucket, object)| !bucket.is_empty() && !object.is_empty())
-		.ok_or_else(|| EngineError::invalid("GCE disk images must use gs://bucket/object.tar.gz"))?;
-	if bucket
-		.bytes()
-		.any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
-		|| object.contains(['?', '#'])
-	{
-		return Err(EngineError::invalid("invalid gs:// disk image reference"));
-	}
-	Ok((bucket.to_owned(), object.to_owned()))
-}
-
-fn gcs_client() -> Result<Client> {
-	Client::builder()
-		.build()
-		.map_err(|error| EngineError::engine(format!("failed to create GCS client: {error}")))
-}
-
-fn access_token() -> Result<String> {
-	registry_auth::metadata_access_token().ok_or_else(|| {
-		EngineError::unauthorized(
-			"failed to obtain a GCE metadata-server OAuth token for the GCS disk image",
-		)
-	})
-}
-
-fn object_metadata(
-	client: &Client,
-	token: &str,
-	bucket: &str,
-	object: &str,
-) -> Result<Option<ObjectMetadata>> {
-	let response = client
-		.get(format!(
-			"https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-			percent_encode(bucket),
-			percent_encode(object)
-		))
-		.header(AUTHORIZATION, format!("Bearer {token}"))
-		.send()
-		.map_err(|error| EngineError::engine(format!("failed to inspect GCS object: {error}")))?;
-	if response.status() == StatusCode::NOT_FOUND {
-		return Ok(None);
-	}
-	let response = require_success(response, "inspect GCS object")?;
-	response
-		.json()
-		.map(Some)
-		.map_err(|error| EngineError::engine(format!("invalid GCS object metadata: {error}")))
-}
-
-fn download_sidecar(
-	client: &Client,
-	token: &str,
-	bucket: &str,
-	object: &str,
-) -> Result<Option<DerivedSidecar>> {
-	let response = client
-		.get(media_url(bucket, object, ""))
-		.header(AUTHORIZATION, format!("Bearer {token}"))
-		.send()
-		.map_err(|error| EngineError::engine(format!("failed to read GCS sidecar: {error}")))?;
-	if response.status() == StatusCode::NOT_FOUND {
-		return Ok(None);
-	}
-	let response = require_success(response, "read GCS sidecar")?;
-	response
-		.json()
-		.map(Some)
-		.map_err(|error| EngineError::engine(format!("invalid GCS rootfs sidecar: {error}")))
-}
-
 fn sidecar_matches(
 	sidecar: &DerivedSidecar,
 	source: &str,
-	source_generation: &str,
-	source_digest: &str,
-	derived_object: &str,
+	source_metadata: &ObjectMetadata,
+	derived: &ObjectLocation,
 	derived_metadata: &ObjectMetadata,
 	agent_sha256: &str,
 ) -> bool {
-	let size = derived_metadata.size.parse::<u64>().ok();
-	sidecar.version == 3
+	sidecar.version == SIDECAR_VERSION
 		&& sidecar.block_size == ROOTFS_BLOCK_SIZE
+		&& source_metadata.etag.is_some()
+		&& derived_metadata.etag.is_some()
 		&& valid_index(sidecar)
 		&& sidecar.source == source
-		&& sidecar.source_generation == source_generation
-		&& sidecar.source_digest == source_digest
-		&& sidecar.object == derived_object
-		&& Some(sidecar.compressed_size) == size
-		&& derived_metadata.md5_hash.as_deref() == Some(sidecar.md5_base64.as_str())
+		&& sidecar.source_version == source_metadata.version
+		&& sidecar.source_digest == source_metadata.digest
+		&& sidecar.object == derived.key
+		&& sidecar.object_version == derived_metadata.version
+		&& sidecar.object_digest == derived_metadata.digest
+		&& sidecar.compressed_size == derived_metadata.size
 		&& sidecar.agent_sha256 == agent_sha256
 }
 
 fn valid_index(sidecar: &DerivedSidecar) -> bool {
 	if sidecar.uncompressed_size == 0
+		|| sidecar.original_size < sidecar.uncompressed_size
+		|| !valid_sha256(&sidecar.sha256)
+		|| !valid_sha256(&sidecar.agent_sha256)
 		|| sidecar.block_size != ROOTFS_BLOCK_SIZE
 		|| sidecar.blocks.len() as u64 != sidecar.uncompressed_size.div_ceil(sidecar.block_size)
 	{
@@ -396,7 +368,7 @@ fn valid_index(sidecar: &DerivedSidecar) -> bool {
 	}
 	let mut expected_offset = 0_u64;
 	for [offset, length] in &sidecar.blocks {
-		if *offset != expected_offset || *length == 0 {
+		if *offset != expected_offset || *length == 0 || *length > ROOTFS_BLOCK_SIZE * 2 {
 			return false;
 		}
 		let Some(next) = expected_offset.checked_add(*length) else {
@@ -407,338 +379,11 @@ fn valid_index(sidecar: &DerivedSidecar) -> bool {
 	expected_offset == sidecar.compressed_size
 }
 
-fn metadata_digest(metadata: &ObjectMetadata) -> Result<String> {
-	let (kind, encoded) = metadata
-		.md5_hash
-		.as_deref()
-		.map(|value| ("md5", value))
-		.or_else(|| metadata.crc32c.as_deref().map(|value| ("crc32c", value)))
-		.ok_or_else(|| EngineError::engine("GCS object metadata contained no content digest"))?;
-	let bytes = B64
-		.decode(encoded)
-		.map_err(|error| EngineError::engine(format!("invalid GCS {kind} digest: {error}")))?;
-	Ok(format!("gcs-{kind}-{}", hex::encode(bytes)))
+fn valid_sha256(value: &str) -> bool {
+	value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn media_url(bucket: &str, object: &str, generation: &str) -> String {
-	let generation = if generation.is_empty() {
-		String::new()
-	} else {
-		format!("&generation={generation}")
-	};
-	format!(
-		"https://storage.googleapis.com/download/storage/v1/b/{}/o/{}?alt=media{}",
-		percent_encode(bucket),
-		percent_encode(object),
-		generation
-	)
-}
-
-fn upload_url(bucket: &str, object: &str) -> String {
-	format!(
-		"https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
-		percent_encode(bucket),
-		percent_encode(object)
-	)
-}
-
-fn resumable_upload_url(bucket: &str, object: &str) -> String {
-	format!(
-		"https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=resumable&name={}",
-		percent_encode(bucket),
-		percent_encode(object)
-	)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UploadState {
-	Incomplete(u64),
-	Complete,
-}
-
-fn upload_file(
-	client: &Client,
-	token: &str,
-	bucket: &str,
-	object: &str,
-	path: &Path,
-) -> Result<()> {
-	let size = path.metadata()?.len();
-	let metadata = br#"{"contentType":"application/octet-stream"}"#;
-	let response = client
-		.post(resumable_upload_url(bucket, object))
-		.header(AUTHORIZATION, format!("Bearer {token}"))
-		.header(CONTENT_TYPE, "application/json; charset=UTF-8")
-		.header(CONTENT_LENGTH, metadata.len())
-		.header("X-Upload-Content-Type", "application/octet-stream")
-		.header("X-Upload-Content-Length", size)
-		.body(metadata.as_slice())
-		.send()
-		.map_err(|error| {
-			EngineError::engine(format!("failed to start GCS resumable upload: {error}"))
-		})?;
-	let response = require_success(response, "start GCS resumable upload")?;
-	let session = response
-		.headers()
-		.get(LOCATION)
-		.and_then(|value| value.to_str().ok())
-		.filter(|value| !value.is_empty())
-		.ok_or_else(|| EngineError::engine("GCS resumable upload omitted its session URI"))?
-		.to_owned();
-	let mut next_progress = UPLOAD_PROGRESS_BYTES;
-	drive_resumable_upload(
-		size,
-		GCS_UPLOAD_CHUNK_SIZE,
-		GCS_UPLOAD_RETRIES,
-		|start, end| {
-			let length = end - start;
-			let mut file = File::open(path)?;
-			file.seek(SeekFrom::Start(start))?;
-			let response = client
-				.put(&session)
-				.header(AUTHORIZATION, format!("Bearer {token}"))
-				.header(CONTENT_TYPE, "application/octet-stream")
-				.header(CONTENT_LENGTH, length)
-				.header(CONTENT_RANGE, format!("bytes {start}-{}/{size}", end - 1))
-				.body(Body::sized(file.take(length), length))
-				.send()
-				.map_err(|error| {
-					EngineError::engine(format!(
-						"GCS resumable chunk request at byte {start} failed: {error}"
-					))
-				})?;
-			parse_upload_response(response, size, "upload rootfs chunk")
-		},
-		|| {
-			let response = client
-				.put(&session)
-				.header(AUTHORIZATION, format!("Bearer {token}"))
-				.header(CONTENT_LENGTH, 0)
-				.header(CONTENT_RANGE, format!("bytes */{size}"))
-				.body(Body::sized(io::empty(), 0))
-				.send()
-				.map_err(|error| {
-					EngineError::engine(format!("failed to query GCS resumable upload: {error}"))
-				})?;
-			parse_upload_response(response, size, "query rootfs upload")
-		},
-		|uploaded, total| {
-			if uploaded == total || uploaded >= next_progress {
-				eprintln!("vmon: uploaded {uploaded}/{total} root filesystem bytes");
-				next_progress = uploaded.saturating_add(UPLOAD_PROGRESS_BYTES);
-			}
-		},
-	)
-}
-
-fn parse_upload_response(response: Response, total: u64, action: &str) -> Result<UploadState> {
-	let status = response.status();
-	if matches!(status, StatusCode::OK | StatusCode::CREATED) {
-		return Ok(UploadState::Complete);
-	}
-	if status.as_u16() == 308 {
-		let committed = match response.headers().get(RANGE) {
-			None => 0,
-			Some(value) => {
-				let value = value.to_str().map_err(|error| {
-					EngineError::engine(format!(
-						"GCS resumable upload returned an invalid Range header: {error}"
-					))
-				})?;
-				let last = value
-					.strip_prefix("bytes=0-")
-					.ok_or_else(|| {
-						EngineError::engine(format!(
-							"GCS resumable upload returned invalid Range {value:?}"
-						))
-					})?
-					.parse::<u64>()
-					.map_err(|error| {
-						EngineError::engine(format!(
-							"GCS resumable upload returned invalid Range {value:?}: {error}"
-						))
-					})?;
-				last.checked_add(1).ok_or_else(|| {
-					EngineError::engine("GCS resumable upload committed offset overflowed")
-				})?
-			},
-		};
-		if committed > total {
-			return Err(EngineError::engine(format!(
-				"GCS resumable upload reported {committed} committed bytes for a {total}-byte object"
-			)));
-		}
-		return Ok(UploadState::Incomplete(committed));
-	}
-	let detail = response.text().unwrap_or_default();
-	let detail = detail.trim();
-	let suffix = if detail.is_empty() {
-		String::new()
-	} else {
-		format!(": {detail}")
-	};
-	Err(EngineError::engine(format!("failed to {action}: HTTP {}{suffix}", status.as_u16())))
-}
-
-fn drive_resumable_upload<S, Q, P>(
-	total: u64,
-	chunk_size: u64,
-	max_retries: usize,
-	mut send: S,
-	mut query: Q,
-	mut progress: P,
-) -> Result<()>
-where
-	S: FnMut(u64, u64) -> Result<UploadState>,
-	Q: FnMut() -> Result<UploadState>,
-	P: FnMut(u64, u64),
-{
-	if total == 0 || chunk_size == 0 {
-		return Err(EngineError::invalid(
-			"GCS resumable upload requires a non-empty object and chunk size",
-		));
-	}
-	let mut offset = 0_u64;
-	let mut failures = 0_usize;
-	while offset < total {
-		let end = offset.saturating_add(chunk_size).min(total);
-		match send(offset, end) {
-			Ok(UploadState::Complete) if end == total => {
-				progress(total, total);
-				return Ok(());
-			},
-			Ok(UploadState::Complete) => {
-				return Err(EngineError::engine(format!(
-					"GCS resumable upload completed prematurely at byte {offset} of {total}"
-				)));
-			},
-			Ok(UploadState::Incomplete(committed)) => {
-				validate_committed_offset(offset, end, committed)?;
-				if committed == offset {
-					failures += 1;
-					if failures > max_retries {
-						return Err(upload_retries_exhausted(
-							offset,
-							max_retries,
-							"GCS accepted no bytes from the upload chunk",
-						));
-					}
-				} else {
-					offset = committed;
-					failures = 0;
-					progress(offset, total);
-				}
-			},
-			Err(error) => {
-				failures += 1;
-				if failures > max_retries {
-					return Err(upload_retries_exhausted(offset, max_retries, &error.to_string()));
-				}
-				loop {
-					match query() {
-						Ok(UploadState::Complete) => {
-							progress(total, total);
-							return Ok(());
-						},
-						Ok(UploadState::Incomplete(committed)) => {
-							validate_committed_offset(offset, end, committed)?;
-							if committed > offset {
-								offset = committed;
-								failures = 0;
-								progress(offset, total);
-							}
-							break;
-						},
-						Err(error) => {
-							failures += 1;
-							if failures > max_retries {
-								return Err(upload_retries_exhausted(
-									offset,
-									max_retries,
-									&error.to_string(),
-								));
-							}
-						},
-					}
-				}
-			},
-		}
-	}
-	Err(EngineError::engine(format!(
-		"GCS resumable upload ended without a completion response at byte {offset} of {total}"
-	)))
-}
-
-fn validate_committed_offset(current: u64, chunk_end: u64, committed: u64) -> Result<()> {
-	if !(current..=chunk_end).contains(&committed) {
-		return Err(EngineError::engine(format!(
-			"GCS resumable upload reported committed byte {committed}, expected \
-			 {current}..={chunk_end}"
-		)));
-	}
-	Ok(())
-}
-
-fn upload_retries_exhausted(offset: u64, max_retries: usize, cause: &str) -> EngineError {
-	EngineError::engine(format!(
-		"GCS resumable upload failed at byte {offset} after {max_retries} retries: {cause}"
-	))
-}
-
-fn upload_json(
-	client: &Client,
-	token: &str,
-	bucket: &str,
-	object: &str,
-	value: &DerivedSidecar,
-) -> Result<()> {
-	let body = serde_json::to_vec_pretty(value)?;
-	let response = client
-		.post(upload_url(bucket, object))
-		.header(AUTHORIZATION, format!("Bearer {token}"))
-		.header(CONTENT_TYPE, "application/json")
-		.header(CONTENT_LENGTH, body.len())
-		.body(body)
-		.send()
-		.map_err(|error| EngineError::engine(format!("failed to upload GCS sidecar: {error}")))?;
-	require_success(response, "upload GCS sidecar")?;
-	Ok(())
-}
-
-fn percent_encode(value: &str) -> String {
-	let mut encoded = String::with_capacity(value.len());
-	for byte in value.bytes() {
-		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-			encoded.push(char::from(byte));
-		} else {
-			use std::fmt::Write as _;
-			let _ = write!(encoded, "%{byte:02X}");
-		}
-	}
-	encoded
-}
-
-fn require_success(response: Response, action: &str) -> Result<Response> {
-	let status = response.status();
-	if status.is_success() {
-		return Ok(response);
-	}
-	let detail = response.text().unwrap_or_default();
-	let detail = detail.trim();
-	let suffix = if detail.is_empty() {
-		String::new()
-	} else {
-		format!(": {detail}")
-	};
-	let message = format!("failed to {action}: HTTP {}{suffix}", status.as_u16());
-	if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-		Err(EngineError::unauthorized(message))
-	} else {
-		Err(EngineError::engine(message))
-	}
-}
-
-const GCS_READ_RETRIES: usize = 5;
+const CLOUD_READ_RETRIES: usize = 5;
 
 struct ResumableReader<F, R> {
 	open:          F,
@@ -764,7 +409,7 @@ where
 			self.failures += 1;
 			if self.failures > self.max_retries {
 				return Err(io::Error::other(format!(
-					"GCS download failed at compressed byte {} after {} retries: {cause}",
+					"cloud download failed at byte {} after {} retries: {cause}",
 					self.offset, self.max_retries
 				)));
 			}
@@ -789,17 +434,17 @@ where
 			match self.current.read(buffer) {
 				Ok(0) if self.offset == self.expected_size => return Ok(0),
 				Ok(0) => self.recover(format!(
-					"GCS response ended before the expected compressed size {}",
+					"response ended before the expected object size {}",
 					self.expected_size
 				))?,
 				Ok(count) => {
 					self.offset = self
 						.offset
 						.checked_add(count as u64)
-						.ok_or_else(|| io::Error::other("GCS compressed download offset overflowed"))?;
+						.ok_or_else(|| io::Error::other("cloud download offset overflowed"))?;
 					if self.offset > self.expected_size {
 						return Err(io::Error::other(format!(
-							"GCS response exceeded expected compressed size {} at byte {}",
+							"response exceeded expected object size {} at byte {}",
 							self.expected_size, self.offset
 						)));
 					}
@@ -812,91 +457,135 @@ where
 	}
 }
 
-fn open_gcs_range(
-	client: &Client,
-	token: &str,
-	url: &str,
-	expected_size: u64,
-	offset: u64,
-) -> io::Result<Response> {
-	let mut request = client
-		.get(url)
-		.header(AUTHORIZATION, format!("Bearer {token}"));
-	if offset > 0 {
-		request = request.header(RANGE, format!("bytes={offset}-"));
-	}
-	let response = request
-		.send()
-		.map_err(|error| io::Error::other(format!("GCS request failed: {error}")))?;
-	let status = response.status();
-	if (offset == 0 && !status.is_success()) || (offset > 0 && status != StatusCode::PARTIAL_CONTENT)
-	{
-		return Err(io::Error::other(format!(
-			"GCS range request at compressed byte {offset} returned HTTP {}",
-			status.as_u16()
-		)));
-	}
-	if offset > 0 {
-		let content_range = response
-			.headers()
-			.get(CONTENT_RANGE)
-			.and_then(|value| value.to_str().ok())
-			.ok_or_else(|| {
-				io::Error::other(format!(
-					"GCS range response at compressed byte {offset} omitted Content-Range"
-				))
-			})?;
-		let expected = format!("bytes {offset}-");
-		let total = format!("/{expected_size}");
-		if !content_range.starts_with(&expected) || !content_range.ends_with(&total) {
-			return Err(io::Error::other(format!(
-				"GCS range response at compressed byte {offset} had invalid Content-Range \
-				 {content_range:?}; expected start {expected:?} and total {expected_size}"
-			)));
-		}
-	}
-	Ok(response)
-}
-
 fn download_rootfs(
-	client: &Client,
-	token: &str,
-	bucket: &str,
-	object: &str,
-	generation: &str,
-	compressed_size: u64,
+	store: &mut ObjectStore,
+	location: &ObjectLocation,
+	metadata: &ObjectMetadata,
+	format: DiskFormat,
 	rootfs: &Path,
 ) -> Result<u64> {
-	let url = media_url(bucket, object, generation);
-	let reader = ResumableReader::new(compressed_size, GCS_READ_RETRIES, |offset| {
-		open_gcs_range(client, token, &url, compressed_size, offset)
+	match format {
+		DiskFormat::GzipTar => {
+			let reader = ResumableReader::new(metadata.size, CLOUD_READ_RETRIES, |offset| {
+				store.open_range(location, metadata, offset)
+			})
+			.map_err(|error| {
+				EngineError::engine(format!("failed to start cloud disk download: {error}"))
+			})?;
+			extract_rootfs_archive(MultiGzDecoder::new(reader), rootfs)
+		},
+		DiskFormat::Raw => extract_remote_root(store, location, metadata, rootfs),
+	}
+}
+
+fn extract_remote_root(
+	store: &mut ObjectStore,
+	location: &ObjectLocation,
+	metadata: &ObjectMetadata,
+	rootfs: &Path,
+) -> Result<u64> {
+	let mut prefix = read_remote_exact(store, location, metadata, 0, 1024)?;
+	let header: &[u8; 512] = prefix[512..1024].try_into().expect("fixed slice");
+	let (entries_offset, entry_count, entry_size) = gpt_layout(header)?;
+	let table_end = entries_offset
+		.checked_add(u64::from(entry_count) * u64::from(entry_size))
+		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+	if table_end > metadata.size {
+		return Err(EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR));
+	}
+	let table_end =
+		usize::try_from(table_end).map_err(|_| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+	if table_end > prefix.len() {
+		prefix.resize(table_end, 0);
+		let remaining =
+			read_remote_exact(store, location, metadata, 1024, table_end.saturating_sub(1024))?;
+		prefix[1024..].copy_from_slice(&remaining);
+	}
+	let partitions = gpt_partitions(&mut std::io::Cursor::new(&prefix))?;
+	let mut candidates = Vec::new();
+	for partition in partitions {
+		let partition_end = partition
+			.offset
+			.checked_add(partition.length)
+			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		if partition_end > metadata.size {
+			continue;
+		}
+		let magic_offset = partition
+			.offset
+			.checked_add(EXT4_MAGIC_OFFSET)
+			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		if read_remote_exact(store, location, metadata, magic_offset, 2)? == EXT4_MAGIC {
+			candidates.push(partition);
+		}
+	}
+	let partition = candidates
+		.into_iter()
+		.max_by_key(|partition| partition.length)
+		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+	let mut reader = ResumableReader::new(partition.length, CLOUD_READ_RETRIES, |relative| {
+		store.open_range(location, metadata, partition.offset.saturating_add(relative))
 	})
-	.map_err(|error| EngineError::engine(format!("failed to start GCS disk download: {error}")))?;
-	extract_rootfs_archive(MultiGzDecoder::new(reader), rootfs)
+	.map_err(|error| EngineError::engine(format!("failed to read root partition: {error}")))?;
+	let mut destination = File::options()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.open(rootfs)?;
+	let copied = io::copy(&mut reader.by_ref().take(partition.length), &mut destination)?;
+	if copied != partition.length {
+		return Err(EngineError::engine(format!(
+			"cloud disk ended after {copied} of {} root partition bytes",
+			partition.length
+		)));
+	}
+	Ok(copied)
+}
+
+fn read_remote_exact(
+	store: &mut ObjectStore,
+	location: &ObjectLocation,
+	metadata: &ObjectMetadata,
+	offset: u64,
+	length: usize,
+) -> Result<Vec<u8>> {
+	let length_u64 =
+		u64::try_from(length).map_err(|_| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+	if offset
+		.checked_add(length_u64)
+		.is_none_or(|end| end > metadata.size)
+	{
+		return Err(EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR));
+	}
+	let mut response = store.open_range(location, metadata, offset)?;
+	let mut bytes = vec![0_u8; length];
+	response.read_exact(&mut bytes)?;
+	Ok(bytes)
 }
 
 fn extract_rootfs_archive(reader: impl Read, rootfs: &Path) -> Result<u64> {
 	let mut archive = Archive::new(reader);
 	let mut entries = archive
 		.entries()
-		.map_err(|error| EngineError::engine(format!("invalid GCE disk image tar: {error}")))?;
+		.map_err(|error| EngineError::engine(format!("invalid cloud disk image tar: {error}")))?;
 	let Some(entry) = entries.next() else {
 		return Err(EngineError::unsupported(
-			"unsupported GCE export: expected disk.raw as the first tar member",
+			"unsupported cloud export: expected disk.raw as the first tar member",
 		));
 	};
-	let mut entry =
-		entry.map_err(|error| EngineError::engine(format!("invalid GCE disk image tar: {error}")))?;
+	let mut entry = entry
+		.map_err(|error| EngineError::engine(format!("invalid cloud disk image tar: {error}")))?;
 	let path = entry
 		.path()
-		.map_err(|error| EngineError::engine(format!("invalid GCE disk image path: {error}")))?;
+		.map_err(|error| EngineError::engine(format!("invalid cloud disk image path: {error}")))?;
 	let normalized = path.to_string_lossy();
 	let entry_type = entry.header().entry_type();
 	if !(entry_type.is_file() || entry_type.is_gnu_sparse())
 		|| !matches!(normalized.as_ref(), "disk.raw" | "./disk.raw")
 	{
 		return Err(EngineError::unsupported(
-			"unsupported GCE export: expected disk.raw as the first tar member",
+			"unsupported cloud export: expected disk.raw as the first tar member",
 		));
 	}
 	let declared_size = entry.size();
@@ -916,6 +605,9 @@ fn extract_streamed_root(source: &mut impl Read, declared_size: u64, out: &Path)
 	let table_end = entries_offset
 		.checked_add(u64::from(entry_count) * u64::from(entry_size))
 		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+	if table_end > declared_size {
+		return Err(EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR));
+	}
 	let table_end =
 		usize::try_from(table_end).map_err(|_| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
 	if table_end > prefix.len() {
@@ -931,88 +623,117 @@ fn extract_streamed_root(source: &mut impl Read, declared_size: u64, out: &Path)
 				))
 			})?;
 	}
-	let partition = gpt_partitions(&mut std::io::Cursor::new(&prefix))?
-		.into_iter()
-		.max_by_key(|partition| partition.length)
-		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
-	let partition_end = partition
-		.offset
-		.checked_add(partition.length)
-		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
-	if partition_end > declared_size {
-		return Err(EngineError::unsupported(format!(
-			"{UNSUPPORTED_LAYOUT_ERROR}: root partition byte range {}..{partition_end} exceeds \
-			 disk.raw tar size {declared_size}",
-			partition.offset
-		)));
-	}
-	let consumed = u64::try_from(prefix.len()).expect("prefix length fits u64");
-	let skip = partition
-		.offset
-		.checked_sub(consumed)
-		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
-	let skipped =
-		std::io::copy(&mut source.by_ref().take(skip), &mut std::io::sink()).map_err(|error| {
-			EngineError::engine(format!(
-				"failed to seek forward through disk.raw from byte {consumed} to root partition at \
-				 byte {} (declared tar size {declared_size}): {error}",
-				partition.offset
-			))
-		})?;
-	if skipped != skip {
-		return Err(EngineError::engine(format!(
-			"disk.raw ended at byte {} while seeking to root partition at byte {} (declared tar size \
-			 {declared_size})",
-			consumed + skipped,
-			partition.offset
-		)));
-	}
-	let mut destination = File::options()
-		.read(true)
-		.write(true)
-		.create(true)
-		.truncate(true)
-		.open(out)?;
-	let mut remaining = partition.length;
+
+	let mut partitions = gpt_partitions(&mut std::io::Cursor::new(&prefix))?;
+	partitions.sort_by_key(|partition| partition.offset);
+	let mut consumed = u64::try_from(prefix.len()).expect("prefix length fits u64");
+	let mut selected = None;
 	let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-	let mut next_progress = PHASE_PROGRESS_BYTES;
-	while remaining > 0 {
-		let amount = usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded by buffer");
-		let partition_progress = partition.length - remaining;
-		let absolute_offset = partition.offset + partition_progress;
-		source.read_exact(&mut buffer[..amount]).map_err(|error| {
+	for partition in partitions {
+		let partition_end = partition
+			.offset
+			.checked_add(partition.length)
+			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		if partition_end > declared_size {
+			continue;
+		}
+		let skip = partition
+			.offset
+			.checked_sub(consumed)
+			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		let skipped =
+			io::copy(&mut source.by_ref().take(skip), &mut io::sink()).map_err(|error| {
+				EngineError::engine(format!(
+					"failed to scan disk.raw from byte {consumed} to partition at byte {} (declared \
+					 tar size {declared_size}): {error}",
+					partition.offset
+				))
+			})?;
+		if skipped != skip {
+			return Err(EngineError::engine(format!(
+				"disk.raw ended at byte {} while scanning for an ext4 root partition (declared tar \
+				 size {declared_size})",
+				consumed + skipped
+			)));
+		}
+		consumed = partition.offset;
+
+		let probe_length = partition.length.min(EXT4_MAGIC_OFFSET + 2);
+		let probe_length_usize = usize::try_from(probe_length)
+			.map_err(|_| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		let mut probe = vec![0_u8; probe_length_usize];
+		source.read_exact(&mut probe).map_err(|error| {
 			EngineError::engine(format!(
-				"failed to read root partition from disk.raw at byte {absolute_offset} ({amount} \
-				 bytes requested, partition {}..{partition_end}, declared tar size {declared_size}): \
+				"failed to inspect disk.raw partition at byte {} (declared tar size {declared_size}): \
 				 {error}",
 				partition.offset
 			))
 		})?;
-		if buffer[..amount].iter().any(|byte| *byte != 0) {
-			destination.write_all(&buffer[..amount])?;
+		consumed = consumed
+			.checked_add(probe_length)
+			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
+		let is_ext4 = probe_length == EXT4_MAGIC_OFFSET + 2
+			&& probe[EXT4_MAGIC_OFFSET as usize..][..2] == EXT4_MAGIC;
+		let replace_selected =
+			is_ext4 && selected.is_none_or(|current: Partition| partition.length > current.length);
+		let mut destination = if replace_selected {
+			Some(
+				File::options()
+					.read(true)
+					.write(true)
+					.create(true)
+					.truncate(true)
+					.open(out)?,
+			)
 		} else {
-			destination.seek(SeekFrom::Current(amount as i64))?;
+			None
+		};
+		if let Some(destination) = destination.as_mut() {
+			write_sparse(destination, &probe)?;
 		}
-		remaining -= amount as u64;
-		let copied = partition.length - remaining;
-		if copied == partition.length || copied >= next_progress {
-			eprintln!("vmon: extracted {copied}/{} root filesystem bytes", partition.length);
-			next_progress = copied.saturating_add(PHASE_PROGRESS_BYTES);
+
+		let mut remaining = partition.length - probe_length;
+		let mut next_progress = PHASE_PROGRESS_BYTES;
+		while remaining > 0 {
+			let amount =
+				usize::try_from(remaining.min(buffer.len() as u64)).expect("bounded by buffer");
+			source.read_exact(&mut buffer[..amount]).map_err(|error| {
+				EngineError::engine(format!(
+					"failed to read disk.raw partition at byte {consumed} ({amount} bytes requested, \
+					 partition {}..{partition_end}, declared tar size {declared_size}): {error}",
+					partition.offset
+				))
+			})?;
+			if let Some(destination) = destination.as_mut() {
+				write_sparse(destination, &buffer[..amount])?;
+			}
+			remaining -= amount as u64;
+			consumed += amount as u64;
+			if replace_selected {
+				let copied = partition.length - remaining;
+				if copied == partition.length || copied >= next_progress {
+					eprintln!("vmon: extracted {copied}/{} root filesystem bytes", partition.length);
+					next_progress = copied.saturating_add(PHASE_PROGRESS_BYTES);
+				}
+			}
+		}
+		if let Some(destination) = destination {
+			destination.set_len(partition.length)?;
+			selected = Some(partition);
 		}
 	}
-	destination.set_len(partition.length)?;
-	destination.seek(SeekFrom::Start(1024 + 56))?;
-	let mut magic = [0_u8; 2];
-	destination.read_exact(&mut magic).map_err(|error| {
-		EngineError::engine(format!(
-			"failed to verify ext4 magic in extracted root partition at byte {}: {error}",
-			1024 + 56
-		))
-	})?;
-	if magic != EXT4_MAGIC {
-		return Err(EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR));
+	selected
+		.map(|partition| partition.length)
+		.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))
+}
+
+fn write_sparse(destination: &mut File, bytes: &[u8]) -> io::Result<()> {
+	if bytes.iter().any(|byte| *byte != 0) {
+		destination.write_all(bytes)
+	} else {
+		destination.seek(SeekFrom::Current(bytes.len() as i64))?;
+		Ok(())
 	}
-	Ok(partition.length)
 }
 
 fn gpt_layout(header: &[u8; 512]) -> Result<(u64, u32, u32)> {
@@ -1075,7 +796,7 @@ fn find_ext4_root<R: Read + Seek>(disk: &mut R) -> Result<Partition> {
 	for partition in gpt_partitions(disk)? {
 		let magic_offset = partition
 			.offset
-			.checked_add(1024 + 56)
+			.checked_add(EXT4_MAGIC_OFFSET)
 			.ok_or_else(|| EngineError::unsupported(UNSUPPORTED_LAYOUT_ERROR))?;
 		let mut magic = [0_u8; 2];
 		disk.seek(SeekFrom::Start(magic_offset))?;
@@ -1092,7 +813,7 @@ fn find_ext4_root<R: Read + Seek>(disk: &mut R) -> Result<Partition> {
 fn required_tool(name: &str) -> Result<PathBuf> {
 	find_tool(name).ok_or_else(|| {
 		EngineError::unsupported(format!(
-			"{name} not found (install e2fsprogs to publish gs:// disk images)"
+			"{name} not found (install e2fsprogs to publish cloud disk images)"
 		))
 	})
 }
@@ -1199,22 +920,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 	Ok(hex::encode(digest.finalize()))
 }
 
-fn content_digests(path: &Path) -> Result<(String, String)> {
-	let mut file = File::open(path)?;
-	let mut sha256 = Sha256::new();
-	let mut md5 = Md5::new();
-	let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
-	loop {
-		let count = file.read(&mut buffer)?;
-		if count == 0 {
-			break;
-		}
-		sha256.update(&buffer[..count]);
-		md5.update(&buffer[..count]);
-	}
-	Ok((hex::encode(sha256.finalize()), B64.encode(md5.finalize())))
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{cell::RefCell, io::Cursor, rc::Rc};
@@ -1222,23 +927,34 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn accepts_supported_export_formats() {
+		assert!(matches!(disk_format("image.tar.gz"), Ok(DiskFormat::GzipTar)));
+		assert!(matches!(disk_format("image.tgz"), Ok(DiskFormat::GzipTar)));
+		for suffix in ["raw", "img", "vhd"] {
+			assert!(matches!(disk_format(&format!("image.{suffix}")), Ok(DiskFormat::Raw)));
+		}
+		assert!(disk_format("image.qcow2").is_err());
+	}
+
+	#[test]
 	fn derived_artifact_names_and_sidecar_round_trip() {
 		let (object, sidecar) = derived_names("exports/ubuntu.tar.gz").expect("names");
 		assert_eq!(object, "exports/ubuntu.rootfs.ext4.zst");
 		assert_eq!(sidecar, "exports/ubuntu.rootfs.ext4.zst.json");
 		let value = DerivedSidecar {
-			version: 3,
+			version: SIDECAR_VERSION,
 			source: "gs://bucket/exports/ubuntu.tar.gz".to_owned(),
-			source_generation: "42".to_owned(),
+			source_version: "42".to_owned(),
 			source_digest: "gcs-md5-deadbeef".to_owned(),
 			object,
+			object_version: "43".to_owned(),
+			object_digest: "gcs-md5-cafebabe".to_owned(),
 			compressed_size: 4096,
 			uncompressed_size: 2 * ROOTFS_BLOCK_SIZE,
 			original_size: 99 * 1024 * 1024,
 			block_size: ROOTFS_BLOCK_SIZE,
 			blocks: vec![[0, 2048], [2048, 2048]],
 			sha256: "abc".to_owned(),
-			md5_base64: "bWQ1".to_owned(),
 			agent_sha256: "agent".to_owned(),
 		};
 		let encoded = serde_json::to_vec(&value).expect("serialize");
@@ -1271,67 +987,58 @@ mod tests {
 	#[test]
 	fn matching_existing_derived_object_is_skipped() {
 		let sidecar = DerivedSidecar {
-			version:           3,
+			version:           SIDECAR_VERSION,
 			source:            "gs://bucket/image.tar.gz".to_owned(),
-			source_generation: "7".to_owned(),
+			source_version:    "7".to_owned(),
 			source_digest:     "gcs-md5-aa".to_owned(),
 			object:            "image.rootfs.ext4.zst".to_owned(),
+			object_version:    "8".to_owned(),
+			object_digest:     "gcs-md5-digest".to_owned(),
 			compressed_size:   8192,
 			uncompressed_size: 2 * ROOTFS_BLOCK_SIZE,
 			original_size:     99 * 1024 * 1024,
 			block_size:        ROOTFS_BLOCK_SIZE,
 			blocks:            vec![[0, 4096], [4096, 4096]],
-			sha256:            "sha".to_owned(),
-			md5_base64:        "digest".to_owned(),
-			agent_sha256:      "agent".to_owned(),
+			sha256:            "a".repeat(64),
+			agent_sha256:      "b".repeat(64),
+		};
+		let source = ObjectMetadata {
+			version:    "7".to_owned(),
+			version_id: None,
+			size:       99 * 1024 * 1024,
+			digest:     "gcs-md5-aa".to_owned(),
+			etag:       Some("\"source\"".to_owned()),
+		};
+		let derived = ObjectLocation {
+			reference: "gs://bucket/image.rootfs.ext4.zst".to_owned(),
+			bucket:    "bucket".to_owned(),
+			key:       "image.rootfs.ext4.zst".to_owned(),
 		};
 		let metadata = ObjectMetadata {
-			generation: "8".to_owned(),
-			size:       "8192".to_owned(),
-			md5_hash:   Some("digest".to_owned()),
-			crc32c:     None,
+			version:    "8".to_owned(),
+			version_id: None,
+			size:       8192,
+			digest:     "gcs-md5-digest".to_owned(),
+			etag:       Some("\"derived\"".to_owned()),
 		};
 		assert!(sidecar_matches(
 			&sidecar,
 			"gs://bucket/image.tar.gz",
-			"7",
-			"gcs-md5-aa",
-			"image.rootfs.ext4.zst",
+			&source,
+			&derived,
 			&metadata,
-			"agent",
+			&"b".repeat(64),
 		));
-	}
-
-	#[test]
-	fn resumable_upload_queries_and_resumes_after_a_mid_chunk_failure() {
-		let events = Rc::new(RefCell::new(Vec::new()));
-		let send_events = Rc::clone(&events);
-		let query_events = Rc::clone(&events);
-		let mut attempts = 0;
-		drive_resumable_upload(
-			20,
-			8,
-			3,
-			move |start, end| {
-				send_events.borrow_mut().push(format!("send:{start}-{end}"));
-				attempts += 1;
-				if attempts == 1 {
-					return Err(EngineError::engine("connection dropped after byte 5"));
-				}
-				if end == 20 {
-					Ok(UploadState::Complete)
-				} else {
-					Ok(UploadState::Incomplete(end))
-				}
-			},
-			move || {
-				query_events.borrow_mut().push("query".to_owned());
-				Ok(UploadState::Incomplete(5))
-			},
-			|_, _| {},
-		)
-		.expect("resume upload");
-		assert_eq!(*events.borrow(), ["send:0-8", "query", "send:5-13", "send:13-20",]);
+		let mut malformed = sidecar;
+		malformed.sha256 = "not-a-sha256".to_owned();
+		assert!(!sidecar_matches(
+			&malformed,
+			"gs://bucket/image.tar.gz",
+			&source,
+			&derived,
+			&metadata,
+			&"b".repeat(64),
+		));
 	}
 
 	#[test]
@@ -1400,6 +1107,31 @@ mod tests {
 		let mut actual_magic = [0_u8; 2];
 		root.read_exact(&mut actual_magic).expect("read magic");
 		assert_eq!(actual_magic, EXT4_MAGIC);
+	}
+
+	#[test]
+	fn streamed_conversion_ignores_a_larger_non_ext4_partition() {
+		let mut disk = vec![0_u8; 8 * 1024 * 1024];
+		disk[512..520].copy_from_slice(b"EFI PART");
+		disk[524..528].copy_from_slice(&92_u32.to_le_bytes());
+		disk[584..592].copy_from_slice(&2_u64.to_le_bytes());
+		disk[592..596].copy_from_slice(&2_u32.to_le_bytes());
+		disk[596..600].copy_from_slice(&128_u32.to_le_bytes());
+		for (index, first, last) in [(0_usize, 2048_u64, 4095_u64), (1, 4096, 12287)] {
+			let entry = 1024 + index * 128;
+			disk[entry] = 1;
+			disk[entry + 32..entry + 40].copy_from_slice(&first.to_le_bytes());
+			disk[entry + 40..entry + 48].copy_from_slice(&last.to_le_bytes());
+		}
+		let root_offset = 2048 * SECTOR_SIZE;
+		let magic = (root_offset + EXT4_MAGIC_OFFSET) as usize;
+		disk[magic..magic + 2].copy_from_slice(&EXT4_MAGIC);
+		let dir = tempfile::tempdir().expect("tempdir");
+		let out = dir.path().join("rootfs.ext4");
+		let extracted =
+			extract_streamed_root(&mut Cursor::new(disk), 8 * 1024 * 1024, &out).expect("extract");
+		assert_eq!(extracted, 2048 * SECTOR_SIZE);
+		assert_eq!(out.metadata().expect("metadata").len(), 2048 * SECTOR_SIZE);
 	}
 
 	#[test]

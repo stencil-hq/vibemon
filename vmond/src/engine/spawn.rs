@@ -14,6 +14,7 @@ use std::{
 };
 
 use serde_json::{Map, Value, json};
+use vmon_cloud::ObjectAuth;
 
 use crate::{
 	doctor,
@@ -254,6 +255,27 @@ pub struct RemoteFsShare {
 	pub sock: PathBuf,
 }
 
+/// Immutable HTTP root-disk base attached beneath a private overlay.
+#[derive(Clone, Debug)]
+pub struct RemoteBlockSpec {
+	/// Range-addressable object URL.
+	pub url:    String,
+	/// Shared sparse block cache.
+	pub cache:  PathBuf,
+	/// Local zstd seek index.
+	pub index:  PathBuf,
+	/// Guest-visible byte capacity.
+	pub size:   u64,
+	/// Optional static bearer for non-cloud endpoints.
+	pub bearer: Option<String>,
+	/// Workload-identity scheme for the object.
+	pub auth:   ObjectAuth,
+	/// AWS signing region required by [`ObjectAuth::Aws`].
+	pub region: Option<String>,
+	/// Immutable object `ETag` required on every range request.
+	pub etag:   Option<String>,
+}
+
 /// Builder-style launch specification consumed by [`build_launch_args`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSpec {
@@ -283,8 +305,14 @@ pub struct LaunchSpec {
 	pub rootfs_remote_index: Option<PathBuf>,
 	/// Guest-visible byte capacity, including the zero-filled tail.
 	pub rootfs_remote_size: Option<u64>,
-	/// Optional OAuth bearer used by remote rootfs range requests.
+	/// Optional bearer used by remote rootfs range requests.
 	pub rootfs_remote_bearer: Option<String>,
+	/// Workload-identity scheme for the immutable remote object.
+	pub rootfs_remote_auth: ObjectAuth,
+	/// AWS signing region required by [`ObjectAuth::Aws`].
+	pub rootfs_remote_region: Option<String>,
+	/// Immutable object `ETag` enforced on every range request.
+	pub rootfs_remote_etag: Option<String>,
 	/// Memory size in MiB.
 	pub mem_mib: Option<u64>,
 	/// vCPU count.
@@ -351,6 +379,9 @@ impl LaunchSpec {
 			rootfs_remote_index: None,
 			rootfs_remote_size: None,
 			rootfs_remote_bearer: None,
+			rootfs_remote_auth: ObjectAuth::None,
+			rootfs_remote_region: None,
+			rootfs_remote_etag: None,
 			mem_mib: Some(DEFAULT_MEM_MIB),
 			cpus: Some(DEFAULT_CPUS),
 			agent_sock: None,
@@ -398,6 +429,9 @@ impl LaunchSpec {
 			rootfs_remote_index: None,
 			rootfs_remote_size: None,
 			rootfs_remote_bearer: None,
+			rootfs_remote_auth: ObjectAuth::None,
+			rootfs_remote_region: None,
+			rootfs_remote_etag: None,
 			mem_mib: None,
 			cpus: None,
 			agent_sock: None,
@@ -459,19 +493,15 @@ impl LaunchSpec {
 	}
 
 	/// Attach an immutable HTTP base beneath the private rootfs overlay.
-	pub fn with_remote_rootfs(
-		mut self,
-		url: impl Into<String>,
-		cache: impl Into<PathBuf>,
-		index: impl Into<PathBuf>,
-		size: u64,
-		bearer: Option<String>,
-	) -> Self {
-		self.rootfs_remote_url = Some(url.into());
-		self.rootfs_remote_cache = Some(cache.into());
-		self.rootfs_remote_index = Some(index.into());
-		self.rootfs_remote_size = Some(size);
-		self.rootfs_remote_bearer = bearer;
+	pub fn with_remote_rootfs(mut self, remote: RemoteBlockSpec) -> Self {
+		self.rootfs_remote_url = Some(remote.url);
+		self.rootfs_remote_cache = Some(remote.cache);
+		self.rootfs_remote_index = Some(remote.index);
+		self.rootfs_remote_size = Some(remote.size);
+		self.rootfs_remote_bearer = remote.bearer;
+		self.rootfs_remote_auth = remote.auth;
+		self.rootfs_remote_region = remote.region;
+		self.rootfs_remote_etag = remote.etag;
 		self
 	}
 
@@ -585,18 +615,67 @@ impl LaunchSpec {
 		let remote_rootfs_any = self.rootfs_remote_url.is_some()
 			|| self.rootfs_remote_cache.is_some()
 			|| self.rootfs_remote_index.is_some()
-			|| self.rootfs_remote_size.is_some();
+			|| self.rootfs_remote_size.is_some()
+			|| self.rootfs_remote_bearer.is_some()
+			|| self.rootfs_remote_auth != ObjectAuth::None
+			|| self.rootfs_remote_region.is_some()
+			|| self.rootfs_remote_etag.is_some();
 		let remote_rootfs_complete = self.rootfs_remote_url.is_some()
 			&& self.rootfs_remote_cache.is_some()
 			&& self.rootfs_remote_index.is_some()
-			&& self.rootfs_remote_size.is_some();
+			&& self.rootfs_remote_size.is_some()
+			&& self.rootfs_remote_etag.is_some();
 		if remote_rootfs_any && !remote_rootfs_complete {
 			return Err(EngineError::invalid(
-				"remote rootfs requires URL, cache path, seek index, and logical size",
+				"remote rootfs requires URL, cache path, seek index, logical size, and immutable ETag",
 			));
 		}
-		if self.rootfs_remote_bearer.is_some() && self.rootfs_remote_url.is_none() {
-			return Err(EngineError::invalid("remote rootfs bearer requires a URL"));
+		if let Some(url) = &self.rootfs_remote_url {
+			let url = reqwest::Url::parse(url)
+				.map_err(|error| EngineError::invalid(format!("invalid remote rootfs URL: {error}")))?;
+			if !matches!(url.scheme(), "http" | "https") {
+				return Err(EngineError::invalid("remote rootfs URL must use http:// or https://"));
+			}
+			if self.rootfs_remote_auth != ObjectAuth::None && url.scheme() != "https" {
+				return Err(EngineError::invalid(
+					"remote rootfs workload auth requires an https:// URL",
+				));
+			}
+			if self.rootfs.is_none() {
+				return Err(EngineError::invalid(
+					"remote rootfs requires a private writable rootfs overlay",
+				));
+			}
+			if self.rootfs_read_only {
+				return Err(EngineError::invalid(
+					"remote rootfs cannot be combined with a read-only rootfs",
+				));
+			}
+		}
+		if self
+			.rootfs_remote_etag
+			.as_deref()
+			.is_some_and(|etag| !is_strong_etag(etag))
+		{
+			return Err(EngineError::invalid("remote rootfs ETag must be a quoted strong entity-tag"));
+		}
+		if self.rootfs_remote_bearer.is_some() && self.rootfs_remote_auth != ObjectAuth::None {
+			return Err(EngineError::invalid(
+				"remote rootfs bearer cannot be combined with workload auth",
+			));
+		}
+		if self
+			.rootfs_remote_region
+			.as_deref()
+			.is_some_and(|region| region.trim().is_empty())
+		{
+			return Err(EngineError::invalid("remote rootfs region must not be empty"));
+		}
+		if self.rootfs_remote_auth == ObjectAuth::Aws && self.rootfs_remote_region.is_none() {
+			return Err(EngineError::invalid("AWS remote rootfs requires a signing region"));
+		}
+		if self.rootfs_remote_auth != ObjectAuth::Aws && self.rootfs_remote_region.is_some() {
+			return Err(EngineError::invalid("remote rootfs region requires AWS workload auth"));
 		}
 		if self.remote_page_url.is_some() && !matches!(self.mode, LaunchMode::Restore { .. }) {
 			return Err(EngineError::invalid("remote page restore requires --restore"));
@@ -716,6 +795,16 @@ pub fn build_launch_args(spec: &LaunchSpec) -> Vec<String> {
 	args
 }
 
+fn is_strong_etag(etag: &str) -> bool {
+	let bytes = etag.as_bytes();
+	bytes.len() >= 2
+		&& bytes.first() == Some(&b'"')
+		&& bytes.last() == Some(&b'"')
+		&& bytes[1..bytes.len() - 1]
+			.iter()
+			.all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
+}
+
 fn append_start_paused_arg(args: &mut Vec<String>, spec: &LaunchSpec) {
 	if spec.start_paused {
 		args.push("--start-paused".to_owned());
@@ -750,6 +839,15 @@ fn append_rootfs_args(args: &mut Vec<String>, spec: &LaunchSpec, allow_direct_re
 	}
 	if let Some(bearer) = &spec.rootfs_remote_bearer {
 		push_arg(args, "--rootfs-remote-bearer", bearer);
+	}
+	if spec.rootfs_remote_auth != ObjectAuth::None {
+		push_arg(args, "--rootfs-remote-auth", spec.rootfs_remote_auth.as_str());
+	}
+	if let Some(region) = &spec.rootfs_remote_region {
+		push_arg(args, "--rootfs-remote-region", region);
+	}
+	if let Some(etag) = &spec.rootfs_remote_etag {
+		push_arg(args, "--rootfs-remote-etag", etag);
 	}
 }
 
@@ -1710,16 +1808,19 @@ mod tests {
 		let spec = LaunchSpec::fork_from("/vm/api.sock", snapshot("template"))
 			.with_tap("tap7")
 			.with_disk_overlay("/templates/base/rootfs.img", "/vms/child/rootfs.img")
-			.with_remote_rootfs(
-				"https://storage.googleapis.com/rootfs",
-				"/state/cache/rootfs.cache",
-				"/state/cache/rootfs.index.json",
-				64 * 1024 * 1024 * 1024,
-				Some("token".to_owned()),
-			)
+			.with_remote_rootfs(RemoteBlockSpec {
+				url:    "https://storage.googleapis.com/rootfs".to_owned(),
+				cache:  "/state/cache/rootfs.cache".into(),
+				index:  "/state/cache/rootfs.index.json".into(),
+				size:   64 * 1024 * 1024 * 1024,
+				bearer: None,
+				auth:   ObjectAuth::Google,
+				region: None,
+				etag:   Some("\"generation-42\"".to_owned()),
+			})
 			.with_agent_sock("/vms/child/agent.sock")
 			.with_console_agent();
-		assert_eq!(build_launch_args(&spec), [
+		assert_eq!(spec.try_build_args().expect("valid Google remote rootfs"), [
 			"--fork-from",
 			"/state/snapshots/template",
 			"--api-sock",
@@ -1738,8 +1839,10 @@ mod tests {
 			"/state/cache/rootfs.index.json",
 			"--rootfs-remote-size",
 			"68719476736",
-			"--rootfs-remote-bearer",
-			"token",
+			"--rootfs-remote-auth",
+			"google",
+			"--rootfs-remote-etag",
+			"\"generation-42\"",
 			"--agent-sock",
 			"/vms/child/agent.sock",
 			"--console-agent",
@@ -1922,29 +2025,36 @@ mod tests {
 	#[test]
 	fn spawn_passes_all_remote_rootfs_flags() {
 		let spec = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
-			.with_remote_rootfs(
-				"https://storage.googleapis.com/rootfs",
-				"/state/images/remote-rootfs/abc.cache",
-				"/state/images/remote-rootfs/abc.index.json",
-				64 * 1024 * 1024 * 1024,
-				Some("token".to_owned()),
-			);
-		let args = build_launch_args(&spec);
+			.with_remote_rootfs(RemoteBlockSpec {
+				url:    "https://images.s3.us-west-2.amazonaws.com/rootfs".to_owned(),
+				cache:  "/state/images/remote-rootfs/abc.cache".into(),
+				index:  "/state/images/remote-rootfs/abc.index.json".into(),
+				size:   64 * 1024 * 1024 * 1024,
+				bearer: None,
+				auth:   ObjectAuth::Aws,
+				region: Some("us-west-2".to_owned()),
+				etag:   Some("\"version-7\"".to_owned()),
+			});
+		let args = spec.try_build_args().expect("valid AWS remote rootfs");
 		let idx = args
 			.iter()
 			.position(|arg| arg == "--rootfs-remote-url")
 			.expect("remote URL");
-		assert_eq!(&args[idx..idx + 10], [
+		assert_eq!(&args[idx..idx + 14], [
 			"--rootfs-remote-url",
-			"https://storage.googleapis.com/rootfs",
+			"https://images.s3.us-west-2.amazonaws.com/rootfs",
 			"--rootfs-remote-cache",
 			"/state/images/remote-rootfs/abc.cache",
 			"--rootfs-remote-index",
 			"/state/images/remote-rootfs/abc.index.json",
 			"--rootfs-remote-size",
 			"68719476736",
-			"--rootfs-remote-bearer",
-			"token",
+			"--rootfs-remote-auth",
+			"aws",
+			"--rootfs-remote-region",
+			"us-west-2",
+			"--rootfs-remote-etag",
+			"\"version-7\"",
 		]);
 	}
 
@@ -1953,6 +2063,53 @@ mod tests {
 		let mut spec = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img");
 		spec.rootfs_remote_cache = Some("/state/images/remote-rootfs/abc.cache".into());
 		assert!(spec.validate().is_err());
+	}
+
+	#[test]
+	fn remote_rootfs_rejects_insecure_or_mutable_workload_contracts() {
+		let remote = || RemoteBlockSpec {
+			url:    "https://storage.googleapis.com/rootfs".to_owned(),
+			cache:  "/state/images/remote-rootfs/abc.cache".into(),
+			index:  "/state/images/remote-rootfs/abc.index.json".into(),
+			size:   512,
+			bearer: None,
+			auth:   ObjectAuth::Google,
+			region: None,
+			etag:   Some("\"immutable\"".to_owned()),
+		};
+
+		let mut missing_etag = remote();
+		missing_etag.etag = None;
+		let error = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
+			.with_remote_rootfs(missing_etag)
+			.validate()
+			.expect_err("remote rootfs without ETag must fail");
+		assert!(error.to_string().contains("immutable ETag"));
+
+		let mut weak_etag = remote();
+		weak_etag.etag = Some("W/\"mutable\"".to_owned());
+		let error = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
+			.with_remote_rootfs(weak_etag)
+			.validate()
+			.expect_err("weak ETag must fail");
+		assert!(error.to_string().contains("quoted strong entity-tag"));
+
+		let mut insecure = remote();
+		insecure.url = "http://storage.googleapis.com/rootfs".to_owned();
+		let error = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
+			.with_remote_rootfs(insecure)
+			.validate()
+			.expect_err("workload credentials over HTTP must fail");
+		assert!(error.to_string().contains("requires an https:// URL"));
+
+		let mut empty_region = remote();
+		empty_region.auth = ObjectAuth::Aws;
+		empty_region.region = Some("  ".to_owned());
+		let error = LaunchSpec::boot_rootfs("/vm/api.sock", "/kernel", "/vm/rootfs.img")
+			.with_remote_rootfs(empty_region)
+			.validate()
+			.expect_err("empty AWS region must fail");
+		assert!(error.to_string().contains("region must not be empty"));
 	}
 
 	#[test]

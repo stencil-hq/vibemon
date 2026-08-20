@@ -1,37 +1,29 @@
-//! Credentials for private image registries.
+//! Short-lived credentials for private OCI registries.
 //!
-//! skopeo authenticates from a Docker-style auth file. vmon materializes one
-//! per pull rather than persisting it, because the cloud tokens it carries are
-//! short-lived: minting on demand keeps a long-running worker from going stale
-//! an hour after boot. The file also keeps secrets out of `--creds`, which
-//! would expose them in argv to every local process through `/proc`.
-//!
-//! Today the only automatic provider is Google Artifact Registry / Container
-//! Registry via the GCE metadata server. `VMON_REGISTRY_AUTH_FILE` overrides
-//! everything for operators who manage credentials themselves (ECR, GHCR, a
-//! private Harbor, …).
+//! `skopeo` receives a temporary Docker-style auth file instead of credentials
+//! in argv. Google Artifact Registry uses the GCE workload token; Amazon ECR
+//! uses environment, ECS task-role, or EC2 instance-role credentials. Other
+//! registries use the operator-managed `VMON_REGISTRY_AUTH_FILE` override.
 
 use std::{
-	io::{Read, Write},
-	net::TcpStream,
 	path::{Path, PathBuf},
 	time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use chrono::Utc;
+use reqwest::blocking::Client;
+use serde::Deserialize;
 use serde_json::json;
 use tempfile::NamedTempFile;
+use vmon_cloud::{aws, google};
 
 /// Environment override naming a caller-managed Docker auth file.
 const AUTH_FILE_ENV: &str = "VMON_REGISTRY_AUTH_FILE";
-/// GCE metadata endpoint issuing the instance service account's token.
-const METADATA_HOST: &str = "metadata.google.internal";
-const METADATA_TOKEN_PATH: &str =
-   "/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform";
-/// The metadata server is link-local; a slow reply means it is absent.
-const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
-/// Username Google registries expect alongside an OAuth access token.
 const OAUTH_USER: &str = "oauth2accesstoken";
+const ECR_TARGET: &str = "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken";
+const ECR_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An auth file for skopeo's `--authfile`.
 ///
@@ -55,30 +47,38 @@ impl AuthFile {
 
 /// Resolve credentials for `reference`, or `None` when the registry needs none.
 ///
-/// Best-effort by design: a public image must still pull on a host with no
-/// metadata server, so every failure degrades to an anonymous pull and lets
-/// skopeo report the authoritative error.
+/// Best-effort by design: public images remain pullable without cloud metadata;
+/// `skopeo` reports the authoritative error when a private pull has no usable
+/// workload identity.
 pub fn auth_file_for(reference: &str) -> Option<AuthFile> {
 	if let Some(path) = std::env::var_os(AUTH_FILE_ENV) {
 		return Some(AuthFile::Managed(PathBuf::from(path)));
 	}
 	let host = registry_host(reference)?;
-	if !is_google_registry(&host) {
-		return None;
-	}
-	let token = metadata_access_token()?;
-	write_auth_file(&host, OAUTH_USER, &token)
+	let credentials = automatic_credentials(&host)
+		.inspect_err(|error| tracing::warn!(%error, host, "registry workload auth failed"))
+		.ok()??;
+	write_auth_file(&host, &credentials.0, &credentials.1)
 		.inspect_err(|error| tracing::warn!(%error, host, "registry auth file write failed"))
 		.ok()
 		.map(AuthFile::Ephemeral)
 }
 
+fn automatic_credentials(host: &str) -> Result<Option<(String, String)>, String> {
+	if is_google_registry(host) {
+		let mut provider = google::TokenProvider::new().map_err(|error| error.to_string())?;
+		return provider
+			.token()
+			.map(|token| Some((OAUTH_USER.to_owned(), token)))
+			.map_err(|error| error.to_string());
+	}
+	let Some(registry) = parse_ecr_registry(host) else {
+		return Ok(None);
+	};
+	ecr_credentials(&registry).map(Some)
+}
+
 /// The registry host of a skopeo reference, if it names one.
-///
-/// Local transports (`oci:`, `dir:`, …) are filesystem paths and never carry a
-/// host. Within a registry reference, the first path component is the host only
-/// when it looks like one — `library/alpine` is a Docker Hub namespace, and a
-/// reference with no `/` at all (`alpine:3.20`) is a bare repository and tag.
 fn registry_host(reference: &str) -> Option<String> {
 	let rest = if let Some(rest) = reference.strip_prefix("docker://") {
 		rest
@@ -97,46 +97,157 @@ fn registry_host(reference: &str) -> Option<String> {
 	looks_like_host.then(|| candidate.to_ascii_lowercase())
 }
 
-/// Whether `host` is served by Google Artifact Registry or Container Registry.
 fn is_google_registry(host: &str) -> bool {
 	let host = host.split_once(':').map_or(host, |(name, _port)| name);
 	host == "gcr.io" || host.ends_with(".gcr.io") || host.ends_with("-docker.pkg.dev")
 }
 
-/// Fetch the instance service account's access token from the metadata server.
-///
-/// Deliberately a hand-rolled plaintext GET against a link-local address: the
-/// image pipeline is synchronous, so borrowing the async HTTP client here would
-/// mean blocking on a runtime from inside a worker thread.
-pub(super) fn metadata_access_token() -> Option<String> {
-	let mut stream = TcpStream::connect((METADATA_HOST, 80))
-		.or_else(|_| TcpStream::connect(("169.254.169.254", 80)))
-		.ok()?;
-	stream.set_read_timeout(Some(METADATA_TIMEOUT)).ok()?;
-	stream.set_write_timeout(Some(METADATA_TIMEOUT)).ok()?;
-	let request = format!(
-		"GET {METADATA_TOKEN_PATH} HTTP/1.1\r\nHost: {METADATA_HOST}\r\nMetadata-Flavor: \
-		 Google\r\nConnection: close\r\n\r\n"
-	);
-	stream.write_all(request.as_bytes()).ok()?;
-	let mut response = Vec::new();
-	stream.take(64 * 1024).read_to_end(&mut response).ok()?;
-	parse_access_token(&String::from_utf8_lossy(&response))
+#[derive(Debug, Eq, PartialEq)]
+struct EcrRegistry {
+	region:   String,
+	api_host: String,
 }
 
-/// Pull `access_token` out of a metadata-server HTTP response.
-fn parse_access_token(response: &str) -> Option<String> {
-	let (head, body) = response.split_once("\r\n\r\n")?;
-	if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+fn parse_ecr_registry(host: &str) -> Option<EcrRegistry> {
+	let host = host.split_once(':').map_or(host, |(name, _port)| name);
+	let (account, region, api_host) = if let Some(prefix) = host.strip_suffix(".amazonaws.com.cn") {
+		let (account, region) = prefix.split_once(".dkr.ecr.")?;
+		(account, region, format!("ecr.{region}.amazonaws.com.cn"))
+	} else if let Some(prefix) = host.strip_suffix(".amazonaws.com") {
+		let (account, region) = prefix.split_once(".dkr.ecr.")?;
+		(account, region, format!("ecr.{region}.amazonaws.com"))
+	} else if let Some(prefix) = host.strip_suffix(".on.aws") {
+		let (account, region) = prefix.split_once(".dkr-ecr.")?;
+		(account, region, format!("ecr.{region}.api.aws"))
+	} else {
+		return None;
+	};
+	if account.len() != 12
+		|| !account.bytes().all(|byte| byte.is_ascii_digit())
+		|| !valid_aws_region(region)
+	{
 		return None;
 	}
-	let parsed: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-	let token = parsed.get("access_token")?.as_str()?;
-	(!token.is_empty()).then(|| token.to_owned())
+	Some(EcrRegistry { region: region.to_owned(), api_host })
 }
 
-/// Write a 0600 Docker-style auth file for one registry host.
+fn valid_aws_region(region: &str) -> bool {
+	let mut parts = region.split('-').peekable();
+	let Some(first) = parts.next() else {
+		return false;
+	};
+	if first.is_empty() || !first.bytes().all(|byte| byte.is_ascii_lowercase()) {
+		return false;
+	}
+	let mut middle_parts = 0;
+	while let Some(part) = parts.next() {
+		if part.is_empty() {
+			return false;
+		}
+		if parts.peek().is_none() {
+			return middle_parts != 0 && part.bytes().all(|byte| byte.is_ascii_digit());
+		}
+		if !part.bytes().all(|byte| byte.is_ascii_lowercase()) {
+			return false;
+		}
+		middle_parts += 1;
+	}
+	false
+}
+
+fn ecr_credentials(registry: &EcrRegistry) -> Result<(String, String), String> {
+	let mut provider = aws::CredentialProvider::new().map_err(|error| error.to_string())?;
+	let credentials = provider.credentials().map_err(|error| error.to_string())?;
+	let body = b"{}";
+	let payload_hash = aws::sha256_hex(body);
+	let timestamp = Utc::now();
+	let date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
+	let host = &registry.api_host;
+	let mut signed_headers = vec![
+		("content-type".to_owned(), ECR_CONTENT_TYPE.to_owned()),
+		("host".to_owned(), host.to_owned()),
+		("x-amz-date".to_owned(), date.clone()),
+		("x-amz-target".to_owned(), ECR_TARGET.to_owned()),
+	];
+	if let Some(token) = &credentials.session_token {
+		signed_headers.push(("x-amz-security-token".to_owned(), token.clone()));
+	}
+	let authorization = aws::authorization(
+		"POST",
+		"/",
+		"",
+		&signed_headers,
+		&payload_hash,
+		timestamp,
+		&registry.region,
+		"ecr",
+		&credentials.access_key,
+		&credentials.secret_key,
+	);
+	let client = Client::builder()
+		.connect_timeout(REQUEST_TIMEOUT)
+		.timeout(REQUEST_TIMEOUT)
+		.build()
+		.map_err(|error| format!("building ECR client: {error}"))?;
+	let mut request = client
+		.post(format!("https://{host}/"))
+		.header("content-type", ECR_CONTENT_TYPE)
+		.header("host", host)
+		.header("x-amz-date", date)
+		.header("x-amz-target", ECR_TARGET)
+		.header("authorization", authorization)
+		.body(body.as_slice());
+	if let Some(token) = &credentials.session_token {
+		request = request.header("x-amz-security-token", token);
+	}
+	let response = request
+		.send()
+		.map_err(|error| format!("requesting ECR token: {error}"))?;
+	if !response.status().is_success() {
+		let status = response.status();
+		let body = response.text().unwrap_or_default();
+		return Err(format!("ECR token API returned HTTP {status}: {}", body.trim()));
+	}
+	let document: EcrTokenResponse = response
+		.json()
+		.map_err(|error| format!("invalid ECR token response: {error}"))?;
+	let token = document
+		.authorization_data
+		.into_iter()
+		.next()
+		.ok_or_else(|| "ECR token response contained no authorization data".to_owned())?
+		.authorization_token;
+	decode_ecr_token(&token)
+}
+
+fn decode_ecr_token(token: &str) -> Result<(String, String), String> {
+	let decoded = B64
+		.decode(token)
+		.map_err(|error| format!("invalid ECR authorization token: {error}"))?;
+	let decoded = String::from_utf8(decoded)
+		.map_err(|error| format!("ECR authorization token was not UTF-8: {error}"))?;
+	let (user, password) = decoded
+		.split_once(':')
+		.filter(|(user, password)| !user.is_empty() && !password.is_empty())
+		.ok_or_else(|| "ECR authorization token omitted username or password".to_owned())?;
+	Ok((user.to_owned(), password.to_owned()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EcrTokenResponse {
+	authorization_data: Vec<EcrAuthorizationData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EcrAuthorizationData {
+	authorization_token: String,
+}
+
 fn write_auth_file(host: &str, user: &str, secret: &str) -> std::io::Result<NamedTempFile> {
+	use std::io::Write as _;
+
 	let document = json!({
 		"auths": { host: { "auth": B64.encode(format!("{user}:{secret}")) } }
 	});
@@ -171,39 +282,58 @@ mod tests {
 			Some("us-central1-docker.pkg.dev")
 		);
 		assert_eq!(
-			registry_host("us-central1-docker.pkg.dev/p/r/i:t").as_deref(),
-			Some("us-central1-docker.pkg.dev")
+			registry_host("123456789012.dkr.ecr.us-east-1.amazonaws.com/team/image:t").as_deref(),
+			Some("123456789012.dkr.ecr.us-east-1.amazonaws.com")
 		);
 		assert_eq!(registry_host("localhost:5000/img:t").as_deref(), Some("localhost:5000"));
-		// Docker Hub short names carry no host component.
 		assert_eq!(registry_host("alpine:3.20"), None);
 		assert_eq!(registry_host("library/alpine:3.20"), None);
-		// Local transports are paths, never registries.
 		assert_eq!(registry_host("oci:/var/lib/vmon/img:latest"), None);
 		assert_eq!(registry_host("dir:/var/lib/vmon/img"), None);
 	}
 
 	#[test]
-	fn google_registries_are_matched_by_suffix_not_substring() {
+	fn provider_registries_are_matched_by_suffix_not_substring() {
 		assert!(is_google_registry("gcr.io"));
 		assert!(is_google_registry("eu.gcr.io"));
 		assert!(is_google_registry("us-central1-docker.pkg.dev"));
-		// A lookalike domain must not receive Google credentials.
+		assert_eq!(
+			parse_ecr_registry("123456789012.dkr.ecr.us-east-1.amazonaws.com"),
+			Some(EcrRegistry {
+				region:   "us-east-1".to_owned(),
+				api_host: "ecr.us-east-1.amazonaws.com".to_owned(),
+			})
+		);
+		assert_eq!(
+			parse_ecr_registry("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn"),
+			Some(EcrRegistry {
+				region:   "cn-north-1".to_owned(),
+				api_host: "ecr.cn-north-1.amazonaws.com.cn".to_owned(),
+			})
+		);
+		assert_eq!(
+			parse_ecr_registry("123456789012.dkr-ecr.eu-west-1.on.aws"),
+			Some(EcrRegistry {
+				region:   "eu-west-1".to_owned(),
+				api_host: "ecr.eu-west-1.api.aws".to_owned(),
+			})
+		);
 		assert!(!is_google_registry("gcr.io.evil.example"));
 		assert!(!is_google_registry("notgcr.io.example.com"));
-		assert!(!is_google_registry("registry-1.docker.io"));
+		assert_eq!(parse_ecr_registry("123456789012.dkr.ecr.us-east-1.amazonaws.com.evil"), None);
+		assert_eq!(parse_ecr_registry("not-an-account.dkr.ecr.us-east-1.amazonaws.com"), None);
+		assert_eq!(parse_ecr_registry("123456789012.dkr.ecr.not-a-region.amazonaws.com"), None);
+		assert_eq!(parse_ecr_registry("123456789012.dkr-ecr.eu-west-1.on.aws.evil"), None);
 	}
 
 	#[test]
-	fn access_token_is_read_only_from_a_successful_response() {
-		let ok = "HTTP/1.1 200 OK\r\nContent-Type: \
-		          application/json\r\n\r\n{\"access_token\":\"ya29.abc\",\"expires_in\":3599}";
-		assert_eq!(parse_access_token(ok).as_deref(), Some("ya29.abc"));
-		let forbidden = "HTTP/1.1 403 Forbidden\r\n\r\n{\"access_token\":\"ya29.abc\"}";
-		assert_eq!(parse_access_token(forbidden), None);
-		let empty = "HTTP/1.1 200 OK\r\n\r\n{\"access_token\":\"\"}";
-		assert_eq!(parse_access_token(empty), None);
-		assert_eq!(parse_access_token("HTTP/1.1 200 OK\r\n\r\nnot json"), None);
+	fn ecr_tokens_decode_as_docker_credentials() {
+		let token = B64.encode("AWS:temporary:password");
+		assert_eq!(decode_ecr_token(&token), Ok(("AWS".to_owned(), "temporary:password".to_owned())));
+		assert!(decode_ecr_token(&B64.encode("missing-separator")).is_err());
+		assert!(decode_ecr_token(&B64.encode(":missing-user")).is_err());
+		assert!(decode_ecr_token(&B64.encode("AWS:")).is_err());
+		assert!(decode_ecr_token("not-base64").is_err());
 	}
 
 	#[test]

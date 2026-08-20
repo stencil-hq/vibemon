@@ -20,6 +20,7 @@ use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 use sha2::Digest;
 use tracing::warn;
+use vmon_cloud::aws;
 
 use crate::{EngineError, Result};
 
@@ -1266,7 +1267,7 @@ impl S3Client {
 			if let Some(token) = &creds.session_token {
 				headers.push(("x-amz-security-token".to_owned(), token.clone()));
 			}
-			let authorization = sigv4::authorization(
+			let authorization = aws::authorization(
 				method.as_str(),
 				&canonical_uri,
 				&canonical_query,
@@ -1274,7 +1275,9 @@ impl S3Client {
 				&payload_hash,
 				now,
 				&self.cfg.region,
-				creds,
+				"s3",
+				&creds.access_key,
+				&creds.secret_key,
 			);
 			request = request
 				.header("host", host)
@@ -1325,7 +1328,7 @@ impl S3Client {
 			if let Some(token) = &creds.session_token {
 				headers.push(("x-amz-security-token".to_owned(), token.clone()));
 			}
-			let authorization = sigv4::authorization(
+			let authorization = aws::authorization(
 				Method::PUT.as_str(),
 				&canonical_uri,
 				&canonical_query,
@@ -1333,7 +1336,9 @@ impl S3Client {
 				UNSIGNED_PAYLOAD,
 				now,
 				&self.cfg.region,
-				creds,
+				"s3",
+				&creds.access_key,
+				&creds.secret_key,
 			);
 			request = request
 				.header("host", host)
@@ -1528,7 +1533,7 @@ impl S3Client {
 			if let Some(token) = &creds.session_token {
 				headers.push(("x-amz-security-token".to_owned(), token.clone()));
 			}
-			let authorization = sigv4::authorization(
+			let authorization = aws::authorization(
 				method.as_str(),
 				&canonical_uri,
 				&canonical_query,
@@ -1536,7 +1541,9 @@ impl S3Client {
 				UNSIGNED_PAYLOAD,
 				now,
 				&self.cfg.region,
-				creds,
+				"s3",
+				&creds.access_key,
+				&creds.secret_key,
 			);
 			request = request
 				.header("host", host)
@@ -1558,36 +1565,7 @@ impl S3Client {
 		key: &str,
 		query: &[(String, String)],
 	) -> std::result::Result<(Url, String, String), S3Error> {
-		let canonical_query = canonical_query(query);
-		let encoded_key = encode_path(key);
-		let canonical_uri = if let Some(endpoint) = &self.cfg.endpoint {
-			let endpoint = endpoint_url(endpoint)?;
-			let mut path = endpoint.path().trim_end_matches('/').to_owned();
-			path.push('/');
-			path.push_str(&encode_component(&self.cfg.bucket));
-			if !encoded_key.is_empty() {
-				path.push('/');
-				path.push_str(&encoded_key);
-			}
-			path
-		} else if encoded_key.is_empty() {
-			"/".to_owned()
-		} else {
-			format!("/{encoded_key}")
-		};
-		let url = if let Some(endpoint) = &self.cfg.endpoint {
-			let base = endpoint.trim_end_matches('/');
-			format!("{base}{canonical_uri}")
-		} else {
-			format!("https://{}.s3.{}.amazonaws.com{canonical_uri}", self.cfg.bucket, self.cfg.region)
-		};
-		let url = if canonical_query.is_empty() {
-			url
-		} else {
-			format!("{url}?{canonical_query}")
-		};
-		let url = Url::parse(&url).map_err(|_| S3Error::BadRequest)?;
-		Ok((url, canonical_uri, canonical_query))
+		request_url_for(&self.cfg.bucket, &self.cfg.region, self.cfg.endpoint.as_deref(), key, query)
 	}
 
 	fn object_key(&self, path: &str) -> std::result::Result<String, S3Error> {
@@ -1610,6 +1588,45 @@ impl S3Client {
 			format!("{key}/")
 		})
 	}
+}
+
+pub(crate) fn request_url_for(
+	bucket: &str,
+	region: &str,
+	endpoint: Option<&str>,
+	key: &str,
+	query: &[(String, String)],
+) -> std::result::Result<(Url, String, String), S3Error> {
+	let canonical_query = canonical_query(query);
+	let encoded_key = encode_path(key);
+	let canonical_uri = if let Some(endpoint) = endpoint {
+		let endpoint = endpoint_url(endpoint)?;
+		let mut path = endpoint.path().trim_end_matches('/').to_owned();
+		path.push('/');
+		path.push_str(&encode_component(bucket));
+		if !encoded_key.is_empty() {
+			path.push('/');
+			path.push_str(&encoded_key);
+		}
+		path
+	} else if encoded_key.is_empty() {
+		"/".to_owned()
+	} else {
+		format!("/{encoded_key}")
+	};
+	let url = if let Some(endpoint) = endpoint {
+		let base = endpoint.trim_end_matches('/');
+		format!("{base}{canonical_uri}")
+	} else {
+		format!("https://{bucket}.s3.{region}.amazonaws.com{canonical_uri}")
+	};
+	let url = if canonical_query.is_empty() {
+		url
+	} else {
+		format!("{url}?{canonical_query}")
+	};
+	let url = Url::parse(&url).map_err(|_| S3Error::BadRequest)?;
+	Ok((url, canonical_uri, canonical_query))
 }
 
 /// Parses an `s3://bucket[/prefix]` mount URI into bucket and normalized
@@ -1870,80 +1887,6 @@ struct ListContents {
 struct ListPrefix {
 	#[serde(rename = "Prefix")]
 	prefix: String,
-}
-
-mod sigv4 {
-	use chrono::{DateTime, Utc};
-	use hmac::{Hmac, Mac};
-	use sha2::{Digest, Sha256};
-
-	use super::S3Credentials;
-
-	type HmacSha256 = Hmac<Sha256>;
-
-	pub(super) fn authorization(
-		method: &str,
-		canonical_uri: &str,
-		canonical_query: &str,
-		headers: &[(String, String)],
-		payload_hash: &str,
-		timestamp: DateTime<Utc>,
-		region: &str,
-		credentials: &S3Credentials,
-	) -> String {
-		let mut headers = headers.to_vec();
-		headers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-		use std::fmt::Write as _;
-
-		let mut canonical_headers = String::new();
-		for (name, value) in &headers {
-			let _ = writeln!(canonical_headers, "{name}:{}", normalize_header(value));
-		}
-		let signed_headers = headers
-			.iter()
-			.map(|(name, _)| name.as_str())
-			.collect::<Vec<_>>()
-			.join(";");
-		let canonical_request = [
-			method,
-			canonical_uri,
-			canonical_query,
-			&canonical_headers,
-			&signed_headers,
-			payload_hash,
-		]
-		.join("\n");
-		let date = timestamp.format("%Y%m%d").to_string();
-		let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
-		let scope = format!("{date}/{region}/s3/aws4_request");
-		let string_to_sign = format!(
-			"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-			hex::encode(Sha256::digest(canonical_request.as_bytes()))
-		);
-		let date_key = hmac(format!("AWS4{}", credentials.secret_key).as_bytes(), &date);
-		let region_key = hmac(&date_key, region);
-		let service_key = hmac(&region_key, "s3");
-		let signing_key = hmac(&service_key, "aws4_request");
-		let signature = hex::encode(hmac(&signing_key, &string_to_sign));
-		format!(
-			"AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, \
-			 Signature={signature}",
-			credentials.access_key
-		)
-	}
-
-	fn normalize_header(value: &str) -> String {
-		value.split_whitespace().collect::<Vec<_>>().join(" ")
-	}
-
-	fn hmac(key: &[u8], value: &str) -> [u8; 32] {
-		let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts arbitrary key sizes");
-		mac.update(value.as_bytes());
-		let output = mac.finalize().into_bytes();
-		let mut bytes = [0; 32];
-		bytes.copy_from_slice(&output);
-		bytes
-	}
 }
 
 #[cfg(test)]
@@ -2578,7 +2521,7 @@ mod tests {
 			("x-amz-date".to_owned(), "20130524T000000Z".to_owned()),
 		];
 		let timestamp = Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).single().unwrap();
-		let authorization = sigv4::authorization(
+		let authorization = aws::authorization(
 			"GET",
 			"/test.txt",
 			"",
@@ -2586,7 +2529,9 @@ mod tests {
 			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 			timestamp,
 			"us-east-1",
-			&credentials,
+			"s3",
+			&credentials.access_key,
+			&credentials.secret_key,
 		);
 		assert_eq!(
 			authorization.split("Signature=").nth(1),

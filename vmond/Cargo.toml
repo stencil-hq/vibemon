@@ -3,6 +3,9 @@ name = "vmond"
 version = "0.1.0"
 edition = "2024"
 description = "Vibemon server core: engine, image pipeline, v1 HTTP API, mesh"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 
@@ -46,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 zeroize = "1"
 vmm = { path = "../vmm" }
+vmon-cloud = { path = "../cloud" }
 vmon-proto = { path = "../proto" }
 vmon-agent = { path = "../agent" }
 bytes = "1"

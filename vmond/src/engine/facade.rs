@@ -43,8 +43,8 @@ use crate::{
 		pty::{PtyCache, PtyControl, PtyStream},
 		s3proxy::S3Proxy,
 		spawn::{
-			LaunchSpec, MAX_CPUS, MAX_MEM_MIB, RemoteFsShare, SandboxRuntime, SandboxVm, VmonRuntime,
-			VolumeMount,
+			LaunchSpec, MAX_CPUS, MAX_MEM_MIB, RemoteBlockSpec, RemoteFsShare, SandboxRuntime,
+			SandboxVm, VmonRuntime, VolumeMount,
 		},
 		vpc::{Vpc, VpcRegistry},
 	},
@@ -88,6 +88,23 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const LOG_FOLLOW_POLL: Duration = Duration::from_millis(100);
 const EXEC_CAPTURE_CAP: Duration = Duration::from_mins(1);
 const WARM_VOLUME_SLOTS: u64 = 8;
+
+fn remote_block_spec(
+	remote: &image::RemoteRootfs,
+	cache: PathBuf,
+	index: PathBuf,
+) -> RemoteBlockSpec {
+	RemoteBlockSpec {
+		url: remote.url.clone(),
+		cache,
+		index,
+		size: remote.logical_size,
+		bearer: None,
+		auth: remote.auth,
+		region: remote.region.clone(),
+		etag: remote.etag.clone(),
+	}
+}
 const ALLOWED_HA: [&str; 4] = ["async", "async+rerun", "off", "rerun"];
 const S3_MOUNTS_FILE: &str = "s3-mounts.json";
 const MAX_S3_MOUNTS: usize = 8;
@@ -3730,13 +3747,7 @@ impl Engine {
 			if let Some(parent) = cache.parent() {
 				fs::create_dir_all(parent)?;
 			}
-			spec = spec.with_remote_rootfs(
-				remote.url,
-				cache,
-				index,
-				remote.logical_size,
-				Some(image::gcs_access_token()?),
-			);
+			spec = spec.with_remote_rootfs(remote_block_spec(&remote, cache, index));
 		}
 		if let Some(secs) = plan.timeout_secs {
 			spec = spec.with_timeout_secs(secs);
@@ -3828,13 +3839,7 @@ impl Engine {
 			if let Some(parent) = cache.parent() {
 				fs::create_dir_all(parent)?;
 			}
-			spec = spec.with_remote_rootfs(
-				remote.url,
-				cache,
-				index,
-				remote.logical_size,
-				Some(image::gcs_access_token()?),
-			);
+			spec = spec.with_remote_rootfs(remote_block_spec(&remote, cache, index));
 		}
 		spec = spec
 			.with_mem_mib(u64::from(plan.params.memory))
@@ -7264,13 +7269,7 @@ impl TemplateBooter for Engine {
 				if let Some(parent) = cache.parent() {
 					fs::create_dir_all(parent)?;
 				}
-				launch = launch.with_remote_rootfs(
-					remote.url.clone(),
-					cache,
-					index,
-					remote.logical_size,
-					Some(image::gcs_access_token()?),
-				);
+				launch = launch.with_remote_rootfs(remote_block_spec(remote, cache, index));
 			}
 			if spec.user_net {
 				launch = launch.with_user_net();
