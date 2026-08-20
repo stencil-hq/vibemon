@@ -30,6 +30,10 @@ miniz_oxide = "0.8"
 rayon = "1"
 flume = { version = "0.11", default-features = false }
 vmon-agent = { path = "../agent" }
+zstd = "0.13"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = { version = "0.14", features = ["fam-wrappers", "serde"] }
@@ -37,6 +41,7 @@ kvm-ioctls = "0.25"
 io-uring = "0.7"
 landlock = "0.4"
 seccompiler = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 iommufd-ioctls = "0.2"
