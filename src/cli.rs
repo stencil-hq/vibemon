@@ -784,8 +784,9 @@ struct SchedArgs {
 	/// Worker liveness window in seconds (match workers' --orch-dead-after-sec).
 	#[arg(long, default_value_t = 5.0)]
 	dead_after_sec:         f64,
-	/// Deadline for one worker create attempt, in seconds.
-	#[arg(long, default_value_t = 60.0)]
+	/// Worker-create deadline in seconds. Two minutes leaves margin over cold
+	/// template builds without affecting the other forwarded RPCs.
+	#[arg(long, default_value_t = 120.0)]
 	create_timeout_sec:     f64,
 	/// Additional placement attempts after a rejected create.
 	#[arg(long, default_value_t = 3)]

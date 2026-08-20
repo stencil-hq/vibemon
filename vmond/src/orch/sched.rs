@@ -37,7 +37,7 @@ use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use serde_json::Value;
 use tokio::{
 	sync::{Semaphore, mpsc},
-	time::timeout,
+	time::{Instant, timeout},
 };
 use tonic::{
 	Code, Request, Response, Status, Streaming,
@@ -51,6 +51,12 @@ use super::{
 	redis::Redis,
 	table::{PlacementNeeds, WorkerTable},
 };
+
+/// Default worker-create budget.
+///
+/// Two minutes leaves 31 seconds of margin over the slowest measured cold
+/// template build while keeping stalled creates bounded.
+pub const DEFAULT_CREATE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Mirror of the API layer's uniform message cap.
 const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
@@ -98,7 +104,7 @@ pub struct SchedGrpcOptions {
 
 impl Default for SchedGrpcOptions {
 	fn default() -> Self {
-		Self { worker_token: None, create_timeout: Duration::from_mins(1), create_retries: 3 }
+		Self { worker_token: None, create_timeout: DEFAULT_CREATE_TIMEOUT, create_retries: 3 }
 	}
 }
 
@@ -391,6 +397,72 @@ const fn create_retryable(code: Code) -> bool {
 	matches!(code, Code::Aborted | Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ClientDeadline(Option<Instant>);
+
+impl ClientDeadline {
+	fn from_request<T>(request: &Request<T>) -> Self {
+		let timeout = request
+			.metadata()
+			.get("grpc-timeout")
+			.and_then(|value| value.to_str().ok())
+			.and_then(parse_grpc_timeout);
+		Self(timeout.and_then(|timeout| Instant::now().checked_add(timeout)))
+	}
+
+	fn remaining(self) -> Option<Duration> {
+		self
+			.0
+			.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+	}
+
+	fn attempt_limit(self, configured: Duration) -> Duration {
+		self
+			.remaining()
+			.map_or(configured, |client| configured.max(client))
+	}
+
+	fn apply<T>(self, request: &mut Request<T>) {
+		if let Some(remaining) = self.remaining() {
+			request.set_timeout(remaining);
+		}
+	}
+}
+
+fn parse_grpc_timeout(value: &str) -> Option<Duration> {
+	let (amount, unit) = value.split_at(value.len().checked_sub(1)?);
+	if amount.is_empty() || amount.len() > 8 {
+		return None;
+	}
+	let amount = amount.parse::<u64>().ok()?;
+	match unit {
+		"H" => Some(Duration::from_secs(amount.checked_mul(60 * 60)?)),
+		"M" => Some(Duration::from_secs(amount.checked_mul(60)?)),
+		"S" => Some(Duration::from_secs(amount)),
+		"m" => Some(Duration::from_millis(amount)),
+		"u" => Some(Duration::from_micros(amount)),
+		"n" => Some(Duration::from_nanos(amount)),
+		_ => None,
+	}
+}
+
+fn create_timeout_status(
+	worker: &str,
+	elapsed: Duration,
+	configured: Duration,
+	applied: Duration,
+) -> Status {
+	coded(
+		Code::DeadlineExceeded,
+		"deadline",
+		true,
+		format!(
+			"create on worker {worker} timed out after {elapsed:?} (configured limit {configured:?}, \
+			 applied limit {applied:?})"
+		),
+	)
+}
+
 /// Annotate a sandbox view JSON document with its owner. `JsonView` is
 /// schemaless by contract, so this is additive for every SDK.
 fn annotate_view(json: &str, wid: &str, url: &str) -> String {
@@ -446,6 +518,7 @@ impl SchedGrpc {
 		spec_json: String,
 		no_wait: bool,
 		needs: &PlacementNeeds,
+		client_deadline: ClientDeadline,
 	) -> Result<Response<pb::JsonView>, Status> {
 		let mut tried: Vec<String> = Vec::new();
 		let mut last: Option<Status> = None;
@@ -454,10 +527,14 @@ impl SchedGrpc {
 				break;
 			};
 			let mut client = self.core.sandbox_client(&placement.url)?;
-			let request = self
+			let mut request = self
 				.core
 				.request(pb::CreateSandboxRequest { spec_json: spec_json.clone(), no_wait });
-			let outcome = timeout(self.core.options.create_timeout, client.create(request)).await;
+			client_deadline.apply(&mut request);
+			let configured = self.core.options.create_timeout;
+			let applied = client_deadline.attempt_limit(configured);
+			let started = Instant::now();
+			let outcome = timeout(applied, client.create(request)).await;
 			match outcome {
 				Ok(Ok(response)) => {
 					self.core.created.fetch_add(1, Ordering::Relaxed);
@@ -492,11 +569,11 @@ impl SchedGrpc {
 				Err(_elapsed) => {
 					self.core.table.penalize(&placement.wid, PENALTY);
 					tried.push(placement.wid.clone());
-					last = Some(coded(
-						Code::DeadlineExceeded,
-						"deadline",
-						true,
-						format!("create on worker {} timed out", placement.wid),
+					last = Some(create_timeout_status(
+						&placement.wid,
+						started.elapsed(),
+						configured,
+						applied,
 					));
 				},
 			}
@@ -517,8 +594,13 @@ impl SchedGrpc {
 	}
 
 	/// Wait for the idempotent winner's sandbox and return its view.
-	async fn await_idempotent_winner(&self, key: &str) -> Result<Response<pb::JsonView>, Status> {
-		let deadline = tokio::time::Instant::now() + self.core.options.create_timeout;
+	async fn await_idempotent_winner(
+		&self,
+		key: &str,
+		client_deadline: ClientDeadline,
+	) -> Result<Response<pb::JsonView>, Status> {
+		let deadline =
+			Instant::now() + client_deadline.attempt_limit(self.core.options.create_timeout);
 		loop {
 			match self.core.redis.get(&idem_key(key)).await {
 				Ok(Some(raw)) => {
@@ -570,6 +652,7 @@ impl SchedGrpc {
 	async fn create_one(
 		&self,
 		message: pb::CreateSandboxRequest,
+		client_deadline: ClientDeadline,
 	) -> Result<Response<pb::JsonView>, Status> {
 		let spec: Value = serde_json::from_str(&message.spec_json)
 			.map_err(|_| coded(Code::InvalidArgument, "invalid", false, "invalid create spec JSON"))?;
@@ -591,7 +674,7 @@ impl SchedGrpc {
 				Ok(true) => {
 					// Winner: create, then durably map key → sid.
 					let response = self
-						.place_and_create(message.spec_json, message.no_wait, &needs)
+						.place_and_create(message.spec_json, message.no_wait, &needs, client_deadline)
 						.await;
 					match &response {
 						Ok(view) => {
@@ -612,7 +695,9 @@ impl SchedGrpc {
 					}
 					return response;
 				},
-				Ok(false) => return self.await_idempotent_winner(key).await,
+				Ok(false) => {
+					return self.await_idempotent_winner(key, client_deadline).await;
+				},
 				Err(error) => {
 					// Redis down: degrade to at-least-once rather than fail.
 					tracing::warn!(%error, "orch: idempotency gate unavailable");
@@ -620,7 +705,7 @@ impl SchedGrpc {
 			}
 		}
 		self
-			.place_and_create(message.spec_json, message.no_wait, &needs)
+			.place_and_create(message.spec_json, message.no_wait, &needs, client_deadline)
 			.await
 	}
 
@@ -628,6 +713,7 @@ impl SchedGrpc {
 		self,
 		mut inbound: S,
 		results: mpsc::Sender<Result<pb::BatchCreateResponse, Status>>,
+		client_deadline: ClientDeadline,
 	) where
 		S: futures_util::Stream<Item = Result<pb::BatchCreateRequest, Status>>
 			+ Send
@@ -651,7 +737,7 @@ impl SchedGrpc {
 			tokio::spawn(async move {
 				let _permit = permit;
 				let outcome = match item.create {
-					Some(create) => match this.create_one(create).await {
+					Some(create) => match this.create_one(create, client_deadline).await {
 						Ok(view) => pb::batch_create_response::Outcome::Json(view.into_inner().json),
 						Err(status) => pb::batch_create_response::Outcome::Error(batch_error(&status)),
 					},
@@ -683,9 +769,14 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 		&self,
 		request: Request<Streaming<pb::BatchCreateRequest>>,
 	) -> Result<Response<Self::BatchCreateStream>, Status> {
+		let client_deadline = ClientDeadline::from_request(&request);
 		let inbound = request.into_inner();
 		let (results, outbound) = mpsc::channel(BATCH_RESULT_QUEUE);
-		tokio::spawn(self.clone().run_batch_create(inbound, results));
+		tokio::spawn(
+			self
+				.clone()
+				.run_batch_create(inbound, results, client_deadline),
+		);
 		Ok(Response::new(
 			Box::pin(tokio_stream::wrappers::ReceiverStream::new(outbound)) as Self::BatchCreateStream
 		))
@@ -719,7 +810,8 @@ impl pb::sandbox_service_server::SandboxService for SchedGrpc {
 		&self,
 		request: Request<pb::CreateSandboxRequest>,
 	) -> Result<Response<pb::JsonView>, Status> {
-		self.create_one(request.into_inner()).await
+		let client_deadline = ClientDeadline::from_request(&request);
+		self.create_one(request.into_inner(), client_deadline).await
 	}
 
 	async fn list(
@@ -1536,7 +1628,9 @@ mod tests {
 		))]);
 		let (sender, mut receiver) = mpsc::channel(1);
 
-		scheduler.run_batch_create(inbound, sender).await;
+		scheduler
+			.run_batch_create(inbound, sender, ClientDeadline::default())
+			.await;
 
 		let status = receiver
 			.recv()
@@ -1546,6 +1640,40 @@ mod tests {
 		assert_eq!(status.code(), Code::DataLoss);
 		assert_eq!(status.message(), "broken inbound stream");
 		assert!(receiver.recv().await.is_none(), "terminal error closes the stream");
+	}
+
+	#[test]
+	fn create_deadline_uses_configuration_and_names_the_limit() {
+		let configured = Duration::from_millis(37);
+		let deadline = ClientDeadline::default();
+		assert_eq!(deadline.attempt_limit(configured), configured);
+
+		let status = create_timeout_status("worker-a", configured, configured, configured);
+		assert_eq!(status.code(), Code::DeadlineExceeded);
+		assert_eq!(
+			status.message(),
+			"create on worker worker-a timed out after 37ms (configured limit 37ms, applied limit \
+			 37ms)"
+		);
+	}
+
+	#[test]
+	fn client_grpc_deadline_extends_and_is_forwarded() {
+		let mut inbound = Request::new(());
+		inbound.set_timeout(Duration::from_mins(5));
+		let deadline = ClientDeadline::from_request(&inbound);
+		assert!(deadline.attempt_limit(Duration::from_mins(2)) > Duration::from_mins(4));
+
+		let mut outbound = Request::new(());
+		deadline.apply(&mut outbound);
+		let forwarded = outbound
+			.metadata()
+			.get("grpc-timeout")
+			.and_then(|value| value.to_str().ok())
+			.and_then(parse_grpc_timeout)
+			.expect("forwarded grpc timeout");
+		assert!(forwarded > Duration::from_mins(4));
+		assert!(forwarded <= Duration::from_mins(5));
 	}
 
 	#[test]

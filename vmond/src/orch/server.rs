@@ -38,7 +38,7 @@ use super::{
 	dashboard, keys,
 	miniredis::MiniRedis,
 	redis::{Redis, StreamFollower},
-	sched::{SchedCore, SchedGrpc, SchedGrpcOptions},
+	sched::{DEFAULT_CREATE_TIMEOUT, SchedCore, SchedGrpc, SchedGrpcOptions},
 	table::{TableConfig, WorkerTable},
 };
 use crate::{EngineError, Result, security::Principal};
@@ -65,7 +65,8 @@ pub struct SchedulerOptions {
 	pub worker_token:   Option<String>,
 	/// Worker liveness window (matches the workers' `--orch-dead-after-sec`).
 	pub dead_after:     Duration,
-	/// Deadline for one worker create attempt.
+	/// Worker-create deadline; defaults to two minutes so measured cold template
+	/// builds have margin without slowing ordinary operations.
 	pub create_timeout: Duration,
 	/// Additional placement attempts after a rejected create.
 	pub create_retries: usize,
@@ -81,7 +82,7 @@ impl Default for SchedulerOptions {
 			token:          None,
 			worker_token:   None,
 			dead_after:     Duration::from_secs(5),
-			create_timeout: Duration::from_mins(1),
+			create_timeout: DEFAULT_CREATE_TIMEOUT,
 			create_retries: 3,
 			autoscaler:     None,
 		}
