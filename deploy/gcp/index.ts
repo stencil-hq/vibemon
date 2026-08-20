@@ -76,8 +76,10 @@ const stateMachineType =
   config.get("stateMachineType") ??
   (arch === "arm64" ? "t2a-standard-1" : "e2-small");
 const schedulerCount = config.getNumber("schedulerCount") ?? 1;
-/** Per-worker admission cap (0 = memory-bound only). */
-const maxSandboxesPerWorker = config.getNumber("maxSandboxesPerWorker") ?? 3;
+/** Optional per-worker hard admission ceiling; zero leaves admission memory-bound. */
+const maxSandboxesPerWorker = config.getNumber("maxSandboxesPerWorker") ?? 0;
+/** Host memory retained for the daemon, kernel, page cache, and CoW divergence. */
+const memoryReserveMiB = config.getNumber("memoryReserveMiB") ?? 32_768;
 /** Preallocated per-worker TAP/network slots for create-path admission. */
 const netSlots = config.getNumber("netSlots") ?? 256;
 /** Autoscaler target memory utilization (0, 1]. */
@@ -338,6 +340,7 @@ VMON_ORCH_REDIS=${redisUrl}
 VMON_ORCH_ID=$INSTANCE_NAME
 VMON_ORCH_URL=http://$PRIVATE_IP:${workerPort}
 VMON_ORCH_MAX_SANDBOXES=${maxSandboxesPerWorker}
+VMON_ORCH_MEMORY_RESERVE_MIB=${memoryReserveMiB}
 VMON_NETWORK_BROKER_SOCKET=/run/vmon/broker.sock
 VMON_NET_SLOTS=${netSlots}
 # Postgres is provisioned for cluster_mode=production, which additionally

@@ -1647,7 +1647,12 @@ mod tests {
 		let tmp = TestDir::new();
 		let base_path = tmp.path().join("sparse-base.img");
 		let dest_path = tmp.path().join("sparse-overlay.img");
-		let base = File::create(&base_path).expect("create sparse base");
+		let base = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(&base_path)
+			.expect("create sparse base");
 		let logical_len = 8u64 << 30;
 		base.set_len(logical_len).expect("size sparse base");
 		base
@@ -1656,7 +1661,12 @@ mod tests {
 		base
 			.write_all_at(b"back", logical_len - 4096)
 			.expect("write back extent");
-		let dest = File::create(&dest_path).expect("create sparse destination");
+		let dest = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.open(&dest_path)
+			.expect("create sparse destination");
 
 		assert!(
 			sparse_copy_extents(&base, &dest).expect("copy sparse extents"),

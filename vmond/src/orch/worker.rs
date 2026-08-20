@@ -76,8 +76,8 @@ pub struct OrchWorkerOptions {
 	/// Optional operator safety ceiling; zero lets measured memory govern
 	/// admission.
 	pub max_sandboxes:      u64,
-	/// Available memory reserved so CoW divergence cannot starve host services.
-	/// Zero disables the reserve.
+	/// Available memory reserved so `CoW` divergence cannot starve host
+	/// services.
 	pub memory_reserve_mib: u64,
 }
 

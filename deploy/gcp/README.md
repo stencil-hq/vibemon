@@ -66,14 +66,22 @@ pulumi up
 | `assetsUrl` / `assetsGcsUri` | none | tarball extracted to `/var/lib/vmon/assets` |
 | `arch` | `x86_64` | `x86_64` or `arm64`; `arm64` demands a `-metal` worker type |
 | `workerMin` / `workerMax` | 1 / 4 | MIG bounds; the vmon autoscaler moves target size within them |
-| `workerMachineType` | `n2-standard-8` | **must support nested virt** (Intel) or be `-metal` |
+| `workerMachineType` | `n2-standard-32` | **must support nested virt** (Intel) or be `-metal` |
+| `workerDiskGb` | 500 | worker boot disk capacity in GiB (`pd-balanced`) |
 | `schedulerCount` | 1 | scheduler instances (each gets a static IP); N×M needs no LB |
 | `schedulerMachineType` | `e2-small` / `t2a-standard-1` | |
 | `stateMachineType` | `e2-small` / `t2a-standard-1` | Redis + Postgres box |
-| `maxSandboxesPerWorker` | 0 | worker admission cap (0 = memory-bound) |
+| `maxSandboxesPerWorker` | 0 | optional worker admission hard ceiling; 0 disables the count cap |
+| `memoryReserveMiB` | 32768 | refuse creates when actual host-available memory reaches this reserve |
 | `netSlots` | 256 | preallocated TAP/network slots per worker (0 disables pooling) |
 | `targetUtil` | 0.7 | autoscaler target memory utilization |
 | `allowedCidr` | `0.0.0.0/0` | who may reach sched :8100 and worker :8000 |
+
+The 32 GiB reserve matches one fleet-standard guest: it leaves enough headroom for a guest's
+shared pages to become private between admission samples, as well as for the worker daemon,
+kernel, and page cache. Admission uses current host-available memory rather than charging
+every sandbox its configured guest RAM, so idle forked sandboxes can share pages without
+hiding memory dirtied under load.
 
 The scheduler's service account carries a custom role with exactly the
 resize/delete permissions, and GCS artifact access is a per-bucket

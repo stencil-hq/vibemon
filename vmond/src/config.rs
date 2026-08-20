@@ -155,8 +155,8 @@ pub struct ServeConfig {
 	/// Optional operator safety ceiling; zero lets measured memory govern
 	/// admission.
 	pub orch_max_sandboxes: u64,
-	/// Available memory reserved so CoW divergence cannot starve host services,
-	/// in MiB. Zero disables the reserve.
+	/// Available memory reserved so `CoW` divergence cannot starve host
+	/// services, in MiB.
 	pub orch_memory_reserve_mib: u64,
 	/// Cluster substrate mode.
 	pub cluster_mode: ClusterMode,
@@ -280,7 +280,7 @@ impl Default for ServeConfig {
 			orch_heartbeat_sec: 1.0,
 			orch_dead_after_sec: 5.0,
 			orch_max_sandboxes: 0,
-			orch_memory_reserve_mib: 0,
+			orch_memory_reserve_mib: 32_768,
 			cluster_mode: ClusterMode::default(),
 			postgres_url: None,
 			s3_endpoint: None,
@@ -1435,7 +1435,7 @@ mod tests {
 		assert_eq!(config.orch_heartbeat_sec, 1.0);
 		assert_eq!(config.orch_dead_after_sec, 5.0);
 		assert_eq!(config.orch_max_sandboxes, 0);
-		assert_eq!(config.orch_memory_reserve_mib, 0);
+		assert_eq!(config.orch_memory_reserve_mib, 32_768);
 		assert_eq!(config.source("orch_redis"), Some(ConfigSource::Default));
 
 		EnvGuard::set("VMON_ORCH_REDIS", "redis://cache:6379");

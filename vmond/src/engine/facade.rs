@@ -658,14 +658,14 @@ impl CreateRollback {
 		&self.vm
 	}
 
-	fn runtime(&self) -> &RuntimeState {
+	const fn runtime(&self) -> &RuntimeState {
 		self
 			.runtime
 			.as_ref()
 			.expect("create runtime remains guarded until publication")
 	}
 
-	fn runtime_mut(&mut self) -> &mut RuntimeState {
+	const fn runtime_mut(&mut self) -> &mut RuntimeState {
 		self
 			.runtime
 			.as_mut()
@@ -2022,7 +2022,12 @@ impl Engine {
 		let generation = transition.generation;
 		let vm = self.sandbox(&record.name);
 		if lifecycle.desired == LifecyclePhase::Running && !pid_alive {
-			if let Some(mut runtime) = self.inner.runtimes.lock().remove(&record.id) {
+			// Drop the runtimes guard before doing any teardown: both branches below
+			// can re-enter runtime/network bookkeeping, and holding the map lock
+			// across them risks self-deadlock and needlessly blocks every other
+			// sandbox operation.
+			let lost_runtime = self.inner.runtimes.lock().remove(&record.id);
+			if let Some(mut runtime) = lost_runtime {
 				self.rollback_uncommitted_runtime(&vm, &mut runtime, true);
 			} else {
 				teardown_network(&record.name);
@@ -3541,7 +3546,7 @@ impl Engine {
 			if let Some(probe) = &plan.params.readiness_probe {
 				Self::wait_until_ready(
 					&agent,
-					&runtime,
+					runtime,
 					probe,
 					plan.params.timeout.unwrap_or(300.0),
 					cancellation.as_deref(),
@@ -3582,7 +3587,7 @@ impl Engine {
 			if let Some(activity_threshold_bytes) = plan.params.activity_threshold_bytes {
 				meta.insert("activity_threshold_bytes".to_owned(), json!(activity_threshold_bytes));
 			}
-			meta.insert("runtime_identity".to_owned(), runtime_identity(&runtime));
+			meta.insert("runtime_identity".to_owned(), runtime_identity(runtime));
 			vm.save_meta(meta)?;
 			Ok(())
 		})();
@@ -5899,7 +5904,7 @@ impl Engine {
 		let now = unix_time();
 		let record = VmRecord {
 			id: sid.clone(),
-			name: sid.clone(),
+			name: sid,
 			status: "paused".to_owned(),
 			pid: meta
 				.get("pid")
