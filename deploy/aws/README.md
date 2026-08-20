@@ -15,9 +15,9 @@ source of truth) and Postgres (vmond's cluster substrate). Redundancy for the
 state box is explicitly out of scope; losing it degrades scheduling freshness
 and durable metadata, not running sandboxes.
 
-The one thing you cannot cheap out on: **workers must be `*.metal` instances**
-— EC2 exposes `/dev/kvm` only on bare metal. That is the dominant line item;
-size `workerMin`/`workerMax` accordingly.
+Workers need `/dev/kvm`: supported x86 instance families use EC2 nested
+virtualization, while Arm workers require `*.metal`. Size
+`workerMin`/`workerMax` around that constraint.
 
 ## Autoscaling (the part that actually moves)
 
@@ -61,14 +61,22 @@ pulumi up
 | `assetsUrl` | none | tarball extracted to `/var/lib/vmon/assets` |
 | `arch` | `arm64` | `arm64` or `x86_64`; picks AMI + instance-type defaults |
 | `workerMin` / `workerMax` | 1 / 4 | ASG bounds; the vmon autoscaler moves desired within them |
-| `workerInstanceType` | `c7g.metal` / `c5.metal` | **must be metal** |
+| `workerInstanceType` | `c7g.metal` / `m7i.2xlarge` | Arm requires metal; x86 uses nested virtualization |
+| `workerDiskGb` | 500 | worker boot disk capacity in GiB (`gp3`) |
 | `schedulerCount` | 1 | scheduler instances (each gets an EIP); N×M needs no LB |
 | `schedulerInstanceType` | `t4g.small` / `t3.small` | |
 | `stateInstanceType` | `t4g.small` / `t3.small` | Redis + Postgres box |
-| `maxSandboxesPerWorker` | 0 | worker admission cap (0 = memory-bound) |
+| `maxSandboxesPerWorker` | 0 | optional worker admission hard ceiling; 0 disables the count cap |
+| `memoryReserveMiB` | 32768 / 8192 | reserve for Arm / x86 defaults; refuse creates at this host-available-memory threshold |
 | `netSlots` | 256 | preallocated TAP/network slots per worker (0 disables pooling) |
 | `targetUtil` | 0.7 | autoscaler target memory utilization |
 | `allowedCidr` | `0.0.0.0/0` | who may reach sched :8100 and worker :8000 |
+
+The reserve defaults are sized for the default Arm and x86 worker families.
+Override `memoryReserveMiB` when selecting a different instance size.
+Admission uses current host-available memory rather than charging every sandbox
+its configured guest RAM, preserving CoW sharing while retaining headroom for
+the worker daemon, kernel, page cache, and dirty guest pages.
 
 ## Connect
 

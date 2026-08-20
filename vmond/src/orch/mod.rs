@@ -88,7 +88,7 @@ pub mod keys {
 pub struct Resources {
 	/// Virtual CPUs (capacity) or vCPUs handed to running sandboxes (usage).
 	pub vcpus:   u64,
-	/// Guest memory in MiB.
+	/// Memory in MiB: total host capacity or measured host use in heartbeats.
 	pub mem_mib: u64,
 }
 

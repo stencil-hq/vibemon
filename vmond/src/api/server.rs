@@ -162,6 +162,7 @@ fn start_orch_worker(
 		heartbeat: Duration::from_secs_f64(config.orch_heartbeat_sec),
 		dead_after: Duration::from_secs_f64(config.orch_dead_after_sec),
 		max_sandboxes: config.orch_max_sandboxes,
+		memory_reserve_mib: config.orch_memory_reserve_mib,
 	})?;
 	drop(worker.spawn(state.engine.clone()));
 	Ok(Some(worker))

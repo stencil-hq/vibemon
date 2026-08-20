@@ -152,8 +152,12 @@ pub struct ServeConfig {
 	pub orch_heartbeat_sec: f64,
 	/// Age in seconds after which an unrefreshed worker key expires.
 	pub orch_dead_after_sec: f64,
-	/// Maximum concurrent sandboxes admitted in orch mode; zero is unlimited.
+	/// Optional operator safety ceiling; zero lets measured memory govern
+	/// admission.
 	pub orch_max_sandboxes: u64,
+	/// Available memory reserved so CoW divergence cannot starve host services,
+	/// in MiB. Zero disables the reserve.
+	pub orch_memory_reserve_mib: u64,
 	/// Cluster substrate mode.
 	pub cluster_mode: ClusterMode,
 	/// `PostgreSQL` connection URL.
@@ -276,6 +280,7 @@ impl Default for ServeConfig {
 			orch_heartbeat_sec: 1.0,
 			orch_dead_after_sec: 5.0,
 			orch_max_sandboxes: 0,
+			orch_memory_reserve_mib: 0,
 			cluster_mode: ClusterMode::default(),
 			postgres_url: None,
 			s3_endpoint: None,
@@ -335,6 +340,7 @@ pub const SERVE_CONFIG_KEYS: &[&str] = &[
 	"orch_heartbeat_sec",
 	"orch_dead_after_sec",
 	"orch_max_sandboxes",
+	"orch_memory_reserve_mib",
 	"cluster_mode",
 	"postgres_url",
 	"s3_endpoint",
@@ -391,6 +397,7 @@ pub const ENV_KEYS: &[(&str, &str)] = &[
 	("orch_heartbeat_sec", "VMON_ORCH_HEARTBEAT_SEC"),
 	("orch_dead_after_sec", "VMON_ORCH_DEAD_AFTER_SEC"),
 	("orch_max_sandboxes", "VMON_ORCH_MAX_SANDBOXES"),
+	("orch_memory_reserve_mib", "VMON_ORCH_MEMORY_RESERVE_MIB"),
 	("cluster_mode", "VMON_CLUSTER_MODE"),
 	("postgres_url", "VMON_POSTGRES_URL"),
 	("s3_endpoint", "VMON_S3_ENDPOINT"),
@@ -447,6 +454,7 @@ pub const CLI_OPTIONS: &[(&str, &str)] = &[
 	("orch_heartbeat_sec", "--orch-heartbeat-sec"),
 	("orch_dead_after_sec", "--orch-dead-after-sec"),
 	("orch_max_sandboxes", "--orch-max-sandboxes"),
+	("orch_memory_reserve_mib", "--orch-memory-reserve-mib"),
 	("cluster_mode", "--cluster-mode"),
 	("postgres_url", "--postgres-url"),
 	("s3_endpoint", "--s3-endpoint"),
@@ -804,6 +812,13 @@ fn apply_value(
 				return Err(EngineError::invalid("orch_max_sandboxes must be non-negative"));
 			}
 			config.orch_max_sandboxes = parsed as u64;
+		},
+		"orch_memory_reserve_mib" => {
+			let parsed = coerce_int(key, value)?;
+			if parsed < 0 {
+				return Err(EngineError::invalid("orch_memory_reserve_mib must be non-negative"));
+			}
+			config.orch_memory_reserve_mib = parsed as u64;
 		},
 		"cluster_mode" => {
 			config.cluster_mode = ClusterMode::parse(&coerce_string(key, value)?)?;
@@ -1420,15 +1435,19 @@ mod tests {
 		assert_eq!(config.orch_heartbeat_sec, 1.0);
 		assert_eq!(config.orch_dead_after_sec, 5.0);
 		assert_eq!(config.orch_max_sandboxes, 0);
+		assert_eq!(config.orch_memory_reserve_mib, 0);
 		assert_eq!(config.source("orch_redis"), Some(ConfigSource::Default));
 
 		EnvGuard::set("VMON_ORCH_REDIS", "redis://cache:6379");
 		EnvGuard::set("VMON_ORCH_MAX_SANDBOXES", "16");
+		EnvGuard::set("VMON_ORCH_MEMORY_RESERVE_MIB", "8192");
 		let env_config = resolve_serve_config(&HashMap::new()).expect("env config");
 		assert_eq!(env_config.orch_redis.as_deref(), Some("redis://cache:6379"));
 		assert_eq!(env_config.orch_max_sandboxes, 16);
+		assert_eq!(env_config.orch_memory_reserve_mib, 8192);
 		assert_eq!(env_config.source("orch_redis"), Some(ConfigSource::Env));
 		assert_eq!(env_config.source("orch_max_sandboxes"), Some(ConfigSource::Env));
+		assert_eq!(env_config.source("orch_memory_reserve_mib"), Some(ConfigSource::Env));
 
 		// A CLI empty string disables the env-provided endpoint.
 		let cli_config = resolve_serve_config(&HashMap::from([
@@ -1446,9 +1465,12 @@ mod tests {
 		assert_eq!(cli_config.orch_dead_after_sec, 2.5);
 		assert_eq!(cli_config.source("orch_url"), Some(ConfigSource::Flag));
 
-		for (key, value) in
-			[("orch_heartbeat_sec", "0"), ("orch_dead_after_sec", "-1"), ("orch_max_sandboxes", "-2")]
-		{
+		for (key, value) in [
+			("orch_heartbeat_sec", "0"),
+			("orch_dead_after_sec", "-1"),
+			("orch_max_sandboxes", "-2"),
+			("orch_memory_reserve_mib", "-2"),
+		] {
 			let overrides = HashMap::from([(key.to_owned(), value.to_owned())]);
 			let err = resolve_serve_config(&overrides).expect_err("bad orch value");
 			assert!(err.message.contains(key), "expected {key:?} in error {:?}", err.message);

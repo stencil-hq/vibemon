@@ -546,15 +546,16 @@ async fn start_stub_worker(redis_url: &str, wid: &str, capacity: usize) -> StubH
 	});
 
 	let worker = OrchWorker::new(OrchWorkerOptions {
-		redis_url:     redis_url.to_owned(),
-		wid:           wid.to_owned(),
-		url:           format!("http://{addr}"),
-		arch:          "testarch".to_owned(),
-		backend:       "test".to_owned(),
-		caps:          Resources { vcpus: 8, mem_mib: 4096 },
-		heartbeat:     Duration::from_millis(200),
-		dead_after:    Duration::from_secs(1),
-		max_sandboxes: u64::try_from(capacity).expect("capacity fits u64"),
+		redis_url:          redis_url.to_owned(),
+		wid:                wid.to_owned(),
+		url:                format!("http://{addr}"),
+		arch:               "testarch".to_owned(),
+		backend:            "test".to_owned(),
+		caps:               Resources { vcpus: 8, mem_mib: 4096 },
+		heartbeat:          Duration::from_millis(200),
+		dead_after:         Duration::from_secs(1),
+		max_sandboxes:      u64::try_from(capacity).expect("capacity fits u64"),
+		memory_reserve_mib: 0,
 	})
 	.expect("orch worker");
 	let routes = worker.spawn_route_writer();
@@ -645,13 +646,10 @@ fn scheduler_options(marker: &std::path::Path) -> SchedulerOptions {
 		create_timeout: Duration::from_secs(5),
 		create_retries: 3,
 		autoscaler:     Some(AutoscalerOptions {
-			// `min` is 2, not 0: at startup the fleet is idle (util 0), and a
-			// lower clamp below the live count would plan an immediate
-			// scale-down that drains both stub workers (15-minute drain keys)
-			// before the test creates anything. Clamping at the fleet size
-			// keeps the Down path unreachable while leaving the Up-path math
-			// untouched: 4×512 MiB / 2×4096 MiB = 0.25 util ≥ 0.1 target →
-			// desired = ceil(2 × 0.25 / 0.1) = 5, clamped to max = 4.
+			// Keep the lower clamp at the live fleet size so an idle test host
+			// cannot trigger scale-down and drain both stub workers. Worker
+			// heartbeats report measured host memory, not configured guest RAM,
+			// so the sandboxes below do not manufacture scale-up pressure.
 			min: 2,
 			max: 4,
 			target_util: 0.1,
@@ -857,13 +855,10 @@ async fn orchestration_end_to_end() {
 	);
 	drop(tx);
 
-	// 10. Autoscaler: leader lease + HPA policy + scale-up hook. With four
-	// 512 MiB sandboxes on 2×4096 MiB the utilization is 0.25 ≥ 0.1, so the
-	// hook must eventually publish desired = 4 (5 clamped to max).
-	wait_until("autoscaler scale-up hook writes desired=4", Duration::from_secs(25), async || {
-		std::fs::read_to_string(&marker).is_ok_and(|content| content.trim() == "4")
-	})
-	.await;
+	// 10. Autoscaler: configured guest RAM is not treated as resident host
+	// memory. The preceding multi-second scenario spans several autoscaler
+	// ticks; low measured host use must not invoke the scale-up hook.
+	assert!(!marker.exists(), "idle CoW guest allocations must not manufacture autoscaler pressure");
 
 	// 11. Worker death: kill stub A and its publisher; the leader's
 	// controller must reap it and mark its sandboxes lost.

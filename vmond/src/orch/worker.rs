@@ -20,14 +20,23 @@
 //! accept/reject semantics: an [`AdmitGuard`] reserves one inflight slot for
 //! the duration of a create dispatch.
 
+#[cfg(target_os = "linux")]
+use std::io::Read as _;
+#[cfg(target_os = "macos")]
+use std::mem::MaybeUninit;
 use std::{
 	collections::HashSet,
+	io,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::Duration,
 };
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+	fn mach_host_self() -> libc::mach_port_t;
+}
 
 use dashmap::DashMap;
 use serde_json::Value;
@@ -49,23 +58,27 @@ const ROUTE_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Static identity and tuning for one orchestration worker.
 pub struct OrchWorkerOptions {
 	/// `redis://` endpoint of the orchestration datastore.
-	pub redis_url:     String,
+	pub redis_url:          String,
 	/// Stable worker id.
-	pub wid:           String,
+	pub wid:                String,
 	/// Advertised base URL schedulers dial.
-	pub url:           String,
+	pub url:                String,
 	/// Normalized host architecture (`aarch64` / `x86_64`).
-	pub arch:          String,
+	pub arch:               String,
 	/// Hypervisor backend (`kvm` / `hvf`).
-	pub backend:       String,
+	pub backend:            String,
 	/// Advertised hard capacity.
-	pub caps:          Resources,
+	pub caps:               Resources,
 	/// Heartbeat publish cadence.
-	pub heartbeat:     Duration,
+	pub heartbeat:          Duration,
 	/// TTL on the self-expiring worker key; missing key means dead.
-	pub dead_after:    Duration,
-	/// Maximum concurrent sandboxes admitted; zero is unlimited.
-	pub max_sandboxes: u64,
+	pub dead_after:         Duration,
+	/// Optional operator safety ceiling; zero lets measured memory govern
+	/// admission.
+	pub max_sandboxes:      u64,
+	/// Available memory reserved so CoW divergence cannot starve host services.
+	/// Zero disables the reserve.
+	pub memory_reserve_mib: u64,
 }
 
 /// Reservation of one admission slot; dropping it releases the slot.
@@ -158,11 +171,19 @@ impl OrchWorker {
 
 	/// Reserve one admission slot for an incoming sandbox create.
 	///
-	/// Rejects with [`EngineError::busy`] while draining or when the
-	/// configured capacity (last published running count plus inflight
-	/// creates) is exhausted. The guard owns the worker, so it may outlive
-	/// the RPC that reserved it (background `no_wait` boots).
+	/// Rejects with [`EngineError::busy`] while draining, when actual host
+	/// available memory has reached the configured reserve, or when the
+	/// optional hard count ceiling (last published running count plus inflight
+	/// creates) is exhausted. The guard owns the worker, so it may outlive the
+	/// RPC that reserved it (background `no_wait` boots).
 	pub fn admit(self: &Arc<Self>) -> Result<AdmitGuard> {
+		let available_mib = host_available_memory_mib().map_err(|error| {
+			EngineError::busy(format!("worker memory headroom unavailable: {error}"))
+		})?;
+		self.admit_with_available(available_mib)
+	}
+
+	fn admit_with_available(self: &Arc<Self>, available_mib: u64) -> Result<AdmitGuard> {
 		if self.draining.load(Ordering::SeqCst) {
 			return Err(EngineError::busy("worker is draining"));
 		}
@@ -171,6 +192,14 @@ impl OrchWorker {
 		if max > 0 && self.live_count() + reserved >= max {
 			self.inflight.fetch_sub(1, Ordering::SeqCst);
 			return Err(EngineError::busy(format!("worker at capacity ({max} sandboxes)")));
+		}
+		let reserve_mib = self.options.memory_reserve_mib;
+		if available_mib <= reserve_mib {
+			self.inflight.fetch_sub(1, Ordering::SeqCst);
+			return Err(EngineError::busy(format!(
+				"worker memory reserve reached ({available_mib} MiB available, {reserve_mib} MiB \
+				 reserved)"
+			)));
 		}
 		Ok(AdmitGuard { worker: Arc::clone(self) })
 	}
@@ -184,22 +213,35 @@ impl OrchWorker {
 			.count() as u64
 	}
 
-	/// Derive one counters-only heartbeat from engine sandbox views. Pure
-	/// with respect to Redis: only the per-process sequence counter advances.
+	/// Derive one counters-only heartbeat from engine sandbox views and actual
+	/// host memory pressure. No Redis I/O happens; only the sequence advances.
 	pub fn build_heartbeat(&self, views: &[Value]) -> WorkerHeartbeat {
+		self.build_heartbeat_with_available(views, host_available_memory_mib().ok())
+	}
+
+	fn build_heartbeat_with_available(
+		&self,
+		views: &[Value],
+		available_memory_mib: Option<u64>,
+	) -> WorkerHeartbeat {
 		let mut running = 0_u64;
 		let mut used = Resources::default();
 		for view in views {
 			if is_live_state(view_state(view)) {
 				running += 1;
 				used.vcpus += view.get("cpus").and_then(Value::as_u64).unwrap_or(0);
-				used.mem_mib += view.get("memory").and_then(Value::as_u64).unwrap_or(0);
 			}
 		}
+		used.mem_mib = available_memory_mib.map_or(self.options.caps.mem_mib, |available| {
+			self.options.caps.mem_mib.saturating_sub(available)
+		});
 		let draining = self.draining.load(Ordering::SeqCst);
 		let inflight = self.inflight.load(Ordering::SeqCst);
 		let max = self.options.max_sandboxes;
-		let accepting = !draining && (max == 0 || running + inflight < max);
+		let below_count_ceiling = max == 0 || running + inflight < max;
+		let has_memory_headroom =
+			available_memory_mib.is_some_and(|available| available > self.options.memory_reserve_mib);
+		let accepting = !draining && below_count_ceiling && has_memory_headroom;
 		let (net_rx_bytes, net_tx_bytes) = match crate::net::host_network_bytes() {
 			Some((rx, tx)) => (Some(rx), Some(tx)),
 			None => (None, None),
@@ -407,6 +449,72 @@ impl OrchWorker {
 	}
 }
 
+#[cfg(target_os = "linux")]
+fn host_available_memory_mib() -> io::Result<u64> {
+	let mut meminfo = [0_u8; 4096];
+	let mut file = std::fs::File::open("/proc/meminfo")?;
+	let mut filled = 0;
+	while filled < meminfo.len() {
+		let read = file.read(&mut meminfo[filled..])?;
+		if read == 0 {
+			break;
+		}
+		filled += read;
+	}
+	let meminfo = std::str::from_utf8(&meminfo[..filled])
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+	parse_linux_available_memory_mib(meminfo).ok_or_else(|| {
+		io::Error::new(io::ErrorKind::InvalidData, "/proc/meminfo has no valid MemAvailable")
+	})
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_available_memory_mib(meminfo: &str) -> Option<u64> {
+	let kib = meminfo.lines().find_map(|line| {
+		let value = line.strip_prefix("MemAvailable:")?;
+		value.split_whitespace().next()?.parse::<u64>().ok()
+	})?;
+	Some(kib / 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn host_available_memory_mib() -> io::Result<u64> {
+	let mut stats = MaybeUninit::<libc::vm_statistics64_data_t>::uninit();
+	let mut count = libc::HOST_VM_INFO64_COUNT;
+	// SAFETY: `stats` points to storage sized for `HOST_VM_INFO64_COUNT`; Mach
+	// initializes it on success and `count` is a valid in/out pointer.
+	let status = unsafe {
+		libc::host_statistics64(
+			mach_host_self(),
+			libc::HOST_VM_INFO64,
+			stats.as_mut_ptr().cast::<libc::integer_t>(),
+			&raw mut count,
+		)
+	};
+	if status != libc::KERN_SUCCESS {
+		return Err(io::Error::other(format!("host_statistics64 failed ({status})")));
+	}
+	// SAFETY: a successful `host_statistics64` initialized the structure.
+	let stats = unsafe { stats.assume_init() };
+	// `inactive` and `speculative` pages are reclaimable without swapping.
+	let available_pages = u64::from(stats.free_count)
+		.saturating_add(u64::from(stats.inactive_count))
+		.saturating_add(u64::from(stats.speculative_count));
+	// SAFETY: `sysconf` takes an integer name and returns process-global data.
+	let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+	let page_size =
+		u64::try_from(page_size).map_err(|_| io::Error::other("invalid host page size"))?;
+	Ok(available_pages.saturating_mul(page_size) / 1_048_576)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn host_available_memory_mib() -> io::Result<u64> {
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"host available-memory probing is unsupported on this platform",
+	))
+}
+
 /// Sandbox id used on the wire: `name` when present, else `id`.
 fn view_sid(view: &Value) -> &str {
 	view
@@ -462,6 +570,7 @@ mod tests {
 			heartbeat: Duration::from_millis(10),
 			dead_after: Duration::from_millis(250),
 			max_sandboxes,
+			memory_reserve_mib: 0,
 		})
 		.expect("worker")
 	}
@@ -478,33 +587,83 @@ mod tests {
 			view("sb-b", "paused", 1, 512),
 			view("sb-c", "stopped", 4, 4096),
 		];
-		let heartbeat = worker.build_heartbeat(&views);
+		let heartbeat = worker.build_heartbeat_with_available(&views, Some(8192));
 		assert_eq!(heartbeat.running, 2, "stopped views must not count");
-		assert_eq!(heartbeat.used, Resources { vcpus: 3, mem_mib: 1536 });
+		assert_eq!(heartbeat.used, Resources { vcpus: 3, mem_mib: 8192 });
 		assert_eq!(heartbeat.caps, Resources { vcpus: 8, mem_mib: 16_384 });
-		assert!(heartbeat.accepting, "unlimited worker always accepts");
+		assert!(heartbeat.accepting, "unlimited worker with headroom accepts");
 		assert!(!heartbeat.draining);
 		assert!(heartbeat.ts_ms > 0 && heartbeat.ts_ms <= now_ms());
-		let next = worker.build_heartbeat(&views);
+		let next = worker.build_heartbeat_with_available(&views, Some(8192));
 		assert_eq!(next.seq, heartbeat.seq + 1, "seq advances per heartbeat");
 
 		let bounded = self::worker("redis://127.0.0.1:1", 2);
-		assert!(!bounded.build_heartbeat(&views).accepting, "2 live >= max 2");
-		assert!(bounded.build_heartbeat(&views[1..]).accepting, "1 live < max 2");
+		assert!(
+			!bounded
+				.build_heartbeat_with_available(&views, Some(8192))
+				.accepting,
+			"2 live >= max 2"
+		);
+		assert!(
+			bounded
+				.build_heartbeat_with_available(&views[1..], Some(8192))
+				.accepting,
+			"1 live < max 2"
+		);
 	}
 
 	#[test]
-	fn admission_enforces_capacity_and_drain() {
-		let worker = worker("redis://127.0.0.1:1", 2);
-		let first = worker.admit().expect("first slot");
-		let _second = worker.admit().expect("second slot");
-		let rejected = worker.admit().expect_err("third must reject");
+	fn admission_uses_memory_headroom_and_optional_count_ceiling() {
+		let memory_bound = worker("redis://127.0.0.1:1", 0);
+		let mut guards = Vec::new();
+		for _ in 0..32 {
+			guards.push(
+				memory_bound
+					.admit_with_available(32_768)
+					.expect("ample headroom must allow well past three sandboxes"),
+			);
+		}
+		assert_eq!(memory_bound.inflight.load(Ordering::SeqCst), 32);
+		drop(guards);
+
+		let mut reserved = worker("redis://127.0.0.1:1", 0);
+		Arc::get_mut(&mut reserved)
+			.expect("sole worker reference")
+			.options
+			.memory_reserve_mib = 16_384;
+		let rejected = reserved
+			.admit_with_available(16_384)
+			.expect_err("admission must reject at the reserve");
+		assert_eq!(rejected.code, ErrorCode::Busy);
+		assert_eq!(reserved.inflight.load(Ordering::SeqCst), 0);
+		let _headroom = reserved
+			.admit_with_available(16_385)
+			.expect("one MiB above the reserve remains admissible");
+
+		let bounded = worker("redis://127.0.0.1:1", 2);
+		let first = bounded.admit_with_available(u64::MAX).expect("first slot");
+		let _second = bounded.admit_with_available(u64::MAX).expect("second slot");
+		let rejected = bounded
+			.admit_with_available(u64::MAX)
+			.expect_err("hard ceiling must reject third sandbox");
 		assert_eq!(rejected.code, ErrorCode::Busy);
 		drop(first);
-		let _third = worker.admit().expect("slot freed by dropped guard");
-		worker.draining.store(true, Ordering::SeqCst);
-		let drained = worker.admit().expect_err("draining must reject");
+		let _third = bounded
+			.admit_with_available(u64::MAX)
+			.expect("slot freed by dropped guard");
+		bounded.draining.store(true, Ordering::SeqCst);
+		let drained = bounded
+			.admit_with_available(u64::MAX)
+			.expect_err("draining must reject");
 		assert_eq!(drained.code, ErrorCode::Busy);
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn linux_available_memory_uses_memavailable() {
+		let meminfo = "MemTotal:       131072000 kB\nMemFree: 1024 kB\nMemAvailable:   33554432 kB\n";
+		assert_eq!(parse_linux_available_memory_mib(meminfo), Some(32_768));
+		assert_eq!(parse_linux_available_memory_mib("MemFree: 12 kB\n"), None);
 	}
 
 	#[tokio::test]
