@@ -126,7 +126,7 @@ impl WarmPool {
 		)
 	}
 
-	fn with_runtime_options(
+	pub(crate) fn with_runtime_options(
 		template: impl Into<PathBuf>,
 		size: usize,
 		fork: bool,
@@ -188,7 +188,13 @@ impl WarmPool {
 				return Ok(None);
 			};
 			let vm = match name {
-				Some(name) if vm.name() != name => rename_vm(vm, name)?,
+				Some(name) if vm.name() != name => match rename_vm(&vm, name) {
+					Ok(renamed) => renamed,
+					Err(error) => {
+						self.teardown(vm);
+						return Err(error);
+					},
+				},
 				_ => vm,
 			};
 			let transition = match (paused, want_paused) {
@@ -383,7 +389,7 @@ impl PoolRegistry {
 	}
 }
 
-fn rename_vm(vm: SandboxVm, name: &str) -> Result<SandboxVm> {
+fn rename_vm(vm: &SandboxVm, name: &str) -> Result<SandboxVm> {
 	let old_meta = vm.meta()?;
 	let old_dir = vm.dir().to_path_buf();
 	let parent = old_dir
@@ -393,8 +399,7 @@ fn rename_vm(vm: SandboxVm, name: &str) -> Result<SandboxVm> {
 	if new_dir.exists() {
 		return Err(crate::EngineError::busy(format!("sandbox '{name}' already exists")));
 	}
-	fs::rename(old_dir, &new_dir)?;
-	let renamed = SandboxVm::from_dir(name.to_owned(), new_dir);
+	let renamed = SandboxVm::from_dir(name.to_owned(), new_dir.clone());
 	let mut meta = serde_json::Map::new();
 	meta.insert("sock".to_owned(), serde_json::json!(renamed.api_sock().to_string_lossy()));
 	if let Some(value) = old_meta.get("agent_sock") {
@@ -407,7 +412,10 @@ fn rename_vm(vm: SandboxVm, name: &str) -> Result<SandboxVm> {
 		meta
 			.insert("rootfs".to_owned(), renamed_path_meta(value, &renamed.dir().join("rootfs.img"))?);
 	}
-	renamed.save_meta(meta)?;
+	// Persist the future paths before the atomic directory rename. If either
+	// step fails, claim still owns the original handle and can tear it down.
+	vm.save_meta(meta)?;
+	fs::rename(old_dir, new_dir)?;
 	Ok(renamed)
 }
 
@@ -482,7 +490,7 @@ mod tests {
 		meta.insert("remote_page_url".to_owned(), serde_json::Value::Null);
 		vm.save_meta(meta)?;
 
-		let renamed = rename_vm(vm, "new")?;
+		let renamed = rename_vm(&vm, "new")?;
 		let meta = renamed.meta()?;
 		assert_eq!(
 			meta.get("sock").and_then(serde_json::Value::as_str),
