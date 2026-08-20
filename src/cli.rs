@@ -65,6 +65,11 @@ enum Commands {
 		#[command(subcommand)]
 		command: FunctionCommands,
 	},
+	/// Publish derived artifacts for non-OCI images.
+	Image {
+		#[command(subcommand)]
+		command: ImageCommands,
+	},
 	/// Inspect durable calls and their reconnectable logs.
 	Call {
 		#[command(subcommand)]
@@ -163,6 +168,36 @@ enum FunctionCommands {
 	/// Resolve a current or pinned function and open an interactive worker
 	/// shell.
 	Shell { reference: String },
+}
+
+fn cmd_image(command: ImageCommands) -> Result<i32> {
+	match command {
+		ImageCommands::PublishGceRootfs { reference } => {
+			let published = vmond::image::publish_gce_rootfs(&reference)?;
+			let action = if published.skipped {
+				"reused"
+			} else {
+				"published"
+			};
+			println!(
+				"{action} {} compressed_size={} uncompressed_size={} original_size={} sha256={} \
+				 sidecar={}",
+				published.object,
+				published.compressed_size,
+				published.uncompressed_size,
+				published.original_size,
+				published.sha256,
+				published.sidecar
+			);
+			Ok(0)
+		},
+	}
+}
+
+#[derive(Subcommand)]
+enum ImageCommands {
+	/// Publish a GCE export's ext4 root as a range-addressable GCS object.
+	PublishGceRootfs { reference: String },
 }
 
 #[derive(Subcommand)]
@@ -591,6 +626,7 @@ fn execute(command: Commands, transport_options: &TransportOptions) -> Result<i3
 		Commands::Run(args) => cmd_run(args, transport_options),
 		Commands::Deploy(args) => cmd_deploy(args, transport_options),
 		Commands::Function { command } => cmd_function(command, transport_options),
+		Commands::Image { command } => cmd_image(command),
 		Commands::Call { command } => cmd_call(command, transport_options),
 		Commands::Ps => cmd_ps(transport_options),
 		Commands::Exec(args) => cmd_exec(args, transport_options),
@@ -2953,6 +2989,19 @@ mod durable_cli_tests {
 			Commands::Function {
 				command: FunctionCommands::Shell { reference }
 			} if reference == "demo/embed@r1"
+		));
+		assert!(matches!(
+			Cli::try_parse_from([
+				"vmon",
+				"image",
+				"publish-gce-rootfs",
+				"gs://bucket/image.tar.gz",
+			])
+			.unwrap()
+			.command,
+			Commands::Image {
+				command: ImageCommands::PublishGceRootfs { reference }
+			} if reference == "gs://bucket/image.tar.gz"
 		));
 		assert!(matches!(
 			Cli::try_parse_from(["vmon", "call", "get", "call-1"]).unwrap().command,
