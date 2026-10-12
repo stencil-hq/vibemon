@@ -13,19 +13,20 @@ jobs:
     name: Rust
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16-alpine
+      mysql:
+        image: mysql:8.4
         env:
-          POSTGRES_DB: fastbench
-          POSTGRES_USER: fastbench
-          POSTGRES_PASSWORD: fastbench
+          MYSQL_ROOT_PASSWORD: vmon
+          MYSQL_DATABASE: vmon
         ports:
-          - 15433:5432
+          - 13306:3306
         options: >-
-          --health-cmd "pg_isready -U fastbench -d fastbench"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pvmon"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
+    env:
+      VMON_MYSQL_TEST_URL: mysql://root:vmon@127.0.0.1:13306/vmon
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,6 +62,16 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Install musl targets and zig
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          pip install ziglang==0.13.0 cargo-zigbuild
+
+      - name: Build static guest agents
+        run: |
+          cargo zigbuild --locked --release -p vmon-agent --target x86_64-unknown-linux-musl
+          cargo zigbuild --locked --release -p vmon-agent --target aarch64-unknown-linux-musl
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
@@ -121,109 +132,3 @@ jobs:
 
       - name: Test Windows backend
         run: cargo test -p vmm --lib --locked
-
-  python:
-    name: Python SDK
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk/py
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install Python 3.14
-        run: uv python install 3.14
-
-      - name: Install dependencies
-        run: uv sync --locked
-
-      - name: Lint
-        run: uv run ruff check
-
-      - name: Type check
-        run: uv run mypy
-
-      - name: Test
-        run: uv run pytest
-
-  go:
-    name: Go SDK
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk/go
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: sdk/go/go.mod
-          cache-dependency-path: sdk/go/go.sum
-
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test with race detector
-        run: go test -race ./...
-
-  ui:
-    name: Web UI
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ui
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Check formatting
-        run: bun run format:check
-
-      - name: Lint
-        run: bun run lint
-
-      - name: Type check
-        run: bun run typecheck
-
-  sdk-ts:
-    name: TypeScript SDK
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk/ts
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Check formatting
-        run: bun run format:check
-
-      - name: Lint
-        run: bun run lint
-
-      - name: Type check
-        run: bun run typecheck
-
-      - name: Test
-        run: bun test
