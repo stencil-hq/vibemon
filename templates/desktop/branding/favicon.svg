@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- vibemon mark: accent "v" chevron + glowing status square on a dark tile. -->
+  <defs>
+    <linearGradient id="v" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8ee4ff"/>
+      <stop offset="0.55" stop-color="#4cc3f0"/>
+      <stop offset="1" stop-color="#2585b3"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#16202a"/>
+      <stop offset="1" stop-color="#0a0f13"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="62" height="62" rx="13" fill="url(#tile)" stroke="#2b3a47" stroke-width="2"/>
+  <path d="M15 20 L29 46 L43 20" fill="none" stroke="url(#v)" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="44" y="40" width="8" height="8" rx="1.5" fill="#4cc3f0"/>
+</svg>

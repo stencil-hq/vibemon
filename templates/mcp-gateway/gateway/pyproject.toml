@@ -1,0 +1,20 @@
+[project]
+name = "mcp-gateway"
+version = "0.1.0"
+description = "E2B-compatible MCP gateway (Docker MCP Catalog + GitHub stdio servers) for the mcp-gateway template"
+requires-python = ">=3.10"
+dependencies = [
+	"mcp==1.30.0",
+	"pyyaml>=6",
+	"uvicorn>=0.30",
+]
+
+[project.scripts]
+mcp-gateway = "mcp_gateway.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mcp_gateway"]

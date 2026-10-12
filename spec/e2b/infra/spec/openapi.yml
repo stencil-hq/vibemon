@@ -1,0 +1,5736 @@
+openapi: 3.0.0
+info:
+  version: 0.1.0
+  title: E2B API
+
+servers:
+  - url: https://api.e2b.app
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    # AuthProviderBearerAuth / AuthProviderTeamAuth: B before T in the name
+    # so Bearer is validated before Team.
+    AuthProviderBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: access_token
+    AuthProviderTeamAuth:
+      type: apiKey
+      in: header
+      name: X-Team-ID
+    # AdminApiKeyAuth / AdminTeamAuth: alphabetical names ensure token
+    # validation runs before team context population.
+    AdminApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+    AdminJWTAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    AdminTeamAuth:
+      type: apiKey
+      in: header
+      name: X-Team-ID
+
+  parameters:
+    clusterID:
+      name: clusterID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Identifier of the cluster
+    rigID:
+      name: rigID
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Rig identifier (e.g. "default")
+    templateID:
+      name: templateID
+      in: path
+      required: true
+      schema:
+        type: string
+    buildID:
+      name: buildID
+      in: path
+      required: true
+      schema:
+        type: string
+    sandboxID:
+      name: sandboxID
+      in: path
+      required: true
+      schema:
+        type: string
+    teamID:
+      name: teamID
+      in: path
+      required: true
+      description: Identifier of the team, as its UUID or its public project ID (prj_)
+      schema:
+        type: string
+    nodeID:
+      name: nodeID
+      in: path
+      required: true
+      schema:
+        type: string
+    apiKeyID:
+      name: apiKeyID
+      in: path
+      required: true
+      schema:
+        type: string
+    snapshotID:
+      name: snapshotID
+      in: path
+      required: true
+      schema:
+        type: string
+        description: Identifier of the snapshot (template ID)
+    tag:
+      name: tag
+      in: path
+      required: true
+      schema:
+        type: string
+        description: Tag name
+    paginationLimit:
+      name: limit
+      in: query
+      description: Maximum number of items to return per page
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        default: 100
+        maximum: 100
+    paginationNextToken:
+      name: nextToken
+      in: query
+      description: Cursor to start the list from
+      required: false
+      schema:
+        type: string
+    volumeID:
+      name: volumeID
+      in: path
+      required: true
+      schema:
+        type: string
+    secretID:
+      name: secretID
+      in: path
+      required: true
+      schema:
+        type: string
+        description: >
+          Identifier of the secret (sec_ prefixed), or its canonical
+          lower-case name
+
+    webhookID:
+      name: webhookID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  headers:
+    XNextToken:
+      description: Cursor to fetch the next page of results, if more exist
+      schema:
+        type: string
+    XTotalRunning:
+      description: >
+        Number of running sandboxes matching the filters, before pagination is applied.
+        Only present when running sandboxes were requested.
+      schema:
+        type: integer
+        format: int32
+
+  responses:
+    "400":
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "401":
+      description: Authentication error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "403":
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "404":
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "409":
+      description: Conflict
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "429":
+      description: Too many requests
+      headers:
+        Retry-After:
+          description: When present, the number of seconds to wait before retrying the request.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          example: 30
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "500":
+      description: Server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "501":
+      description: Not implemented by this deployment
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "502":
+      description: Backend error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "503":
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "504":
+      description: Backend timeout
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Rig:
+      description: An orchestrator node pool backed by one cloud scaling group
+      required:
+        - id
+        - provider
+        - resourceID
+        - capacityDesired
+        - capacityCurrent
+      properties:
+        id:
+          type: string
+          description: Rig identifier (e.g. "default")
+        provider:
+          type: string
+          description: Cloud provider backing the rig ("aws" or "gcp")
+        resourceID:
+          type: string
+          description: Canonical cloud resource ID of the scaling group backing the rig (ARN on AWS, self-link on GCP)
+        capacityDesired:
+          type: integer
+          format: int32
+          description: Desired number of instances in the rig
+        capacityMin:
+          type: integer
+          format: int32
+          description: >
+            Minimum capacity enforced on the rig's scaling group. Omitted when
+            nothing enforces bounds (GCP MIG without an active autoscaler).
+        capacityMax:
+          type: integer
+          format: int32
+          description: >
+            Maximum capacity enforced on the rig's scaling group. Omitted when
+            nothing enforces bounds (GCP MIG without an active autoscaler).
+        capacityCurrent:
+          type: integer
+          format: int32
+          description: Number of instances currently attached to the rig
+
+    RigCapacityChange:
+      description: Desired capacity to set on the rig's scaling group
+      required:
+        - desired
+      properties:
+        desired:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Absolute desired number of instances in the rig
+
+    RigInstance:
+      description: An instance attached to a rig's scaling group
+      required:
+        - id
+        - transitioning
+        - terminating
+      properties:
+        id:
+          type: string
+          description: Provider instance ID (EC2 instance ID on AWS, instance name on GCP), also the node ID the orchestrator reports
+        createdAt:
+          type: string
+          format: date-time
+          description: When the provider created the instance. Omitted while the instance is transitioning.
+        transitioning:
+          type: boolean
+          description: The provider is creating, deleting, recreating or otherwise mutating the instance
+        terminating:
+          type: boolean
+          description: The instance is on its way out of the group and can never become healthy again
+
+    RigError:
+      description: >
+        Scaling error on the rig's scaling group, e.g. a failed instance
+        creation due to resource exhaustion
+      required:
+        - timestamp
+        - code
+        - message
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: When the error occurred
+        code:
+          type: string
+          description: Provider-specific error code (e.g. ZONE_RESOURCE_POOL_EXHAUSTED, Failed)
+        message:
+          type: string
+          description: Human-readable error message
+        instance:
+          type: string
+          description: Instance the error relates to, if any
+        action:
+          type: string
+          description: Action being performed when the error occurred (e.g. CREATING)
+
+    Team:
+      required:
+        - teamID
+        - name
+        - apiKey
+        - isDefault
+      properties:
+        teamID:
+          type: string
+          description: Identifier of the team
+        name:
+          type: string
+          description: Name of the team
+        apiKey:
+          type: string
+          description: API key for the team
+        isDefault:
+          type: boolean
+          description: Whether the team is the default team
+
+    TeamUser:
+      required:
+        - id
+        - email
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identifier of the user
+        email:
+          type: string
+          nullable: true
+          deprecated: true
+          default: null
+          description: Email of the user
+
+    TemplateUpdateRequest:
+      properties:
+        public:
+          type: boolean
+          description: Whether the template is public or only accessible by the team
+
+    TemplateUpdateResponse:
+      required:
+        - names
+      properties:
+        names:
+          type: array
+          description: Names of the template (namespace/alias format when namespaced)
+          items:
+            type: string
+
+    CPUCount:
+      type: integer
+      format: int32
+      minimum: 1
+      description: CPU cores for the sandbox
+
+    MemoryMB:
+      type: integer
+      format: int32
+      minimum: 128
+      description: Memory for the sandbox in MiB
+
+    DiskSizeMB:
+      type: integer
+      format: int32
+      minimum: 0
+      description: Disk size for the sandbox in MiB
+
+    MinFreeDiskMb:
+      type: integer
+      format: int32
+      minimum: 0
+      description: >-
+        Requested minimum free space after the template's build steps, in MiB.
+        Omit to use the team's default. Set to 0 to request no minimum free-disk
+        growth. The filesystem is never shrunk, including inherited or already-larger
+        filesystems. Growth is best effort, so filesystem metadata can leave the
+        available space slightly below the requested minimum.
+
+    EnvdVersion:
+      type: string
+      description: Version of the envd running in the sandbox
+
+    SandboxMetadata:
+      additionalProperties:
+        type: string
+        description: Metadata of the sandbox
+
+    SandboxState:
+      type: string
+      description: State of the sandbox
+      enum:
+        - running
+        - paused
+
+    OrderDirection:
+      type: string
+      description: Sort direction
+      default: desc
+      enum:
+        - asc
+        - desc
+
+    SnapshotInfo:
+      type: object
+      required:
+        - snapshotID
+        - names
+      properties:
+        snapshotID:
+          type: string
+          description: Identifier of the snapshot template including the tag. Uses namespace/alias when a name was provided (e.g. team-slug/my-snapshot:default), otherwise falls back to the raw template ID (e.g. abc123:default).
+        names:
+          type: array
+          items:
+            type: string
+          description: Full names of the snapshot template including team namespace and tag (e.g. team-slug/my-snapshot:v2)
+
+    EnvVars:
+      additionalProperties:
+        type: string
+        description: Environment variables for the sandbox
+
+    Mcp:
+      type: object
+      description: MCP configuration for the sandbox
+      additionalProperties: {}
+      nullable: true
+
+    SandboxNetworkConfig:
+      type: object
+      properties:
+        allowPublicTraffic:
+          type: boolean
+          default: true
+          description: Specify if the sandbox URLs should be accessible only with authentication.
+        allowOut:
+          type: array
+          description: List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. "8.8.8.8/32"), a bare IP address (e.g. "8.8.8.8"), or a domain name (e.g. "example.com", "*.example.com"). Allowed entries always take precedence over denied entries.
+          items:
+            type: string
+        denyOut:
+          type: array
+          description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+          items:
+            type: string
+        egressProxy:
+          $ref: "#/components/schemas/SandboxEgressProxyConfig"
+        maskRequestHost:
+          type: string
+          description: Specify host mask which will be used for all sandbox requests
+        httpsPorts:
+          type: array
+          description: Sandbox ports that serve HTTPS rather than plaintext HTTP. Affects how the proxy reaches the service inside the sandbox; the public URL is HTTPS either way. Certificates are not verified, so self-signed ones work. The envd port (49983) cannot be listed.
+          maxItems: 128
+          uniqueItems: true
+          items:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 65535
+        rules:
+          type: object
+          description: >
+            Per-domain transform rules applied to matching outbound HTTPS requests.
+            Keys may be exact DNS names (for example, "api.example.com") or a leading wildcard
+            (for example, "*.example.com"), and are normalized to lowercase on write.
+            Wildcards match subdomains at any depth but not the apex domain; a bare "*" is invalid.
+            Exact rules take precedence, followed by the longest matching wildcard suffix, and
+            matching rule sets are not merged. Broad wildcards such as "*.com" are allowed and may
+            expose transformed credentials to every matching destination the sandbox contacts.
+            Rules do not grant network access; configure allowOut separately to permit the destination.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/SandboxNetworkRule"
+
+    SandboxNetworkUpdateConfig:
+      type: object
+      description: Network configuration update for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting a field clears it.
+      properties:
+        allowOut:
+          type: array
+          description: List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. "8.8.8.8/32"), a bare IP address (e.g. "8.8.8.8"), or a domain name (e.g. "example.com", "*.example.com"). Allowed entries always take precedence over denied entries.
+          items:
+            type: string
+        denyOut:
+          type: array
+          description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+          items:
+            type: string
+        egressProxy:
+          $ref: "#/components/schemas/SandboxEgressProxyConfig"
+        rules:
+          type: object
+          description: >
+            Per-domain transform rules applied to matching outbound HTTPS requests. Replaces all
+            existing rules when provided. Keys may be exact DNS names or a single leading wildcard
+            (for example, "*.example.com"), and are normalized to lowercase on write. Wildcards match
+            subdomains at any depth but not the apex domain; a bare "*" is invalid. Exact rules take
+            precedence, followed by the longest matching wildcard suffix, and matching rule sets are
+            not merged. Broad wildcards such as "*.com" are allowed and may expose transformed
+            credentials to every matching destination the sandbox contacts. Rules do not grant
+            network access; configure allowOut separately to permit the destination.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/SandboxNetworkRule"
+        allow_internet_access:
+          type: boolean
+          description:
+            Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+            to 0.0.0.0/0 in the network config.
+
+    SandboxNetworkRule:
+      type: object
+      description: Transform rule applied to egress requests matching a domain pattern.
+      properties:
+        transform:
+          $ref: "#/components/schemas/SandboxNetworkTransform"
+
+    SandboxNetworkTransform:
+      type: object
+      description: Transformations applied to matching egress requests before forwarding.
+      properties:
+        headers:
+          type: object
+          description: >
+            HTTP headers to inject or override in matching requests.
+            An existing header with the same name is replaced. Values are plain strings;
+            secret resolution happens client-side before sending to the API.
+          additionalProperties:
+            type: string
+
+    SandboxEgressProxyConfig:
+      type: object
+      nullable: true
+      description: >-
+        SOCKS5 proxy for sandbox egress. Outbound TCP is tunneled through the
+        proxy after allow/deny filtering; the sandbox is unaware. Domain-matched
+        flows use remote DNS (ATYP=domain).
+      required:
+        - address
+      properties:
+        address:
+          type: string
+          description: >-
+            SOCKS5 proxy address in host:port format (e.g. "proxy.example.com:1080").
+        username:
+          type: string
+          maxLength: 255
+          description: >-
+            Optional SOCKS5 username (RFC 1929), max 255 bytes.
+        password:
+          type: string
+          maxLength: 255
+          description: >-
+            Optional SOCKS5 password (RFC 1929), max 255 bytes.
+        tls:
+          $ref: "#/components/schemas/SandboxEgressProxyTLSConfig"
+
+    SandboxEgressProxyTLSConfig:
+      type: object
+      nullable: true
+      description: >-
+        TLS for the connection to the SOCKS5 proxy. The SOCKS5 negotiation and
+        the tunneled traffic both run inside the TLS session, so the proxy
+        credentials are not sent in the clear. This secures only the hop to the
+        proxy; what the proxy does onward is its own concern. A half-close from
+        the sandbox reaches the proxy as a TLS close_notify, not a TCP FIN, and
+        a proxy that treats close_notify as a full close cuts the reply short.
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: >-
+            Connect to the proxy over TLS. When false, no other field in this
+            object may be set.
+        serverName:
+          type: string
+          maxLength: 253
+          description: >-
+            Name to verify the proxy certificate against, and to send as SNI.
+            Defaults to the host part of address. Set this only when the
+            certificate does not match the address the proxy is reached at.
+        caCert:
+          type: string
+          maxLength: 8192
+          description: >-
+            One or more PEM-encoded certificates to verify the proxy against,
+            for a proxy fronted by a private CA. These replace the system trust
+            store, which is what is used when this is omitted. The system trust
+            store depends on the host the orchestrator runs on, so set this to
+            get the same verification everywhere.
+
+    SandboxAutoResumeEnabled:
+      type: boolean
+      description: Auto-resume enabled flag for paused sandboxes. Default false.
+      default: false
+
+    SandboxAutoResumeConfig:
+      type: object
+      description: Auto-resume configuration for paused sandboxes.
+      required:
+        - enabled
+      properties:
+        enabled:
+          $ref: "#/components/schemas/SandboxAutoResumeEnabled"
+
+    SandboxOnTimeout:
+      type: string
+      description: Action taken when the sandbox times out.
+      enum:
+        - kill
+        - pause
+
+    SandboxLifecycle:
+      type: object
+      description: Sandbox lifecycle policy returned by sandbox info.
+      required:
+        - autoResume
+        - onTimeout
+      properties:
+        autoResume:
+          type: boolean
+          description: Whether the sandbox can auto-resume.
+        onTimeout:
+          $ref: "#/components/schemas/SandboxOnTimeout"
+
+    SandboxLog:
+      description: Log entry with timestamp and line
+      required:
+        - timestamp
+        - line
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the log entry
+        line:
+          type: string
+          description: Log line content
+
+    SandboxLogEntry:
+      required:
+        - timestamp
+        - level
+        - message
+        - fields
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the log entry
+        message:
+          type: string
+          description: Log message content
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+
+    SandboxLogs:
+      required:
+        - logs
+        - logEntries
+      properties:
+        logs:
+          description: Logs of the sandbox
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxLog"
+        logEntries:
+          description: Structured logs of the sandbox
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxLogEntry"
+
+    SandboxLogsV2Response:
+      required:
+        - logs
+      properties:
+        logs:
+          default: []
+          description: Sandbox logs structured
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxLogEntry"
+
+    SandboxMetric:
+      description: Metric entry with timestamp and line
+      required:
+        - timestamp
+        - timestampUnix
+        - cpuCount
+        - cpuUsedPct
+        - memUsed
+        - memTotal
+        - memCache
+        - diskUsed
+        - diskTotal
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          deprecated: true
+          description: Timestamp of the metric entry
+        timestampUnix:
+          type: integer
+          format: int64
+          description: Timestamp of the metric entry in Unix time (seconds since epoch)
+        cpuCount:
+          type: integer
+          format: int32
+          description: Number of CPU cores
+        cpuUsedPct:
+          type: number
+          format: float
+          description: CPU usage percentage
+        memUsed:
+          type: integer
+          format: int64
+          description: Memory used in bytes
+        memTotal:
+          type: integer
+          format: int64
+          description: Total memory in bytes
+        memCache:
+          type: integer
+          format: int64
+          description: Cached memory (page cache) in bytes
+        diskUsed:
+          type: integer
+          format: int64
+          description: Disk used in bytes
+        diskTotal:
+          type: integer
+          format: int64
+          description: Total disk space in bytes
+
+    SandboxVolumeMount:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Name of the volume
+        path:
+          type: string
+          description: Path of the volume
+      required:
+        - name
+        - path
+
+    Sandbox:
+      required:
+        - templateID
+        - sandboxID
+        - clientID
+        - envdVersion
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template from which is the sandbox created
+        sandboxID:
+          type: string
+          description: Identifier of the sandbox
+        alias:
+          type: string
+          description: Alias of the template
+        clientID:
+          type: string
+          deprecated: true
+          description: Identifier of the client
+        envdVersion:
+          $ref: "#/components/schemas/EnvdVersion"
+        envdAccessToken:
+          type: string
+          description: Access token used for envd communication
+        trafficAccessToken:
+          type: string
+          nullable: true
+          description: Token required for accessing sandbox via proxy.
+        domain:
+          type: string
+          nullable: true
+          description: Base domain where the sandbox traffic is accessible
+
+    SandboxDetail:
+      required:
+        - templateID
+        - sandboxID
+        - clientID
+        - startedAt
+        - cpuCount
+        - memoryMB
+        - diskSizeMB
+        - endAt
+        - state
+        - envdVersion
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template from which is the sandbox created
+        alias:
+          type: string
+          description: Alias of the template
+        sandboxID:
+          type: string
+          description: Identifier of the sandbox
+        clientID:
+          type: string
+          deprecated: true
+          description: Identifier of the client
+        startedAt:
+          type: string
+          format: date-time
+          description: Time when the sandbox was started
+        endAt:
+          type: string
+          format: date-time
+          description: Time when the sandbox will expire
+        envdVersion:
+          $ref: "#/components/schemas/EnvdVersion"
+        envdAccessToken:
+          type: string
+          description: Access token used for envd communication
+        allowInternetAccess:
+          type: boolean
+          nullable: true
+          description: Whether internet access was explicitly enabled or disabled for the sandbox. Null means it was not explicitly set.
+        domain:
+          type: string
+          nullable: true
+          description: Base domain where the sandbox traffic is accessible
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+        state:
+          $ref: "#/components/schemas/SandboxState"
+        network:
+          $ref: "#/components/schemas/SandboxNetworkConfig"
+        lifecycle:
+          $ref: "#/components/schemas/SandboxLifecycle"
+        volumeMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    ListedSandbox:
+      required:
+        - templateID
+        - sandboxID
+        - clientID
+        - startedAt
+        - cpuCount
+        - memoryMB
+        - diskSizeMB
+        - endAt
+        - state
+        - envdVersion
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template from which is the sandbox created
+        alias:
+          type: string
+          description: Alias of the template
+        sandboxID:
+          type: string
+          description: Identifier of the sandbox
+        clientID:
+          type: string
+          deprecated: true
+          description: Identifier of the client
+        startedAt:
+          type: string
+          format: date-time
+          description: Time when the sandbox was started
+        endAt:
+          type: string
+          format: date-time
+          description: Time when the sandbox will expire
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+        state:
+          $ref: "#/components/schemas/SandboxState"
+        envdVersion:
+          $ref: "#/components/schemas/EnvdVersion"
+        volumeMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    SandboxesWithMetrics:
+      required:
+        - sandboxes
+      properties:
+        sandboxes:
+          additionalProperties:
+            $ref: "#/components/schemas/SandboxMetric"
+
+    NewSandbox:
+      required:
+        - templateID
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the required template
+        timeout:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 15
+          description: Time to live for the sandbox in seconds.
+        autoPause:
+          type: boolean
+          default: false
+          description: Automatically pauses the sandbox after the timeout
+        autoPauseMemory:
+          type: boolean
+          default: true
+          description: >-
+            Controls the snapshot kind taken when the sandbox auto-pauses on
+            timeout (only relevant when autoPause is true). When false, the
+            auto-pause drops the in-memory state and persists only the
+            filesystem (a filesystem-only snapshot); resuming it cold-boots
+            (reboots) the sandbox from disk. Such a snapshot cannot be
+            auto-resumed by traffic and must be resumed explicitly, so it cannot
+            be combined with autoResume. Defaults to true (full memory snapshot).
+        autoResume:
+          $ref: "#/components/schemas/SandboxAutoResumeConfig"
+        secure:
+          type: boolean
+          deprecated: true
+          description: "Ignored. All system communication with the sandbox is always secured; the template's envd version must support secured access."
+        allow_internet_access:
+          type: boolean
+          description:
+            Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+            to 0.0.0.0/0 in the network config.
+        network:
+          $ref: "#/components/schemas/SandboxNetworkConfig"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+        envVars:
+          $ref: "#/components/schemas/EnvVars"
+        mcp:
+          $ref: "#/components/schemas/Mcp"
+        iam:
+          $ref: "#/components/schemas/SandboxIam"
+        volumeMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    NewSandboxV2:
+      description: >-
+        Sandbox creation request. All system communication with the sandbox is
+        always secured; the template's envd version must support secured access.
+      required:
+        - templateID
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the required template
+        timeout:
+          type: integer
+          format: int32
+          minimum: 1
+          default: 300
+          description: Time to live for the sandbox in seconds.
+        autoPause:
+          type: boolean
+          default: false
+          description: Automatically pauses the sandbox after the timeout
+        autoPauseMemory:
+          type: boolean
+          default: true
+          description: >-
+            Controls the snapshot kind taken when the sandbox auto-pauses on
+            timeout (only relevant when autoPause is true). When false, the
+            auto-pause drops the in-memory state and persists only the
+            filesystem (a filesystem-only snapshot); resuming it cold-boots
+            (reboots) the sandbox from disk. Such a snapshot cannot be
+            auto-resumed by traffic and must be resumed explicitly, so it cannot
+            be combined with autoResume. Defaults to true (full memory snapshot).
+        autoResume:
+          $ref: "#/components/schemas/SandboxAutoResumeConfig"
+        allow_internet_access:
+          type: boolean
+          description:
+            Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+            to 0.0.0.0/0 in the network config.
+        network:
+          $ref: "#/components/schemas/SandboxNetworkConfig"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+        envVars:
+          $ref: "#/components/schemas/EnvVars"
+        mcp:
+          $ref: "#/components/schemas/Mcp"
+        iam:
+          $ref: "#/components/schemas/SandboxIam"
+        volumeMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxVolumeMount"
+
+    SandboxIam:
+      type: object
+      description: >-
+        Sandbox workload identity configuration. A non-empty, valid tokens map
+        enables workload identity for the sandbox.
+      properties:
+        tokens:
+          $ref: "#/components/schemas/SandboxIamTokens"
+
+    SandboxIamTokens:
+      type: object
+      description: >-
+        Named workload-token definitions, keyed by a caller-chosen token name.
+      additionalProperties:
+        $ref: "#/components/schemas/SandboxIamToken"
+
+    SandboxIamToken:
+      type: object
+      required:
+        - audience
+        - tokenType
+      properties:
+        audience:
+          type: string
+          description: Audience of the workload token, stored exactly as provided.
+        tokenType:
+          type: string
+          description: Workload token type.
+
+    ResumedSandbox:
+      properties:
+        timeout:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 15
+          description: Time to live for the sandbox in seconds.
+        autoPause:
+          type: boolean
+          deprecated: true
+          description: Automatically pauses the sandbox after the timeout
+        memory:
+          type: boolean
+          description: >-
+            Defaults to true. When false, resume from disk state only: the sandbox cold-boots fresh and
+            any memory in the snapshot is ignored, never modified or deleted. Disk
+            state has crash-recovery semantics — writes not flushed before the pause
+            may be lost. A no-op for snapshots that contain no memory. Rejected with
+            an error in environments where this capability is not enabled, never
+            silently downgraded to a memory restore.
+
+    ConnectSandbox:
+      type: object
+      required:
+        - timeout
+      properties:
+        timeout:
+          description: Timeout in seconds from the current time after which the sandbox should expire
+          type: integer
+          format: int32
+          minimum: 0
+        memory:
+          type: boolean
+          description: >-
+            Defaults to true. When false and the sandbox is paused, resume from disk state only: the
+            sandbox cold-boots fresh and any memory in the snapshot is ignored, never
+            modified or deleted. Disk state has crash-recovery semantics — writes not
+            flushed before the pause may be lost. A no-op for snapshots that contain
+            no memory. Rejected with an error in environments where this capability
+            is not enabled, never silently downgraded to a memory restore.
+
+    ConnectSandboxV2:
+      type: object
+      properties:
+        timeout:
+          description: Timeout in seconds from the current time after which the sandbox should expire
+          type: integer
+          format: int32
+          minimum: 1
+          default: 300
+        memory:
+          type: boolean
+          description: >-
+            Defaults to true. When false and the sandbox is paused, resume from disk state only: the
+            sandbox cold-boots fresh and any memory in the snapshot is ignored, never
+            modified or deleted. Disk state has crash-recovery semantics — writes not
+            flushed before the pause may be lost. A no-op for snapshots that contain
+            no memory. Rejected with an error in environments where this capability
+            is not enabled, never silently downgraded to a memory restore.
+
+    SandboxTimeoutRequest:
+      type: object
+      required:
+        - timeout
+      properties:
+        timeout:
+          description: Timeout in seconds from the current time after which the sandbox should expire
+          type: integer
+          format: int32
+          minimum: 0
+
+    SandboxRefreshRequest:
+      type: object
+      properties:
+        duration:
+          description: Duration for which the sandbox should be kept alive in seconds
+          type: integer
+          maximum: 3600 # 1 hour
+          minimum: 0
+
+    SandboxSnapshotRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
+        memory:
+          type: boolean
+          description: >-
+            Whether to capture a full memory snapshot. When false, only the
+            filesystem is persisted: the snapshot is smaller and faster to take,
+            and sandboxes created from it cold-boot (start fresh from disk)
+            instead of restoring memory, so they begin without the source
+            sandbox's running processes, in-memory state, and open connections.
+            The source sandbox keeps running in both cases. Defaults to true.
+
+    SandboxPauseRequest:
+      type: object
+      properties:
+        memory:
+          type: boolean
+          default: true
+          description: >-
+            Whether to capture a full memory snapshot. When false, only the
+            filesystem is persisted and resuming the sandbox cold-boots
+            (reboots) it from disk, losing in-memory state, running processes,
+            and open connections. Resume it with an explicit request (connect or
+            resume); auto-resume, which can be triggered by arbitrary traffic,
+            refuses such a sandbox. Defaults to true.
+
+    SandboxForkRequest:
+      type: object
+      properties:
+        timeout:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 15
+          description: Time to live for the new forked sandboxes in seconds.
+        count:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+          default: 1
+          description: >-
+            Number of forked sandboxes to create. All forks boot from the same
+            snapshot, so the snapshot is captured once regardless of count.
+            Each fork succeeds or fails independently; the outcome of each is
+            reported in its entry of the response list.
+
+    SandboxForkResult:
+      type: object
+      description: >-
+        Result of one requested fork. Exactly one of sandbox or error is set:
+        sandbox when the fork started successfully, error when it failed to
+        start.
+      properties:
+        sandbox:
+          $ref: "#/components/schemas/Sandbox"
+        error:
+          $ref: "#/components/schemas/Error"
+
+    TeamMetric:
+      description: Team metric with timestamp
+      required:
+        - timestamp
+        - timestampUnix
+        - concurrentSandboxes
+        - sandboxStartRate
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          deprecated: true
+          description: Timestamp of the metric entry
+        timestampUnix:
+          type: integer
+          format: int64
+          description: Timestamp of the metric entry in Unix time (seconds since epoch)
+        concurrentSandboxes:
+          type: integer
+          format: int32
+          description: The number of concurrent sandboxes for the team
+        sandboxStartRate:
+          type: number
+          format: float
+          description: Number of sandboxes started per second
+
+    MaxTeamMetric:
+      description: Team metric with timestamp
+      required:
+        - timestamp
+        - timestampUnix
+        - value
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          deprecated: true
+          description: Timestamp of the metric entry
+        timestampUnix:
+          type: integer
+          format: int64
+          description: Timestamp of the metric entry in Unix time (seconds since epoch)
+        value:
+          type: number
+          description: The maximum value of the requested metric in the given interval
+
+    AdminSandboxKillResult:
+      required:
+        - killedCount
+        - failedCount
+      properties:
+        killedCount:
+          type: integer
+          description: Number of sandboxes successfully killed
+        failedCount:
+          type: integer
+          description: Number of sandboxes that failed to kill
+
+    AdminSandbox:
+      type: object
+      required:
+        - sandboxID
+        - teamID
+        - state
+      properties:
+        sandboxID:
+          type: string
+          description: Identifier of the sandbox
+        teamID:
+          type: string
+          format: uuid
+          description: Identifier of the team that owns the sandbox
+        state:
+          $ref: "#/components/schemas/AdminSandboxState"
+
+    AdminSandboxState:
+      type: string
+      description: State after the sandbox's latest create, resume, pause or kill event
+      enum:
+        - running
+        - paused
+        - killed
+      x-enum-varnames:
+        - AdminSandboxStateRunning
+        - AdminSandboxStatePaused
+        - AdminSandboxStateKilled
+
+    AdminTeamRunningSandboxCounts:
+      type: object
+      description: |
+        Cached live sandbox index count keyed by team ID. Counts may briefly
+        include sandboxes transitioning out of running; teams without indexed
+        sandboxes are omitted.
+      additionalProperties:
+        type: integer
+        format: int64
+        minimum: 1
+
+    AdminBuildCancelResult:
+      required:
+        - cancelledCount
+        - failedCount
+      properties:
+        cancelledCount:
+          type: integer
+          description: Number of builds successfully cancelled
+        failedCount:
+          type: integer
+          description: Number of builds that failed to cancel
+
+    VolumeToken:
+      type: object
+      properties:
+        token:
+          type: string
+      required:
+        - token
+
+    Template:
+      required:
+        - templateID
+        - buildID
+        - cpuCount
+        - memoryMB
+        - diskSizeMB
+        - public
+        - createdAt
+        - updatedAt
+        - createdBy
+        - lastSpawnedAt
+        - spawnCount
+        - buildCount
+        - envdVersion
+        - aliases
+        - names
+        - buildStatus
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template
+        buildID:
+          type: string
+          description: Identifier of the last successful build for given template
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        public:
+          type: boolean
+          description: Whether the template is public or only accessible by the team
+        aliases:
+          type: array
+          description: Aliases of the template
+          deprecated: true
+          items:
+            type: string
+        names:
+          type: array
+          description: Names of the template (namespace/alias format when namespaced)
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the template was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Time when the template was last updated
+        createdBy:
+          allOf:
+            - $ref: "#/components/schemas/TeamUser"
+          nullable: true
+        lastSpawnedAt:
+          type: string
+          nullable: true
+          format: date-time
+          description: Time when the template was last used
+        spawnCount:
+          type: integer
+          format: int64
+          description: Number of times the template was used
+        buildCount:
+          type: integer
+          format: int32
+          description: Number of times the template was built
+        envdVersion:
+          $ref: "#/components/schemas/EnvdVersion"
+        buildStatus:
+          $ref: "#/components/schemas/TemplateBuildStatus"
+
+    TemplateRequestResponseV3:
+      required:
+        - templateID
+        - buildID
+        - public
+        - aliases
+        - names
+        - tags
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template
+        buildID:
+          type: string
+          description: Identifier of the last successful build for given template
+        public:
+          type: boolean
+          description: Whether the template is public or only accessible by the team
+        names:
+          type: array
+          description: Names of the template
+          items:
+            type: string
+        tags:
+          type: array
+          description: Tags assigned to the template build
+          items:
+            type: string
+        aliases:
+          type: array
+          description: Aliases of the template
+          deprecated: true
+          items:
+            type: string
+
+    TemplateBuild:
+      required:
+        - buildID
+        - status
+        - createdAt
+        - updatedAt
+        - cpuCount
+        - memoryMB
+      properties:
+        buildID:
+          type: string
+          format: uuid
+          description: Identifier of the build
+        status:
+          $ref: "#/components/schemas/TemplateBuildStatus"
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the build was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Time when the build was last updated
+        finishedAt:
+          type: string
+          format: date-time
+          description: Time when the build was finished
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        envdVersion:
+          $ref: "#/components/schemas/EnvdVersion"
+
+    TemplateWithBuilds:
+      required:
+        - templateID
+        - public
+        - aliases
+        - names
+        - createdAt
+        - updatedAt
+        - lastSpawnedAt
+        - spawnCount
+        - builds
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template
+        public:
+          type: boolean
+          description: Whether the template is public or only accessible by the team
+        aliases:
+          type: array
+          description: Aliases of the template
+          deprecated: true
+          items:
+            type: string
+        names:
+          type: array
+          description: Names of the template (namespace/alias format when namespaced)
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the template was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Time when the template was last updated
+        lastSpawnedAt:
+          type: string
+          nullable: true
+          format: date-time
+          description: Time when the template was last used
+        spawnCount:
+          type: integer
+          format: int64
+          description: Number of times the template was used
+        builds:
+          type: array
+          description: List of builds for the template
+          items:
+            $ref: "#/components/schemas/TemplateBuild"
+
+    TemplateAliasResponse:
+      required:
+        - templateID
+        - public
+      properties:
+        templateID:
+          type: string
+          description: Identifier of the template
+        public:
+          type: boolean
+          description: Whether the template is public or only accessible by the team
+
+    TemplateStep:
+      description: Step in the template build process
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          description: Type of the step
+        args:
+          default: []
+          type: array
+          description: Arguments for the step
+          items:
+            type: string
+        filesHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Hash of the files used in the step (lowercase hex SHA-256)
+        force:
+          default: false
+          type: boolean
+          description: Whether the step should be forced to run regardless of the cache
+
+    TemplateBuildRequestV3:
+      properties:
+        name:
+          description: Name of the template. Can include a tag with colon separator (e.g. "my-template" or "my-template:v1"). If tag is included, it will be treated as if the tag was provided in the tags array.
+          type: string
+          maxLength: 128
+        tags:
+          type: array
+          description: Tags to assign to the template build
+          items:
+            type: string
+        alias:
+          description: Alias of the template. Deprecated, use name instead.
+          type: string
+          maxLength: 128
+          deprecated: true
+        teamID:
+          deprecated: true
+          type: string
+          description: Identifier of the team, as its UUID or its public project ID (prj_)
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        minFreeDiskMb:
+          $ref: "#/components/schemas/MinFreeDiskMb"
+
+    FromImageRegistry:
+      oneOf:
+        - $ref: "#/components/schemas/AWSRegistry"
+        - $ref: "#/components/schemas/GCPRegistry"
+        - $ref: "#/components/schemas/GeneralRegistry"
+      discriminator:
+        propertyName: type
+        mapping:
+          aws: "#/components/schemas/AWSRegistry"
+          gcp: "#/components/schemas/GCPRegistry"
+          registry: "#/components/schemas/GeneralRegistry"
+
+    AWSRegistry:
+      type: object
+      required:
+        - type
+        - awsAccessKeyId
+        - awsSecretAccessKey
+        - awsRegion
+      properties:
+        type:
+          type: string
+          enum: [aws]
+          description: Type of registry authentication
+        awsAccessKeyId:
+          type: string
+          description: AWS Access Key ID for ECR authentication
+        awsSecretAccessKey:
+          type: string
+          description: AWS Secret Access Key for ECR authentication
+        awsRegion:
+          type: string
+          description: AWS Region where the ECR registry is located
+
+    GCPRegistry:
+      type: object
+      required:
+        - type
+        - serviceAccountJson
+      properties:
+        type:
+          type: string
+          enum: [gcp]
+          description: Type of registry authentication
+        serviceAccountJson:
+          type: string
+          description: Service Account JSON for GCP authentication
+
+    GeneralRegistry:
+      type: object
+      required:
+        - type
+        - username
+        - password
+      properties:
+        type:
+          type: string
+          enum: [registry]
+          description: Type of registry authentication
+        username:
+          type: string
+          description: Username to use for the registry
+        password:
+          type: string
+          description: Password to use for the registry
+
+    TemplateBuildStartV2:
+      type: object
+      description: Exactly one of fromImage or fromTemplate must be given and non-empty.
+      properties:
+        fromImage:
+          type: string
+          minLength: 1
+          description: Image to use as a base for the template build
+        fromTemplate:
+          type: string
+          minLength: 1
+          description: Template to use as a base for the template build
+        fromImageRegistry:
+          $ref: "#/components/schemas/FromImageRegistry"
+        force:
+          default: false
+          type: boolean
+          description: Whether the whole build should be forced to run regardless of the cache
+        steps:
+          default: []
+          description: List of steps to execute in the template build
+          type: array
+          items:
+            $ref: "#/components/schemas/TemplateStep"
+        startCmd:
+          description: Start command to execute in the template after the build
+          type: string
+        readyCmd:
+          description: Ready check command to execute in the template after the build
+          type: string
+
+    TemplateBuildFileUpload:
+      required:
+        - present
+      properties:
+        present:
+          type: boolean
+          description: Whether the file is already present in the cache
+        url:
+          description: Url where the file should be uploaded to
+          type: string
+        headers:
+          description: Request headers that must be sent with the upload request
+          type: object
+          additionalProperties:
+            type: string
+
+    LogLevel:
+      type: string
+      description: State of the sandbox
+      enum:
+        - debug
+        - info
+        - warn
+        - error
+
+    BuildLogEntry:
+      required:
+        - timestamp
+        - message
+        - level
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the log entry
+        message:
+          type: string
+          description: Log message content
+        level:
+          $ref: "#/components/schemas/LogLevel"
+        step:
+          type: string
+          description: Step in the build process related to the log entry
+
+    BuildStatusReason:
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          description: Message with the status reason, currently reporting only for error status
+        step:
+          type: string
+          description: Step that failed
+        logEntries:
+          default: []
+          description: Log entries related to the status reason
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+
+    TemplateBuildStatus:
+      type: string
+      description: Status of the template build
+      enum:
+        - building
+        - waiting
+        - ready
+        - error
+
+    TemplateBuildInfo:
+      required:
+        - templateID
+        - buildID
+        - status
+        - logs
+        - logEntries
+      properties:
+        logs:
+          default: []
+          deprecated: true
+          description: Build logs (always empty since the V1 build path was removed, use logEntries)
+          type: array
+          items:
+            type: string
+        logEntries:
+          default: []
+          description: Build logs structured
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+        templateID:
+          type: string
+          description: Identifier of the template
+        buildID:
+          type: string
+          description: Identifier of the build
+        status:
+          $ref: "#/components/schemas/TemplateBuildStatus"
+        reason:
+          $ref: "#/components/schemas/BuildStatusReason"
+
+    TemplateBuildLogsResponse:
+      required:
+        - logs
+      properties:
+        logs:
+          default: []
+          description: Build logs structured
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+
+    LogsDirection:
+      type: string
+      description: Direction of the logs that should be returned
+      enum:
+        - forward
+        - backward
+      x-enum-varnames:
+        - LogsDirectionForward
+        - LogsDirectionBackward
+
+    LogsSource:
+      type: string
+      description: Source of the logs that should be returned
+      enum:
+        - temporary
+        - persistent
+      x-enum-varnames:
+        - LogsSourceTemporary
+        - LogsSourcePersistent
+
+    NodeStatus:
+      type: string
+      description: |
+        Status of the node.
+        - standby: the node is not actively used, but it can return to ready and continue serving traffic.
+      enum:
+        - ready
+        - draining
+        - connecting
+        - unhealthy
+        - standby
+        - shutting_down
+      x-enum-varnames:
+        - NodeStatusReady
+        - NodeStatusDraining
+        - NodeStatusConnecting
+        - NodeStatusUnhealthy
+        - NodeStatusStandby
+        - NodeStatusShuttingDown
+
+    NodeStatusChange:
+      required:
+        - status
+      properties:
+        clusterID:
+          type: string
+          format: uuid
+          description: Identifier of the cluster
+        status:
+          $ref: "#/components/schemas/NodeStatus"
+
+    DiskMetrics:
+      required:
+        - mountPoint
+        - device
+        - filesystemType
+        - usedBytes
+        - totalBytes
+      properties:
+        mountPoint:
+          type: string
+          description: Mount point of the disk
+        device:
+          type: string
+          description: Device name
+        filesystemType:
+          type: string
+          description: Filesystem type (e.g., ext4, xfs)
+        usedBytes:
+          type: integer
+          format: uint64
+          description: Used space in bytes
+        totalBytes:
+          type: integer
+          format: uint64
+          description: Total space in bytes
+
+    NodeMetrics:
+      description: Node metrics
+      required:
+        - allocatedCPU
+        - allocatedMemoryBytes
+        - cpuPercent
+        - memoryUsedBytes
+        - cpuCount
+        - memoryTotalBytes
+        - disks
+        - hugePagesTotal
+        - hugePagesUsed
+        - hugePagesReserved
+        - hugePageSizeBytes
+      properties:
+        allocatedCPU:
+          type: integer
+          format: uint32
+          description: Number of allocated CPU cores
+        cpuPercent:
+          type: integer
+          format: uint32
+          description: Node CPU usage percentage
+        cpuCount:
+          type: integer
+          format: uint32
+          description: Total number of CPU cores on the node
+        allocatedMemoryBytes:
+          type: integer
+          format: uint64
+          description: Amount of allocated memory in bytes
+        memoryUsedBytes:
+          type: integer
+          format: uint64
+          description: Node memory used in bytes
+        memoryTotalBytes:
+          type: integer
+          format: uint64
+          description: Total node memory in bytes
+        hugePagesTotal:
+          type: integer
+          format: uint64
+          description: Total number of preallocated hugepages on the node
+        hugePagesUsed:
+          type: integer
+          format: uint64
+          description: Number of hugepages in use (total - free)
+        hugePagesReserved:
+          type: integer
+          format: uint64
+          description: Number of reserved hugepages (committed but not yet faulted)
+        hugePageSizeBytes:
+          type: integer
+          format: uint64
+          description: Size of a single hugepage in bytes
+        disks:
+          type: array
+          description: Detailed metrics for each disk/mount point
+          items:
+            $ref: "#/components/schemas/DiskMetrics"
+    MachineInfo:
+      required:
+        - cpuFamily
+        - cpuModel
+        - cpuModelName
+        - cpuArchitecture
+      properties:
+        cpuFamily:
+          type: string
+          description: CPU family of the node
+        cpuModel:
+          type: string
+          description: CPU model of the node
+        cpuModelName:
+          type: string
+          description: CPU model name of the node
+        cpuArchitecture:
+          type: string
+          description: CPU architecture of the node
+
+    Node:
+      required:
+        - id
+        - serviceInstanceID
+        - clusterID
+        - status
+        - statusChangedAt
+        - sandboxCount
+        - outstandingWork
+        - maxSandboxes
+        - metrics
+        - createSuccesses
+        - createFails
+        - sandboxStartingCount
+        - version
+        - commit
+        - machineInfo
+      properties:
+        version:
+          type: string
+          description: Version of the orchestrator
+        commit:
+          type: string
+          description: Commit of the orchestrator
+        id:
+          type: string
+          description: Identifier of the node
+        serviceInstanceID:
+          type: string
+          description: Service instance identifier of the node
+        clusterID:
+          type: string
+          description: Identifier of the cluster
+        machineInfo:
+          $ref: "#/components/schemas/MachineInfo"
+        status:
+          $ref: "#/components/schemas/NodeStatus"
+        statusChangedAt:
+          type: string
+          format: date-time
+          description: Time when the node status was last changed
+        sandboxCount:
+          type: integer
+          format: uint32
+          description: Number of sandboxes running on the node
+        maxSandboxes:
+          type: integer
+          format: int64
+          description: Cached node-scoped sandbox admission limit. Nonpositive values reject creation.
+        outstandingWork:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Cached count of work holds on the node. Zero means idle or not yet reported; it does not by itself authorize deletion.
+        metrics:
+          $ref: "#/components/schemas/NodeMetrics"
+        createSuccesses:
+          type: integer
+          format: uint64
+          description: Number of sandbox create successes
+        createFails:
+          type: integer
+          format: uint64
+          description: Number of sandbox create fails
+        sandboxStartingCount:
+          type: integer
+          format: int
+          description: Number of starting Sandboxes
+
+    NodeDetail:
+      required:
+        - id
+        - serviceInstanceID
+        - clusterID
+        - status
+        - statusChangedAt
+        - sandboxCount
+        - outstandingWork
+        - maxSandboxes
+        - createSuccesses
+        - createFails
+        - version
+        - commit
+        - metrics
+        - machineInfo
+      properties:
+        clusterID:
+          type: string
+          description: Identifier of the cluster
+        version:
+          type: string
+          description: Version of the orchestrator
+        commit:
+          type: string
+          description: Commit of the orchestrator
+        id:
+          type: string
+          description: Identifier of the node
+        serviceInstanceID:
+          type: string
+          description: Service instance identifier of the node
+        machineInfo:
+          $ref: "#/components/schemas/MachineInfo"
+        status:
+          $ref: "#/components/schemas/NodeStatus"
+        statusChangedAt:
+          type: string
+          format: date-time
+          description: Time when the node status was last changed
+        sandboxCount:
+          type: integer
+          format: uint32
+          description: Number of sandboxes running on the node
+        maxSandboxes:
+          type: integer
+          format: int64
+          description: Cached node-scoped sandbox admission limit. Nonpositive values reject creation.
+        outstandingWork:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Cached count of work holds on the node. Zero means idle or not yet reported; it does not by itself authorize deletion.
+        metrics:
+          $ref: "#/components/schemas/NodeMetrics"
+        createSuccesses:
+          type: integer
+          format: uint64
+          description: Number of sandbox create successes
+        createFails:
+          type: integer
+          format: uint64
+          description: Number of sandbox create fails
+
+    TeamAPIKey:
+      required:
+        - id
+        - name
+        - mask
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identifier of the API key
+        name:
+          type: string
+          description: Name of the API key
+        mask:
+          $ref: "#/components/schemas/IdentifierMaskingDetails"
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp of API key creation
+        createdBy:
+          allOf:
+            - $ref: "#/components/schemas/TeamUser"
+          nullable: true
+        lastUsed:
+          type: string
+          format: date-time
+          description: Last time this API key was used
+          nullable: true
+
+    CreatedTeamAPIKey:
+      required:
+        - id
+        - key
+        - mask
+        - name
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Identifier of the API key
+        key:
+          type: string
+          description: Raw value of the API key
+        mask:
+          $ref: "#/components/schemas/IdentifierMaskingDetails"
+        name:
+          type: string
+          description: Name of the API key
+        createdAt:
+          type: string
+          format: date-time
+          description: Timestamp of API key creation
+        createdBy:
+          allOf:
+            - $ref: "#/components/schemas/TeamUser"
+          nullable: true
+        lastUsed:
+          type: string
+          format: date-time
+          description: Last time this API key was used
+          nullable: true
+
+    NewTeamAPIKey:
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Name of the API key
+
+    UpdateTeamAPIKey:
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: New name for the API key
+
+    AssignedTemplateTags:
+      required:
+        - tags
+        - buildID
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+          description: Assigned tags of the template
+        buildID:
+          type: string
+          format: uuid
+          description: Identifier of the build associated with these tags
+
+    TemplateTag:
+      required:
+        - tag
+        - buildID
+        - createdAt
+      properties:
+        tag:
+          type: string
+          description: The tag name
+        buildID:
+          type: string
+          format: uuid
+          description: Identifier of the build associated with this tag
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the tag was assigned
+
+    AssignTemplateTagsRequest:
+      required:
+        - target
+        - tags
+      properties:
+        target:
+          type: string
+          description: Target template in "name:tag" format
+        tags:
+          description: Tags to assign to the template
+          type: array
+          items:
+            type: string
+
+    DeleteTemplateTagsRequest:
+      required:
+        - name
+        - tags
+      properties:
+        name:
+          type: string
+          description: Name of the template
+        tags:
+          description: Tags to delete
+          type: array
+          items:
+            type: string
+
+    Error:
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: Error code
+        error_code:
+          type: string
+          description: >-
+            Machine-readable semantic error code. Not a closed set; initial values:
+            sandbox_capacity_unavailable, sandbox_placement_timeout,
+            sandbox_no_compatible_node, sandbox_create_failed, internal_server_error,
+            secret_limit_reached, idempotency_request_mismatch, idempotency_in_progress,
+            idempotency_outcome_unknown.
+        message:
+          type: string
+          description: Error
+
+    IdentifierMaskingDetails:
+      required:
+        - prefix
+        - valueLength
+        - maskedValuePrefix
+        - maskedValueSuffix
+      properties:
+        prefix:
+          type: string
+          description: Prefix that identifies the token or key type
+        valueLength:
+          type: integer
+          description: Length of the token or key
+        maskedValuePrefix:
+          type: string
+          description: Prefix used in masked version of the token or key
+        maskedValueSuffix:
+          type: string
+          description: Suffix used in masked version of the token or key
+
+    Volume:
+      type: object
+      properties:
+        volumeID:
+          type: string
+          description: ID of the volume
+        name:
+          type: string
+          description: Name of the volume
+      required:
+        - volumeID
+        - name
+
+    VolumeAndToken:
+      type: object
+      properties:
+        volumeID:
+          type: string
+          description: ID of the volume
+        name:
+          type: string
+          description: Name of the volume
+        token:
+          type: string
+          description: Auth token to use for interacting with volume content
+        domain:
+          type: string
+          description: |
+            Domain to use as the destination for volume content requests,
+            replacing the default `api.<E2B_DOMAIN>`. Only returned when the
+            team is connected to a custom (BYOC) cluster; absent otherwise, in
+            which case the default domain is used.
+      required:
+        - volumeID
+        - name
+        - token
+
+    NewVolume:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Name of the volume
+          pattern: "^[a-zA-Z0-9_-]+$"
+      required:
+        - name
+
+    SecretMetadata:
+      type: object
+      description: >
+        Customer metadata of the secret. Always present, empty when unset.
+        At most 32 entries; keys are limited to 128 bytes, values to 1024
+        bytes, and a secret's metadata to 8192 bytes in total.
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 1024
+
+    Secret:
+      type: object
+      description: Metadata of a secret. It never carries the secret value.
+      required:
+        - secretID
+        - name
+        - currentVersion
+        - metadata
+        - createdAt
+        - updatedAt
+      properties:
+        secretID:
+          type: string
+          description: Identifier of the secret
+        name:
+          type: string
+          description: Name of the secret, unique within the project
+        currentVersion:
+          type: integer
+          format: int64
+          description: Version served to readers that do not name one
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the secret was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Time when the secret was last updated
+
+    NewSecret:
+      type: object
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9_-]+$'
+          description: >
+            Name of the secret, unique within the project. Names are
+            lower-cased before storage and returned in that canonical form;
+            the sec_ prefix is reserved for secret identifiers.
+        value:
+          type: string
+          description: Runtime marker stored as the secret's first version. The runtime resolves it to a value at sandbox egress.
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
+
+    SecretUpdate:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          description: Runtime marker stored as the secret's new version. The runtime resolves it to a value at sandbox egress.
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
+
+    SandboxEvent:
+      description: Sandbox event
+      required:
+        - id
+        - version
+        - type
+        - timestamp
+        - sandboxId
+        - sandboxExecutionId
+        - sandboxTemplateId
+        - sandboxBuildId
+        - sandboxTeamId
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Event unique identifier
+        version:
+          type: string
+          description: Event structure version
+        type:
+          type: string
+          description: Event name
+        eventCategory:
+          type: string
+          deprecated: true
+          description: Category of the event (e.g., 'lifecycle', 'process', etc.)
+        eventLabel:
+          type: string
+          deprecated: true
+          description: Label for the specific event type (e.g., 'sandbox_started', 'process_oom', etc.)
+        eventData:
+          type: object
+          nullable: true
+          description: Optional JSON data associated with the event
+
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp of the event
+        sandboxId:
+          type: string
+          format: string
+          description: Unique identifier for the sandbox
+        sandboxExecutionId:
+          type: string
+          format: string
+          description: Unique identifier for the sandbox execution
+        sandboxTemplateId:
+          type: string
+          format: string
+          description: Unique identifier for the sandbox template
+        sandboxBuildId:
+          type: string
+          format: string
+          description: Unique identifier for the sandbox build
+        sandboxTeamId:
+          type: string
+          format: uuid
+          description: Team identifier associated with the sandbox
+    WebhookCreate:
+      description: Configuration for registering new webhooks
+      required:
+        - name
+        - url
+        - events
+        - signatureSecret
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+          default: true
+        signatureSecret:
+          type: string
+          description: Secret used to sign the webhook payloads
+    WebhookCreation:
+      description: Webhook creation response
+      required:
+        - id
+        - name
+        - createdAt
+        - teamId
+        - url
+        - enabled
+        - events
+      properties:
+        id:
+          type: string
+          description: Webhook unique identifier
+        name:
+          type: string
+          description: Webhook user friendly name
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the template was created
+        teamId:
+          type: string
+          description: Unique identifier for the team
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+        events:
+          type: array
+          items:
+            type: string
+    WebhookDetail:
+      description: Webhook detail response
+      required:
+        - id
+        - teamId
+        - name
+        - createdAt
+        - url
+        - enabled
+        - events
+      properties:
+        id:
+          type: string
+          description: Webhook unique identifier
+        teamId:
+          type: string
+          description: Unique identifier for the team
+        name:
+          type: string
+          description: Webhook user friendly name
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the template was created
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+        events:
+          type: array
+          items:
+            type: string
+    WebhookConfiguration:
+      description: Configuration for updating existing webhooks
+      properties:
+        enabled:
+          type: boolean
+        name:
+          type: string
+          description: Webhook user friendly name
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+        signatureSecret:
+          type: string
+          description: Secret used to sign the webhook payloads
+    WebhookDelivery:
+      description: Webhook delivery attempt
+      required:
+        - id
+        - teamId
+        - webhookId
+        - eventId
+        - sandboxId
+        - eventType
+        - status
+        - durationMs
+        - requestBody
+        - requestHeaders
+        - requestUrl
+        - errorClass
+        - timestamp
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Delivery attempt identifier
+        teamId:
+          type: string
+          format: uuid
+          description: Team identifier
+        webhookId:
+          type: string
+          format: uuid
+          description: Webhook configuration identifier
+        eventId:
+          type: string
+          format: uuid
+          description: Sandbox event identifier
+        sandboxId:
+          type: string
+          description: Sandbox identifier
+        eventType:
+          type: string
+          description: Sandbox event type
+        status:
+          type: string
+          enum: [success, failed]
+          description: Delivery attempt status
+        durationMs:
+          type: integer
+          format: int32
+          description: Delivery request duration in milliseconds
+        requestBody:
+          type: string
+          description: Serialized webhook request body
+        requestHeaders:
+          type: string
+          description: JSON-encoded request headers with sensitive values redacted
+        requestUrl:
+          type: string
+          format: uri
+          description: URL attempted for this delivery
+        responseBody:
+          type: string
+          nullable: true
+          description: Truncated response body, if a response was received
+        responseHeaders:
+          type: string
+          nullable: true
+          description: JSON-encoded response headers, if a response was received
+        responseHttpStatusCode:
+          type: integer
+          format: int32
+          nullable: true
+          description: HTTP response status code, if a response was received
+        errorClass:
+          type: string
+          nullable: true
+          enum:
+            - http_error
+            - dns_error
+            - timeout
+            - transport_error
+            - request_error
+            - signature_error
+            - canceled
+          description: Machine-readable non-HTTP or HTTP failure class
+        errorMessage:
+          type: string
+          nullable: true
+          description: Error message for failures without a useful response body
+        timestamp:
+          type: string
+          format: date-time
+          description: Time when the delivery attempt started
+    WebhookDeliveryStats:
+      description: Webhook delivery aggregate stats
+      required:
+        - buckets
+        - total
+        - failed
+        - durationMs
+      properties:
+        buckets:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookDeliveryStatsBucket"
+        total:
+          type: integer
+          format: int64
+        failed:
+          type: integer
+          format: int64
+        durationMs:
+          $ref: "#/components/schemas/WebhookDeliveryDurationStats"
+    WebhookDeliveryDurationStats:
+      description: Webhook delivery duration statistics in milliseconds
+      required:
+        - minimum
+        - average
+        - maximum
+      properties:
+        minimum:
+          type: number
+          format: double
+        average:
+          type: number
+          format: double
+        maximum:
+          type: number
+          format: double
+    WebhookDeliveryStatsBucket:
+      description: Webhook delivery stats for a time bucket
+      required:
+        - timestamp
+        - total
+        - failed
+        - durationMs
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        total:
+          type: integer
+          format: int64
+        failed:
+          type: integer
+          format: int64
+        durationMs:
+          $ref: "#/components/schemas/WebhookDeliveryDurationStats"
+    WebhookDeliveryGroup:
+      description: Webhook delivery attempts grouped by sandbox event
+      required:
+        - eventId
+        - eventType
+        - sandboxId
+        - attempts
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        sandboxId:
+          type: string
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookDelivery"
+    WebhookDeliveriesListPayload:
+      description: Paginated webhook delivery attempts grouped by event
+      required:
+        - data
+        - nextCursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/WebhookDeliveryGroup"
+        nextCursor:
+          type: string
+          nullable: true
+          description: Cursor to pass to the next list request, or null when there is no next page.
+tags:
+  - name: templates
+  - name: sandboxes
+  - name: auth
+  - name: api-keys
+  - name: tags
+  - name: volumes
+  - name: secrets
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Health check
+      responses:
+        "204":
+          description: The service is healthy
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+
+  /teams:
+    get:
+      summary: List teams
+      description: List all teams
+      tags: [auth]
+      security:
+        - AuthProviderBearerAuth: []
+      responses:
+        "200":
+          description: Successfully returned all teams
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Team"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /teams/{teamID}/metrics:
+    get:
+      summary: Team metrics
+      description: Get metrics for the team
+      tags: [auth]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/teamID"
+        - in: query
+          name: start
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Unix timestamp for the start of the interval, in seconds, for which the metrics
+        - in: query
+          name: end
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            description: Unix timestamp for the end of the interval, in seconds, for which the metrics
+      responses:
+        "200":
+          description: Successfully returned the team metrics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TeamMetric"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /teams/{teamID}/metrics/max:
+    get:
+      summary: Maximum team metrics
+      description: Get the maximum metrics for the team in the given interval
+      tags: [auth]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/teamID"
+        - in: query
+          name: start
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Unix timestamp for the start of the interval, in seconds, for which the metrics
+        - in: query
+          name: end
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            description: Unix timestamp for the end of the interval, in seconds, for which the metrics
+        - in: query
+          name: metric
+          required: true
+          schema:
+            type: string
+            enum: [concurrent_sandboxes, sandbox_start_rate]
+          description: Metric to retrieve the maximum value for
+      responses:
+        "200":
+          description: Successfully returned the team metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaxTeamMetric"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes:
+    get:
+      summary: List running sandboxes
+      x-api-group: list
+      description: List all running sandboxes. Use GET /v2/sandboxes instead.
+      deprecated: true
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: metadata
+          in: query
+          description: Metadata query used to filter the sandboxes (e.g. "user=abc&app=prod"). Each key and values must be URL encoded.
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successfully returned all running sandboxes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ListedSandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Create sandbox
+      description: Create a sandbox from the template. All system communication with the sandbox is secured. Use POST /v2/sandboxes instead.
+      deprecated: true
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSandbox"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /v2/sandboxes:
+    post:
+      summary: Create sandbox (v2)
+      description: Create a sandbox from the template. All system communication with the sandbox is secured.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Optional team-scoped key for retrying sandbox creation. Use 1 to 255 lowercase ASCII
+            letters or digits (a-z, 0-9). When idempotency is enabled, matching retries replay the original
+            status and body, including errors, for the retention period.
+            Different request parameters return 409 with error_code idempotency_request_mismatch.
+            An in-progress request returns 409 with error_code idempotency_in_progress; an unknown
+            outcome returns 422 with error_code idempotency_outcome_unknown. These retries do not execute the request again.
+            Retries do not extend retention. After the key expires, it can start a new creation.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+            pattern: '^[a-z0-9]+$'
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSandboxV2"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          description: The Idempotency-Key conflicts with a different request (error_code idempotency_request_mismatch), or the matching original request has no recorded response yet and is within its expected response window (error_code idempotency_in_progress); this request was not executed again
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: The matching original request has no recorded response and its expected response deadline has passed or is unknown (error_code idempotency_outcome_unknown); this request was not executed again
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+        "504":
+          $ref: "#/components/responses/504"
+    get:
+      summary: List sandboxes (v2)
+      x-api-group: list
+      description: List all sandboxes
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: metadata
+          in: query
+          description: Metadata query used to filter the sandboxes (e.g. "user=abc&app=prod"). Each key and values must be URL encoded.
+          required: false
+          schema:
+            type: string
+        - name: state
+          in: query
+          description: Filter sandboxes by one or more states
+          required: false
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/SandboxState"
+          style: form
+          explode: false
+        - name: order
+          in: query
+          description: Sort direction by sandbox start time. Defaults to desc (newest first).
+          required: false
+          schema:
+            $ref: "#/components/schemas/OrderDirection"
+        - name: startedAfter
+          in: query
+          description: Return sandboxes started at or after this timestamp.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: template
+          in: query
+          description: Filter sandboxes by a template ID or alias.
+          required: false
+          schema:
+            type: string
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully returned all running sandboxes
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+            X-Total-Running:
+              $ref: "#/components/headers/XTotalRunning"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ListedSandbox"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/metrics:
+    get:
+      summary: List sandbox metrics
+      x-api-group: list
+      description: List metrics for given sandboxes
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: sandbox_ids
+          in: query
+          required: true
+          description: Comma-separated list of sandbox IDs to get metrics for
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+            maxItems: 100
+            uniqueItems: true
+      responses:
+        "200":
+          description: Successfully returned all running sandboxes with metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxesWithMetrics"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/logs:
+    get:
+      summary: Sandbox logs
+      description: Get sandbox logs. Use /v2/sandboxes/{sandboxID}/logs instead.
+      deprecated: true
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+        - in: query
+          name: start
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Starting timestamp of the logs that should be returned in milliseconds
+        - in: query
+          name: limit
+          schema:
+            default: 1000
+            format: int32
+            minimum: 0
+            type: integer
+          description: Maximum number of logs that should be returned
+      responses:
+        "200":
+          description: Successfully returned the sandbox logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxLogs"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v2/sandboxes/{sandboxID}/logs:
+    get:
+      summary: Sandbox logs (v2)
+      description: Get sandbox logs
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+        - in: query
+          name: cursor
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Starting timestamp of the logs that should be returned in milliseconds
+        - in: query
+          name: limit
+          schema:
+            default: 1000
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 1000
+          description: Maximum number of logs that should be returned
+        - in: query
+          name: direction
+          schema:
+            $ref: "#/components/schemas/LogsDirection"
+          description: Direction of the logs that should be returned
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
+          description: Minimum log level to return. Logs below this level are excluded
+        - in: query
+          name: search
+          schema:
+            type: string
+            maxLength: 256
+          description: Case-sensitive substring match on log message content
+      responses:
+        "200":
+          description: Successfully returned the sandbox logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxLogsV2Response"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}:
+    get:
+      summary: Sandbox
+      description: Get a sandbox by id
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "200":
+          description: Successfully returned the sandbox
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxDetail"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+    delete:
+      summary: Kill sandbox
+      x-api-group: delete
+      description: Kill a sandbox
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "204":
+          description: The sandbox was killed successfully
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/metrics:
+    get:
+      summary: Sandbox metrics
+      description: Get sandbox metrics
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+        - in: query
+          name: start
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Unix timestamp for the start of the interval, in seconds, for which the metrics
+        - in: query
+          name: end
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            description: Unix timestamp for the end of the interval, in seconds, for which the metrics
+
+      responses:
+        "200":
+          description: Successfully returned the sandbox metrics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxMetric"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
+  /sandboxes/{sandboxID}/pause:
+    post:
+      summary: Pause sandbox
+      description: Pause the sandbox
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxPauseRequest"
+      responses:
+        "204":
+          description: The sandbox was paused successfully and can be resumed
+        "409":
+          $ref: "#/components/responses/409"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+
+  /sandboxes/{sandboxID}/resume:
+    post:
+      summary: Resume sandbox
+      deprecated: true
+      description: Resume the sandbox
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResumedSandbox"
+      responses:
+        "201":
+          description: The sandbox was resumed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "409":
+          $ref: "#/components/responses/409"
+        "404":
+          $ref: "#/components/responses/404"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /sandboxes/{sandboxID}/fork:
+    post:
+      summary: Fork sandbox
+      description: >-
+        Fork the sandbox: checkpoint the running sandbox in place (it is
+        briefly paused, snapshotted with its full memory state, and resumed on
+        its node, keeping its ID and expiration untouched) and create count
+        new sandboxes from that snapshot. Returns one result per requested
+        fork, each carrying either the created sandbox or the error that
+        prevented it from starting. A non-201 status means the request failed
+        before any fork was attempted.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxForkRequest"
+      responses:
+        "201":
+          description: >-
+            The sandbox was snapshotted and the forks were attempted; each
+            entry reports one fork's outcome
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxForkResult"
+        "409":
+          $ref: "#/components/responses/409"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+
+  /sandboxes/{sandboxID}/connect:
+    post:
+      summary: Connect sandbox
+      description: Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended. Use POST /v2/sandboxes/{sandboxID}/connect instead.
+      deprecated: true
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectSandbox"
+      responses:
+        "200":
+          description: The sandbox was already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "201":
+          description: The sandbox was resumed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /v2/sandboxes/{sandboxID}/connect:
+    post:
+      summary: Connect sandbox (v2)
+      description: >-
+        Returns sandbox details. If the sandbox is paused, it will be resumed.
+        TTL is only extended. The request body is optional; an omitted timeout
+        defaults to 300 seconds.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectSandboxV2"
+      responses:
+        "200":
+          description: The sandbox was already running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "201":
+          description: The sandbox was resumed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /sandboxes/{sandboxID}/timeout:
+    post:
+      summary: Set sandbox timeout
+      description: Set the timeout for the sandbox. The sandbox will expire x seconds from the time of the request. Calling this method multiple times overwrites the TTL, each time using the current timestamp as the starting point to measure the timeout duration.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxTimeoutRequest"
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "204":
+          description: Successfully set the sandbox timeout
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/network:
+    put:
+      summary: Update sandbox network
+      description: Update the network configuration for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting field clears it.
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxNetworkUpdateConfig"
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "204":
+          description: Successfully updated the sandbox network configuration
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/refreshes:
+    post:
+      summary: Refresh sandbox
+      description: Refresh the sandbox extending its time to live
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      tags: [sandboxes]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxRefreshRequest"
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "204":
+          description: Successfully refreshed the sandbox
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+
+  /sandboxes/{sandboxID}/snapshots:
+    post:
+      summary: Create snapshot
+      description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxSnapshotRequest"
+      responses:
+        "201":
+          description: Snapshot created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotInfo"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /snapshots:
+    get:
+      summary: List snapshots
+      x-api-group: list
+      description: List all snapshots for the team
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: sandboxID
+          in: query
+          required: false
+          schema:
+            type: string
+            description: Filter snapshots by source sandbox ID
+        - name: name
+          in: query
+          description: Filter snapshots by name or ID, optionally tag-qualified (e.g. "my-snapshot", "my-team/my-snapshot" or "my-snapshot:v1").
+          required: false
+          schema:
+            type: string
+        - $ref: "#/components/parameters/paginationLimit"
+        - $ref: "#/components/parameters/paginationNextToken"
+      responses:
+        "200":
+          description: Successfully returned snapshots
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SnapshotInfo"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v3/templates:
+    post:
+      summary: Create template (v3)
+      description: Create a new template
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildRequestV3"
+
+      responses:
+        "202":
+          description: The build was requested successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateRequestResponseV3"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v2/templates:
+    get:
+      summary: List templates (v2)
+      x-api-group: list
+      description: List all templates
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - in: query
+          required: false
+          name: teamID
+          schema:
+            type: string
+            description: Identifier of the team, as its UUID or its public project ID (prj_)
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully returned all templates
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Template"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/files/{hash}:
+    get:
+      summary: Template build file upload URL
+      description: Get an upload link for a tar file containing build layer files
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+            description: Hash of the files (lowercase hex SHA-256)
+
+      responses:
+        "201":
+          description: The upload link where to upload the tar file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildFileUpload"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates:
+    get:
+      summary: List templates
+      x-api-group: list
+      description: List all templates
+      deprecated: true
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - in: query
+          required: false
+          name: teamID
+          schema:
+            type: string
+            description: Identifier of the team, as its UUID or its public project ID (prj_)
+      responses:
+        "200":
+          description: Successfully returned all templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Template"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}:
+    get:
+      summary: List template builds
+      x-api-group: list
+      description: List all builds for a template
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully returned the template with its builds
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateWithBuilds"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Delete template
+      x-api-group: delete
+      description: Delete a template
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+      responses:
+        "204":
+          description: The template was deleted successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    patch:
+      summary: Update template
+      description: Update template
+      deprecated: true
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateUpdateRequest"
+      responses:
+        "200":
+          description: The template was updated successfully
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v2/templates/{templateID}/builds/{buildID}:
+    post:
+      summary: Start template build (v2)
+      description: Start the build
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/buildID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildStartV2"
+      responses:
+        "202":
+          description: The build has started
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /v2/templates/{templateID}:
+    patch:
+      summary: Update template (v2)
+      description: Update template
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateUpdateRequest"
+      responses:
+        "200":
+          description: The template was updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateUpdateResponse"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/builds/{buildID}/status:
+    get:
+      summary: Template build status
+      description: Get template build info
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/buildID"
+        - in: query
+          name: logsOffset
+          schema:
+            default: 0
+            type: integer
+            format: int32
+            minimum: 0
+          description: Index of the starting build log that should be returned with the template
+        - in: query
+          name: limit
+          schema:
+            default: 100
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 100
+          description: Maximum number of logs that should be returned
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
+      responses:
+        "200":
+          description: Successfully returned the template
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildInfo"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/builds/{buildID}/logs:
+    get:
+      summary: Template build logs
+      description: Get template build logs
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/buildID"
+        - in: query
+          name: cursor
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Starting timestamp of the logs that should be returned in milliseconds
+        - in: query
+          name: limit
+          schema:
+            default: 100
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 100
+          description: Maximum number of logs that should be returned
+        - in: query
+          name: direction
+          schema:
+            $ref: "#/components/schemas/LogsDirection"
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
+        - in: query
+          name: source
+          schema:
+            $ref: "#/components/schemas/LogsSource"
+          description: Source of the logs that should be returned from
+      responses:
+        "200":
+          description: Successfully returned the template build logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildLogsResponse"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/tags:
+    post:
+      summary: Assign template tags
+      description: Assign tag(s) to a template build
+      tags: [tags]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssignTemplateTagsRequest"
+      responses:
+        "201":
+          description: Tag assigned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssignedTemplateTags"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Delete template tags
+      description: Delete multiple tags from templates
+      tags: [tags]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteTemplateTagsRequest"
+      responses:
+        "204":
+          description: Tags deleted successfully
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/tags:
+    get:
+      summary: List template tags
+      x-api-group: list
+      description: List all tags for a template
+      tags: [tags]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+      responses:
+        "200":
+          description: Successfully returned the template tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateTag"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/aliases/{alias}:
+    get:
+      summary: Check template alias
+      description: Check if template with given alias exists
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: alias
+          in: path
+          required: true
+          schema:
+            type: string
+            description: Template alias
+      responses:
+        "200":
+          description: Successfully queried template by alias
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateAliasResponse"
+        "400":
+          $ref: "#/components/responses/400"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /nodes:
+    get:
+      summary: List nodes
+      description: List all nodes
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - in: query
+          name: clusterID
+          description: Identifier of the cluster
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Successfully returned all nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Node"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /nodes/{nodeID}:
+    get:
+      summary: Node info
+      description: Get node info
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/nodeID"
+        - in: query
+          name: clusterID
+          description: Identifier of the cluster
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Successfully returned the node
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeDetail"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Change node status
+      description: Change status of a node
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/nodeID"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeStatusChange"
+      responses:
+        "204":
+          description: The node status was changed successfully
+        "409":
+          $ref: "#/components/responses/409"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/teams/{teamID}/sandboxes/kill:
+    post:
+      summary: Kill all sandboxes for a team
+      description: Kills all sandboxes for the specified team
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - name: teamID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Team ID
+      responses:
+        "200":
+          description: Successfully killed sandboxes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminSandboxKillResult"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/sandboxes/running-counts:
+    get:
+      summary: Count running sandboxes by team
+      description: |
+        Returns a shared snapshot normally refreshed after five seconds. A
+        sandbox transitioning out of running can remain counted until removal.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      responses:
+        "200":
+          description: Running sandbox counts keyed by team ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTeamRunningSandboxCounts"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/sandboxes/{sandboxID}:
+    get:
+      summary: Get a sandbox's team and state
+      description: |
+        Reads the team and state of a sandbox from its latest lifecycle event.
+        The state lags the sandbox while that event is in flight. A sandbox
+        whose events have expired is not found.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "200":
+          description: The sandbox, its team and its state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminSandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/teams/{teamID}/builds/cancel:
+    post:
+      summary: Cancel all builds for a team
+      description: Cancels all in-progress and pending builds for the specified team
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - name: teamID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Team ID
+      responses:
+        "200":
+          description: Successfully cancelled builds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminBuildCancelResult"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/teams/{teamID}/api-keys:
+    post:
+      summary: Create team API key as admin
+      description: Creates a team API key for internal service workflows.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - name: teamID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Team ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewTeamAPIKey"
+      responses:
+        "201":
+          description: Team API key created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedTeamAPIKey"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/teams/{teamID}/api-keys/{apiKeyID}:
+    delete:
+      summary: Delete team API key as admin
+      description: Deletes a team API key for internal service workflows.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - name: teamID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Team ID
+        - $ref: "#/components/parameters/apiKeyID"
+      responses:
+        "204":
+          description: Team API key deleted successfully
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /api-keys:
+    get:
+      summary: List team API keys
+      x-api-group: list
+      description: List all team API keys
+      tags: [api-keys]
+      security:
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      responses:
+        "200":
+          description: Successfully returned all team API keys
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TeamAPIKey"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Create team API key
+      description: Create a new team API key
+      tags: [api-keys]
+      security:
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewTeamAPIKey"
+      responses:
+        "201":
+          description: Team API key created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedTeamAPIKey"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /api-keys/{apiKeyID}:
+    patch:
+      summary: Update team API key
+      description: Update a team API key
+      tags: [api-keys]
+      security:
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/apiKeyID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTeamAPIKey"
+      responses:
+        "200":
+          description: Team API key updated successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Delete team API key
+      description: Delete a team API key
+      tags: [api-keys]
+      security:
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/apiKeyID"
+      responses:
+        "204":
+          description: Team API key deleted successfully
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes:
+    get:
+      summary: List team volumes
+      x-api-group: list
+      description: List all team volumes
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      responses:
+        "200":
+          description: Successfully listed all team volumes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+    post:
+      summary: Create team volume
+      description: Create a new team volume
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewVolume"
+      responses:
+        "201":
+          description: Successfully created a new team volume
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeAndToken"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes/{volumeID}:
+    get:
+      summary: Team volume
+      description: Get team volume info
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/volumeID"
+      responses:
+        "200":
+          description: Successfully retrieved a team volume
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeAndToken"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+    delete:
+      summary: Delete team volume
+      description: Delete a team volume
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/volumeID"
+      responses:
+        "204":
+          description: Successfully deleted a team volume
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /secrets:
+    get:
+      summary: List project secrets
+      x-api-group: list
+      description: List the project's secrets. No response carries a secret value.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully listed the project's secrets
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "502":
+          $ref: "#/components/responses/502"
+        "504":
+          $ref: "#/components/responses/504"
+
+    post:
+      summary: Create a secret
+      description: Create a secret by storing a runtime marker as its first version. The response carries metadata only.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSecret"
+      responses:
+        "201":
+          description: Successfully created the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          description: >-
+            Secret name conflict or project live-secret limit reached. A quota
+            response has error_code secret_limit_reached and, when reported by
+            the backend, the effective cap in message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                secretLimitReached:
+                  value:
+                    code: 409
+                    message: Project has reached its limit of 50 live secrets
+                    error_code: secret_limit_reached
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "502":
+          $ref: "#/components/responses/502"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /secrets/{secretID}:
+    get:
+      summary: Get a secret
+      description: Get one secret's metadata, selected by identifier or name.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      responses:
+        "200":
+          description: Successfully retrieved the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "502":
+          $ref: "#/components/responses/502"
+        "504":
+          $ref: "#/components/responses/504"
+
+    post:
+      summary: Update a secret
+      description: Replace the secret's stored marker by appending a new version. The response carries metadata only.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretUpdate"
+      responses:
+        "200":
+          description: Successfully updated the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "502":
+          $ref: "#/components/responses/502"
+        "504":
+          $ref: "#/components/responses/504"
+
+    delete:
+      summary: Delete a secret
+      description: Revoke the secret and schedule its versions for cleanup.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      responses:
+        "204":
+          description: Successfully deleted the secret
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "403":
+          $ref: "#/components/responses/403"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "502":
+          $ref: "#/components/responses/502"
+        "504":
+          $ref: "#/components/responses/504"
+
+  /clusters/{clusterID}/rigs:
+    get:
+      summary: List rigs of a cluster
+      description: >
+        List the orchestrator node pools ("rigs") of a cluster with a snapshot
+        of their scaling groups. Forwarded to the cluster's edge service; a
+        cluster with no rig management configured returns an empty list, and
+        the local cluster answers 501.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/clusterID"
+      responses:
+        "200":
+          description: Successfully returned the rigs of the cluster
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Rig"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          $ref: "#/components/responses/501"
+
+  /clusters/{clusterID}/rigs/{rigID}/capacity:
+    put:
+      summary: Set the capacity of a rig
+      description: >
+        Set the desired instance count on the rig's scaling group. The value is
+        passed to the cloud provider unchanged; violations of the group's bounds
+        or conflicting concurrent operations surface as errors.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/clusterID"
+        - $ref: "#/components/parameters/rigID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RigCapacityChange"
+      responses:
+        "202":
+          description: Capacity change accepted
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          $ref: "#/components/responses/501"
+
+  /clusters/{clusterID}/rigs/instances/{instanceID}:
+    delete:
+      summary: Terminate an instance of a rig
+      description: >
+        Terminate an instance in whichever rig's scaling group it belongs to.
+        The caller chooses whether the rig shrinks or the instance is replaced.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/clusterID"
+        - name: instanceID
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Provider instance ID
+        - name: decrementDesired
+          in: query
+          required: true
+          schema:
+            type: boolean
+          description: >
+            When true, desired capacity is decremented (rig shrinks);
+            when false, the scaling group launches a replacement instance
+      responses:
+        "202":
+          description: Instance termination accepted
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          $ref: "#/components/responses/501"
+
+  /clusters/{clusterID}/rigs/{rigID}/instances:
+    get:
+      summary: List the instances attached to a rig
+      description: >
+        List the instances attached to the rig's scaling group with their
+        creation time and transition state, sorted by instance ID.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/clusterID"
+        - $ref: "#/components/parameters/rigID"
+      responses:
+        "200":
+          description: Successfully returned the instances of the rig
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RigInstance"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          $ref: "#/components/responses/501"
+
+  /clusters/{clusterID}/rigs/{rigID}/errors:
+    get:
+      summary: List recent scaling errors of a rig
+      description: >
+        List recent scaling errors on the rig's scaling group (e.g. failed
+        instance creations due to resource exhaustion), newest first.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+        - AdminJWTAuth: []
+      parameters:
+        - $ref: "#/components/parameters/clusterID"
+        - $ref: "#/components/parameters/rigID"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 50
+            default: 20
+          description: Maximum number of errors to return
+      responses:
+        "200":
+          description: Successfully returned the scaling errors of the rig
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RigError"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "429":
+          $ref: "#/components/responses/429"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          $ref: "#/components/responses/501"
+
+  /events/sandboxes/{sandboxID}:
+    get:
+      description: Get sandbox events
+      tags: [events]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 10
+        - name: orderAsc
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: types
+          in: query
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+          description: Filter events to the provided event types
+      responses:
+        "200":
+          description: Successfully returned the sandbox events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxEvent"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/sandboxes:
+    get:
+      description: Get all sandbox events for the team associated with the API key
+      tags: [events]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 10
+        - name: orderAsc
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: types
+          in: query
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+          description: Filter events to the provided event types
+      responses:
+        "200":
+          description: Successfully returned the sandbox events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxEvent"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks:
+    post:
+      description: Register events webhook.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookCreate"
+      responses:
+        "201":
+          description: Successfully created webhook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookCreation"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+    get:
+      description: List registered webhooks.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      responses:
+        "200":
+          description: List of registered webhooks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookDetail"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks/{webhookID}:
+    get:
+      description: Get a registered webhook.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+      responses:
+        "200":
+          description: Successfully returned the webhook configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetail"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+    patch:
+      description: Update a registered webhook configuration.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookConfiguration"
+      responses:
+        "200":
+          description: Successfully updated webhook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetail"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+    delete:
+      description: Delete a registered webhook.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+      responses:
+        "200":
+          description: Successfully deleted webhook.
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks/{webhookID}/deliveries:
+    get:
+      description: List webhook delivery attempts.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque cursor from the previous response's nextCursor field.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: orderAsc
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Include deliveries at or after this timestamp.
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Include deliveries before this timestamp.
+        - name: deliveryStatus
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+              enum: [success, failed]
+          description: Filter deliveries by delivery status
+        - name: eventType
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            items:
+              type: string
+          description: Filter deliveries by event type
+      responses:
+        "200":
+          description: List of webhook delivery attempts grouped by event.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDeliveriesListPayload"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks/{webhookID}/stats:
+    get:
+      description: Get webhook delivery aggregate stats.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+        - AdminJWTAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+        - name: start
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Inclusive stats range start. Defaults to 24 hours ago.
+        - name: end
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Exclusive stats range end. Defaults to now.
+      responses:
+        "200":
+          description: Webhook delivery stats.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDeliveryStats"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
