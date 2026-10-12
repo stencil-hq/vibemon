@@ -42,6 +42,8 @@ struct Guest {
 	closed_for:       Mutex<HashMap<u16, u32>>,
 	/// Signalled when the streaming endpoint sees its reader go away.
 	stream_cancelled: Notify,
+	/// Makes `/break` abort its connection mid-body (the VM went away).
+	break_stream:     Notify,
 }
 
 struct Harness {
@@ -100,6 +102,19 @@ fn guest_app(guest: Arc<Guest>) -> Router {
 					}
 				});
 				Body::from_stream(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)))
+			}),
+		)
+		.route(
+			"/break",
+			get(|State(guest): State<Arc<Guest>>| async move {
+				let chunks = futures::stream::once(async {
+					Ok::<_, std::io::Error>(Bytes::from_static(b"first\n"))
+				})
+				.chain(futures::stream::once(async move {
+					guest.break_stream.notified().await;
+					Err(std::io::Error::other("vm stopped"))
+				}));
+				Body::from_stream(chunks)
 			}),
 		)
 		.route(
@@ -326,6 +341,65 @@ impl Harness {
 	fn dials(&self, port: u16) -> u32 {
 		self.guest.dials.lock().get(&port).copied().unwrap_or(0)
 	}
+}
+
+/// Pausing ends every tunnel; the client must not see that as a failed stream
+/// while the sandbox is paused (the SDK would health-probe and auto-resume
+/// it), but must once the sandbox runs again or is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn broken_stream_is_held_while_paused() {
+	let h = harness().await;
+	let host = format!("8000-irunning.{DOMAIN}");
+	let open_stream = || async {
+		let response = h.get_host(&host, "/break").send().await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+		let mut stream = response.bytes_stream();
+		assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(b"first\n"));
+		stream
+	};
+	let next_within = Duration::from_millis;
+
+	// Running sandbox: an upstream failure reaches the client at once.
+	h.put_route("irunning", |_| {}).await;
+	let mut stream = open_stream().await;
+	h.guest.break_stream.notify_one();
+	let ended = tokio::time::timeout(next_within(2_000), stream.next())
+		.await
+		.expect("not held");
+	assert!(ended.is_some_and(|item| item.is_err()), "running: failure is reported");
+
+	// Pausing: held while paused, released with the failure once resumed.
+	let mut stream = open_stream().await;
+	h.put_route("irunning", |r| r.state = RouteState::Pausing)
+		.await;
+	h.guest.break_stream.notify_one();
+	assert!(
+		tokio::time::timeout(next_within(1_500), stream.next())
+			.await
+			.is_err(),
+		"held while the sandbox pauses"
+	);
+	h.put_route("irunning", |_| {}).await;
+	let ended = tokio::time::timeout(next_within(2_000), stream.next())
+		.await
+		.expect("released on resume");
+	assert!(ended.is_some_and(|item| item.is_err()));
+
+	// Pausing, then gone without a paused row (killed): released.
+	let mut stream = open_stream().await;
+	h.put_route("irunning", |r| r.state = RouteState::Pausing)
+		.await;
+	h.guest.break_stream.notify_one();
+	assert!(
+		tokio::time::timeout(next_within(1_000), stream.next())
+			.await
+			.is_err()
+	);
+	h.state.cluster.kv.delete("sbx/irunning").await.unwrap();
+	let ended = tokio::time::timeout(next_within(2_000), stream.next())
+		.await
+		.expect("released when gone");
+	assert!(ended.is_some_and(|item| item.is_err()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

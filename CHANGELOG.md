@@ -77,6 +77,7 @@ All notable changes to this project are recorded here.
 ### Fixed
 
 - Fixed `just serve` handing out template-file upload URLs on the host's outbound address while listening on loopback: the recipe now passes `--public-url http://127.0.0.1:3000`
+- Fixed `autoResume` sandboxes waking up right after a pause while a client held an open stream (e.g. a background command): the stream's failure made the SDKs health-check envd through the ingress, which resumed the sandbox. Ingress now holds a response whose upstream breaks while its sandbox is pausing or paused, reporting the failure once the sandbox runs again, is killed, or after 620 s
 - Fixed the five `/clusters/{clusterID}/rigs…` admin operations answering 404: they now check the admin token and answer the spec's `501 Not implemented by this deployment`
 - Fixed the release binary tarball shipping the guest agent as `vmon-agent`, a name nodes never look up: it is now `vmon-agent-<arch>`, like the guest-assets tarball
 - Fixed misleading CLI help: `vmon admin block` (blocked teams can still read), `vmon admin set-limits` (omitted flags keep their values), `vmon serve --net user` (rejected on Linux), and `vmon vmm --remote-page-url` (no mesh)

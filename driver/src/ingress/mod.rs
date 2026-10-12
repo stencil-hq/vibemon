@@ -2,6 +2,7 @@
 //! request either to a sandbox port (ingress proxy) or to the E2B API, and
 //! applies the browser CORS policy to both.
 
+pub mod hold;
 pub mod listener;
 pub mod policy;
 pub mod proxy;
@@ -68,7 +69,7 @@ async fn ingress(state: &AppState, target: Target, req: Request) -> Response {
 		Resolve::Proxy(error) => error.render(&headers),
 		Resolve::Internal(message) => response::routing_failed(&message),
 	};
-	let route = match resolve(state, &target.sandbox_id).await {
+	let route = match resolve(state, &target, req.uri().path()).await {
 		Ok(route) => route,
 		Err(error) => return fail(error),
 	};
@@ -88,16 +89,25 @@ async fn ingress(state: &AppState, target: Target, req: Request) -> Response {
 		https:       target.port != policy::ENVD_PORT && route.https_ports.contains(&target.port),
 		masked_host: policy::masked_host(&route, target.port),
 	};
-	let mut response = proxy::forward(upstream, req).await;
-	if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-		response::allow_any_origin(response.headers_mut());
+	let response = proxy::forward(upstream, req).await;
+	if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+		return response;
 	}
+	let mut response = response.map(|body| {
+		axum::body::Body::new(hold::HoldWhilePaused::new(
+			body,
+			state.clone(),
+			target.sandbox_id.clone(),
+		))
+	});
+	response::allow_any_origin(response.headers_mut());
 	response
 }
 
 /// Finds the live route of a sandbox: local KV read, waiting out `resuming`,
 /// and auto-resuming paused sandboxes that opted in.
-async fn resolve(state: &AppState, sandbox_id: &str) -> Result<SandboxRoute, Resolve> {
+async fn resolve(state: &AppState, target: &Target, path: &str) -> Result<SandboxRoute, Resolve> {
+	let sandbox_id = target.sandbox_id.as_str();
 	let key = format!("sbx/{sandbox_id}");
 	let deadline = Instant::now() + RESUMING_WAIT;
 	loop {
@@ -108,13 +118,13 @@ async fn resolve(state: &AppState, sandbox_id: &str) -> Result<SandboxRoute, Res
 			.await
 			.map_err(|e| Resolve::Internal(e.to_string()))?;
 		let Some(entry) = entry else {
-			return resume(state, sandbox_id).await;
+			return resume(state, target, path).await;
 		};
 		let route: SandboxRoute = serde_json::from_slice(&entry.value)
 			.map_err(|e| Resolve::Internal(format!("corrupt route {key}: {e}")))?;
 		match route.state {
 			RouteState::Running | RouteState::Snapshotting => return Ok(route),
-			RouteState::Pausing if route.auto_resume => return resume(state, sandbox_id).await,
+			RouteState::Pausing if route.auto_resume => return resume(state, target, path).await,
 			RouteState::Killing | RouteState::Pausing => {
 				return Err(Resolve::Proxy(ProxyError::not_found(sandbox_id)));
 			},
@@ -128,7 +138,14 @@ async fn resolve(state: &AppState, sandbox_id: &str) -> Result<SandboxRoute, Res
 
 /// Auto-resume through the lifecycle state machine, mapping its API errors
 /// onto the upstream proxy bodies.
-async fn resume(state: &AppState, sandbox_id: &str) -> Result<SandboxRoute, Resolve> {
+async fn resume(state: &AppState, target: &Target, path: &str) -> Result<SandboxRoute, Resolve> {
+	let sandbox_id = target.sandbox_id.as_str();
+	tracing::info!(
+		sandbox = sandbox_id,
+		port = target.port,
+		path,
+		"ingress traffic for a sandbox without a running route; trying auto-resume"
+	);
 	// Boxed: the lifecycle future is deep enough to overflow the `Send`
 	// evaluation of the router's service future otherwise.
 	let resumed: std::pin::Pin<

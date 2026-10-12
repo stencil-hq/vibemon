@@ -124,5 +124,6 @@ Traffic to a paused sandbox resumes it when the sandbox was created with auto-re
 - While another request is resuming the sandbox, ingress polls every 200 ms for up to 1 minute.
 - A paused sandbox without auto-resume, or a killed one, gets 502 `The sandbox was not found`.
 - The resumed sandbox gets the timeout remembered at create time, raised to at least 300 s and capped at the team's maximum sandbox length.
+- A pause ends every proxied stream to the sandbox (open command or log streams, long downloads). Ingress keeps such a response open, sending nothing, while the sandbox is pausing or paused, and reports the broken stream only once the sandbox runs again, is killed, or after 620 s. Without this, the SDKs react to the failed stream with an envd health check through the ingress, which would auto-resume the sandbox right after it paused.
 
 Resume may move a sandbox to another node when its own node is gone and an object store is configured; see [Storage, object store, and volumes](storage.md). Lifecycle semantics are in [Sandboxes](../concepts/sandboxes.md).

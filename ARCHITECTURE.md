@@ -1022,7 +1022,11 @@ buffering). Implements: envd control paths (`/init`, `/freeze`, `/unfreeze`,
 `/collapse`, `/fsfreeze`, `/fsthaw`, `/upgrade`) → 404 on port 49983;
 `e2b-traffic-access-token` for non-49983 ports when
 `allowPublicTraffic=false`; `maskRequestHost`; `httpsPorts` (TLS to guest,
-no verify); auto-resume of paused sandboxes; dial retry (5 × 100–400 ms);
+no verify); auto-resume of paused sandboxes; holding a proxied response
+whose upstream breaks while its sandbox is pausing/paused (`ingress::hold`:
+no data, no error until the sandbox runs again, is killed, or 620 s pass), so
+the SDKs' health probe after a failed stream does not auto-resume the
+sandbox right after a pause; dial retry (5 × 100–400 ms);
 502 bodies `The sandbox was not found` / `The sandbox is running but port is
 not open`; CORS.
 

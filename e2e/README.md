@@ -75,23 +75,23 @@ pass `--serve-arg=--registry-mirror=<url>`. Other workstreams: pick your own
 |---|---|---|---|
 | Baseline (before fixes) | plain, one pass, `E2B_HTTP_VERSION=1.1` | 1356 passed, **70 failed, 26 errors**, 34 skipped (12 min) | — |
 | Mid | tls, one pass | 1419 passed, 33 failed, 34 skipped | 1003 passed, 5 failed, 36 skipped |
-| Latest full `run.py all --ingress tls` | tls | offline pass 505/505; live pass 937 passed, **10 failed**, 34 skipped | 1004 passed, **4 failed**, 36 skipped |
+| Previous full `run.py all --ingress tls` | tls | offline pass 505/505; live pass 937 passed, 10 failed, 34 skipped | 1004 passed, 4 failed, 36 skipped |
+| **Final** (2026-10-12, `--kernel target/kernel/Image-aarch64 --serve-arg=--registry-mirror=https://mirror.gcr.io`, 10 min) | tls | offline pass **505/505**; live pass **939 passed, 8 failed**, 34 skipped (1444 passed in total) | **1006 passed, 2 failed**, 36 skipped |
+| JS re-run after the ingress hold fix (2026-10-12, `just e2e js --ingress tls`, same flags, 3 min) | tls | — | **1007 passed, 1 failed**, 36 skipped |
 
-The latest full run predates the last three fixes (title-cased ingress
-headers, RUN unknown-user wording, GC4 random request ids) and the
-NodeRuntime HVF interrupt-state fix; a confirming rerun was blocked by Docker
-Hub's unauthenticated pull limit (`HTTP 429 TOOMANYREQUESTS` on
-`e2bdev/base` manifests, 100 GETs/h per IP shared by every workstream).
+Every failure from the previous run that had a fix (filesystem-only pause,
+snapshot pause/resume, `httpsPorts`, `mask_request_host`, RUN unknown user)
+passes in the final run. One JS test regressed between the two runs; it was
+fixed afterwards (below) and passes in the JS re-run, whose only failure is
+the Linux-only `firewall transform injects headers`.
 
-### Remaining failures in the latest run
+### Remaining failures in the final run
 
 | Test(s) | Root cause | Status |
 |---|---|---|
 | py `files/test_secured.py::test_download_url_with_*` (sync+async, 6) | macOS-Python harness limitation: `download_url()` builds on `envd_direct_url`, which the SDK sets to `E2B_SANDBOX_URL`; a bare `…/files?signature=…` carries no sandbox id. Would pass with pure upstream env (Linux `--ingress tls`). | Justified (harness/platform) |
 | py `test_network.py::test_firewall_transform_injects_headers` (2), js `firewall transform injects headers` | Egress header `rules` need the Linux egress MITM proxy; macOS user-net nodes are not eligible → `503 no compatible node`. | Justified (Linux-only feature; Linux/KVM run not possible — Lima VM stopped by request) |
-| py `test_auto_pause_filesystem_only_reboots`, `test_pause_filesystem_only` | `guest agent echoed the wrong hello epoch`: a `hello` from a timed-out earlier GC4 connection was answered with id 1 = the new connection's id. | **Fixed** after the run (node/src/gc4 random per-connection ids) |
-| js `snapshot.test.ts` pause/resume ×2 | Resumed VM deaf to interrupts: HVF snapshot taken mid-interrupt-handler (GIC active priority never dropped). | **Fixed** by NodeRuntime after the run (vmm `Vcpu::mid_interrupt`); templates must be rebuilt |
-| js `httpsPorts option > public URL proxies to an HTTPS backend` | 30 s test timeout; the Python twin (`test_https_ports`) passes against the same ingress. Not root-caused. | Open (DriverIngress: guest-TLS dial path under Node fetch) |
+| js `lifecyclePayload.test.ts > auto-resume wakes paused sandbox on http request` | Regression between the two runs. Pausing stops the VM and ends the test's open background-command stream; the JS SDK reacts with an envd `GET /health` (port 49983, valid token) through the ingress, which auto-resumed the sandbox about 180 ms after the pause, before the test's 500 ms poll could see `paused`. Upstream has the same mechanism but pauses/resumes slower than one poll. | **Fixed** after the run (`driver/src/ingress/hold.rs`: a guest stream that breaks while the sandbox is pausing/paused is held open until it runs again, is killed, or 620 s pass). Passes in the full JS re-run |
 
 ### Skips (identical to upstream CI)
 

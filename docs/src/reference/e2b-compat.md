@@ -151,11 +151,13 @@ client stream for `StreamInput`), HTTP/1.1 + h2c.
 
 `e2e/run.py` runs upstream's unmodified `packages/python-sdk/tests` and
 `packages/js-sdk/tests` (pinned to the `spec/e2b/` snapshot) against a
-monolithic `vmon serve`. Latest macOS/HVF run: Python 1442 passed / 10 failed
-/ 34 skipped, JS 1004 passed / 4 failed / 36 skipped; skips match upstream CI.
-Remaining failures (macOS-only egress `rules`, signed URLs under the macOS
-Python routing workaround, one JS `httpsPorts` timeout) and the fixes made are
-listed in [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README.md).
+monolithic `vmon serve`. Final macOS/HVF run (2026-10-12): Python 1444 passed
+/ 8 failed / 34 skipped, JS 1006 passed / 2 failed / 36 skipped; skips match
+upstream CI. Remaining failures: egress header `rules` (Linux-only feature, 3)
+and signed download URLs under the macOS Python routing workaround (6). The
+run's one JS auto-resume regression was fixed afterwards in the ingress; a JS
+re-run then gave 1007 passed / 1 failed (egress `rules`) / 36 skipped.
+Details and the fixes made are listed in [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README.md).
 
 ## 5. Deliberate deviations
 
