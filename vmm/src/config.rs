@@ -1402,19 +1402,22 @@ mod tests {
 
 	#[test]
 	fn remote_fs_mode_suffix() {
-		let ro = parse_remote_fs("data:/run/s3.sock").expect("read-only binding");
+		// An absolute proxy endpoint: a Unix socket, or a named pipe on Windows.
+		#[cfg(windows)]
+		const SOCK: &str = r"\\.\pipe\s3";
+		#[cfg(not(windows))]
+		const SOCK: &str = "/run/s3.sock";
+		let ro = parse_remote_fs(&format!("data:{SOCK}")).expect("read-only binding");
 		assert_eq!(
 			(ro.tag.as_str(), ro.sock.as_path(), ro.writable),
-			("data", Path::new("/run/s3.sock"), false)
+			("data", Path::new(SOCK), false)
 		);
-		let rw = parse_remote_fs("data:/run/s3.sock:rw").expect("writable binding");
-		assert_eq!((rw.sock.as_path(), rw.writable), (Path::new("/run/s3.sock"), true));
-		let explicit_ro = parse_remote_fs("data:/run/s3.sock:ro").expect("explicit read-only");
-		assert_eq!(
-			(explicit_ro.sock.as_path(), explicit_ro.writable),
-			(Path::new("/run/s3.sock"), false)
-		);
+		let rw = parse_remote_fs(&format!("data:{SOCK}:rw")).expect("writable binding");
+		assert_eq!((rw.sock.as_path(), rw.writable), (Path::new(SOCK), true));
+		let explicit_ro = parse_remote_fs(&format!("data:{SOCK}:ro")).expect("explicit read-only");
+		assert_eq!((explicit_ro.sock.as_path(), explicit_ro.writable), (Path::new(SOCK), false));
 		assert!(parse_remote_fs("data::rw").is_err());
+		assert!(parse_remote_fs("data:relative.sock").is_err(), "relative endpoint");
 	}
 
 	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
