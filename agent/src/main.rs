@@ -1,7 +1,32 @@
+//! `vmon-agent`: guest PID 1 / `envd` service. Dispatch: `envd [--port N]`
+//! runs only the envd server; anything else serves GC4 on the `vmon.gc4`
+//! virtio-console port (plus envd), doing PID-1 init duties first when running
+//! as PID 1.
+
 #[cfg(target_os = "linux")]
 fn main() {
-	if let Err(err) = linux_agent::run() {
+	let args: Vec<String> = std::env::args().collect();
+	// SAFETY: `getpid` has no preconditions.
+	let pid1 = unsafe { libc::getpid() } == 1;
+	let result = if !pid1 && args.get(1).map(String::as_str) == Some("envd") {
+		vmon_agent::envd::run_standalone(&args[2..]).map_err(|err| format!("envd: {err}"))
+	} else {
+		linux_agent::run(pid1)
+	};
+	if let Err(err) = result {
+		vmon_agent::logging::emit(
+			vmon_agent::logging::Level::Error,
+			"agent exited",
+			serde_json::json!({"error": err}),
+		);
 		eprintln!("vmon-agent: {err}");
+		if pid1 {
+			// PID 1 must never exit (kernel panic); park forever so the host can
+			// still see the console log and kill the VM.
+			loop {
+				std::thread::park();
+			}
+		}
 		std::process::exit(1);
 	}
 }
@@ -15,10 +40,10 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux_agent {
 	use std::{
-		collections::{HashMap, HashSet},
+		collections::HashMap,
 		ffi::CString,
 		fs::{self, File, OpenOptions},
-		io::{self, Read, Write},
+		io::{self, BufReader, Read, Write},
 		net::{Ipv4Addr, TcpStream, ToSocketAddrs},
 		os::unix::{
 			ffi::OsStrExt,
@@ -30,12 +55,19 @@ mod linux_agent {
 		str::FromStr,
 		sync::{Arc, Mutex, MutexGuard},
 		thread,
-		time::{Duration, SystemTime, UNIX_EPOCH},
+		time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 	};
 
 	use serde::Deserialize;
 	use serde_json::{Value, json};
-	use vmon_agent::proto::{self, Frame};
+	use vmon_agent::{
+		entropy, envd,
+		logging::{self, Level},
+		proto::{self, Frame, Op},
+		provision, reaper,
+		tunnel::{ConnectRequest, FrameSink, Tunnels},
+		unpack,
+	};
 
 	type SharedWriter = Arc<Mutex<File>>;
 	type Sessions = Arc<Mutex<HashMap<u32, Session>>>;
@@ -54,7 +86,12 @@ mod linux_agent {
 		exit:       Option<(i32, SystemTime)>,
 	}
 
-	const HVC0: &str = "/dev/hvc0";
+	/// sysfs view of virtio-console ports: `<dev>/name` per `/dev/<dev>`.
+	const VIRTIO_PORTS: &str = "/sys/class/virtio-ports";
+	/// Upper bound for the VMM's port announcement to reach userspace.
+	const AGENT_PORT_WAIT: Duration = Duration::from_secs(10);
+	/// GC4 read buffer: frame headers and small frames cost no extra syscall.
+	const CHANNEL_READ_BUF: usize = 64 * 1024;
 	const CONSOLE: &str = "/dev/console";
 	const DEFAULT_IFACE: &str = "eth0";
 	const STREAM_CHUNK: usize = 64 * 1024;
@@ -111,85 +148,132 @@ mod linux_agent {
 		bytes: u64,
 	}
 
-	pub fn run() -> Result<(), String> {
-		setup_pid1()?;
-		set_child_subreaper()?;
+	/// Default `PATH` when the kernel/init gave us none.
+	const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-		let cmdline = read_cmdline();
+	pub fn run(pid1: bool) -> Result<(), String> {
+		if std::env::var_os("PATH").is_none() {
+			// SAFETY: still single-threaded; no other thread reads the
+			// environment.
+			unsafe { std::env::set_var("PATH", DEFAULT_PATH) };
+		}
+		let cmdline = read_cmdline_after_proc(pid1)?;
+		if pid1 {
+			set_child_subreaper()?;
+			init_pid1(&cmdline);
+		}
 		match cmdline.get("vmon.agent").map(String::as_str) {
 			Some("run") => run_one_shot(&cmdline),
-			_ => serve(),
+			_ => serve(pid1),
 		}
 	}
 
-	/// Put the virtio-console RPC device into raw mode.
-	///
-	/// `/dev/hvc0` is a tty, so it comes up in canonical line-discipline mode:
-	/// reads block until a newline and the discipline rewrites CR/LF and
-	/// intercepts control bytes. The agent protocol is length-prefixed binary,
-	/// so without raw mode `read_frame` stalls and frames are corrupted. A
-	/// non-tty backend (`ENOTTY`) needs no change.
-	fn set_hvc_raw(device: &File) -> Result<(), String> {
-		let fd = device.as_raw_fd();
-		// SAFETY: `fd` is a valid open file descriptor owned by `device`, and
-		// `termios` is fully initialized by `tcgetattr` before use.
-		unsafe {
-			let mut termios: libc::termios = std::mem::zeroed();
-			if libc::tcgetattr(fd, &mut termios) != 0 {
-				let err = io::Error::last_os_error();
-				if err.raw_os_error() == Some(libc::ENOTTY) {
-					return Ok(());
+	/// Mount `/proc` first when PID 1 so the kernel cmdline is readable.
+	fn read_cmdline_after_proc(pid1: bool) -> Result<HashMap<String, String>, String> {
+		if pid1 {
+			fs::create_dir_all("/proc").map_err(|err| format!("create /proc: {err}"))?;
+			mount_fs("proc", "/proc", "proc", 0, None)?;
+		}
+		Ok(read_cmdline())
+	}
+
+	/// `/dev` node of the virtio-console port named [`proto::AGENT_PORT_NAME`].
+	fn find_agent_port() -> Option<std::path::PathBuf> {
+		fs::read_dir(VIRTIO_PORTS)
+			.ok()?
+			.flatten()
+			.find_map(|entry| {
+				let name = fs::read_to_string(entry.path().join("name")).ok()?;
+				(name.trim_end() == proto::AGENT_PORT_NAME)
+					.then(|| std::path::Path::new("/dev").join(entry.file_name()))
+			})
+	}
+
+	/// Open the GC4 channel: the VMM's `vmon.gc4` virtio-console port, a plain
+	/// character device (no tty line discipline, so bytes pass verbatim). The
+	/// device names the port in a control handshake that can finish after
+	/// early userspace starts, so wait for it.
+	fn open_agent_port() -> Result<File, String> {
+		let deadline = Instant::now() + AGENT_PORT_WAIT;
+		loop {
+			if let Some(path) = find_agent_port() {
+				return OpenOptions::new()
+					.read(true)
+					.write(true)
+					.open(&path)
+					.map_err(|err| format!("open {}: {err}", path.display()));
+			}
+			if Instant::now() >= deadline {
+				return Err(format!(
+					"no virtio-console port named {} under {VIRTIO_PORTS} after {AGENT_PORT_WAIT:?}",
+					proto::AGENT_PORT_NAME
+				));
+			}
+			thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	fn serve(pid1: bool) -> Result<(), String> {
+		let device = open_agent_port()?;
+		if pid1 {
+			thread::spawn(|| {
+				loop {
+					reaper::reap_untracked();
+					thread::sleep(Duration::from_millis(100));
 				}
-				return Err(format!("tcgetattr {HVC0}: {err}"));
-			}
-			libc::cfmakeraw(&mut termios);
-			if libc::tcsetattr(fd, libc::TCSANOW, &termios) != 0 {
-				return Err(format!("tcsetattr {HVC0}: {}", io::Error::last_os_error()));
-			}
-			// Discard anything the tty buffered (and line-discipline-mangled) before
-			// raw mode took effect — kernel/boot console noise on hvc0, or canonical
-			// CR/LF rewrites — so the first `read_frame` starts on a clean boundary.
-			// The host only sends real frames in response to later client actions,
-			// so flushing the startup buffer never drops a genuine request.
-			if libc::tcflush(fd, libc::TCIFLUSH) != 0 {
-				return Err(format!("tcflush {HVC0}: {}", io::Error::last_os_error()));
-			}
+			});
 		}
-		Ok(())
-	}
-
-	fn serve() -> Result<(), String> {
-		let device = OpenOptions::new()
-			.read(true)
-			.write(true)
-			.open(HVC0)
-			.map_err(|err| format!("open {HVC0}: {err}"))?;
-		set_hvc_raw(&device)?;
+		// envd listens before readiness is announced, so the host may tunnel to
+		// 49983 as soon as it sees SYNC. A failed envd is logged, not fatal: GC4
+		// stays usable for diagnosis.
+		let _envd = match envd::spawn(envd::EnvdConfig::default()) {
+			Ok(handle) => Some(handle),
+			Err(err) => {
+				logging::emit(Level::Error, "envd failed to start", json!({"error": err.to_string()}));
+				None
+			},
+		};
 		// Announce readiness with one complete alignment marker. The host bridge
 		// discards this marker before accepting clients, so no partial startup
 		// frame can leave a newly connected reader out of alignment.
 		{
 			let mut out = &device;
 			out.write_all(&proto::SYNC)
-				.map_err(|err| format!("write ready marker to {HVC0}: {err}"))?;
+				.map_err(|err| format!("write ready marker to the agent port: {err}"))?;
 			out.flush()
-				.map_err(|err| format!("flush ready marker to {HVC0}: {err}"))?;
+				.map_err(|err| format!("flush ready marker to the agent port: {err}"))?;
 		}
-		let mut reader = device
-			.try_clone()
-			.map_err(|err| format!("clone {HVC0}: {err}"))?;
+		let mut reader = BufReader::with_capacity(
+			CHANNEL_READ_BUF,
+			device
+				.try_clone()
+				.map_err(|err| format!("clone the agent port: {err}"))?,
+		);
 		let writer = Arc::new(Mutex::new(device));
 		let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 		let pty_sessions: PtySessions = Arc::new(Mutex::new(HashMap::new()));
 		let pending_writes: PendingWrites = Arc::new(Mutex::new(HashMap::new()));
-		spawn_orphan_reaper(sessions.clone(), pty_sessions.clone());
+		let tunnels = Tunnels::new(writer.clone() as Arc<dyn FrameSink>);
 
-		let agent =
-			Agent { writer, sessions, pty_sessions, pending_writes, epoch: Arc::new(Mutex::new(0)) };
+		let agent = Agent {
+			writer,
+			sessions,
+			pty_sessions,
+			pending_writes,
+			tunnels,
+			epoch: Arc::new(Mutex::new(0)),
+		};
+		logging::emit(
+			Level::Info,
+			"agent ready",
+			json!({"version": env!("CARGO_PKG_VERSION"), "pid1": pid1}),
+		);
 
-		// Discard pre-protocol bytes (guest-kernel console noise on hvc0) up to the
-		// host's SYNC marker so the frame loop starts on a clean boundary.
-		if !proto::resync_to_marker(&mut reader).map_err(|err| format!("resync {HVC0}: {err}"))? {
+		// Discard bytes up to the host's SYNC marker (a stale tail of a previous
+		// host connection) so the frame loop starts on a clean boundary.
+		if !proto::resync_to_marker(&mut reader)
+			.map_err(|err| format!("resync the agent port: {err}"))?
+		{
 			return Ok(());
 		}
 
@@ -207,6 +291,7 @@ mod linux_agent {
 		sessions:       Sessions,
 		pty_sessions:   PtySessions,
 		pending_writes: PendingWrites,
+		tunnels:        Arc<Tunnels>,
 		epoch:          Arc<Mutex<u64>>,
 	}
 
@@ -216,6 +301,9 @@ mod linux_agent {
 				proto::FRAME_REQ => self.handle_request(frame.id, &frame.payload),
 				proto::FRAME_STDIN => self.handle_stdin(frame.id, &frame.payload),
 				proto::FRAME_KILL => self.handle_kill(frame.id, &frame.payload),
+				proto::FRAME_DATA | proto::FRAME_WINDOW | proto::FRAME_CLOSE => {
+					self.tunnels.handle_frame(frame);
+				},
 				other => self.send_error(frame.id, format!("unknown frame type {other}")),
 			}
 		}
@@ -229,51 +317,160 @@ mod linux_agent {
 				},
 			};
 
-			let Some(op) = request.get("op").and_then(Value::as_str) else {
+			let Some(name) = request.get("op").and_then(Value::as_str) else {
 				self.send_error(id, "missing op");
+				return;
+			};
+			let Some(op) = Op::from_name(name) else {
+				self.send_error(id, format!("unknown op {name:?}"));
 				return;
 			};
 
 			match op {
-				proto::OP_HELLO => self.hello(id, &request),
-				"ping" => self.send_resp(
-					id,
-					json!({
-						 "ok": true,
-						 "version": env!("CARGO_PKG_VERSION"),
-						 "arch": std::env::consts::ARCH,
-					}),
-				),
-				"activity" => match activity_sample() {
-					Ok(sample) => self.send_resp(id, sample),
-					Err(error) => self.send_error(id, format!("reading guest activity: {error}")),
-				},
-				"exec" => self.start_exec(id, &request),
-				"pty_open" => self.pty_open(id, &request),
-				"pty_attach" => self.pty_attach(id, &request),
-				"pty_detach" => self.pty_detach(id, &request),
-				"pty_resize" => self.pty_resize(id, &request),
-				"pty_list" => self.pty_list(id),
-				"pty_close" => self.pty_close(id, &request),
-				"pty_exec" => self.pty_exec(id, &request),
-				"fs_read" => self.fs_read(id, &request),
-				"fs_sync" => {
-					// SAFETY: `sync` has no pointer arguments and flushes every mounted filesystem.
-					unsafe { libc::sync() };
-					self.send_resp(id, json!({"ok": true}));
-				},
-				"fs_write" => self.fs_write(id, &request),
-				"fs_list" => self.fs_list(id, &request),
-				"fs_stat" => self.fs_stat(id, &request),
-				"fs_mkdir" => self.fs_mkdir(id, &request),
-				"fs_remove" => self.fs_remove(id, &request),
-				"net_config" => self.net_config(id, &request),
-				"resize" => self.resize(id, &request),
-				"tcp_probe" => self.tcp_probe(id, &request),
-				"mount" => self.mount(id, &request),
-				"mount_overlay" => self.mount_overlay(id, &request),
-				_ => self.send_error(id, "unknown op"),
+				Op::Hello => self.hello(id, &request),
+				Op::Ping => self.ping(id),
+				Op::Activity => self.activity(id),
+				Op::Exec => self.start_exec(id, &request),
+				Op::Resize => self.resize(id, &request),
+				Op::PtyOpen => self.pty_open(id, &request),
+				Op::PtyAttach => self.pty_attach(id, &request),
+				Op::PtyDetach => self.pty_detach(id, &request),
+				Op::PtyResize => self.pty_resize(id, &request),
+				Op::PtyList => self.pty_list(id),
+				Op::PtyClose => self.pty_close(id, &request),
+				Op::PtyExec => self.pty_exec(id, &request),
+				Op::FsRead => self.fs_read(id, &request),
+				Op::FsWrite => self.fs_write(id, &request),
+				Op::FsList => self.fs_list(id, &request),
+				Op::FsStat => self.fs_stat(id, &request),
+				Op::FsMkdir => self.fs_mkdir(id, &request),
+				Op::FsRemove => self.fs_remove(id, &request),
+				Op::FsSync => self.fs_sync(id),
+				Op::NetConfig => self.net_config(id, &request),
+				Op::TcpProbe => self.tcp_probe(id, &request),
+				Op::TcpConnect => self.tcp_connect(id, &request),
+				Op::Mount => self.mount(id, &request),
+				Op::MountOverlay => self.mount_overlay(id, &request),
+				Op::OciUnpack => self.oci_unpack(id, &request),
+				Op::Provision => self.provision(id, request),
+				Op::SetTime => self.set_time(id, &request),
+				Op::Reseed => self.reseed(id, &request),
+				Op::Poweroff => self.poweroff(id),
 			}
+		}
+
+		fn ping(&self, id: u32) {
+			self.send_resp(
+				id,
+				json!({
+					"ok": true,
+					"version": env!("CARGO_PKG_VERSION"),
+					"arch": std::env::consts::ARCH,
+				}),
+			);
+		}
+
+		fn activity(&self, id: u32) {
+			match activity_sample() {
+				Ok(sample) => self.send_resp(id, sample),
+				Err(error) => self.send_error(id, format!("reading guest activity: {error}")),
+			}
+		}
+
+		fn fs_sync(&self, id: u32) {
+			// SAFETY: `sync` has no pointer arguments and flushes every mounted
+			// filesystem.
+			unsafe { libc::sync() };
+			self.send_resp(id, json!({"ok": true}));
+		}
+
+		fn tcp_connect(&self, id: u32, request: &Value) {
+			match ConnectRequest::from_json(request) {
+				Ok(connect) => self.tunnels.open(id, connect),
+				Err(err) => self.send_error(id, err),
+			}
+		}
+
+		fn reseed(&self, id: u32, request: &Value) {
+			match entropy::reseed(request) {
+				Ok(()) => self.send_resp(id, json!({"ok": true})),
+				Err(err) => self.send_io_error(id, format!("reseed: {err}"), &err),
+			}
+		}
+
+		fn oci_unpack(&self, id: u32, request: &Value) {
+			let layers = match string_array(request, "layers") {
+				Ok(layers) => layers
+					.into_iter()
+					.map(std::path::PathBuf::from)
+					.collect::<Vec<_>>(),
+				Err(err) => return self.send_error(id, err),
+			};
+			let dest = match string_field(request, "dest") {
+				Ok(dest) => std::path::PathBuf::from(dest),
+				Err(err) => return self.send_error(id, err),
+			};
+			let writer = self.writer.clone();
+			thread::spawn(move || {
+				let started = std::time::Instant::now();
+				let response = match unpack::apply_layers(&layers, &dest) {
+					Ok(stats) => {
+						logging::emit(
+							Level::Info,
+							"oci_unpack done",
+							json!({
+								"layers": layers.len(), "files": stats.files, "bytes": stats.bytes,
+								"ms": started.elapsed().as_millis() as u64,
+							}),
+						);
+						json!({"ok": true, "bytes": stats.bytes, "files": stats.files, "whiteouts": stats.whiteouts})
+					},
+					Err(err) => io_error_json(format!("oci_unpack: {err}"), &err),
+				};
+				send_json(&writer, proto::FRAME_RESP, id, &response);
+			});
+		}
+
+		fn provision(&self, id: u32, request: Value) {
+			let request: provision::ProvisionRequest = match serde_json::from_value(request) {
+				Ok(request) => request,
+				Err(err) => return self.send_error(id, format!("provision request: {err}")),
+			};
+			let writer = self.writer.clone();
+			thread::spawn(move || {
+				let response = match provision::provision(&request) {
+					Ok(user) => {
+						let mut value = serde_json::to_value(user).unwrap_or_default();
+						value["ok"] = json!(true);
+						value
+					},
+					Err(err) => io_error_json(format!("provision: {err}"), &err),
+				};
+				send_json(&writer, proto::FRAME_RESP, id, &response);
+			});
+		}
+
+		fn set_time(&self, id: u32, request: &Value) {
+			let Some(unix_ns) = request.get("unix_ns").and_then(Value::as_u64) else {
+				return self.send_error(id, "unix_ns must be a non-negative integer");
+			};
+			let ts = libc::timespec {
+				tv_sec:  (unix_ns / 1_000_000_000) as _,
+				tv_nsec: (unix_ns % 1_000_000_000) as _,
+			};
+			// SAFETY: `ts` is a valid, initialized timespec.
+			if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } == 0 {
+				self.send_resp(id, json!({"ok": true}));
+			} else {
+				let err = io::Error::last_os_error();
+				self.send_io_error(id, format!("clock_settime: {err}"), &err);
+			}
+		}
+
+		fn poweroff(&self, id: u32) {
+			self.send_resp(id, json!({"ok": true}));
+			logging::emit(Level::Info, "powering off", Value::Null);
+			power_off();
 		}
 
 		fn hello(&self, id: u32, request: &Value) {
@@ -289,6 +486,7 @@ mod linux_agent {
 			for session in lock(&self.pty_sessions).values_mut() {
 				session.binding = None;
 			}
+			self.tunnels.abort_all();
 			self.send_resp(id, json!({ "ok": true, "epoch": epoch }));
 		}
 
@@ -389,6 +587,7 @@ mod linux_agent {
 					Ok(())
 				});
 			}
+			let guard = reaper::spawn_guard();
 			let mut child = match command.spawn() {
 				Ok(child) => child,
 				Err(error) => {
@@ -398,6 +597,8 @@ mod linux_agent {
 					return;
 				},
 			};
+			guard.track(child.id() as i32);
+			drop(guard);
 			close_fd(slave_fd);
 			// SAFETY: master_fd is uniquely owned after successful openpty.
 			let master = unsafe { File::from_raw_fd(master_fd) };
@@ -453,6 +654,7 @@ mod linux_agent {
 					}
 				}
 				let status = child.wait().ok();
+				reaper::untrack(child.id() as i32);
 				let code = status.and_then(|status| status.code()).unwrap_or(-1);
 				let binding = {
 					let mut all = lock(&sessions);
@@ -493,7 +695,8 @@ mod linux_agent {
 				ws_xpixel: 0,
 				ws_ypixel: 0,
 			};
-			// SAFETY: the session owns a live PTY master and ioctl only reads winsize.
+			// SAFETY: the session owns a live PTY master and ioctl only reads
+			// winsize.
 			unsafe {
 				libc::ioctl(session.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
 			}
@@ -547,7 +750,8 @@ mod linux_agent {
 				ws_xpixel: 0,
 				ws_ypixel: 0,
 			};
-			// SAFETY: the session owns a live PTY master and ioctl only reads winsize.
+			// SAFETY: the session owns a live PTY master and ioctl only reads
+			// winsize.
 			let rc = unsafe { libc::ioctl(session.master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
 			drop(sessions);
 			if rc < 0 {
@@ -651,7 +855,8 @@ mod linux_agent {
 					);
 				}
 			}
-			// SAFETY: setsid is async-signal-safe and isolates timeout termination.
+			// SAFETY: setsid is async-signal-safe and isolates timeout
+			// termination.
 			unsafe {
 				command.pre_exec(|| {
 					if libc::setsid() < 0 {
@@ -661,6 +866,7 @@ mod linux_agent {
 					}
 				});
 			}
+			let guard = reaper::spawn_guard();
 			let mut child = match command.spawn() {
 				Ok(child) => child,
 				Err(error) => {
@@ -668,6 +874,8 @@ mod linux_agent {
 					return;
 				},
 			};
+			guard.track(child.id() as i32);
+			drop(guard);
 			let stdout = child.stdout.take().unwrap();
 			let stderr = child.stderr.take().unwrap();
 			let stdout_reader =
@@ -694,6 +902,7 @@ mod linux_agent {
 					Err(error) => break Err(error),
 				}
 			};
+			reaper::untrack(child.id() as i32);
 			let stdout = stdout_reader.join().unwrap_or_default();
 			let stderr = stderr_reader.join().unwrap_or_default();
 			match status {
@@ -725,25 +934,37 @@ mod linux_agent {
 				},
 			};
 
+			let user = match request.get("user") {
+				None | Some(Value::Null) => None,
+				Some(spec) => match ExecUser::resolve(spec) {
+					Ok(user) => Some(user),
+					Err(err) => {
+						self.send_error(id, err);
+						return;
+					},
+				},
+			};
+
 			let mut command = Command::new(&cmd[0]);
 			command.args(&cmd[1..]);
 			if let Some(cwd) = request.get("cwd").and_then(Value::as_str) {
 				command.current_dir(cwd);
 			}
 			command.env_clear();
-			if let Some(env) = request.get("env") {
-				match env_object(env) {
-					Ok(env) => {
-						for (key, value) in env {
-							command.env(key, value);
-						}
-					},
+			let mut env = match request.get("env") {
+				None | Some(Value::Null) => Vec::new(),
+				Some(env) => match env_object(env) {
+					Ok(env) => env,
 					Err(err) => {
 						self.send_error(id, err);
 						return;
 					},
-				}
+				},
+			};
+			if let Some(user) = &user {
+				user.default_env(&mut env);
 			}
+			command.envs(env);
 
 			// A tty session runs the child as a session leader whose controlling
 			// terminal is the pty slave bound to fd 0/1/2; the parent keeps the
@@ -825,6 +1046,11 @@ mod linux_agent {
 				}
 			}
 
+			if let Some(user) = user {
+				user.apply(&mut command);
+			}
+
+			let guard = reaper::spawn_guard();
 			let mut child = match command.spawn() {
 				Ok(child) => child,
 				Err(err) => {
@@ -838,6 +1064,8 @@ mod linux_agent {
 			};
 
 			let pid = child.id() as i32;
+			guard.track(pid);
+			drop(guard);
 
 			let (stdin, tty_master, joins) = if let Some((master_fd, slave_fd)) = pty_fds {
 				// The child holds its own slave reference now; drop the parent's.
@@ -888,6 +1116,7 @@ mod linux_agent {
 				let status = child.wait();
 				let removed = lock(&sessions).remove(&id);
 				drop(removed);
+				reaper::untrack(pid);
 
 				for join in joins {
 					let _ = join.join();
@@ -1340,12 +1569,14 @@ mod linux_agent {
 		}
 
 		fn mount(&self, id: u32, request: &Value) {
-			let tag = match string_field(request, "tag") {
-				Ok(tag) => tag,
-				Err(err) => {
-					self.send_error(id, err);
-					return;
-				},
+			let Some(tag) = request
+				.get("source")
+				.or_else(|| request.get("tag"))
+				.and_then(Value::as_str)
+				.map(str::to_owned)
+			else {
+				self.send_error(id, "source (or tag) must be a string");
+				return;
 			};
 			let path = match string_field(request, "path") {
 				Ok(path) => path,
@@ -1378,12 +1609,26 @@ mod linux_agent {
 				return;
 			};
 			let flags = if ro { libc::MS_RDONLY } else { 0 };
-
-			// SAFETY: all three C strings are nul-terminated and live across the
-			// call; data is null (virtiofs takes no mount options here).
-			let rc = unsafe {
-				libc::mount(source.as_ptr(), target.as_ptr(), fs_type.as_ptr(), flags, std::ptr::null())
+			let options = match request
+				.get("options")
+				.and_then(Value::as_str)
+				.map(CString::new)
+			{
+				None => None,
+				Some(Ok(options)) => Some(options),
+				Some(Err(_)) => {
+					self.send_error(id, "options contain an interior nul byte");
+					return;
+				},
 			};
+			let data = options
+				.as_ref()
+				.map_or(std::ptr::null(), |options| options.as_ptr().cast());
+
+			// SAFETY: all C strings are nul-terminated and live across the call;
+			// data is null or a nul-terminated option string.
+			let rc =
+				unsafe { libc::mount(source.as_ptr(), target.as_ptr(), fs_type.as_ptr(), flags, data) };
 			if rc != 0 {
 				self.send_error(id, format!("mount {tag} -> {path}: {}", io::Error::last_os_error()));
 				return;
@@ -1449,6 +1694,13 @@ mod linux_agent {
 				);
 				return;
 			}
+			// The overlay root takes the upper dir's attributes: mirror the
+			// lower root's so users the lower admits may write at the top.
+			if let Ok(meta) = fs::metadata(&lower) {
+				use std::os::unix::fs::PermissionsExt;
+				let _ = fs::set_permissions(&upper, fs::Permissions::from_mode(meta.mode() & 0o7777));
+				let _ = std::os::unix::fs::chown(&upper, Some(meta.uid()), Some(meta.gid()));
+			}
 
 			let Ok(overlay_source) = CString::new("overlay") else {
 				self.send_error(id, "mount_overlay overlay source contains an interior nul byte");
@@ -1500,13 +1752,170 @@ mod linux_agent {
 		}
 
 		fn send_io_error(&self, id: u32, error: impl Into<String>, source: &io::Error) {
-			let error = error.into();
-			let response = match source.raw_os_error() {
-				Some(errno) => json!({"ok": false, "error": error, "errno": errno}),
-				None => json!({"ok": false, "error": error}),
-			};
-			self.send_resp(id, response);
+			self.send_resp(id, io_error_json(error.into(), source));
 		}
+	}
+
+	/// `RESP {ok:false, error, errno?}` for an I/O failure.
+	fn io_error_json(error: String, source: &io::Error) -> Value {
+		match source.raw_os_error() {
+			Some(errno) => json!({"ok": false, "error": error, "errno": errno}),
+			None => json!({"ok": false, "error": error}),
+		}
+	}
+
+	/// Resolved `exec.user`: credentials applied in the child before exec.
+	struct ExecUser {
+		name:   String,
+		uid:    libc::uid_t,
+		gid:    libc::gid_t,
+		home:   String,
+		groups: Vec<libc::gid_t>,
+	}
+
+	impl ExecUser {
+		/// Resolve a user name or numeric uid through the guest's NSS
+		/// (`/etc/passwd`, `/etc/group`).
+		fn resolve(spec: &Value) -> Result<Self, String> {
+			let name_or_uid = match spec {
+				Value::String(name) => name.clone(),
+				Value::Number(uid) => uid.to_string(),
+				_ => return Err("user must be a name or uid".to_owned()),
+			};
+			// SAFETY: getpw* return a pointer into static storage or null; we copy
+			// out every field before any other NSS call.
+			let entry = unsafe {
+				if let Ok(uid) = name_or_uid.parse::<libc::uid_t>() {
+					libc::getpwuid(uid)
+				} else {
+					let name = CString::new(name_or_uid.as_str()).map_err(|_| "user contains nul")?;
+					libc::getpwnam(name.as_ptr())
+				}
+			};
+			if entry.is_null() {
+				// Numeric ids without a passwd entry still work (like `docker run
+				// -u`).
+				return match name_or_uid.parse::<libc::uid_t>() {
+					Ok(uid) => Ok(Self {
+						name: uid.to_string(),
+						uid,
+						gid: uid,
+						home: "/".into(),
+						groups: vec![uid],
+					}),
+					// envd's wording; template builds surface it verbatim (E2B SDK tests match it).
+					Err(_) => Err(format!("unauthenticated: invalid username: '{name_or_uid}'")),
+				};
+			}
+			// SAFETY: `entry` is non-null and its strings are nul-terminated.
+			let (name, uid, gid, home) = unsafe {
+				let entry = &*entry;
+				(
+					std::ffi::CStr::from_ptr(entry.pw_name)
+						.to_string_lossy()
+						.into_owned(),
+					entry.pw_uid,
+					entry.pw_gid,
+					std::ffi::CStr::from_ptr(entry.pw_dir)
+						.to_string_lossy()
+						.into_owned(),
+				)
+			};
+			let c_name = CString::new(name.as_str()).map_err(|_| "user contains nul")?;
+			let mut groups = vec![0 as libc::gid_t; 256];
+			let mut count = groups.len() as libc::c_int;
+			// SAFETY: `groups` has `count` writable slots; `c_name` is valid.
+			let rc =
+				unsafe { libc::getgrouplist(c_name.as_ptr(), gid, groups.as_mut_ptr(), &mut count) };
+			groups.truncate(if rc < 0 { 1 } else { count.max(0) as usize });
+			if groups.is_empty() || rc < 0 {
+				groups = vec![gid];
+			}
+			Ok(Self { name, uid, gid, home, groups })
+		}
+
+		/// Fill `HOME`/`USER`/`LOGNAME` unless the request set them.
+		fn default_env(&self, env: &mut Vec<(String, String)>) {
+			for (key, value) in [("HOME", &self.home), ("USER", &self.name), ("LOGNAME", &self.name)] {
+				if !env.iter().any(|(k, _)| k == key) {
+					env.push((key.to_owned(), value.clone()));
+				}
+			}
+		}
+
+		/// Drop privileges in the child (registered after other `pre_exec`
+		/// hooks).
+		fn apply(self, command: &mut Command) {
+			// SAFETY: the closure only calls async-signal-safe setgroups/setgid/
+			// setuid on data prepared before fork.
+			unsafe {
+				command.pre_exec(move || {
+					if libc::setgroups(self.groups.len(), self.groups.as_ptr()) != 0
+						|| libc::setgid(self.gid) != 0
+						|| libc::setuid(self.uid) != 0
+					{
+						return Err(io::Error::last_os_error());
+					}
+					Ok(())
+				});
+			}
+		}
+	}
+
+	/// `reboot(2)` command that makes the VMM exit cleanly. x86_64 direct-kernel
+	/// boots carry no ACPI tables, so `RB_POWER_OFF` would only halt the vCPUs
+	/// and the VMM would never exit; a restart under the `reboot=t` cmdline
+	/// triple-faults into `KVM_EXIT_SHUTDOWN`, which the VMM treats as a clean
+	/// guest shutdown. aarch64 powers off through PSCI `SYSTEM_OFF`.
+	#[cfg(target_arch = "x86_64")]
+	const POWER_OFF_CMD: libc::c_int = libc::RB_AUTOBOOT;
+	#[cfg(not(target_arch = "x86_64"))]
+	const POWER_OFF_CMD: libc::c_int = libc::RB_POWER_OFF;
+
+	/// Sync, unmount real filesystems, and power the VM off. Never returns
+	/// unless `reboot` fails.
+	fn power_off() {
+		// SAFETY: `sync` takes no arguments.
+		unsafe { libc::sync() };
+		let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();
+		let pseudo =
+			["proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup2", "mqueue", "virtiofs"];
+		for line in mounts.lines().rev() {
+			let mut fields = line.split_ascii_whitespace();
+			let (Some(_), Some(target), Some(fstype)) = (fields.next(), fields.next(), fields.next())
+			else {
+				continue;
+			};
+			if target == "/" || pseudo.contains(&fstype) {
+				continue;
+			}
+			let target = target.replace("\\040", " ");
+			if let Ok(target) = CString::new(target) {
+				// SAFETY: valid C string; failure leaves the mount for the kernel.
+				unsafe {
+					if libc::umount2(target.as_ptr(), 0) != 0 {
+						libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+					}
+				}
+			}
+		}
+		// SAFETY: remount of `/` read-only with null source/type/data is valid.
+		unsafe {
+			libc::mount(
+				std::ptr::null(),
+				c"/".as_ptr(),
+				std::ptr::null(),
+				libc::MS_REMOUNT | libc::MS_RDONLY,
+				std::ptr::null(),
+			);
+			libc::sync();
+			libc::reboot(POWER_OFF_CMD);
+		}
+		logging::emit(
+			Level::Error,
+			"poweroff failed",
+			json!({"error": io::Error::last_os_error().to_string()}),
+		);
 	}
 
 	fn activity_sample() -> io::Result<Value> {
@@ -1762,104 +2171,98 @@ mod linux_agent {
 		}
 	}
 
-	fn spawn_orphan_reaper(sessions: Sessions, pty_sessions: PtySessions) {
-		thread::spawn(move || {
-			loop {
-				reap_orphans(&sessions, &pty_sessions);
-				thread::sleep(std::time::Duration::from_millis(100));
+	/// PID-1 duties: pseudo filesystems, loopback, hostname. Failures are
+	/// logged, never fatal (a missing mount point or kernel feature must not
+	/// keep GC4 from coming up). `/tmp` stays on the rootfs: template build
+	/// steps run under this init, and files they write to `/tmp` must persist
+	/// into the template like they do upstream.
+	fn init_pid1(cmdline: &HashMap<String, String>) {
+		let nosuid = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+		let mounts: [(&str, &str, &str, libc::c_ulong, Option<&str>); 7] = [
+			("sysfs", "/sys", "sysfs", nosuid, None),
+			("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, Some("mode=0755")),
+			(
+				"devpts",
+				"/dev/pts",
+				"devpts",
+				libc::MS_NOSUID | libc::MS_NOEXEC,
+				Some("gid=5,mode=620,ptmxmode=666"),
+			),
+			("tmpfs", "/dev/shm", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=1777")),
+			("tmpfs", "/run", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=0755")),
+			("cgroup2", "/sys/fs/cgroup", "cgroup2", nosuid, None),
+			("none", "/run/e2b", "", 0, None),
+		];
+		for (source, target, fstype, flags, data) in mounts {
+			if let Err(err) = fs::create_dir_all(target) {
+				logging::emit(
+					Level::Warn,
+					"mkdir failed",
+					json!({"path": target, "error": err.to_string()}),
+				);
+				continue;
 			}
-		});
-	}
-
-	/// Reap reparented orphan/grandchild processes without stealing the exit
-	/// status of any tracked exec-session leader.
-	///
-	/// As PID1 with `PR_SET_CHILD_SUBREAPER`, every descendant whose parent
-	/// dies is reparented to us, so reaping must happen on every poll — not
-	/// only when no sessions are active — or zombies accumulate while any exec
-	/// is running.
-	///
-	/// Invariant: a session leader's zombie is owned by that session's waiter
-	/// thread (`child.wait()` in `start_exec`), which is authoritative for
-	/// emitting the EXIT frame with the real status. We must therefore never
-	/// consume a leader's zombie here. To stay race-free we *peek* with
-	/// `WNOWAIT` (which leaves the child reapable) instead of an unconditional
-	/// `waitpid(-1)`: a tracked leader pid is left untouched for its own
-	/// thread, while an untracked orphan is reaped (status discarded) with a
-	/// targeted `waitpid(pid)`.
-	///
-	/// This is exempt from the snapshot/exit race because `start_exec` removes
-	/// a session from the map only *after* `child.wait()` has reaped its
-	/// leader: while a leader is a live zombie it is always present in the map
-	/// (so we skip it), and once it leaves the map it has already been reaped
-	/// (so `waitid` can no longer observe it). A leader's status is thus never
-	/// double-reaped, regardless of how the 100ms poll interleaves with exits.
-	fn reap_orphans(sessions: &Sessions, pty_sessions: &PtySessions) {
-		// Snapshot tracked leader pids, then drop the locks before any wait syscall.
-		let mut leaders: HashSet<i32> = lock(sessions).values().map(|session| session.pid).collect();
-		leaders.extend(lock(pty_sessions).values().map(|session| session.pid));
-
-		loop {
-			// SAFETY: an all-zero `siginfo_t` is a valid initial buffer for
-			// `waitid`, which fully initializes the fields it reports.
-			let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-			// SAFETY: `info` is a valid writable pointer, and WNOWAIT ensures
-			// tracked session leaders remain reapable by their waiter threads.
-			let rc = unsafe {
-				libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
-			};
-			// rc == -1: no children left (ECHILD) or interrupted — retry next poll.
-			if rc == -1 {
-				break;
+			if fstype.is_empty() {
+				continue;
 			}
-			// SAFETY: `waitid` returned success and `info` has been initialized.
-			// WNOHANG with nothing waitable leaves si_pid == 0.
-			let pid = unsafe { info.si_pid() };
-			if pid == 0 {
-				break;
+			if let Err(err) = mount_fs(source, target, fstype, flags, data) {
+				logging::emit(Level::Warn, "mount failed", json!({"path": target, "error": err}));
 			}
-			if leaders.contains(&pid) {
-				// Tracked leader: leave the zombie for its owning session
-				// thread. WNOWAIT did not consume it, so a re-peek would just
-				// return this same front-of-list child again; stop scanning
-				// this poll. The blocked `child.wait()` reaps it within
-				// microseconds, and any orphan behind it is collected on the
-				// next 100ms tick.
-				break;
-			}
-			// Untracked orphan reparented to us: reap it and discard the status.
-			let mut status = 0;
-			// SAFETY: `pid` came from `waitid` and is still waitable because the
-			// earlier call used WNOWAIT.
-			let _ = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+		}
+		let _ = std::os::unix::fs::symlink("/proc/self/fd", "/dev/fd");
+		if let Err(err) = bring_up("lo") {
+			logging::emit(Level::Warn, "lo up failed", json!({"error": err}));
+		}
+		let hostname = cmdline
+			.get("vmon.hostname")
+			.cloned()
+			.or_else(|| {
+				fs::read_to_string("/etc/hostname")
+					.ok()
+					.map(|h| h.trim().to_owned())
+			})
+			.filter(|h| !h.is_empty())
+			.unwrap_or_else(|| "vibemon".to_owned());
+		// SAFETY: pointer/length describe the live `hostname` bytes.
+		if unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) } != 0 {
+			logging::emit(
+				Level::Warn,
+				"sethostname failed",
+				json!({"error": io::Error::last_os_error().to_string()}),
+			);
 		}
 	}
 
-	fn setup_pid1() -> Result<(), String> {
-		// SAFETY: `getpid` has no preconditions and touches no Rust memory.
-		if unsafe { libc::getpid() } != 1 {
-			return Ok(());
+	fn bring_up(iface: &str) -> Result<(), String> {
+		let name = CString::new(iface).map_err(|err| err.to_string())?;
+		// SAFETY: `name` is a valid C string.
+		let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+		if index == 0 {
+			return Err(format!("if_nametoindex {iface}: {}", io::Error::last_os_error()));
 		}
-		fs::create_dir_all("/proc").map_err(|err| format!("create /proc: {err}"))?;
-		fs::create_dir_all("/sys").map_err(|err| format!("create /sys: {err}"))?;
-		fs::create_dir_all("/dev").map_err(|err| format!("create /dev: {err}"))?;
-		mount_fs("proc", "/proc", "proc")?;
-		mount_fs("sysfs", "/sys", "sysfs")?;
-		mount_fs("devtmpfs", "/dev", "devtmpfs")?;
-		fs::create_dir_all("/dev/pts").map_err(|err| format!("create /dev/pts: {err}"))?;
-		mount_fs("devpts", "/dev/pts", "devpts")?;
-		Ok(())
+		set_link_up(index)
 	}
 
-	fn mount_fs(source: &str, target: &str, fstype: &str) -> Result<(), String> {
+	fn mount_fs(
+		source: &str,
+		target: &str,
+		fstype: &str,
+		flags: libc::c_ulong,
+		data: Option<&str>,
+	) -> Result<(), String> {
 		let source = CString::new(source).map_err(|err| err.to_string())?;
 		let target = CString::new(target).map_err(|err| err.to_string())?;
 		let fstype = CString::new(fstype).map_err(|err| err.to_string())?;
-		// SAFETY: all C strings are nul-terminated and live across the call;
-		// data is null because these pseudo-filesystems need no mount options.
-		let rc = unsafe {
-			libc::mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), 0, std::ptr::null())
-		};
+		let data = data
+			.map(CString::new)
+			.transpose()
+			.map_err(|err| err.to_string())?;
+		let data_ptr = data
+			.as_ref()
+			.map_or(std::ptr::null(), |d| d.as_ptr().cast());
+		// SAFETY: all C strings are nul-terminated and live across the call.
+		let rc =
+			unsafe { libc::mount(source.as_ptr(), target.as_ptr(), fstype.as_ptr(), flags, data_ptr) };
 		if rc == 0 {
 			return Ok(());
 		}
@@ -2002,6 +2405,7 @@ mod linux_agent {
 		}
 
 		set_link_up(ifindex)?;
+		flush_ipv4_addrs(ifindex)?;
 		add_ipv4_addr(ifindex, ip, prefix)?;
 		add_default_route(ifindex, gw)?;
 		write_resolv_conf(dns)?;
@@ -2017,6 +2421,12 @@ mod linux_agent {
 			data.push_str("nameserver ");
 			data.push_str(server);
 			data.push('\n');
+		}
+		// A symlink (e.g. into systemd-resolved's /run directory) may dangle; the
+		// sandbox's resolver config must not depend on it.
+		if fs::symlink_metadata("/etc/resolv.conf").is_ok_and(|meta| meta.file_type().is_symlink()) {
+			fs::remove_file("/etc/resolv.conf")
+				.map_err(|err| format!("unlink /etc/resolv.conf: {err}"))?;
 		}
 		fs::write("/etc/resolv.conf", data).map_err(|err| format!("write /etc/resolv.conf: {err}"))
 	}
@@ -2034,6 +2444,33 @@ mod linux_agent {
 		push_struct(&mut payload, &msg);
 		netlink_request(libc::RTM_NEWLINK, (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16, &payload)
 			.map_err(|err| format!("link up: {err}"))
+	}
+
+	/// Delete every IPv4 address on `ifindex` (a forked/restored guest still
+	/// carries its template's address). `RTM_DELADDR` without `IFA_LOCAL`
+	/// removes the first address; repeat until the kernel reports none left.
+	fn flush_ipv4_addrs(ifindex: u32) -> Result<(), String> {
+		for _ in 0..256 {
+			let mut payload = Vec::new();
+			let msg = IfAddrMsg {
+				ifa_family:    libc::AF_INET as u8,
+				ifa_prefixlen: 0,
+				ifa_flags:     0,
+				ifa_scope:     0,
+				ifa_index:     ifindex,
+			};
+			push_struct(&mut payload, &msg);
+			match netlink_request(
+				libc::RTM_DELADDR,
+				(libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+				&payload,
+			) {
+				Ok(()) => {},
+				Err(err) if err.raw_os_error() == Some(libc::EADDRNOTAVAIL) => return Ok(()),
+				Err(err) => return Err(format!("addr flush: {err}")),
+			}
+		}
+		Err("addr flush: too many addresses".to_owned())
 	}
 
 	fn add_ipv4_addr(ifindex: u32, ip: Ipv4Addr, prefix: u8) -> Result<(), String> {
@@ -2106,7 +2543,8 @@ mod linux_agent {
 			push_struct(&mut request, &header);
 			request.extend_from_slice(payload);
 
-			// SAFETY: zero is a valid sockaddr_nl baseline; fields are filled below.
+			// SAFETY: zero is a valid sockaddr_nl baseline; fields are filled
+			// below.
 			let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
 			addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
 			addr.nl_pid = 0;
@@ -2159,8 +2597,9 @@ mod linux_agent {
 		if buf.len() < header_len + std::mem::size_of::<libc::nlmsgerr>() {
 			return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short netlink error"));
 		}
-		// SAFETY: the length check above guarantees a complete nlmsgerr; unaligned
-		// reads are required because the payload starts in a byte slice.
+		// SAFETY: the length check above guarantees a complete nlmsgerr;
+		// unaligned reads are required because the payload starts in a byte
+		// slice.
 		let err =
 			unsafe { std::ptr::read_unaligned(buf[header_len..].as_ptr().cast::<libc::nlmsgerr>()) };
 		if err.error == 0 {
@@ -2215,12 +2654,14 @@ mod linux_agent {
 				scrollback,
 				exit: exit_code.map(|code| (code, SystemTime::now())),
 			});
+			let writer = Arc::new(Mutex::new(writer));
 			let agent = Arc::new(Agent {
-				writer:         Arc::new(Mutex::new(writer)),
-				sessions:       Arc::new(Mutex::new(HashMap::new())),
-				pty_sessions:   Arc::clone(&sessions),
+				tunnels: Tunnels::new(writer.clone() as Arc<dyn FrameSink>),
+				writer,
+				sessions: Arc::new(Mutex::new(HashMap::new())),
+				pty_sessions: Arc::clone(&sessions),
 				pending_writes: Arc::new(Mutex::new(HashMap::new())),
-				epoch:          Arc::new(Mutex::new(7)),
+				epoch: Arc::new(Mutex::new(7)),
 			});
 			(agent, sessions, reader)
 		}

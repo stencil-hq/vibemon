@@ -2,6 +2,7 @@
 name = "vmon-agent"
 version = "0.3.2"
 edition = "2024"
+description = "Vibemon guest agent: PID 1, GC4 control channel, and E2B envd server"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,3 +14,33 @@ workspace = true
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Guest-only: the envd server, OCI unpacking, and provisioning run inside the
+# Linux VM. Host builds only use `vmon_agent::proto`.
+[target.'cfg(target_os = "linux")'.dependencies]
+base64.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+multer = "3"
+parking_lot.workspace = true
+pbjson = "0.9"
+pbjson-types = "0.9"
+percent-encoding.workspace = true
+prost = "0.14"
+ruzstd = "0.9"
+sha2.workspace = true
+tar.workspace = true
+tokio.workspace = true
+
+# Unconditional: Cargo evaluates `[target.cfg(..)].build-dependencies` against
+# the *host*, so a macOS→Linux cross build would not see them. `build.rs` is a
+# no-op unless `CARGO_CFG_TARGET_OS == "linux"`.
+[build-dependencies]
+pbjson-build = "0.9"
+prost-build = "0.14"
+protox = "0.10"
