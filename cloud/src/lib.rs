@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod aws;
 pub mod google;
+pub mod s3;
 
 /// Authentication scheme used for a range-addressable cloud object.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

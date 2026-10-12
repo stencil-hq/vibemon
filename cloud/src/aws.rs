@@ -72,7 +72,9 @@ impl Credentials {
 		})
 	}
 
-	fn is_fresh(&self) -> bool {
+	/// Whether these credentials remain usable beyond the refresh margin.
+	/// Permanent credentials are always fresh.
+	pub fn is_fresh(&self) -> bool {
 		self
 			.expires_at
 			.is_none_or(|expiration| expiration - Utc::now() > REFRESH_MARGIN)
@@ -359,7 +361,9 @@ fn require_success(
 	Err(Error::new(format!("{context} returned HTTP {status}: {}", body.trim())))
 }
 
-fn encode_component(value: &str) -> String {
+/// RFC 3986 percent-encoding of everything except unreserved characters, as
+/// `SigV4` canonical URIs and queries require.
+pub(crate) fn encode_component(value: &str) -> String {
 	let mut encoded = String::with_capacity(value.len());
 	for byte in value.bytes() {
 		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -479,6 +483,21 @@ pub fn authorization(
 	let canonical_request =
 		[method, canonical_uri, canonical_query, &canonical_headers, &signed_headers, payload_hash]
 			.join("\n");
+	let (scope, signature) = signature(&canonical_request, timestamp, region, service, secret_key);
+	format!(
+		"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, \
+		 Signature={signature}"
+	)
+}
+
+/// Credential scope and hex signature of one canonical request.
+fn signature(
+	canonical_request: &str,
+	timestamp: DateTime<Utc>,
+	region: &str,
+	service: &str,
+	secret_key: &str,
+) -> (String, String) {
 	let date = timestamp.format("%Y%m%d").to_string();
 	let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
 	let scope = format!("{date}/{region}/{service}/aws4_request");
@@ -490,11 +509,53 @@ pub fn authorization(
 	let region_key = hmac(&date_key, region);
 	let service_key = hmac(&region_key, service);
 	let signing_key = hmac(&service_key, "aws4_request");
-	let signature = hex::encode(hmac(&signing_key, &string_to_sign));
-	format!(
-		"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, \
-		 Signature={signature}"
-	)
+	(scope, hex::encode(hmac(&signing_key, &string_to_sign)))
+}
+
+/// Query-string (pre-signed) `SigV4` URL for `method` on `url`.
+///
+/// Valid for `expires_secs` (1..=604800) from `timestamp`. Only `host` is
+/// signed and the payload is unsigned, so any holder of the URL may perform
+/// exactly that request until it expires.
+pub fn presign(
+	method: &str,
+	url: &Url,
+	region: &str,
+	service: &str,
+	credentials: &Credentials,
+	expires_secs: u64,
+	timestamp: DateTime<Utc>,
+) -> Result<Url> {
+	if !(1..=604_800).contains(&expires_secs) {
+		return Err(Error::new("pre-signed URL expiry must be between 1 s and 7 days"));
+	}
+	let date = timestamp.format("%Y%m%d").to_string();
+	let amz_date = timestamp.format("%Y%m%dT%H%M%SZ").to_string();
+	let mut url = url.clone();
+	{
+		let mut pairs = url.query_pairs_mut();
+		pairs.append_pair("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+		pairs.append_pair(
+			"X-Amz-Credential",
+			&format!("{}/{date}/{region}/{service}/aws4_request", credentials.access_key),
+		);
+		pairs.append_pair("X-Amz-Date", &amz_date);
+		pairs.append_pair("X-Amz-Expires", &expires_secs.to_string());
+		if let Some(token) = &credentials.session_token {
+			pairs.append_pair("X-Amz-Security-Token", token);
+		}
+		pairs.append_pair("X-Amz-SignedHeaders", "host");
+	}
+	let (uri, query, host) = canonical_url(&url)?;
+	// Send exactly the canonical encoding: form encoding would turn spaces
+	// into `+`, which S3 does not canonicalize back to `%20`.
+	url.set_query(Some(&query));
+	let canonical_request =
+		[method, &uri, &query, &format!("host:{host}\n"), "host", "UNSIGNED-PAYLOAD"].join("\n");
+	let (_, signature) =
+		signature(&canonical_request, timestamp, region, service, &credentials.secret_key);
+	url.set_query(Some(&format!("{query}&X-Amz-Signature={signature}")));
+	Ok(url)
 }
 
 fn normalize_header(value: &str) -> String {
@@ -564,6 +625,27 @@ mod tests {
 			 SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
 			 Signature=edacce68e5445863e1f916719fac26d3be9c1581fccd7878ade0879597fc0dc1"
 		);
+	}
+
+	#[test]
+	fn presigns_the_documented_s3_get_vector() {
+		let credentials = Credentials::permanent(
+			"AKIAIOSFODNN7EXAMPLE",
+			"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+			None,
+		);
+		let timestamp = Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).single().unwrap();
+		let url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
+		let signed =
+			presign("GET", &url, "us-east-1", "s3", &credentials, 86_400, timestamp).unwrap();
+		assert_eq!(
+			signed.as_str(),
+			"https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&\
+			 X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&\
+			 X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&\
+			 X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+		);
+		assert!(presign("GET", &url, "us-east-1", "s3", &credentials, 0, timestamp).is_err());
 	}
 
 	#[test]

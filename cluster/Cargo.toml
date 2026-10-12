@@ -1,0 +1,35 @@
+[package]
+name = "vmon-cluster"
+version = "0.3.2"
+edition = "2024"
+description = "Vibemon cluster layer: gossip memberlist and raft-replicated KV store"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+openraft.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
