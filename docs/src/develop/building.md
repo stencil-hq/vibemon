@@ -127,6 +127,17 @@ python3 e2e/run.py all --ingress tls      # upstream's TLS topology with a throw
 
 `--ingress plain` (default) routes SDK traffic through `E2B_API_URL`/`E2B_SANDBOX_URL`; `--ingress tls` serves `*.<name>.localhost` on port 443. Use your own `--name` and `--slot` when several plain-HTTP stacks share a host; TLS stacks all bind port 443, so only one can run per host. The harness options, the latest pass/fail counts, and the known failures are in [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README.md); record new counts there when they change. Per-operation coverage is in [E2B compatibility](../reference/e2b-compat.md).
 
+## Documentation
+
+This site is an mdBook (0.5 or newer) in `docs/`: pages in `docs/src/`, the table of contents in `docs/src/SUMMARY.md`, the theme in `docs/theme/custom.css`.
+
+```sh
+mdbook serve docs --port 3100    # live preview on http://localhost:3100
+mdbook build docs                # static site in docs/book/ (gitignored)
+```
+
+The `Documentation` workflow (`.github/workflows/docs.yml`) builds the book and checks local Markdown links on pull requests that touch `docs/`, and publishes it to GitHub Pages on pushes to `main`. Run it by hand with `workflow_dispatch` to republish.
+
 ## Code conventions
 
 The full list is in [`AGENTS.md`](https://github.com/stencil-hq/vibemon/blob/main/AGENTS.md).
