@@ -1,5 +1,0 @@
-# Repo-root uv workspace. The Python SDK lives in `sdk/py`, but this root
-# table makes `uv` resolve that project from the repository root, so a single
-# `.venv` serves both `uv run <cmd>` here and `cd sdk/py && uv run <cmd>`.
-[tool.uv.workspace]
-members = ["sdk/py"]

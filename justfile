@@ -10,7 +10,7 @@
 # implementation for the current OS: Linux runs KVM directly; macOS runs HVF
 # natively, ad-hoc codesigning the spawned binary via demo/hvf-test-runner.sh.
 # The `lima-*` recipes additionally drive the Linux/KVM path from a Mac.
-# Override behaviour with variables, e.g. `just profile=release run --restore D`.
+# Override behaviour with variables, e.g. `just profile=release run vmm --restore D`.
 
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
@@ -20,8 +20,8 @@ profile := env_var_or_default("PROFILE", "debug")
 entitlements := "hvf.entitlements"
 # Lima instance name for the Linux-in-macOS path.
 lima_vm := env_var_or_default("VMON_LIMA_VM", "kvm")
-# vmon checkout inside the Lima guest (the macOS checkout is not mounted there).
-lima_repo := env_var_or_default("LIMA_REPO", "~/vmon")
+# vmon checkout inside the Lima guest (default: this checkout, mounted at the same path).
+lima_repo := env_var_or_default("LIMA_REPO", justfile_directory())
 
 # `--release` when profile is release, empty otherwise.
 _prof_flag := if profile == "release" { "--release" } else { "" }
@@ -70,7 +70,7 @@ codesign:
 
 # macOS HVF needs no root for the hypervisor itself; vmnet networking does
 # (run the whole command under sudo).
-# Build, sign, then run vmon, e.g. `just run --restore /tmp/snaps/snap1`.
+# Build, sign, then run vmon, e.g. `just run vmm --restore /tmp/snaps/snap1`.
 [macos]
 [positional-arguments]
 run *args: build
@@ -154,125 +154,72 @@ seccomp-audit:
     @{{just_executable()}} lima-seccomp-audit
 
 # ------------------------------------------------------- format / lint / check
-#
-# Umbrella recipes fan out across the web UI (biome), the Python SDK
-# (ruff + mypy), and the Rust workspace (cargo fmt/clippy/check). Dedicated
-# TypeScript SDK recipes live under `sdk-ts` and `sdk-ts-smoke`.
 
-# Format every language in place.
-format: fmt-rust fmt-py fmt-ui fmt-ts fmt-go
-
-# Verify formatting across every language without writing (CI gate).
-fmt-check: fmt-check-rust fmt-check-py fmt-check-ui fmt-check-ts fmt-check-go
-
-# Lint every language (biome | ruff | clippy | go vet).
-lint: lint-rust lint-py lint-ui lint-ts lint-go
-
-# Static/type-check every language (tsc | mypy | cargo check | go build).
-check: check-rust check-py check-ui check-ts check-go
-
-# -- Rust --
-fmt-rust:
+# Format the Rust workspace in place.
+format:
     cargo fmt --all
 
-fmt-check-rust:
+# Verify formatting without writing (CI gate).
+fmt-check:
     cargo fmt --all -- --check
 
-lint-rust:
+# Clippy across the workspace (warnings are errors, as in CI).
+lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-check-rust:
+# Type-check the workspace, plus the Linux-only crates for both guest arches.
+check:
     cargo check --workspace --all-targets
+    cargo zigbuild --release -p vmon-agent --target aarch64-unknown-linux-musl
+    cargo zigbuild --release -p vmon-agent --target x86_64-unknown-linux-musl
 
-# -- Python (sdk/py) --
-fmt-py:
-    cd sdk/py && uv run ruff format .
+# --------------------------------------------------------------- serve / e2e
 
-fmt-check-py:
-    cd sdk/py && uv run ruff format --check .
+# Start MySQL 8.4 for local development (docker container `vmon-mysql`, port 13306).
+mysql:
+    docker start vmon-mysql 2>/dev/null || docker run -d --name vmon-mysql -e MYSQL_ROOT_PASSWORD=vmon -e MYSQL_DATABASE=vmon -p 13306:3306 mysql:8.4
 
-lint-py:
-    cd sdk/py && uv run ruff check .
+# Monolithic dev server (node + driver) against `just mysql`; extra args are forwarded.
+[positional-arguments]
+serve *args: build agent-musl
+    "$({{just_executable()}} _bin {{profile}})" serve \
+        --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
+        --agent "{{justfile_directory()}}/target/test-assets/vmon-agent-$(uname -m | sed 's/arm64/aarch64/')" \
+        --listen 127.0.0.1:3000 --domain localhost "$@"
 
-check-py:
-    cd sdk/py && uv run mypy
+# Official E2B SDK test suites against a fresh monolithic `vmon serve`
+# (python | js | all | serve | shell); see e2e/README.md. Extra args go to
+# e2e/run.py, e.g. `just e2e python -- tests/sync/sandbox_sync`.
+[positional-arguments]
+e2e suite="all" *args: build agent-musl fetch-assets mysql
+    VMON_BIN="$({{just_executable()}} _bin {{profile}})" \
+    VMON_AGENT="{{justfile_directory()}}/target/test-assets/vmon-agent-$(uname -m | sed 's/arm64/aarch64/')" \
+    python3 e2e/run.py "$@"
 
-# Python SDK test suite.
-test-py:
-    cd sdk/py && uv run pytest
-
-# Gated cluster e2e (real hypervisor required; skips otherwise).
-[linux]
-cluster-e2e: fetch-assets
-    VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
-
-[macos]
-cluster-e2e: fetch-assets
+# Gated distributed e2e (tests/cluster.rs): 3 drivers + 2 nodes on loopback,
+# leader/node failover, graceful node restart; see docs/cluster.md.
+cluster-e2e: agent-musl fetch-assets mysql
     CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
     VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
-    VMON_CLUSTER_E2E=1 VMON_E2E=1 cargo test --test cluster_e2e -- --test-threads=1
+    VMON_CLUSTER_E2E=1 cargo test --test cluster -- --nocapture
 
-# -- Web UI (ui/) --
-fmt-ui:
-    cd ui && bun run format
+# Build the default templates (base, code-interpreter-v1, desktop, mcp-gateway)
+# as public templates of the system team against a running `vmon serve`
+# (default: `just serve`); extra args go to templates/build.py, e.g.
+# `just templates -j 2 base desktop`. See templates/SOURCES.md.
+[positional-arguments]
+templates *args: build
+    VMON_BIN="$({{just_executable()}} _bin {{profile}})" uv run templates/build.py "$@"
 
-fmt-check-ui:
-    cd ui && bun run format:check
-
-lint-ui:
-    cd ui && bun run lint
-
-check-ui:
-    cd ui && bun run typecheck
-
-# -- TypeScript SDK (sdk/ts) --
-fmt-ts:
-    cd sdk/ts && bun run format
-
-fmt-check-ts:
-    cd sdk/ts && bun run format:check
-
-lint-ts:
-    cd sdk/ts && bun run lint
-
-check-ts:
-    cd sdk/ts && bun run typecheck
-
-sdk-ts:
-    cd sdk/ts && bun install && bun run typecheck
-
-sdk-ts-smoke:
-    cd sdk/ts && bun install && VMON_TS_SMOKE=1 bun test
-
-# -- Go SDK (sdk/go) --
-fmt-go:
-    gofmt -s -w sdk/go
-
-fmt-check-go:
-    @test -z "$(gofmt -l sdk/go)" || { echo "Go files need formatting. Run 'just format' to fix."; gofmt -d sdk/go; exit 1; }
-
-lint-go:
-    cd sdk/go && go vet ./...
-
-check-go:
-    cd sdk/go && go build ./...
-
-sdk-go:
-    cd sdk/go && go test ./...
+# Driver tests that need MySQL (`just mysql` first).
+test-db:
+    VMON_MYSQL_TEST_URL=mysql://root:vmon@127.0.0.1:13306/vmon cargo test -p vmon-driver
 
 # ----------------------------------------------------------------------- assets
 
 # Download pinned UEFI firmware + guest images used by the integration suite.
 fetch-assets:
     ./demo/fetch-test-assets.sh
-
-# Build the React/Vite web UI into vmond/web for embedding in vmon serve.
-ui:
-    cd ui && bun install && bun run build
-
-# Regenerate protobuf client code (Go/Py/TS/UI) from proto/. Needs network (buf remote plugins).
-proto:
-    bunx @bufbuild/buf generate
 
 # Build the statically linked (musl) guest agent for the host arch into
 # target/test-assets so e2e initramfs builders can embed it when present.
@@ -292,6 +239,25 @@ agent-musl:
     mkdir -p "$dest"
     cp "$target_dir/$triple/release/vmon-agent" "$dest/vmon-agent-$arch"
     echo "guest agent -> $dest/vmon-agent-$arch"
+
+# Build the vmon guest kernels (kernel/README.md) into target/kernel/; args go
+# to kernel/build.sh, e.g. `just kernel --arch aarch64`.
+[linux]
+[positional-arguments]
+kernel *args:
+    ./kernel/build.sh "$@"
+
+# macOS: builds in one Ubuntu 24.04 container (kernel/Dockerfile) capped at 4
+# CPUs and niced. Source and build trees live in the `vmon-kernel-cache`
+# volume (the kernel tree needs a case-sensitive filesystem); outputs land in
+# this checkout's target/kernel/.
+[macos]
+[positional-arguments]
+kernel *args:
+    docker build --quiet --tag vmon-kernel-build kernel >/dev/null
+    docker run --rm --cpus 4 \
+        --volume "{{justfile_directory()}}:/src" --volume vmon-kernel-cache:/root/.cache/vmon-kernel \
+        --workdir /src vmon-kernel-build nice -n 10 ./kernel/build.sh --jobs 4 "$@"
 
 # Remove build artifacts.
 clean:
@@ -352,18 +318,7 @@ lima-shell: _lima-check
 license-check:
     cargo deny check licenses
 
-# Validate systemd, Compose, Helm templates, and Kubernetes schemas.
-validate-deploy:
-    shellcheck deploy/single-node/*.sh
-    VMON_API_TOKEN=validation-token-000000000000 docker compose -f deploy/single-node/docker-compose.yml config --quiet
-    docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 lint /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml
-    docker run --rm -v "$PWD:/src" alpine/helm:3.17.3 template vmon /src/deploy/helm/vmon -f /src/deploy/helm/vmon/ci-values.yaml | docker run --rm -i ghcr.io/yannh/kubeconform:v0.6.7 -strict -summary
-
-# Package every local release artifact for an explicit Linux musl target.
-# This builds and smoke-checks binaries but never uploads or publishes.
+# Package release binaries and guest assets for an explicit Linux musl target
+# (builds and smoke-checks; never uploads).
 local-release target:
     ./scripts/package-local-release.sh --target "{{target}}"
-
-# Package the deployment assets into a release tarball
-package-deploy:
-    ./scripts/package-release.sh
