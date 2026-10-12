@@ -32,7 +32,8 @@ use std::{
 /// `/sys/class/virtio-ports/<dev>/name` for the `/dev/<dev>` character device.
 pub const AGENT_PORT_NAME: &str = "vmon.gc4";
 
-/// Name of the virtio-console port for structured guest log lines (`vmon-log:{json}`).
+/// Name of the virtio-console port for structured guest log lines
+/// (`vmon-log:{json}`).
 ///
 /// The VMM appends its output to the console log, so it replaces `/dev/console`
 /// (a byte-per-exit UART) for high-rate lines.

@@ -20,10 +20,10 @@
 //! Control handshake (virtio 1.2 §5.3.6.2): driver `DEVICE_READY` -> device
 //! `DEVICE_ADD(0)`, `DEVICE_ADD(1)`; driver `PORT_READY(n)` -> device
 //! `PORT_OPEN(n, 1)`, then `PORT_NAME(n)`, so a port whose name is visible in
-//! sysfs is already writable. The host end stays open for the device's lifetime: the agent
-//! bridge forwards host bytes only after the guest agent announced itself on
-//! the port, and a generic port drops data that arrives while no guest process
-//! holds it open.
+//! sysfs is already writable. The host end stays open for the device's
+//! lifetime: the agent bridge forwards host bytes only after the guest agent
+//! announced itself on the port, and a generic port drops data that arrives
+//! while no guest process holds it open.
 //!
 //! The host injects bytes by pushing them into the shared `input` deque and
 //! kicking `input_evt`; the worker copies them into the guest's RX descriptors.
@@ -1031,13 +1031,10 @@ mod tests {
 			delivered(3),
 			control_message(0, VIRTIO_CONSOLE_PORT_NAME, 1, proto::AGENT_PORT_NAME.as_bytes())
 		);
-		assert_eq!(
-			control_replies(LOG_PORT_ID, VIRTIO_CONSOLE_PORT_READY, 1),
-			vec![
-				control_message(1, VIRTIO_CONSOLE_PORT_OPEN, 1, &[]),
-				control_message(1, VIRTIO_CONSOLE_PORT_NAME, 1, proto::LOG_PORT_NAME.as_bytes()),
-			]
-		);
+		assert_eq!(control_replies(LOG_PORT_ID, VIRTIO_CONSOLE_PORT_READY, 1), vec![
+			control_message(1, VIRTIO_CONSOLE_PORT_OPEN, 1, &[]),
+			control_message(1, VIRTIO_CONSOLE_PORT_NAME, 1, proto::LOG_PORT_NAME.as_bytes()),
+		]);
 		assert!(console.control_out.is_empty());
 		console
 			.drain()

@@ -193,11 +193,10 @@ impl Bitmap {
 			return;
 		}
 		let (first, last) = ((start / 64) as usize, ((end - 1) / 64) as usize);
-		for index in first..=last {
+		for (index, word) in (first..=last).zip(&mut self.words[first..=last]) {
 			let lo = if index == first { start % 64 } else { 0 };
 			let hi = if index == last { (end - 1) % 64 } else { 63 };
-			let mask = (u64::MAX << lo) & (u64::MAX >> (63 - hi));
-			self.words[index] |= mask;
+			*word |= (u64::MAX << lo) & (u64::MAX >> (63 - hi));
 		}
 		self.dirty = Some(match self.dirty {
 			Some((lo, hi)) => (lo.min(first), hi.max(last + 1)),
@@ -285,8 +284,9 @@ impl Overlay {
 		let mut bytes = vec![0u8; footer.bitmap_len as usize];
 		file.read_exact_at(&mut bytes, footer.bitmap_off)?;
 		let mut bitmap = Bitmap::new(footer.clusters());
-		for (word, chunk) in bitmap.words.iter_mut().zip(bytes.chunks_exact(8)) {
-			*word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+		let (chunks, _) = bytes.as_chunks::<8>();
+		for (word, chunk) in bitmap.words.iter_mut().zip(chunks) {
+			*word = u64::from_le_bytes(*chunk);
 		}
 		Ok(Self { file, base, footer, bitmap, read_only })
 	}
@@ -762,7 +762,7 @@ pub(crate) mod macos {
 	};
 
 	/// Result of trying to clone the base into a new destination entry.
-	pub(crate) enum CloneOutcome {
+	pub enum CloneOutcome {
 		/// The clone exists and was reopened and verified; nothing to copy.
 		Cloned(File),
 		/// The filesystem cannot clone (not APFS, cross-device); the
@@ -778,11 +778,7 @@ pub(crate) mod macos {
 	/// dev/ino, on the directory's filesystem, as a single-link regular file
 	/// owned by us with the base's length. A swapped entry is rejected
 	/// rather than handed to the guest as its disk.
-	pub(crate) fn clone_into_new(
-		src: &File,
-		src_meta: &Metadata,
-		dest: &Path,
-	) -> io::Result<CloneOutcome> {
+	pub fn clone_into_new(src: &File, src_meta: &Metadata, dest: &Path) -> io::Result<CloneOutcome> {
 		let parent = dest
 			.parent()
 			.filter(|parent| !parent.as_os_str().is_empty())

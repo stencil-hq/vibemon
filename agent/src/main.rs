@@ -1862,11 +1862,12 @@ mod linux_agent {
 		}
 	}
 
-	/// `reboot(2)` command that makes the VMM exit cleanly. x86_64 direct-kernel
-	/// boots carry no ACPI tables, so `RB_POWER_OFF` would only halt the vCPUs
-	/// and the VMM would never exit; a restart under the `reboot=t` cmdline
-	/// triple-faults into `KVM_EXIT_SHUTDOWN`, which the VMM treats as a clean
-	/// guest shutdown. aarch64 powers off through PSCI `SYSTEM_OFF`.
+	/// `reboot(2)` command that makes the VMM exit cleanly. `x86_64`
+	/// direct-kernel boots carry no ACPI tables, so `RB_POWER_OFF` would only
+	/// halt the vCPUs and the VMM would never exit; a restart under the
+	/// `reboot=t` cmdline triple-faults into `KVM_EXIT_SHUTDOWN`, which the VMM
+	/// treats as a clean guest shutdown. aarch64 powers off through PSCI
+	/// `SYSTEM_OFF`.
 	#[cfg(target_arch = "x86_64")]
 	const POWER_OFF_CMD: libc::c_int = libc::RB_AUTOBOOT;
 	#[cfg(not(target_arch = "x86_64"))]

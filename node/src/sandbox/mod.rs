@@ -460,7 +460,8 @@ impl SandboxManager {
 			// A delta may reference the template's RAM base only when that base
 			// survives every node: published in the object store. Otherwise the
 			// pause carries its own `base/`.
-			let manifest = crate::artifacts::published::object_key(&meta.build_id, crate::artifacts::MANIFEST);
+			let manifest =
+				crate::artifacts::published::object_key(&meta.build_id, crate::artifacts::MANIFEST);
 			let template = match store.s3().exists(&manifest).await {
 				Ok(true) => template,
 				Ok(false) => None,

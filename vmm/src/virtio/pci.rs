@@ -252,15 +252,15 @@ impl MsixState {
 		let end = (start + data.len()).min(table_bytes);
 		let first = start / MSIX_TABLE_ENTRY_SIZE;
 		let last = (end - 1) / MSIX_TABLE_ENTRY_SIZE;
-		for idx in first..=last {
+		for (idx, entry) in (first..=last).zip(&mut self.table[first..=last]) {
 			let entry_start = idx * MSIX_TABLE_ENTRY_SIZE;
 			let entry_end = entry_start + MSIX_TABLE_ENTRY_SIZE;
 			let copy_start = start.max(entry_start);
 			let copy_end = end.min(entry_end);
-			let mut bytes = self.table[idx].to_bytes();
+			let mut bytes = entry.to_bytes();
 			bytes[copy_start - entry_start..copy_end - entry_start]
 				.copy_from_slice(&data[copy_start - start..copy_end - start]);
-			self.table[idx] = MsixEntry::from_bytes(bytes);
+			*entry = MsixEntry::from_bytes(bytes);
 		}
 		self.flush_pending();
 	}
