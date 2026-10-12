@@ -47,9 +47,10 @@ fn virtio_net_bulk_throughput() {
 	let mib = common::parse_env_usize("VMON_TPUT_MIB", 64);
 	let floor = common::parse_env_usize("VMON_TPUT_FLOOR", 100);
 
-	// Host sink: accept the guest's bulk stream and count bytes. Bind before boot
-	// so the SYN is never refused; nonblocking accept + a read deadline guarantee
-	// the drain thread can never wedge the test if the guest dies early.
+	// Host sink: accept the guest's bulk stream and count bytes. Bind before
+	// boot so the SYN is never refused; nonblocking accept + a read deadline
+	// guarantee the drain thread can never wedge the test if the guest dies
+	// early.
 	let listener = TcpListener::bind(("0.0.0.0", port))
 		.unwrap_or_else(|e| panic!("binding throughput sink on 0.0.0.0:{port}: {e}"));
 	listener
@@ -206,8 +207,9 @@ fn user_net_transfer(mode: &str, extra_markers: &[&str]) {
 	}
 	common::assert_no_panic(&output);
 
-	// Confirm the host actually received the bulk stream over the NAT, tolerating
-	// a small short read if the connection is torn down at the very end.
+	// Confirm the host actually received the bulk stream over the NAT,
+	// tolerating a small short read if the connection is torn down at the very
+	// end.
 	let received = sink.join().expect("user-net sink thread panicked");
 	let expected = mib * 1024 * 1024 * 9 / 10;
 	assert!(
@@ -272,7 +274,8 @@ fn drain_one(listener: &TcpListener, deadline: Duration) -> usize {
 			Err(_) => return 0,
 		}
 	};
-	// Switch to blocking reads with a timeout so EOF or a dead peer both unblock.
+	// Switch to blocking reads with a timeout so EOF or a dead peer both
+	// unblock.
 	let _ = stream.set_nonblocking(false);
 	let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 	let mut buf = vec![0u8; 256 * 1024];

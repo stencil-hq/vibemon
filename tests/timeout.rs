@@ -11,7 +11,8 @@ fn timeout_secs_self_terminates_with_status_json() {
 	}
 
 	// Volume write round-trips require the agent/e2e path and are covered by the
-	// Python e2e suite; this legacy initramfs harness only needs lifecycle smoke.
+	// Python e2e suite; this legacy initramfs harness only needs lifecycle
+	// smoke.
 	let dir = common::test_dir("timeout");
 	let sock = dir.join("api.sock");
 	let mut args = common::base_args("soak");

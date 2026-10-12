@@ -47,8 +47,8 @@ fn boots_ubuntu_via_uefi() {
 	// Cloud images take longer to boot and reach login prompt
 	let output = common::boot_capture(&refs, "login:", Duration::from_mins(2));
 
-	// Either the serial terminal showed login/Welcome, or cloud-init completed, or
-	// we successfully reached UEFI/OS loading
+	// Either the serial terminal showed login/Welcome, or cloud-init completed,
+	// or we successfully reached UEFI/OS loading
 	assert!(
 		output.contains("login:") || output.contains("Welcome") || output.contains("Ubuntu"),
 		"UEFI boot output of cloud image did not contain expected serial markers:\n{output}"

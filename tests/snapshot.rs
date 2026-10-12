@@ -28,10 +28,10 @@ fn fork_from_count_two_starts_two_clones() {
 		return;
 	}
 	// The supervisor only exits once every forked clone self-terminates, but the
-	// x86_64 test guest cannot power off under vmm (no ACPI shutdown — its kernel
-	// halts instead of exiting), so the supervisor would never return. Fork
-	// reaping is exercised on aarch64 (PSCI poweroff) and by the Python e2e
-	// `t_fork`, which covers fork on x86_64 too.
+	// x86_64 test guest cannot power off under vmm (no ACPI shutdown — its
+	// kernel halts instead of exiting), so the supervisor would never return.
+	// Fork reaping is exercised on aarch64 (PSCI poweroff) and by the Python
+	// e2e `t_fork`, which covers fork on x86_64 too.
 	if cfg!(target_arch = "x86_64") {
 		return;
 	}
@@ -143,6 +143,64 @@ fn delta_snapshot_restores_and_is_smaller() {
 		output.contains("SNAPSHOT_AFTER_RESTORE") || output.contains("SNAPSHOT_RESTORED"),
 		"restore marker missing:\n{output}"
 	);
+	common::assert_no_panic(&output);
+}
+
+/// A fork of a snapshot captured long ago continues the guest's monotonic
+/// clock from the capture: the time between snapshot and fork must not show up
+/// as guest time (on HVF the restore used to re-apply the raw vtimer offset,
+/// jumping `CLOCK_MONOTONIC` by the whole downtime and firing every guest
+/// timeout at once), and timers must keep firing on every vCPU of a multi-vCPU
+/// fork (a vCPU-numbering mismatch used to hand per-vCPU interrupt state to
+/// the wrong vCPU and wedge the guest).
+#[test]
+fn fork_of_old_multi_vcpu_snapshot_keeps_guest_time_and_timers() {
+	if !common::require_hv() {
+		return;
+	}
+	// The guest prints SNAPSHOT_READY, sleeps GUEST_SLEEP of guest time, then
+	// prints SNAPSHOT_RESTORED. The snapshot lands early in that sleep and the
+	// fork starts DOWNTIME later, so the sleep must still have most of
+	// GUEST_SLEEP left after the fork; a counter that counted the downtime ends
+	// it at once.
+	const GUEST_SLEEP: u64 = 10;
+	const DOWNTIME: Duration = Duration::from_secs(15);
+
+	let dir = common::test_dir("snapshot-clock");
+	let sock = dir.join("control.sock");
+	let cmdline =
+		common::cmdline_with("snapshot", &[("vmon.snapshot_delay", &GUEST_SLEEP.to_string())]);
+	let mut args = common::base_args_with_cmdline(cmdline);
+	args.extend(["--cpus", "4", "--api-sock"].map(String::from));
+	args.push(sock.display().to_string());
+	args.push("--snapshot-root".into());
+	args.push(dir.display().to_string());
+	let refs = common::as_refs(&args);
+	let mut vm = common::spawn_vmm(&refs);
+	vm.wait_for("SNAPSHOT_READY", Duration::from_mins(1));
+	let mut control = common::ControlClient::connect(&sock, Duration::from_secs(10));
+	assert_eq!(control.command("pause"), "OK");
+	assert_eq!(control.command("snapshot snapshot"), "OK");
+	assert_eq!(control.command("quit"), "OK");
+	let (status, output) = vm.wait(Duration::from_secs(30));
+	assert!(status.success(), "snapshot source exited with {status}; output:\n{output}");
+	let snap = dir.join("snapshot");
+	common::assert_snapshot_written(&snap);
+	std::thread::sleep(DOWNTIME);
+
+	let fork_args = ["--fork-from".to_string(), snap.display().to_string()];
+	let refs = common::as_refs(&fork_args);
+	let started = std::time::Instant::now();
+	let mut fork = common::spawn_vmm(&refs);
+	let output = fork.wait_for("SNAPSHOT_RESTORED", Duration::from_secs(GUEST_SLEEP * 3));
+	let slept = started.elapsed();
+	assert!(
+		slept >= Duration::from_secs(GUEST_SLEEP / 2),
+		"guest sleep ended {slept:?} after the fork: the {DOWNTIME:?} between snapshot and fork \
+		 leaked into guest time:\n{output}"
+	);
+	let (status, output) = fork.wait(Duration::from_secs(30));
+	assert!(status.success(), "fork exited with {status}; output:\n{output}");
 	common::assert_no_panic(&output);
 }
 

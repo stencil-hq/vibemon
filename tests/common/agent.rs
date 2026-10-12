@@ -13,7 +13,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use vmon_agent::proto::{self, Frame};
+use vmon_agent::proto::{self, Frame, Op};
 
 pub struct AgentClient {
 	stream:  UnixStream,
@@ -67,9 +67,10 @@ impl AgentClient {
 	}
 
 	/// Ping until the agent answers or `timeout` elapses. Anything queued
-	/// before the guest agent owns /dev/hvc0 — including the connect-time SYNC
-	/// preamble — is dropped by the guest tty layer, so every retry re-sends
-	/// SYNC (harmless mid-stream; readers skip it) plus a fresh request id.
+	/// before the guest agent opens its virtio-console port — including the
+	/// connect-time SYNC preamble — is dropped by the guest, so every retry
+	/// re-sends SYNC (harmless mid-stream; readers skip it) plus a fresh
+	/// request id.
 	pub fn ping(&mut self, timeout: Duration) -> Value {
 		let deadline = Instant::now() + timeout;
 		loop {
@@ -77,7 +78,7 @@ impl AgentClient {
 				.stream
 				.write_all(&proto::SYNC)
 				.expect("re-send SYNC preamble");
-			let id = self.send_request(&json!({"op": "ping"}));
+			let id = self.send_request(&json!({"op": Op::Ping}));
 			let attempt = (Instant::now() + Duration::from_millis(500)).min(deadline);
 			if let Some(resp) = self.wait_resp(id, attempt) {
 				return resp;
@@ -91,7 +92,7 @@ impl AgentClient {
 	/// hand-off) are skipped.
 	pub fn exec(&mut self, argv: &[&str], timeout: Duration) -> (i64, Vec<u8>) {
 		let deadline = Instant::now() + timeout;
-		let id = self.send_request(&json!({"op": "exec", "cmd": argv, "tty": false}));
+		let id = self.send_request(&json!({"op": Op::Exec, "cmd": argv, "tty": false}));
 		let mut stdout = Vec::new();
 		loop {
 			let frame = self.recv_until(deadline, "agent exec");
@@ -122,7 +123,7 @@ impl AgentClient {
 	pub fn write_file(&mut self, path: &str, content: &[u8], mode: u32, timeout: Duration) {
 		let deadline = Instant::now() + timeout;
 		let id = self.send_request(&json!({
-			"op": "fs_write",
+			"op": Op::FsWrite,
 			"path": path,
 			"mode": mode,
 		}));
