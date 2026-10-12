@@ -10,5 +10,5 @@ RUN apt-get update \
 	esac \
 	&& DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
 		bc bison build-essential ca-certificates cpio curl dwarves flex libelf-dev libssl-dev \
-		perl xz-utils $cross \
+		perl python3 xz-utils $cross \
 	&& rm -rf /var/lib/apt/lists/*

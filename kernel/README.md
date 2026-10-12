@@ -29,7 +29,7 @@ trees in the Docker volume `vmon-kernel-cache` (the kernel tree needs a
 case-sensitive filesystem); outputs still land in `target/kernel/`. The host
 arch builds natively; the other arch is cross-compiled
 with `gcc-<arch>-linux-gnu`. Tools: `build-essential flex bison bc libelf-dev
-libssl-dev dwarves cpio xz-utils curl` (+ `gcc-aarch64-linux-gnu` /
+libssl-dev dwarves python3 cpio xz-utils curl` (+ `gcc-aarch64-linux-gnu` /
 `gcc-x86-64-linux-gnu`). The source tarball and build trees are cached in
 `~/.cache/vmon-kernel` (`--cache`); an incremental rebuild takes about a
 minute, a cold build 3–4 minutes per arch on 8 cores (about twice that in the

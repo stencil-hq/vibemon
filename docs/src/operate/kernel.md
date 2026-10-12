@@ -48,7 +48,7 @@ kernel/build.sh --config-only    # resolve and verify the .config only
 
 ```sh
 sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev \
-  dwarves cpio xz-utils curl
+  dwarves python3 cpio xz-utils curl
 ```
 
 **macOS**: `just kernel` runs `build.sh` in one Ubuntu 24.04 container built from [`kernel/Dockerfile`](https://github.com/stencil-hq/vibemon/blob/main/kernel/Dockerfile), capped at 4 CPUs and niced, with the source and build trees in the Docker volume `vmon-kernel-cache` (the kernel tree needs a case-sensitive filesystem). Docker must be running. Outputs still land in the checkout's `target/kernel/`.

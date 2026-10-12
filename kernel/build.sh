@@ -58,7 +58,8 @@ die() {
 [[ "$(uname -s)" == Linux ]] || die "kernel builds run on Linux (on macOS: just kernel builds in a Docker container)"
 host_arch="$(uname -m)"
 
-need=(make gcc flex bison bc perl pahole cpio xz sha256sum curl)
+# python3: the BTF tooling (resolve_btfids → libbpf) generates its headers.
+need=(make gcc flex bison bc perl python3 pahole cpio xz sha256sum curl)
 for arch in "${arches[@]}"; do
 	case "$arch" in
 	aarch64 | x86_64) ;;
@@ -72,7 +73,7 @@ for tool in "${need[@]}"; do
 done
 if ((${#missing[@]})); then
 	die "missing tools: ${missing[*]}
-  Debian/Ubuntu: sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev dwarves cpio xz-utils curl gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu"
+  Debian/Ubuntu: sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev dwarves python3 cpio xz-utils curl gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu"
 fi
 
 # --- source -----------------------------------------------------------------

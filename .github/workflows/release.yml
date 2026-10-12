@@ -112,7 +112,7 @@ jobs:
       - name: Install kernel build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential flex bison bc libelf-dev libssl-dev dwarves cpio xz-utils
+          sudo apt-get install --yes build-essential flex bison bc libelf-dev libssl-dev dwarves python3 cpio xz-utils
 
       - name: Cache kernel source tarball
         uses: actions/cache@v4
