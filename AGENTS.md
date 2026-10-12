@@ -21,7 +21,8 @@ SDK and no other API.
 ## Architecture & Data Flow
 
 Normative design: `ARCHITECTURE.md`. Keep it in sync with behavior changes.
-E2B coverage per operation: `docs/e2b-compat.md`.
+E2B coverage per operation: `docs/src/reference/e2b-compat.md`. User and
+operator documentation: the mdBook site in `docs/` (`docs/src/SUMMARY.md`).
 
 ```
 E2B SDKs / e2b CLI
@@ -110,7 +111,7 @@ run `codesign --sign - --entitlements hvf.entitlements --force <vmon>`.
   Use runtime queries plus `#[derive(sqlx::FromRow)]`, and register each new
   migration in `store/mod.rs` `MIGRATIONS`. Never edit an applied migration.
 - **E2B fidelity:** match upstream wire behavior, using `spec/e2b/` and the
-  upstream sources cited in `docs/e2b-compat.md`. Protocol identifiers (`E2B_*`
+  upstream sources cited in `docs/src/reference/e2b-compat.md`. Protocol identifiers (`E2B_*`
   env vars, `/.e2b`, `/run/e2b`, aliases) stay as upstream. User-visible
   branding (hostname, wallpaper, noVNC title) is `vibemon`.
 - **Platform code:** keep OS/arch differences behind `vmm/src/{os,hv,arch}`,

@@ -197,7 +197,7 @@ e2e suite="all" *args: build agent-musl fetch-assets mysql
     python3 e2e/run.py "$@"
 
 # Gated distributed e2e (tests/cluster.rs): 3 drivers + 2 nodes on loopback,
-# leader/node failover, graceful node restart; see docs/cluster.md.
+# leader/node failover, graceful node restart; see docs/src/develop/cluster-verification.md.
 cluster-e2e: agent-musl fetch-assets mysql
     CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
     VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \

@@ -1,0 +1,347 @@
+<!doctype html>
+<!--
+  Source for the README graphics: assets/hero.png (#hero), assets/architecture.png (#arch),
+  assets/lifecycle.png (#flow). Render each element to PNG at device scale 2 with any
+  Chromium screenshot tool (element screenshot, transparent margins excluded).
+  Tokens match docs/theme/custom.css: dark, flat, sharp, accent hue 230.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg:        oklch(0.115 0.010 230);
+    --bg2:       oklch(0.135 0.011 230);
+    --raised:    oklch(0.165 0.012 230);
+    --inset:     oklch(0.090 0.007 230);
+    --fg:        oklch(0.96 0.004 230);
+    --muted:     oklch(0.68 0.010 230);
+    --faint:     oklch(0.48 0.012 230);
+    --accent:    oklch(0.78 0.135 230);
+    --accent-hi: oklch(0.88 0.14 230);
+    --accent-dim:oklch(0.56 0.10 230);
+    --accent-faint: oklch(0.78 0.135 230 / 0.12);
+    --warm:      oklch(0.82 0.13 75);
+    --border:    oklch(0.30 0.014 230 / 0.55);
+    --border-hi: oklch(0.40 0.02 230 / 0.65);
+    --glass:     oklch(0.16 0.012 230 / 0.80);
+    --glass-hi:  oklch(0.19 0.014 230 / 0.85);
+    --mono: "SF Mono", "JetBrains Mono", "Cascadia Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: "Avenir Next", "SF Pro Text", -apple-system, "Segoe UI", sans-serif;
+    --display: "SF Pro Display", -apple-system, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #060809; font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+  .frame { margin: 24px; display: inline-block; }
+
+  /* ============ shared ============ */
+  .grid-dots {
+    background-image: radial-gradient(oklch(0.40 0.015 230 / 0.22) 1px, transparent 1.5px);
+    background-size: 22px 22px;
+  }
+  .panel {
+    position: relative; overflow: hidden; border-radius: 4px; border: 1px solid var(--border-hi);
+    box-shadow: 0 24px 60px oklch(0.03 0.015 230 / 0.5), inset 0 1px 0 oklch(0.6 0.03 230 / 0.08);
+  }
+  .accentbar { position: absolute; top: 0; left: 44px; width: 180px; height: 2px;
+    background: linear-gradient(90deg, var(--accent-hi), var(--accent), transparent); }
+  .sq { display: inline-block; width: 7px; height: 7px; background: var(--accent); border-radius: 1px;
+    box-shadow: 0 0 8px var(--accent); flex: none; }
+  .kicker { font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent); font-weight: 500; display: flex; align-items: center; gap: 10px; }
+  .kicker .dim { color: var(--faint); }
+  .sub { color: var(--muted); font-size: 15px; margin-top: 8px; max-width: 860px; line-height: 1.45; }
+  .chip {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.02em;
+    color: var(--muted); padding: 5px 10px; border-radius: 3px;
+    border: 1px solid var(--border); background: var(--glass); white-space: nowrap;
+  }
+  .chip b { color: var(--accent); font-weight: 600; }
+  .mono { font-family: var(--mono); }
+  .pill { font-family: var(--mono); font-size: 11px; color: var(--accent);
+    background: var(--inset); border: 1px solid var(--border-hi); border-radius: 3px; padding: 3px 10px;
+    white-space: nowrap; box-shadow: 0 2px 10px oklch(0.03 0.015 230 / 0.4); }
+  .pill.solid { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 700; }
+
+  /* ============ HERO ============ */
+  #hero {
+    width: 1280px; height: 520px;
+    background:
+      radial-gradient(90% 120% at 82% -10%, oklch(0.27 0.09 230 / 0.38) 0%, transparent 46%),
+      radial-gradient(60% 80% at 105% 105%, oklch(0.24 0.07 75 / 0.10) 0%, transparent 50%),
+      linear-gradient(160deg, var(--bg2) 0%, var(--bg) 50%, var(--inset) 100%);
+  }
+  #hero .dots { position: absolute; inset: 0; opacity: 0.45;
+    -webkit-mask-image: linear-gradient(108deg, #000 0%, transparent 55%); mask-image: linear-gradient(108deg, #000 0%, transparent 55%); }
+  #hero .wrap { position: relative; height: 100%; display: flex; padding: 46px 52px 40px; }
+  #hero .left { width: 57%; display: flex; flex-direction: column; z-index: 2; }
+
+  .wordmark { margin-top: 18px; font-family: var(--display); font-weight: 800; font-size: 92px; line-height: 0.9;
+    letter-spacing: -0.05em; color: var(--fg); }
+  .wordmark .mon {
+    background: linear-gradient(130deg, var(--accent-hi) 0%, var(--accent) 55%, var(--accent-dim) 100%);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .tagline { margin-top: 20px; font-size: 19.5px; line-height: 1.42; color: var(--muted); max-width: 600px; }
+  .tagline b { color: var(--fg); font-weight: 600; }
+
+  .term { margin-top: 24px; align-self: flex-start; font-family: var(--mono); font-size: 14px; line-height: 1.75;
+    color: var(--fg); background: oklch(0.08 0.006 230 / 0.92); border: 1px solid var(--border-hi);
+    border-radius: 4px; padding: 12px 18px; min-width: 470px;
+    box-shadow: 0 6px 20px oklch(0.03 0.015 230 / 0.35), inset 0 1px 0 oklch(0.6 0.03 230 / 0.06); }
+  .term .p { color: var(--accent); font-weight: 700; margin-right: 10px; }
+  .term .arg { color: var(--muted); }
+  .term .cm { color: var(--faint); }
+  .term .cur { width: 8px; height: 16px; background: var(--accent); display: inline-block; vertical-align: -3px;
+    margin-left: 2px; border-radius: 1px; box-shadow: 0 0 6px var(--accent); }
+
+  .caps { margin-top: auto; padding-top: 22px; display: flex; gap: 7px; flex-wrap: wrap; }
+
+  /* right: one template snapshot fanning out into CoW sandboxes */
+  #hero .right { width: 43%; position: relative; }
+  .tpl { position: absolute; top: 34px; right: 0; width: 300px; border-radius: 5px;
+    border: 1px solid oklch(0.46 0.08 230 / 0.6);
+    background: linear-gradient(160deg, oklch(0.22 0.05 230 / 0.9), oklch(0.16 0.03 230 / 0.9));
+    box-shadow: 0 0 0 1px oklch(0.44 0.08 230 / 0.2), 0 16px 40px oklch(0.03 0.015 230 / 0.55); }
+  .hd { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .hd .t { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .hd .r { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+  .bd { padding: 11px 14px; font-family: var(--mono); font-size: 11.5px; color: var(--faint); line-height: 1.75; }
+  .bd .k { color: var(--accent-dim); font-weight: 600; display: inline-block; width: 62px; }
+  .bd .v { color: var(--muted); }
+
+  .fan { position: absolute; top: 214px; right: 0; width: 300px; height: 210px; }
+  .fan svg { position: absolute; inset: 0; overflow: visible; }
+  .sbx { position: absolute; width: 138px; border-radius: 4px; border: 1px solid var(--border-hi);
+    background: linear-gradient(160deg, var(--glass-hi), var(--glass));
+    box-shadow: 0 10px 28px oklch(0.03 0.015 230 / 0.5); }
+  .sbx .hd { padding: 7px 10px; }
+  .sbx .hd .t { font-size: 10.5px; }
+  .sbx .st { padding: 7px 10px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); display: flex; align-items: center; gap: 6px; }
+  .led { width: 6px; height: 6px; border-radius: 50%; background: oklch(0.8 0.15 160); box-shadow: 0 0 6px oklch(0.8 0.15 160); }
+  .led.paused { background: var(--warm); box-shadow: 0 0 6px var(--warm); }
+  .s1 { top: 60px; left: 0; }
+  .s2 { top: 60px; right: 0; }
+  .s3 { top: 150px; left: 60px; width: 180px; opacity: 0.92; }
+
+  /* ============ ARCHITECTURE ============ */
+  #arch { width: 1200px; padding: 40px 44px 44px;
+    background:
+      radial-gradient(60% 50% at 50% 0%, oklch(0.19 0.03 230 / 0.28) 0%, transparent 55%),
+      linear-gradient(170deg, var(--bg2), var(--bg) 60%, var(--inset)); }
+  .tiers { display: grid; grid-template-columns: 1fr 250px; gap: 0 22px; margin-top: 28px; }
+  .tier { border: 1px solid var(--border-hi); border-radius: 4px; padding: 14px 16px 16px;
+    background: linear-gradient(160deg, var(--glass-hi), var(--glass));
+    box-shadow: 0 8px 24px oklch(0.03 0.015 230 / 0.25), inset 0 1px 0 oklch(0.6 0.03 230 / 0.05); }
+  .tier.host { background: linear-gradient(160deg, oklch(0.20 0.05 230 / 0.85), oklch(0.15 0.035 230 / 0.85));
+    border-color: oklch(0.44 0.06 230 / 0.55); }
+  .tier-h { display: flex; align-items: baseline; gap: 12px; }
+  .tier-h .n { font-family: var(--display); font-size: 19px; font-weight: 700; color: var(--fg); }
+  .tier-h .n .mono { color: var(--accent); font-weight: 600; font-size: 17px; }
+  .tier-h .d { font-size: 13.5px; color: var(--muted); }
+  .tier-h .tag { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--faint);
+    border: 1px solid var(--border); border-radius: 3px; padding: 3px 8px; background: oklch(0.10 0.006 230 / 0.5); }
+  .row { display: flex; gap: 10px; margin-top: 12px; }
+  .box { flex: 1; border: 1px solid var(--border); border-radius: 3px; padding: 9px 12px;
+    background: oklch(0.11 0.008 230 / 0.6); font-family: var(--mono); font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .box b { color: var(--fg); font-weight: 600; display: block; font-size: 12.5px; }
+  .box.vm { border-color: oklch(0.44 0.06 230 / 0.5); }
+  .box.vm b { color: var(--accent-hi); }
+  .conn { display: flex; align-items: center; justify-content: center; height: 40px; position: relative; }
+  .conn .line { width: 1px; height: 100%; background: linear-gradient(var(--border-hi), var(--accent-dim) 50%, var(--border-hi)); }
+  .conn .pill { position: absolute; }
+  .side { display: flex; flex-direction: column; gap: 12px; }
+  .store { border: 1px dashed var(--border-hi); border-radius: 4px; padding: 12px 14px;
+    background: oklch(0.10 0.007 230 / 0.6); }
+  .store .n { font-family: var(--mono); font-size: 13px; color: var(--fg); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .store .d { font-size: 12.5px; color: var(--muted); margin-top: 5px; line-height: 1.4; }
+  .store .o { font-family: var(--mono); font-size: 10.5px; color: var(--faint); margin-left: auto; font-weight: 400; }
+  .spacer { height: 170px; }
+
+  /* ============ LIFECYCLE ============ */
+  #flow { width: 1280px; padding: 40px 44px 46px;
+    background:
+      radial-gradient(50% 40% at 30% 0%, oklch(0.19 0.03 230 / 0.25) 0%, transparent 55%),
+      linear-gradient(170deg, var(--bg2), var(--bg) 60%, var(--inset)); }
+  .f-row { display: flex; align-items: center; margin-top: 34px; }
+  .node { border: 1px solid var(--border-hi); border-radius: 5px; padding: 15px 18px; width: 192px; min-height: 124px; flex: none;
+    background: linear-gradient(160deg, var(--glass-hi), var(--glass));
+    box-shadow: 0 12px 32px oklch(0.03 0.015 230 / 0.3), inset 0 1px 0 oklch(0.6 0.03 230 / 0.05); }
+  .node .lab { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+  .node .big { font-family: var(--display); font-size: 18px; font-weight: 700; color: var(--fg); margin-top: 5px; }
+  .node .small { font-size: 11.5px; color: var(--muted); margin-top: 6px; font-family: var(--mono); line-height: 1.5; }
+  .node.hi { border-color: oklch(0.46 0.08 230 / 0.55);
+    box-shadow: 0 0 0 1px oklch(0.44 0.08 230 / 0.25), 0 12px 32px oklch(0.06 0.03 230 / 0.2);
+    background: linear-gradient(160deg, oklch(0.21 0.045 230 / 0.85), oklch(0.16 0.03 230 / 0.85)); }
+  .node.hi .lab { color: var(--accent); }
+  .node.warm { border-color: oklch(0.6 0.09 75 / 0.45); }
+  .node.warm .lab { color: var(--warm); }
+  .arrow { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 70px; padding: 0 2px; }
+  .arrow .ln { width: 100%; height: 1.5px; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); position: relative; }
+  .arrow .ln::after { content: ""; position: absolute; right: -1px; top: -3.5px; border: 4px solid transparent; border-left-color: var(--accent); }
+  .arrow .pill { margin-bottom: 8px; }
+  .loop { display: flex; justify-content: flex-end; margin-top: 18px; padding-right: 0; }
+  .loop .back { display: flex; align-items: center; gap: 12px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .loop .back .ln { width: 330px; height: 1.5px; background: linear-gradient(90deg, var(--accent), var(--accent-dim)); position: relative; }
+  .loop .back .ln::before { content: ""; position: absolute; left: -1px; top: -3.5px; border: 4px solid transparent; border-right-color: var(--accent); }
+  .notes { display: flex; gap: 10px; margin-top: 26px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<!-- ===================== HERO ===================== -->
+<div class="frame">
+<div id="hero" class="panel">
+  <div class="dots grid-dots" style="position:absolute;inset:0"></div>
+  <div class="accentbar"></div>
+  <div class="wrap">
+    <div class="left">
+      <div class="kicker"><span class="sq"></span> E2B-compatible <span class="dim">·</span> KVM <span class="dim">·</span> HVF</div>
+      <div class="wordmark">Vibe<span class="mon">mon</span></div>
+      <div class="tagline">Self-hosted sandboxes for the <b>official E2B SDKs and CLI</b>, unmodified. Every sandbox is a <b>hardware-isolated microVM</b>, forked copy-on-write from a template snapshot.</div>
+      <div class="term">
+        <div><span class="p">$</span>vmon serve <span class="arg">--role node,driver</span></div>
+        <div><span class="p">&gt;&gt;&gt;</span>sbx = Sandbox.create() <span class="cm"># fork of base</span><span class="cur"></span></div>
+      </div>
+      <div class="caps">
+        <span class="chip"><b>E2B</b> REST + envd</span>
+        <span class="chip"><b>CoW</b> fork</span>
+        <span class="chip"><b>pause</b> / resume anywhere</span>
+        <span class="chip">gossip + <b>raft</b></span>
+        <span class="chip"><b>egress</b> policy</span>
+        <span class="chip"><b>S3</b> portable state</span>
+      </div>
+    </div>
+    <div class="right">
+      <div class="tpl">
+        <div class="hd"><span class="sq"></span><span class="t">template · base</span><span class="r">snapshot</span></div>
+        <div class="bd">
+          <span class="k">rootfs</span><span class="v">raw base, block CoW</span><br>
+          <span class="k">memory</span><span class="v">RAM + device state</span><br>
+          <span class="k">guest</span><span class="v">systemd · envd :49983</span><br>
+          <span class="k">start</span><span class="v">startCmd already running</span>
+        </div>
+      </div>
+      <div class="fan">
+        <svg viewBox="0 0 300 210" width="300" height="210">
+          <path d="M150 -12 V 30 M150 30 C 150 48, 69 44, 69 60 M150 30 C 150 48, 231 44, 231 60 M150 30 V 150"
+                fill="none" stroke="oklch(0.62 0.11 230)" stroke-width="1.4" stroke-dasharray="3 4" />
+        </svg>
+        <div class="sbx s1"><div class="hd"><span class="t">sandbox i7f…</span></div><div class="st"><span class="led"></span>running</div></div>
+        <div class="sbx s2"><div class="hd"><span class="t">sandbox k2q…</span></div><div class="st"><span class="led"></span>running</div></div>
+        <div class="sbx s3"><div class="hd"><span class="t">sandbox a9c…</span></div><div class="st"><span class="led paused"></span>paused → any node</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<div class="frame">
+<div id="arch" class="panel">
+  <div class="kicker"><span class="sq"></span> Architecture</div>
+  <div class="sub">One binary, two roles. Drivers speak E2B and route traffic; nodes run one <span class="mono">vmon vmm</span> process per microVM and reach the guest only through the agent channel.</div>
+
+  <div class="tiers">
+    <div>
+      <div class="tier">
+        <div class="tier-h"><span class="n">Clients</span><span class="d">official packages, unmodified</span></div>
+        <div class="row">
+          <div class="box"><b>e2b</b>Python · JS SDK</div>
+          <div class="box"><b>code-interpreter</b>Python · JS</div>
+          <div class="box"><b>desktop</b>Python · JS</div>
+          <div class="box"><b>e2b CLI</b>auth · template · sandbox</div>
+        </div>
+      </div>
+      <div class="conn"><div class="line"></div><span class="pill">HTTPS · api.&lt;domain&gt; · &lt;port&gt;-&lt;id&gt;.&lt;domain&gt; · E2b-Sandbox-* headers</span></div>
+      <div class="tier">
+        <div class="tier-h"><span class="n">driver <span class="mono">vmon serve --role driver</span></span><span class="tag">:3000 public</span></div>
+        <div class="row">
+          <div class="box"><b>E2B REST API</b>auth · teams · templates</div>
+          <div class="box"><b>scheduler</b>admission · placement</div>
+          <div class="box"><b>lifecycle</b>reaper · auto-pause</div>
+          <div class="box"><b>ingress</b>TLS · h2 · WebSocket</div>
+        </div>
+      </div>
+      <div class="conn"><div class="line"></div><span class="pill">node API /node/v1 · upgrade tunnels · :7947 cluster listener</span></div>
+      <div class="tier">
+        <div class="tier-h"><span class="n">node <span class="mono">vmon serve --role node</span></span><span class="tag">KVM · HVF</span></div>
+        <div class="row">
+          <div class="box"><b>sandboxes</b>create · pause · resume · fork</div>
+          <div class="box"><b>template builds</b>OCI pull · provision · snapshot</div>
+          <div class="box"><b>networking</b>TAP/NAT · user-net · egress</div>
+          <div class="box"><b>artifacts</b>peer transfer · volumes</div>
+        </div>
+      </div>
+      <div class="conn"><div class="line"></div><span class="pill">spawns one process per VM · control socket</span></div>
+      <div class="tier host">
+        <div class="tier-h"><span class="n"><span class="mono">vmon vmm</span> · microVM</span><span class="tag">GC4 over virtio-console</span></div>
+        <div class="row">
+          <div class="box vm"><b>vCPU threads</b>KVM_RUN · HVF</div>
+          <div class="box vm"><b>virtio</b>blk · net · console · fs · rng</div>
+          <div class="box vm"><b>snapshot</b>restore · CoW fork</div>
+          <div class="box vm"><b>guest</b>systemd/OpenRC + envd</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="spacer"></div>
+      <div class="store"><div class="n"><span class="sq"></span>MySQL</div><div class="d">Durable state: teams, keys, templates, builds, paused sandboxes, events.</div></div>
+      <div class="store"><div class="n"><span class="sq"></span>raft KV</div><div class="d">Live state on the drivers: sandbox routes, admission, locks. Nodes forward KV calls.</div></div>
+      <div class="store"><div class="n"><span class="sq"></span>gossip <span class="o">:7946</span></div><div class="d">SWIM memberlist: roles, URLs, capacity. Seeds via <span class="mono">--join</span>.</div></div>
+      <div class="store"><div class="n"><span class="sq"></span>object store <span class="o">optional</span></div><div class="d">Templates, paused sandboxes, and volumes portable across nodes.</div></div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ===================== LIFECYCLE ===================== -->
+<div class="frame">
+<div id="flow" class="panel">
+  <div class="kicker"><span class="sq"></span> Build once · fork many · resume anywhere</div>
+  <div class="sub">A template is a running VM captured to disk. Creating a sandbox restores it copy-on-write instead of booting; pausing writes only what changed.</div>
+  <div class="f-row">
+    <div class="node">
+      <div class="lab">source</div>
+      <div class="big">OCI image</div>
+      <div class="small">Template() builder<br>or Dockerfile</div>
+    </div>
+    <div class="arrow"><span class="pill">build VM</span><div class="ln"></div></div>
+    <div class="node">
+      <div class="lab">node</div>
+      <div class="big">provision</div>
+      <div class="small">unpack · systemd · envd<br>steps · startCmd</div>
+    </div>
+    <div class="arrow"><span class="pill">capture</span><div class="ln"></div></div>
+    <div class="node hi">
+      <div class="lab">template</div>
+      <div class="big">snapshot</div>
+      <div class="small">RAM + rootfs<br>→ object store (opt.)</div>
+    </div>
+    <div class="arrow"><span class="pill solid">create</span><div class="ln"></div></div>
+    <div class="node">
+      <div class="lab">sandbox</div>
+      <div class="big">CoW fork</div>
+      <div class="small">no kernel boot<br>fresh entropy</div>
+    </div>
+    <div class="arrow"><span class="pill">pause</span><div class="ln"></div></div>
+    <div class="node warm">
+      <div class="lab">paused</div>
+      <div class="big">delta on disk</div>
+      <div class="small">RAM delta + overlay<br>→ object store (opt.)</div>
+    </div>
+  </div>
+  <div class="loop">
+    <div class="back"><span>connect · auto-resume on traffic · same node, or any node from the object store</span><div class="ln"></div></div>
+  </div>
+  <div class="notes">
+    <span class="chip"><b>fork</b> running sandbox → N children</span>
+    <span class="chip"><b>snapshot</b> sandbox → new template</span>
+    <span class="chip"><b>lazy resume</b> disk blocks + Linux RAM on demand</span>
+    <span class="chip"><b>auto-pause</b> on timeout</span>
+  </div>
+</div>
+</div>
+
+</body>
+</html>

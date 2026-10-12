@@ -1,5 +1,6 @@
 //! Bring-your-own-bucket mounts: the `vmonS3Mounts` create extension
-//! (ARCHITECTURE.md §9.6, docs/e2b-compat.md "Extensions").
+//! (ARCHITECTURE.md §9.6, docs/src/reference/e2b-compat.md §5 "Deliberate
+//! deviations").
 //!
 //! Validated at create; the non-secret part of every mount is stored in
 //! `sandboxes.s3_mounts`, inline credentials only encrypted

@@ -35,6 +35,7 @@ All notable changes to this project are recorded here.
   `disk_snapshot` of a remote disk writes the whole guest-visible disk.
 - `vmon vmm --restore --remote-page-url` accepts delta snapshots (the page
   source serves the reconstructed RAM).
+- Added the documentation site (`docs/`, mdBook): quickstart, installation, client setup, concepts, operator guides, `vmon serve`/`vmon admin` references, and contributor docs for the E2B-compatible platform. The E2B compatibility matrix and the cluster verification guide moved into it (`docs/src/reference/e2b-compat.md`, `docs/src/develop/cluster-verification.md`)
 - Added `vmon serve --role node,driver`: one binary runs the node role, the driver role, or both, discovering peers through gossip (`--join`)
 - Added `vmon-cluster`: an in-house SWIM gossip memberlist with authenticated packets and a raft-replicated KV store (openraft) with transactions, TTLs, watches, and leader-confirmed bootstrap and membership driven by gossip
 - Added `vmon-driver`: the E2B REST API (sandboxes, snapshots, fork, templates and v2 builds, tags and aliases, volumes and volume content, secrets, teams, API keys, events, webhooks, admin, nodes), MySQL persistence, the scheduler, the sandbox lifecycle with auto-pause and auto-resume, the leader-only reaper and reconciler, the build supervisor, CLI login, and sandbox ingress (`<port>-<id>.<domain>` or `E2b-Sandbox-*` headers, TLS with h2, WebSocket passthrough, traffic tokens, masked hosts, HTTPS guest ports)

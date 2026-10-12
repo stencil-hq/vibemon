@@ -2,7 +2,7 @@
 
 Normative design for the E2B-compatible vibemon platform. When code and this
 document disagree, one of them is a bug. E2B wire-level facts referenced here
-live in `spec/e2b/` (vendored upstream specs) and `docs/e2b-compat.md`
+live in `spec/e2b/` (vendored upstream specs) and `docs/src/reference/e2b-compat.md`
 (endpoint-by-endpoint compatibility matrix).
 
 ## 1. Shape
@@ -884,7 +884,7 @@ protocol, inode table only in snapshots); the proxy owns all state.
 ### 9.1 API
 
 Every operation in `spec/e2b/infra/spec/openapi.yml` is served
-(`docs/e2b-compat.md` lists status per operation). Errors are
+(`docs/src/reference/e2b-compat.md` lists status per operation). Errors are
 `{"code": <http status>, "message": "...", "error_code"?: "..."}`.
 Pagination: `limit` (≤ 100) + `nextToken`, cursor in `X-Next-Token`.
 
@@ -917,7 +917,7 @@ served at `/dashboard/` on the public listeners):
 - `X-Admin-Token` == `--admin-token` → admin (`/nodes*`, `/admin/*`,
   including the dashboard API of §9.1).
 - `X-Access-Token` == the sandbox's envd access token (vmon extension,
-  `docs/e2b-compat.md` §5) → that sandbox's team, only on
+  `docs/src/reference/e2b-compat.md` §5) → that sandbox's team, only on
   `GET /sandboxes/{id}`, `POST /sandboxes/{id}/timeout` and
   `POST /sandboxes/{id}/refreshes` of that same sandbox (matched route +
   path ID; constant-time compare before any lookup; killed/unknown → 401).
@@ -1033,7 +1033,7 @@ operator store (`volumes.object_store`, no node): `volumeMounts` mount it as
 a write-back S3 mount (§8.8) on any node with feature `object-store` (no
 placement pin), the driver serves the volume-content API directly against S3
 with the same object layout, and `DELETE /volumes/{id}` deletes the prefix.
-Bring-your-own-bucket mounts (`vmonS3Mounts`, docs/e2b-compat.md §5) are
+Bring-your-own-bucket mounts (`vmonS3Mounts`, docs/src/reference/e2b-compat.md §5) are
 validated at create (`lifecycle::s3mounts`), stored without credentials in
 `sandboxes.s3_mounts` (inline credentials encrypted, `credentialsSecret`
 re-resolved on every resume/fork), and forwarded to the node in
@@ -1098,4 +1098,4 @@ at the requested path. The volume-content API is proxied by the driver to
   covered by `tests/cluster.rs` and the scripts in `e2e/cluster/`.
 - `tests/cluster.rs` (`VMON_CLUSTER_E2E=1`, `just cluster-e2e`): 3 drivers + 2
   nodes; raft bootstrap, cross-driver ingress, leader and node failover,
-  graceful node restart (docs/cluster.md).
+  graceful node restart (docs/src/develop/cluster-verification.md).

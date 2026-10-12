@@ -1,0 +1,20 @@
+[book]
+title = "Vibemon"
+description = "KVM/HVF microVM platform with an E2B-compatible control plane"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/stencil-hq/vibemon"
+edit-url-template = "https://github.com/stencil-hq/vibemon/edit/main/docs/{path}"
+site-url = "/vibemon/"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["theme/custom.css"]
+no-section-label = true
+
+[output.html.search]
+limit-results = 20

@@ -5,13 +5,15 @@ Target: the official E2B SDKs (`e2b`, `@e2b/code-interpreter` /
 unmodified against vibemon when pointed at it with `E2B_DOMAIN` /
 `E2B_API_URL` / `E2B_SANDBOX_URL` / `E2B_API_KEY`.
 
-Sources: `spec/e2b/` (vendored upstream specs; provenance in
-`spec/e2b/SOURCES.md`). Design: `ARCHITECTURE.md`.
+Sources: [`spec/e2b/`](https://github.com/stencil-hq/vibemon/tree/main/spec/e2b)
+(vendored upstream specs; provenance in `spec/e2b/SOURCES.md`). Design:
+[`ARCHITECTURE.md`](https://github.com/stencil-hq/vibemon/blob/main/ARCHITECTURE.md).
 
 Legend: **Core** is what the stripped core (`vmm` + `vmon-agent`) provided
 before the rework. **Implementation** is what vibemon adds, and where. Proof
-for each area is in §4a (official SDK suites), §6 (CLI), `docs/cluster.md`
-(distributed, TLS) and `e2e/README.md`.
+for each area is in §4a (official SDK suites), §6 (CLI),
+[Distributed, Linux/KVM, and TLS verification](../develop/cluster-verification.md)
+and [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README.md).
 
 ## 1. What the core VM gives us
 
@@ -80,6 +82,9 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | POST | `/admin/teams/{teamID}/sandboxes/kill` | Admin | Kill every team sandbox. |
 | GET | `/admin/sandboxes/running-counts` | Admin | Counts from KV catalog. |
 | GET | `/admin/sandboxes/{id}` | Admin | Team + state. |
+| GET | `/admin/cluster` | Admin | vmon extension (dashboard): gossip members with roles, raft view, node capacity/status/create counters, plus 1 h of 5 s fleet samples. |
+| GET | `/admin/teams` | Admin | vmon extension (dashboard): every team with limits and MySQL running/paused counts, by name. |
+| GET | `/admin/sandboxes` | Admin | vmon extension (dashboard): every team's running/paused sandboxes (`ListedSandbox` + `teamID`, `teamName`, `nodeID`), newest first; `state`, `team`, `limit` ≤ 1000 (default 500), `nextToken`/`X-Next-Token`; `id` returns just that sandbox (`[]` when killed/unknown). |
 | POST | `/admin/teams/{teamID}/builds/cancel` | Admin | Cancel team builds. |
 | POST | `/admin/teams/{teamID}/api-keys` | Admin | Create key. |
 | DELETE | `/admin/teams/{teamID}/api-keys/{id}` | Admin | Delete key. |
@@ -127,7 +132,7 @@ client stream for `StreamInput`), HTTP/1.1 + h2c.
 
 | Behavior | Implementation |
 |---|---|
-| `https://<port>-<id>.<domain>` and `E2b-Sandbox-Id/-Port` routing | Driver ingress (§9.5 of ARCHITECTURE.md). Optional TLS listener with operator-provided wildcard cert. Proven with the Python SDK (h2 via ALPN) and the JS SDK without `E2B_SANDBOX_URL`, against `--tls-listen` with a `*.vmon.test` cert (docs/cluster.md §3). Exception: the Python SDK's volume content API always targets `https://api.<domain>`. |
+| `https://<port>-<id>.<domain>` and `E2b-Sandbox-Id/-Port` routing | Driver ingress (§9.5 of ARCHITECTURE.md). Optional TLS listener with operator-provided wildcard cert. Proven with the Python SDK (h2 via ALPN) and the JS SDK without `E2B_SANDBOX_URL`, against `--tls-listen` with a `*.vmon.test` cert ([TLS verification](../develop/cluster-verification.md#3-tls-and-true-subdomain-routing-no-e2b_sandbox_url)). Exception: the Python SDK's volume content API always targets `https://api.<domain>`. |
 | 502 `was not found` / `port is not open` | Ingress. |
 | Public envd control paths blocked | Ingress. |
 | `allowPublicTraffic=false` + `e2b-traffic-access-token` | Ingress. |
@@ -150,7 +155,7 @@ monolithic `vmon serve`. Latest macOS/HVF run: Python 1442 passed / 10 failed
 / 34 skipped, JS 1004 passed / 4 failed / 36 skipped; skips match upstream CI.
 Remaining failures (macOS-only egress `rules`, signed URLs under the macOS
 Python routing workaround, one JS `httpsPorts` timeout) and the fixes made are
-listed in `e2e/README.md`.
+listed in [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README.md).
 
 ## 5. Deliberate deviations
 
@@ -194,6 +199,10 @@ listed in `e2e/README.md`.
   exactly as with API-key authentication. This is a vmon extension, not an
   upstream E2B capability.
 
+- **Admin dashboard.** `/dashboard/` on the public listener and its
+  `GET /admin/cluster`, `GET /admin/teams`, `GET /admin/sandboxes` endpoints
+  (`X-Admin-Token`) are vmon extensions with no upstream counterpart.
+
 - **Sandbox log fields are strings.** `SandboxLogEntry.fields` is
   `map<string,string>`, so non-string envd fields (`pid`, `process_result`)
   reach `e2b sandbox logs` as strings; upstream's v1 `line` keeps their JSON
@@ -228,6 +237,11 @@ listed in `e2e/README.md`.
   defaults (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`) resolve
   for every team and cannot be squatted; ordinary teams are addressed as
   `<slug>/<alias>` (ARCHITECTURE.md §7).
+- **`minFreeDiskMb` is validated, not applied.** Builds accept it (0 to the
+  team's `max_disk_mb`) and record it, but every build disk is already a
+  sparse ext4 image of the team's `max_disk_mb`. Free space after the steps is
+  that size minus what they wrote; upstream instead grows the filesystem to
+  the requested free space and keeps it smaller otherwise.
 - **Default templates are multi-arch.** `templates/` mirrors the upstream
   definitions but picks architecture-specific packages at build time (JDK 11:
   OpenJDK x64 / Temurin aarch64; desktop: Google Chrome on amd64, Chromium
@@ -244,7 +258,7 @@ Configuration: `E2B_API_URL`, `E2B_DOMAIN`, and (without TLS on the sandbox
 domain) `E2B_SANDBOX_URL`. Commands authenticate with `E2B_API_KEY` or with the
 project key that `e2b auth login` stores in `~/.e2b/config.json`. The CLI opens
 the login page at `${E2B_DOCS_BASE:-https://$E2B_DOMAIN/docs}/api/cli`. The
-driver serves that page on any Host, so `E2B_DOCS_BASE=http://<api>/docs` is
+driver serves that page on any Host that does not address a sandbox, so `E2B_DOCS_BASE=http://<api>/docs` is
 only needed when the apex domain does not resolve to the driver over HTTPS. The
 CLI never reads `E2B_ACCESS_TOKEN`.
 

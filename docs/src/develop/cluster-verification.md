@@ -2,7 +2,8 @@
 
 How to rerun the checks for the distributed topology, for the Linux/KVM node
 path, and for TLS subdomain routing. The design is specified in
-ARCHITECTURE.md §5 and §9.4.
+[`ARCHITECTURE.md`](https://github.com/stencil-hq/vibemon/blob/main/ARCHITECTURE.md)
+§5 and §9.4.
 
 ## 1. Gated distributed test (`tests/cluster.rs`)
 
