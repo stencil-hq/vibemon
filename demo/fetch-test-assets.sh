@@ -521,11 +521,7 @@ case "$mode" in
     ;;
 
   agent)
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      [ -c /dev/hvc0 ] && break
-      sleep 1
-    done
-    [ -c /dev/hvc0 ] || fail "wait for /dev/hvc0"
+    # vmon-agent waits for its virtio-console port (vmon.gc4) itself.
     if [ ! -x /usr/bin/vmon-agent ]; then
       echo "AGENT_MISSING"
       finish

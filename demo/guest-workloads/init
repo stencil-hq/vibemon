@@ -20,14 +20,6 @@ if [ -e /sys/fs/cgroup/cgroup.subtree_control ]; then
   chown vmon:vmon /sys/fs/cgroup/vmon
 fi
 
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ -c /dev/hvc0 ] && break
-  sleep 1
-done
-[ -c /dev/hvc0 ] || {
-  echo "VMON_TEST_FAIL: wait for /dev/hvc0" >&2
-  poweroff -f
-}
-
+# vmon-agent waits for its virtio-console port (vmon.gc4) itself.
 echo "AGENT_INIT_OK"
 exec /usr/bin/vmon-agent
