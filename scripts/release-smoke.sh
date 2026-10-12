@@ -125,8 +125,8 @@ AGENT_BIN=${AGENT_BIN:-"${TARGET_DIR}/${TARGET}/release/vmon-agent"}
 [[ -f "${AGENT_BIN}" && -x "${AGENT_BIN}" && -s "${AGENT_BIN}" ]] || fail "missing executable vmon-agent: ${AGENT_BIN}"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate release ELF headers"
 
-# vmon-agent has no host-side CLI: it is guest PID 1 and opening /dev/hvc0 is
-# its first useful action. Executing it on a host can hang if that device exists,
+# vmon-agent has no host-side CLI: it is guest PID 1 and opening its
+# virtio-console port is its first useful action, which a host does not have,
 # so validate its ELF architecture here without representing that as an agent
 # runtime smoke. The vmon CLI is exercised through the target runner below.
 python3 - "${TARGET_ARCH}" "${VMON_BIN}" "${AGENT_BIN}" <<'PY'

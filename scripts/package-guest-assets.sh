@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Build a guest agent and package it with the pinned architecture-matched kernel.
+# Build a guest agent and package it with the architecture-matched vmon guest
+# kernel built by kernel/build.sh (`just kernel`).
+#
+# Kernel input: $VMON_RELEASE_KERNEL (with its resolved config at
+# $VMON_RELEASE_KERNEL_CONFIG, default config-<arch> beside it), else
+# target/kernel/<image> + target/kernel/config-<arch>.
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -49,17 +54,11 @@ case "${TARGET}" in
         ARCH=x86_64
         ELF_MACHINE=62
         KERNEL_FILE=bzImage-x86_64
-        KERNEL_RELEASE=ch-release-v6.12.8-20250613
-        KERNEL_URL=https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.12.8-20250613/bzImage-x86_64
-        KERNEL_SHA256=d4af401aa859e4659d4b08a153ac608eb6a315c6918e567daa46981af5d2e5ef
         ;;
     aarch64-unknown-linux-musl)
         ARCH=aarch64
         ELF_MACHINE=183
         KERNEL_FILE=Image-aarch64
-        KERNEL_RELEASE=ch-release-v6.16.9-20260508
-        KERNEL_URL=https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/Image-arm64
-        KERNEL_SHA256=69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010
         ;;
     *) fail "unsupported release target '${TARGET}'; only x86_64-unknown-linux-musl and aarch64-unknown-linux-musl are supported" ;;
 esac
@@ -79,10 +78,8 @@ command -v cargo >/dev/null 2>&1 || fail "cargo is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
 WORK_DIR=$(mktemp -d "${DIST_DIR}/.${PACKAGE}.XXXXXX")
-CACHE_TEMP=""
 cleanup() {
     rm -rf "${WORK_DIR}"
-    [[ -z "${CACHE_TEMP}" ]] || rm -f "${CACHE_TEMP}"
 }
 trap cleanup EXIT
 
@@ -125,54 +122,36 @@ if machine != expected:
     raise SystemExit(f"error: release agent has ELF machine {machine}, expected {expected}: {path}")
 PY
 
-# An explicitly supplied kernel is never replaced or silently accepted. Without
-# an override, reuse a verified pinned test/cache copy or fetch the immutable URL
-# into the release-only cache and validate it before use.
-KERNEL_PATH=""
-if [[ -n "${VMON_RELEASE_KERNEL:-}" ]]; then
-    [[ -f "${VMON_RELEASE_KERNEL}" && -s "${VMON_RELEASE_KERNEL}" ]] || fail "VMON_RELEASE_KERNEL does not name a non-empty file: ${VMON_RELEASE_KERNEL}"
-    ACTUAL_KERNEL_SHA=$(hash_file "${VMON_RELEASE_KERNEL}")
-    [[ "${ACTUAL_KERNEL_SHA}" == "${KERNEL_SHA256}" ]] || fail "kernel checksum mismatch for ${VMON_RELEASE_KERNEL}: expected ${KERNEL_SHA256}, got ${ACTUAL_KERNEL_SHA}"
-    KERNEL_PATH=${VMON_RELEASE_KERNEL}
-else
-    CACHE_DIR=${VMON_RELEASE_ASSET_CACHE_DIR:-"${ROOT_DIR}/target/release-assets"}
-    case "${CACHE_DIR}" in
-        /*) ;;
-        *) CACHE_DIR="${ROOT_DIR}/${CACHE_DIR}" ;;
-    esac
-    mkdir -p "${CACHE_DIR}"
-    for candidate in "${ROOT_DIR}/target/test-assets/${KERNEL_FILE}" "${CACHE_DIR}/${KERNEL_FILE}"; do
-        if [[ -f "${candidate}" && -s "${candidate}" ]] && [[ "$(hash_file "${candidate}")" == "${KERNEL_SHA256}" ]]; then
-            KERNEL_PATH=${candidate}
-            break
-        fi
-    done
-    if [[ -z "${KERNEL_PATH}" ]]; then
-        command -v curl >/dev/null 2>&1 || fail "curl is required to fetch the pinned ${ARCH} kernel"
-        DOWNLOAD="${WORK_DIR}/${KERNEL_FILE}.download"
-        curl --fail --location --retry 3 --output "${DOWNLOAD}" "${KERNEL_URL}"
-        [[ -s "${DOWNLOAD}" ]] || fail "downloaded kernel is empty: ${KERNEL_URL}"
-        ACTUAL_KERNEL_SHA=$(hash_file "${DOWNLOAD}")
-        [[ "${ACTUAL_KERNEL_SHA}" == "${KERNEL_SHA256}" ]] || fail "downloaded kernel checksum mismatch: expected ${KERNEL_SHA256}, got ${ACTUAL_KERNEL_SHA}"
-        # Create beside the cache destination so the final rename is atomic.
-        # The EXIT trap removes this unique temporary file after interruption.
-        CACHE_TEMP=$(mktemp "${CACHE_DIR}/.${KERNEL_FILE}.XXXXXX")
-        install -m 0644 "${DOWNLOAD}" "${CACHE_TEMP}"
-        mv "${CACHE_TEMP}" "${CACHE_DIR}/${KERNEL_FILE}"
-        CACHE_TEMP=""
-        KERNEL_PATH="${CACHE_DIR}/${KERNEL_FILE}"
-    fi
-fi
-
-ACTUAL_KERNEL_SHA=$(hash_file "${KERNEL_PATH}")
-[[ "${ACTUAL_KERNEL_SHA}" == "${KERNEL_SHA256}" ]] || fail "verified kernel changed while packaging: ${KERNEL_PATH}"
+# The vmon kernel: an explicit release build (CI downloads the `kernel` job's
+# artifact) or the dev build from `just kernel`. Its resolved config must be
+# beside it and must identify the vmon kernel build.
+KERNEL_PATH=${VMON_RELEASE_KERNEL:-"${ROOT_DIR}/target/kernel/${KERNEL_FILE}"}
+KERNEL_CONFIG=${VMON_RELEASE_KERNEL_CONFIG:-"$(dirname -- "${KERNEL_PATH}")/config-${ARCH}"}
+[[ -f "${KERNEL_PATH}" && -s "${KERNEL_PATH}" ]] || fail "missing ${ARCH} vmon kernel ${KERNEL_PATH}; build it with \`just kernel --arch ${ARCH}\` or set VMON_RELEASE_KERNEL"
+[[ -f "${KERNEL_CONFIG}" ]] || fail "missing kernel config ${KERNEL_CONFIG} (written by kernel/build.sh)"
+grep -qx 'CONFIG_LOCALVERSION="-vmon"' "${KERNEL_CONFIG}" || fail "${KERNEL_CONFIG} is not a vmon kernel config (kernel/build.sh)"
+# Boot-image magic per arch: arm64 Image "ARMd" at 0x38, x86 bzImage "HdrS" at 0x202.
+python3 - "${ARCH}" "${KERNEL_PATH}" <<'PY'
+import sys
+arch, path = sys.argv[1], sys.argv[2]
+offset, magic = (0x38, b"ARM\x64") if arch == "aarch64" else (0x202, b"HdrS")
+with open(path, "rb") as kernel:
+    kernel.seek(offset)
+    if kernel.read(4) != magic:
+        raise SystemExit(f"error: {path} is not an {arch} boot image")
+PY
+KERNEL_SHA256=$(hash_file "${KERNEL_PATH}")
+KERNEL_CONFIG_SHA256=$(hash_file "${KERNEL_CONFIG}")
+KERNEL_TAG=$(sed -n 's/^KERNEL_TAG=//p' "${ROOT_DIR}/kernel/build.sh")
+[[ -n "${KERNEL_TAG}" ]] || fail "cannot read KERNEL_TAG from kernel/build.sh"
 AGENT_SHA256=$(hash_file "${AGENT_BIN}")
 
 STAGE_DIR="${WORK_DIR}/${PACKAGE}"
 # deterministic-tar.py preserves mode bits, so set the archive root explicitly
 # rather than inheriting the caller's umask.
 install -d -m 0755 "${STAGE_DIR}"
-install -m 0644 "${KERNEL_PATH}" "${STAGE_DIR}/${KERNEL_FILE}"
+install -m 0644 "${KERNEL_PATH}" "${STAGE_DIR}/vmon-kernel-${ARCH}"
+install -m 0644 "${KERNEL_CONFIG}" "${STAGE_DIR}/vmon-kernel-${ARCH}.config"
 install -m 0755 "${AGENT_BIN}" "${STAGE_DIR}/vmon-agent-${ARCH}"
 install -m 0644 \
     "${ROOT_DIR}/LICENSE" \
@@ -185,10 +164,12 @@ Vibemon guest runtime assets
 release target: ${TARGET}
 architecture: ${ARCH}
 
-kernel file: ${KERNEL_FILE}
-kernel upstream: Cloud Hypervisor Linux release ${KERNEL_RELEASE}
-kernel source: ${KERNEL_URL}
+kernel file: vmon-kernel-${ARCH} (${KERNEL_FILE} from kernel/build.sh)
+kernel source: https://github.com/cloud-hypervisor/linux tag ${KERNEL_TAG}
+kernel configuration: ch_defconfig + kernel/config/ of this Vibemon release;
+  resolved config in vmon-kernel-${ARCH}.config
 kernel sha256: ${KERNEL_SHA256}
+kernel config sha256: ${KERNEL_CONFIG_SHA256}
 kernel license: GPL-2.0-only WITH Linux-syscall-note
 
 agent file: vmon-agent-${ARCH}
@@ -197,14 +178,15 @@ agent target: ${TARGET}
 agent sha256: ${AGENT_SHA256}
 agent license: MIT
 
-The external kernel is not covered by Vibemon's first-party licenses. See
+The Linux guest kernel is not covered by Vibemon's first-party licenses. See
 THIRD-PARTY-NOTICES.txt for the corresponding provenance and licensing notice.
 EOF
 chmod 0644 "${STAGE_DIR}/MANIFEST.txt"
 
 # Validate the exact staged inputs after the manifest is written and before the
 # deterministic archive consumes them.
-[[ "$(hash_file "${STAGE_DIR}/${KERNEL_FILE}")" == "${KERNEL_SHA256}" ]] || fail "staged kernel checksum changed"
+[[ "$(hash_file "${STAGE_DIR}/vmon-kernel-${ARCH}")" == "${KERNEL_SHA256}" ]] || fail "staged kernel checksum changed"
+[[ "$(hash_file "${STAGE_DIR}/vmon-kernel-${ARCH}.config")" == "${KERNEL_CONFIG_SHA256}" ]] || fail "staged kernel config checksum changed"
 [[ "$(hash_file "${STAGE_DIR}/vmon-agent-${ARCH}")" == "${AGENT_SHA256}" ]] || fail "staged agent checksum changed"
 
 TEMP_ARCHIVE="${WORK_DIR}/${PACKAGE}.tar.gz"

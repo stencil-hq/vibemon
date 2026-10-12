@@ -9,8 +9,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/package-local-release.sh --target <triple>
 
-Package the Rust binaries, architecture-matched guest assets, Python SDK,
-TypeScript SDK, and deployment assets locally. Nothing is uploaded or published.
+Package the Rust binaries and architecture-matched guest assets locally.
+Nothing is uploaded or published.
 
 Supported release targets:
   x86_64-unknown-linux-musl
@@ -64,15 +64,9 @@ esac
 cd "${ROOT_DIR}"
 ./scripts/package-rust-release.sh --target "${target}"
 ./scripts/package-guest-assets.sh --target "${target}"
-./scripts/package-python-sdk.sh
-(
-    cd sdk/ts
-    bun run package
-)
-./scripts/package-release.sh
 
 cat <<EOF
 Local release complete for ${target}.
-Artifacts are under dist/, sdk/py/dist/, and sdk/ts/dist/package/.
+Artifacts are under dist/.
 No artifact was uploaded or published.
 EOF
