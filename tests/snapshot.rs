@@ -199,6 +199,13 @@ fn fork_of_old_multi_vcpu_snapshot_keeps_guest_time_and_timers() {
 		"guest sleep ended {slept:?} after the fork: the {DOWNTIME:?} between snapshot and fork \
 		 leaked into guest time:\n{output}"
 	);
+	// The x86_64 test guest cannot power off under vmm (no ACPI shutdown; its
+	// kernel halts instead), so the fork never exits on its own there.
+	if cfg!(target_arch = "x86_64") {
+		fork.kill();
+		common::assert_no_panic(&output);
+		return;
+	}
 	let (status, output) = fork.wait(Duration::from_secs(30));
 	assert!(status.success(), "fork exited with {status}; output:\n{output}");
 	common::assert_no_panic(&output);
