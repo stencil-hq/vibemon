@@ -8,7 +8,10 @@ use std::{
 	os::unix::{fs::DirBuilderExt, net::UnixStream, process::CommandExt},
 	path::{Path, PathBuf},
 	process::{Child, Command, ExitStatus, Stdio},
-	sync::{Arc, Mutex},
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicU32, Ordering},
+	},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -205,12 +208,20 @@ fn required_asset(name: &str) -> PathBuf {
 		.unwrap_or_else(|e| panic!("canonicalizing raw asset {}: {e}", path.display()))
 }
 
+/// Fresh private scratch dir `<test-runs>/<name>-<pid>-<seq>`. Kept short:
+/// control and agent sockets inside it must fit `sun_path` (108 bytes) even
+/// under a deep checkout path such as a CI runner's.
 pub fn test_dir(name: &str) -> PathBuf {
-	let nanos = SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.expect("system clock before Unix epoch")
-		.as_nanos();
-	let dir = test_runs_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
+	static SEQ: AtomicU32 = AtomicU32::new(0);
+	let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+	let dir = test_runs_dir().join(format!("{name}-{}-{seq}", std::process::id()));
+	// A previous run with the same pid may have left this dir behind.
+	match fs::remove_dir_all(&dir) {
+		Err(e) if e.kind() != io::ErrorKind::NotFound => {
+			panic!("removing stale {}: {e}", dir.display());
+		},
+		_ => {},
+	}
 	// Private mode so control/agent sockets created here satisfy vmon's
 	// 0700-or-stricter parent-directory requirement on every host.
 	fs::DirBuilder::new()
