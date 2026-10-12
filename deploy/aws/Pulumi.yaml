@@ -1,6 +1,0 @@
-name: vibevmm-orch
-description: vibevmm sandbox orchestration layer on AWS — scheduler fleet, bare-metal worker ASG, and one small state VM running Redis + Postgres
-runtime:
-  name: nodejs
-  options:
-    packagemanager: bun
