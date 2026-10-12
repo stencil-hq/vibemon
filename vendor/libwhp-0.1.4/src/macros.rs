@@ -56,8 +56,11 @@ macro_rules! bitfield128 {
             #[allow(non_snake_case)]
             pub fn $thing(&self) -> $fieldtype {
                 // We assume that $r.start < $r.end and both are
-                // either smaller or greater than 64.
-                let diff = ($r.end + $r.start) & 0x3f;
+                // either smaller or greater than 64. Shift the field's top
+                // bit to bit 63, then its low bit down to bit 0.
+                // (vibemon: upstream used `($r.end + $r.start) & 0x3f`, which
+                // is not the width and overflows `>> 64` for `[64..128]`.)
+                let diff = $r.end - $r.start;
                 if $r.start < 64 {
                     self.$field.Low64 <<
                         match $r.end {
