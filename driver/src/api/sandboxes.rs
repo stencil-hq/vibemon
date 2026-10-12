@@ -1,7 +1,7 @@
 //! Sandbox, snapshot, and admin-sandbox endpoints of the E2B API.
 //!
-//! Wire reference: `local://e2b-api.md` A.3 rows 5–24 and 43–45, semantics
-//! in C §4 and F §3–8. Handlers validate the request and delegate
+//! Wire reference: `spec/e2b/infra/spec/openapi.yml`; semantics in
+//! ARCHITECTURE.md §9.4. Handlers validate the request and delegate
 //! transitions to [`crate::lifecycle`].
 
 pub mod dto;

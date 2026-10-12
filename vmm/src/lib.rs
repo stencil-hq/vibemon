@@ -56,7 +56,7 @@ pub use virtio::materialize_remote_disk;
 /// tracing, boot or restore, block until shutdown.
 pub fn run_cli(args: Vec<String>) -> result::Result<()> {
 	if args.first().map(String::as_str) == Some("--print-cpu-baseline") {
-		// Probe only the restore-relevant CPU surface for mesh placement; skip
+		// Probe only the restore-relevant CPU surface for node placement; skip
 		// normal CLI parsing.
 		println!("{}", arch::state::cpu_baseline()?);
 		return Ok(());
@@ -75,7 +75,7 @@ pub fn run_cli(args: Vec<String>) -> result::Result<()> {
 	vmm::run(config)
 }
 
-/// Probe the restore-relevant CPU baseline for mesh placement and restore
+/// Probe the restore-relevant CPU baseline for node placement and restore
 /// compatibility checks.
 pub fn cpu_baseline() -> result::Result<String> {
 	arch::state::cpu_baseline()

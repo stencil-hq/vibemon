@@ -1,7 +1,7 @@
 //! E2B sandbox network configuration and its node egress translation.
 //!
 //! `SandboxNetworkConfig` / `SandboxNetworkUpdateConfig` become the node
-//! egress policy plus ingress settings (`local://e2b-api.md` F §8, §3.1).
+//! egress policy plus ingress settings (ARCHITECTURE.md §8.4, §9.5).
 //!
 //! Egress validation/normalization is delegated to
 //! `vmon_node::egress::policy::normalize`; this module folds

@@ -1,4 +1,4 @@
-//! Ingress access policies applied before proxying (e2b-api Part F §5.3):
+//! Ingress access policies applied before proxying (ARCHITECTURE.md §9.5):
 //! envd control-path blocking, private-traffic tokens, and host masking.
 
 use axum::http::HeaderMap;

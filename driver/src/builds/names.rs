@@ -1,8 +1,7 @@
 //! Pure parsing and validation for the template API.
 //!
 //! Template names and references (`[namespace/]alias[:tag]`), tags, files
-//! hashes, build steps, resources, and the User-Agent template version
-//! (`local://e2b-api.md` Part D §2, §4, §10).
+//! hashes, build steps, resources, and the User-Agent template version.
 
 use vmon_node::api::{BuildStep, TemplateVersion};
 
@@ -274,7 +273,7 @@ fn is_octal_mode(mode: &str) -> bool {
 	(3..=4).contains(&mode.len()) && mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
 }
 
-/// Template version selected by the client's `User-Agent` (Part D §10.3).
+/// Template version selected by the client's `User-Agent`.
 ///
 /// An `e2b-js-sdk/<v>` or `e2b-python-sdk/<v>` token below 2.3.0 selects
 /// v2.0.0; anything else (including unknown agents) v2.1.0. An unparsable

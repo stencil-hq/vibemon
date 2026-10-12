@@ -13,7 +13,7 @@ One binary, `vmon`, three entry points:
 |---|---|
 | `vmon vmm …` | Per-VM monitor (the `vmm` crate). Spawned by the node role; never by users. |
 | `vmon serve --role node,driver …` | Long-running server. A process runs the **node** role (hosts microVMs), the **driver** role (E2B API, scheduling, ingress), or both. |
-| `vmon admin …` | Operator tooling against MySQL (teams, users, API keys, admin tokens). |
+| `vmon admin …` | Operator tooling against MySQL (teams, users, API keys, limits, system teams). The admin token is `vmon serve --admin-token`. |
 
 ```mermaid
 graph TD
@@ -25,7 +25,7 @@ graph TD
   D1 <-->|raft over cluster HTTP| D2
   D1 & D2 -->|SQL| M[(MySQL)]
   D1 -->|cluster HTTP: node API, tunnels| N1 & N2
-  N1 -->|spawn| V1[vmon vmm] --> G1[guest: vmon-agent = init + envd]
+  N1 -->|spawn| V1[vmon vmm] --> G1[guest: systemd/OpenRC + vmon-agent as envd]
 ```
 
 - **Gossip memberlist** (`cluster::gossip`): every process. Membership,
@@ -40,7 +40,9 @@ graph TD
   volumes, exposes the node API and guest tunnels on the cluster listener.
 - **Driver** (`driver` crate): E2B REST API, auth, placement, lifecycle
   supervision, build supervision, ingress proxy for sandbox traffic.
-- **Guest agent** (`agent` crate, `vmon-agent`): PID 1 inside every VM. Serves
+- **Guest agent** (`agent` crate, `vmon-agent`): installed as `/usr/bin/envd`
+  and run as the `envd` service under the template's systemd/OpenRC (PID 1
+  only in build VMs and in templates of unknown distributions, §10). Serves
   the GC4 control channel on the `vmon.gc4` virtio-console port and an E2B
   **envd**-compatible HTTP/Connect server on guest TCP `49983`.
 
@@ -390,12 +392,12 @@ grouped by table, no ORM).
 
 ## 8. Node
 
-### 8.1 Data layout (`--data-dir`, default `$HOME/.vmon` on macOS, `/var/lib/vmon` on Linux)
+### 8.1 Data layout (`--data-dir`, default `/var/lib/vmon` for root on Linux, else `$HOME/.vmon`)
 
 ```
 node-id
 raft/                         (drivers)
-files/<templateID>/<hash>.tar (build file contexts; drivers)
+files/<templateID>/<hash>.tar (build file contexts; nodes, located through KV `file/<templateID>/<hash>`)
 cache/oci/blobs/sha256/<hex>  (pulled layers, shared)
 builds/<buildID>/             rootfs.ext4 (raw; a block overlay + rootfs.ext4.base for snapshot builds), snapshot/ (vmm snapshot dir), meta.json (ArtifactMeta), manifest.json, build.log, console-*.log
 cache/steps/<layerKey>/       step-cache layers (rootfs.ext4 + layer.json)
@@ -655,7 +657,7 @@ and `fs_write`.
 
 | Platform | Default | Egress policy |
 |---|---|---|
-| Linux | TAP per sandbox (`--net tap`), /30 lease from `--net-pool` (default `172.20.0.0/16`), NAT via iptables; requires CAP_NET_ADMIN (root or the `vmon net-broker` helper). A pool of ready TAPs (addressed, up, NAT rules, the lease's connection mark `CONNMARK --set-mark <index+1>` in mangle `PREROUTING`, and the egress hooks with closed policy chains; one per boot slot, at most 32) is created after restart recovery — idle `vmon<N>` TAPs no recovered sandbox holds are removed first — and refilled in the background up to that target; creates/resumes take a ready TAP. A TAP whose VM exited and whose policy chains were reset to closed has its guest's conntrack entries flushed (one ctnetlink `IPCTNL_MSG_CT_DELETE` filtered by `CTA_MARK`/`CTA_MARK_MASK`, no conntrack-tools) and returns to the pool while it holds fewer than twice the target (torn down otherwise, so a create/kill cycle neither refills nor tears down). TAP teardown (pool full, startup sweep, shutdown, adopted or template-build TAPs) removes the egress rules, NAT rules, and device and flushes the mark's conntrack entries. Template-build VMs get a fresh TAP without egress hooks (unrestricted). `Node::shutdown` removes the idle ones. | Guest TCP is redirected (iptables `REDIRECT`) to the node's transparent egress proxy, which implements E2B semantics: domain allow (Host on :80, SNI on :443), CIDR allow/deny, private ranges always denied, SOCKS5 `egressProxy`, HTTPS header `rules` via MITM with a per-cluster CA installed into the guest at `/init`. UDP/ICMP: the same CIDR rules and private ranges via per-TAP iptables chains (`8.8.8.8` is implicitly allowed when `allowOut` has domains, so DNS works under deny-all). Per-TAP hooks are installed and removed as one `iptables-restore --noflush` transaction per binary after one `-S` listing per table (no per-rule `iptables` spawns), off the request path; attaching a sandbox to a pooled TAP is one add-only `iptables-restore` that inserts its policy above the closed chain's `-j DROP` (made unreachable by the entry chain's final `-g vmon-u-<tap>`; commits that delete rules cost 7–15 ms under nested KVM, add-only ones ~1.5 ms), and detaching resets the chains to closed in the background. |
+| Linux | TAP per sandbox (`--net tap`), /30 lease from `--net-pool` (default `172.20.0.0/16`), NAT via iptables; requires root or CAP_NET_ADMIN (without it, `--net auto` starts a node that rejects creates; `--net tap` fails at startup). A pool of ready TAPs (addressed, up, NAT rules, the lease's connection mark `CONNMARK --set-mark <index+1>` in mangle `PREROUTING`, and the egress hooks with closed policy chains; one per boot slot, at most 32) is created after restart recovery — idle `vmon<N>` TAPs no recovered sandbox holds are removed first — and refilled in the background up to that target; creates/resumes take a ready TAP. A TAP whose VM exited and whose policy chains were reset to closed has its guest's conntrack entries flushed (one ctnetlink `IPCTNL_MSG_CT_DELETE` filtered by `CTA_MARK`/`CTA_MARK_MASK`, no conntrack-tools) and returns to the pool while it holds fewer than twice the target (torn down otherwise, so a create/kill cycle neither refills nor tears down). TAP teardown (pool full, startup sweep, shutdown, adopted or template-build TAPs) removes the egress rules, NAT rules, and device and flushes the mark's conntrack entries. Template-build VMs get a fresh TAP without egress hooks (unrestricted). `Node::shutdown` removes the idle ones. | Guest TCP is redirected (iptables `REDIRECT`) to the node's transparent egress proxy, which implements E2B semantics: domain allow (Host on :80, SNI on :443), CIDR allow/deny, private ranges always denied, SOCKS5 `egressProxy`, HTTPS header `rules` via MITM with a per-node CA installed into the guest at `/init`. UDP/ICMP: the same CIDR rules and private ranges via per-TAP iptables chains (`8.8.8.8` is implicitly allowed when `allowOut` has domains, so DNS works under deny-all). Per-TAP hooks are installed and removed as one `iptables-restore --noflush` transaction per binary after one `-S` listing per table (no per-rule `iptables` spawns), off the request path; attaching a sandbox to a pooled TAP is one add-only `iptables-restore` that inserts its policy above the closed chain's `-j DROP` (made unreachable by the entry chain's final `-g vmon-u-<tap>`; commits that delete rules cost 7–15 ms under nested KVM, add-only ones ~1.5 ms), and detaching resets the chains to closed in the background. |
 | macOS | user-mode NAT (`--net user`, libslirp in the VMM) | VMM user-net packet filter (`vmon vmm --user-net-policy <json>`, replaced live by control method `set_net_policy {policy}`): CIDR allow/deny + private ranges (incl. the slirp gateway, i.e. host loopback) on new TCP flows (SYN; established flows survive updates) and per UDP/ICMP packet. `allowOut` domains: the filter snoops answers of the slirp resolver (10.0.2.3) for allowed patterns and admits the answered IPs on TCP 80/443 only, TTL-bounded (60 s–1 h) in a capped table; addresses learned from other resolvers (DoH, 8.8.8.8, …) never unlock domains. `rules` and `egressProxy` need a node with feature `egress-proxy` (Linux); placement rejects otherwise with `sandbox_no_compatible_node`. |
 
 Node hooks (`node::egress`): `Egress::start(EgressConfig{data_dir,
@@ -795,8 +797,10 @@ create a sandbox. A snapshot is only reused when `arch`, `backend` and
 `cpu_baseline` match; otherwise the node reruns step 5 (without
 `configure.sh`) locally from the rootfs (template snapshot regeneration).
 
-Step 4's user phase and sandbox defaults follow `StartBuild.template_version`
-(local://e2b-api.md Part D §10.3).
+Step 4's user phase and sandbox defaults follow `StartBuild.template_version`,
+which the driver picks from the client's `User-Agent`: an `e2b-js-sdk` or
+`e2b-python-sdk` below 2.3.0 selects v2.0, anything else v2.1
+(`driver::builds::names::template_version_from_user_agent`).
 
 ### 8.8 S3 filesystems (`node::s3fs`)
 
@@ -918,7 +922,8 @@ served at `/dashboard/` on the public listeners):
   `POST /sandboxes/{id}/refreshes` of that same sandbox (matched route +
   path ID; constant-time compare before any lookup; killed/unknown → 401).
   Other credentials take precedence; bearer/admin-only guards reject it.
-- CLI login: `GET /docs/api/cli` (any Host) serves a login form (email +
+- CLI login: `GET /docs/api/cli` (any Host that does not address a sandbox)
+  serves a login form (email +
   password); success redirects to the CLI callback with `accessToken`
   (JWT, 1 h), `refreshToken`, `tokenEndpoint`, `revokeEndpoint`,
   `clientId`, `email`. `POST /auth/token` (refresh_token grant),
@@ -1088,8 +1093,9 @@ at the requested path. The volume-content API is proxied by the driver to
   queries against MySQL in Docker when `VMON_MYSQL_TEST_URL` is set, envd
   protocol handlers on the host build of the agent).
 - `tests/` (repo root): VMM-only integration tests (`VMON_E2E=1`).
-- `e2e/`: official E2B SDK suites (Python + JS) against a live monolithic and
-  a 3-process distributed `vmon serve` (`VMON_E2E=1`, MySQL via Docker).
+- `e2e/`: official E2B SDK suites (Python + JS) against a live monolithic
+  `vmon serve` (`just e2e`, MySQL via Docker); the distributed topology is
+  covered by `tests/cluster.rs` and the scripts in `e2e/cluster/`.
 - `tests/cluster.rs` (`VMON_CLUSTER_E2E=1`, `just cluster-e2e`): 3 drivers + 2
   nodes; raft bootstrap, cross-driver ingress, leader and node failover,
   graceful node restart (docs/cluster.md).

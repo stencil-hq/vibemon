@@ -75,6 +75,10 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Fixed `just serve` handing out template-file upload URLs on the host's outbound address while listening on loopback: the recipe now passes `--public-url http://127.0.0.1:3000`
+- Fixed the five `/clusters/{clusterID}/rigs…` admin operations answering 404: they now check the admin token and answer the spec's `501 Not implemented by this deployment`
+- Fixed the release binary tarball shipping the guest agent as `vmon-agent`, a name nodes never look up: it is now `vmon-agent-<arch>`, like the guest-assets tarball
+- Fixed misleading CLI help: `vmon admin block` (blocked teams can still read), `vmon admin set-limits` (omitted flags keep their values), `vmon serve --net user` (rejected on Linux), and `vmon vmm --remote-page-url` (no mesh)
 - Fixed recycled TAP leases keeping the previous sandbox's conntrack entries (NAT mappings, `ESTABLISHED` UDP state) for the next sandbox on the same address: guest flows carry a per-lease connection mark and are flushed through ctnetlink (no conntrack-tools) before the lease is reused or freed
 - Fixed a guest reaching the network unfiltered between VM start and egress attach (resumed sandboxes run user code in that window): TAP policy chains are closed until the sandbox's policy is in place
 - Fixed ~40 ms added to every SDK call routed through the cluster listener (envd commands, file reads): its accepted sockets lacked `TCP_NODELAY`, so multi-segment responses waited on Nagle and delayed ACKs; gossip push-pull sockets now set it too

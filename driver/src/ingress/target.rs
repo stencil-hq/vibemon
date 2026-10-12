@@ -1,4 +1,4 @@
-//! Public request dispatch (ARCHITECTURE.md §3, e2b-api Part F §5.2): decides
+//! Public request dispatch (ARCHITECTURE.md §3): decides
 //! whether a request addresses a sandbox port and, if so, which one.
 
 use axum::http::{HeaderMap, Uri, header};

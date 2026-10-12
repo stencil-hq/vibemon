@@ -1,7 +1,7 @@
 """`mcp-gateway`: the template behind `Sandbox.create(mcp={...})`.
 
 Upstream E2B's `mcp-gateway` template is not public; this one implements the
-contract the SDKs rely on (local://e2b-api.md Part E §4):
+contract the SDKs rely on (ARCHITECTURE.md §7):
 
 - `mcp-gateway --config '<json>'` (run by the SDK as root with
   `GATEWAY_ACCESS_TOKEN`) starts a detached gateway and exits 0 once it

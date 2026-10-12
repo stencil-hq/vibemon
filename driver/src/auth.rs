@@ -1,4 +1,4 @@
-//! Request authentication (ARCHITECTURE.md §9.2, E2B Part F §2): axum
+//! Request authentication (ARCHITECTURE.md §9.2): axum
 //! extractors for team-scoped, user-scoped, and admin routes.
 
 use std::{
@@ -126,7 +126,10 @@ impl AuthCache {
 		self.keys.lock().remove(hash);
 	}
 
-	/// Drops every cached key of a team (after block/limit changes).
+	/// Drops every cached key of a team, so tests see a block at once. In
+	/// production `vmon admin` changes teams from another process and drivers
+	/// pick them up when the entries expire ([`KEY_CACHE_TTL`]).
+	#[cfg(test)]
 	pub fn invalidate_team(&self, team_id: &str) {
 		self.keys.lock().retain(|_, entry| entry.team.id != team_id);
 	}

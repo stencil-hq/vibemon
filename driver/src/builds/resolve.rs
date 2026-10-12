@@ -1,6 +1,6 @@
 //! Template reference resolution: template id, `alias`, `namespace/alias`,
 //! each with an optional `:tag`; public templates of other teams resolve,
-//! deleted templates do not (`local://e2b-api.md` Part F §1, §4).
+//! deleted templates do not (ARCHITECTURE.md §7).
 
 use super::{
 	ResolvedTemplate, artifact_sources,

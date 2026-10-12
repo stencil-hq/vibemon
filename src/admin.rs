@@ -67,13 +67,14 @@ enum AdminCommand {
 		#[arg(long)]
 		default: bool,
 	},
-	/// Replace a team's limits.
+	/// Change a team's limits (omitted flags keep their current values).
 	SetLimits {
 		team:   String,
 		#[command(flatten)]
 		limits: LimitArgs,
 	},
-	/// Block a team (its API keys stop working).
+	/// Block a team: its credentials may still read, every change is refused
+	/// with 403 `team is blocked`.
 	Block { team: String },
 	/// Unblock a team.
 	Unblock { team: String },

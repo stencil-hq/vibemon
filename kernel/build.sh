@@ -55,7 +55,7 @@ die() {
 	exit 1
 }
 
-[[ "$(uname -s)" == Linux ]] || die "kernel builds run on Linux (on macOS: just kernel builds inside the Lima VM)"
+[[ "$(uname -s)" == Linux ]] || die "kernel builds run on Linux (on macOS: just kernel builds in a Docker container)"
 host_arch="$(uname -m)"
 
 need=(make gcc flex bison bc perl pahole cpio xz sha256sum curl)

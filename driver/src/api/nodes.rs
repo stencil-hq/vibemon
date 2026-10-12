@@ -49,7 +49,9 @@ struct MachineInfo {
 	cpu_architecture: String,
 }
 
-/// `NodeMetrics` (hugepages are not used by vibemon and report 0).
+/// `NodeMetrics`. The `hugePages*` fields report 0 and `disks` is empty:
+/// nodes do not gossip their hugetlb pool (`--hugepage-pool-mb`) or per-disk
+/// usage.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeMetrics {

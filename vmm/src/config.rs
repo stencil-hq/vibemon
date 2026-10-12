@@ -275,7 +275,7 @@ struct CliArgs {
 	#[arg(long, value_name = "PATH")]
 	zram_swap_file: Option<PathBuf>,
 
-	/// Fetch guest RAM pages lazily from this mesh HTTP endpoint during restore
+	/// Fetch guest RAM pages lazily from this HTTP page server during restore
 	#[arg(long, value_name = "URL")]
 	remote_page_url: Option<String>,
 

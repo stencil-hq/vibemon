@@ -1,6 +1,6 @@
 //! Build registration (`POST /v3/templates`), build start on a builder node
 //! (`POST /v2/templates/{id}/builds/{buildID}`), cancellation, and template
-//! deletion (`local://e2b-api.md` Part D §2.1, §2.4, §10).
+//! deletion (ARCHITECTURE.md §8.6, §9.1).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -225,7 +225,7 @@ pub async fn start_build(
 					"no node holding template '{parent_ref}' is available right now"
 				)));
 			}
-			// Neither command set: inherit the parent's pair (Part D §6).
+			// Neither command set: inherit the parent's pair, as upstream does.
 			let (start_cmd, ready_cmd) = if req.start_cmd.is_none() && req.ready_cmd.is_none() {
 				(parent.start_cmd.clone(), parent.ready_cmd.clone())
 			} else {

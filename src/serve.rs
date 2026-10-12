@@ -26,7 +26,7 @@ enum NetArg {
 	Auto,
 	/// Host TAP + NAT (Linux, needs the net-admin capability).
 	Tap,
-	/// User-mode NAT inside the VMM.
+	/// User-mode NAT inside the VMM (macOS; rejected on Linux).
 	User,
 }
 

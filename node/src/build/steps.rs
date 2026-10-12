@@ -1,4 +1,4 @@
-//! E2B v2 build steps (e2b-api reference Part D §4).
+//! E2B v2 build steps (ARCHITECTURE.md §8.6 step 4).
 //!
 //! Parses the wire `{type, args}` form and renders the guest shell that
 //! implements each step with upstream semantics. Rendering is pure so it is

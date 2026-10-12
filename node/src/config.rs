@@ -22,7 +22,9 @@ pub struct NodeConfig {
 	pub data_dir:                PathBuf,
 	/// Short directory for per-VM Unix sockets (see [`default_run_dir`]).
 	pub run_dir:                 PathBuf,
-	/// Guest kernel; `None` = pinned kernel under `<data_dir>/assets/`.
+	/// Guest kernel; `None` = discovered by [`crate::assets::resolve_kernel`]
+	/// (`vmon-kernel-<arch>` beside `vmon_bin`, then `target/kernel/` in a dev
+	/// tree, then the pinned download under `<data_dir>/assets/`).
 	pub kernel:                  Option<PathBuf>,
 	/// Static guest agent; `None` = `vmon-agent-<arch>` beside `vmon_bin`
 	/// or `target/test-assets/` in a dev tree.

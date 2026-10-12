@@ -1,8 +1,7 @@
 //! `GET /v2/sandboxes` query parsing.
 //!
 //! Covers the SDKs' triple-encoded `metadata` filter, the `state` CSV, and
-//! the upstream cursor format `urlsafe-base64("<RFC3339Nano>__<id>[__asc]")`
-//! (`local://e2b-api.md` C §4.1, F §3.3).
+//! the upstream cursor format `urlsafe-base64("<RFC3339Nano>__<id>[__asc]")`.
 
 use std::collections::BTreeMap;
 

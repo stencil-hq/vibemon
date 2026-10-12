@@ -1,4 +1,4 @@
-//! Step cache (ARCHITECTURE.md §8.6 step 3).
+//! Step cache (ARCHITECTURE.md §8.6 step 4).
 //!
 //! Every build layer (base, default-user phase, each step) has a key chained
 //! by SHA-256 over the previous key and the layer's definition, mirroring

@@ -220,7 +220,7 @@ mod linux {
 	fn parse_http_endpoint(url: &str) -> Result<HttpEndpoint> {
 		let rest = url
 			.strip_prefix("http://")
-			.ok_or_else(|| err("remote page-in supports only http:// mesh URLs"))?;
+			.ok_or_else(|| err("remote page-in supports only http:// URLs"))?;
 		let (authority, raw_path) = rest.split_once('/').unwrap_or((rest, ""));
 		if authority.is_empty() {
 			return Err(err("remote page URL is missing a host"));

@@ -1,7 +1,7 @@
 //! Pure lifecycle rules: sandbox IDs, timeouts, and lifecycle flags.
 //!
-//! Timeout validation and clamping follow `local://e2b-api.md` F §1 and
-//! §3.1–3.2.
+//! Timeout validation and clamping follow upstream's API (the `timeout`
+//! fields of `spec/e2b/infra/spec/openapi.yml`) and ARCHITECTURE.md §9.4.
 
 use rand::RngExt;
 

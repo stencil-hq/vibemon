@@ -1,7 +1,7 @@
 //! Build file-context archives (`COPY` sources): signed upload URLs on this
 //! driver, archive sniffing (gzip or plain tar), streaming to a storage node
 //! (`PUT /node/v1/files/{templateId}/{hash}`), and the `file/<tid>/<hash>`
-//! KV record (`local://e2b-api.md` Part D §2.2–2.3).
+//! KV record (ARCHITECTURE.md §6, §8.6).
 
 use std::{
 	io,

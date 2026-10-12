@@ -97,7 +97,8 @@ STAGE_DIR="${WORK_DIR}/${PACKAGE}"
 # rather than inheriting the caller's umask.
 install -d -m 0755 "${STAGE_DIR}"
 install -m 0755 "${VMON_BIN}" "${STAGE_DIR}/vmon"
-install -m 0755 "${AGENT_BIN}" "${STAGE_DIR}/vmon-agent"
+# The node finds the guest agent next to `vmon` under its arch-suffixed name.
+install -m 0755 "${AGENT_BIN}" "${STAGE_DIR}/vmon-agent-${ARCH}"
 install -m 0644 \
     "${ROOT_DIR}/LICENSE" \
     "${ROOT_DIR}/LICENSE-APACHE" \
@@ -114,7 +115,7 @@ python3 "${ROOT_DIR}/scripts/deterministic-tar.py" "${TEMP_ARCHIVE}" "${STAGE_DI
 "${ROOT_DIR}/scripts/release-smoke.sh" \
     --target "${TARGET}" \
     --vmon "${STAGE_DIR}/vmon" \
-    --agent "${STAGE_DIR}/vmon-agent"
+    --agent "${STAGE_DIR}/vmon-agent-${ARCH}"
 
 ARCHIVE_SHA256=$(hash_file "${TEMP_ARCHIVE}")
 TEMP_CHECKSUM="${WORK_DIR}/${PACKAGE}.tar.gz.sha256"

@@ -66,7 +66,7 @@ jobs:
           ./scripts/release-smoke.sh \
             --target "${RELEASE_TARGET}" \
             --vmon "${smoke_dir}/vmon-${RELEASE_TARGET}/vmon" \
-            --agent "${smoke_dir}/vmon-${RELEASE_TARGET}/vmon-agent"
+            --agent "${smoke_dir}/vmon-${RELEASE_TARGET}/vmon-agent-${{ matrix.arch }}"
 
       - name: Download the vmon kernel
         uses: actions/download-artifact@v4

@@ -1,4 +1,4 @@
-//! Build phases (ARCHITECTURE.md §8.6, e2b-api reference Part D §10.4).
+//! Build phases (ARCHITECTURE.md §8.6).
 //!
 //! Phases: base (pull + unpack VM + provisioning), default-user phase
 //! (template version 2.1), steps, and finalize (configure, start/ready,

@@ -1,5 +1,5 @@
 //! `limit` + `nextToken` pagination with the cursor returned in
-//! `X-Next-Token` (E2B Part A.2).
+//! `X-Next-Token` (ARCHITECTURE.md §9.1).
 
 use axum::{
 	Json,

@@ -1,5 +1,6 @@
-//! Template, build, tag, and alias endpoints (`local://e2b-api.md` Part A.3
-//! rows 25–39 and 46, Part D). Domain logic lives in [`crate::builds`].
+//! Template, build, tag, and alias endpoints
+//! (`spec/e2b/infra/spec/openapi.yml`). Domain logic lives in
+//! [`crate::builds`].
 
 use std::collections::HashMap;
 

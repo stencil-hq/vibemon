@@ -185,7 +185,7 @@ serve *args: build agent-musl
     "$({{just_executable()}} _bin {{profile}})" serve \
         --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
         --agent "{{justfile_directory()}}/target/test-assets/vmon-agent-$(uname -m | sed 's/arm64/aarch64/')" \
-        --listen 127.0.0.1:3000 --domain localhost "$@"
+        --listen 127.0.0.1:3000 --public-url http://127.0.0.1:3000 --domain localhost "$@"
 
 # Official E2B SDK test suites against a fresh monolithic `vmon serve`
 # (python | js | all | serve | shell); see e2e/README.md. Extra args go to

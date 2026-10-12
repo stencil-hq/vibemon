@@ -1,12 +1,12 @@
-//! Admin API-key management (`X-Admin-Token`). Sandbox and node admin
-//! routes live in `api::sandboxes` / `api::nodes`.
+//! Admin API-key management and the rig operations (`X-Admin-Token`).
+//! Sandbox and node admin routes live in `api::sandboxes` / `api::nodes`.
 
 use axum::{
 	Json, Router,
 	extract::{Path, State},
 	http::StatusCode,
 	response::IntoResponse,
-	routing::{delete, post},
+	routing::{delete, get, post, put},
 };
 
 use super::keys::{ApiKeyDto, KeyName, delete_team_key};
@@ -22,6 +22,18 @@ pub fn routes() -> Router<AppState> {
 	Router::new()
 		.route("/admin/teams/{team_id}/api-keys", post(create_key))
 		.route("/admin/teams/{team_id}/api-keys/{key_id}", delete(delete_key))
+		.route("/clusters/{cluster_id}/rigs", get(rigs_unsupported))
+		.route("/clusters/{cluster_id}/rigs/{rig_id}/capacity", put(rigs_unsupported))
+		.route("/clusters/{cluster_id}/rigs/{rig_id}/instances", get(rigs_unsupported))
+		.route("/clusters/{cluster_id}/rigs/{rig_id}/errors", get(rigs_unsupported))
+		.route("/clusters/{cluster_id}/rigs/instances/{instance_id}", delete(rigs_unsupported))
+}
+
+/// The five `/clusters/{clusterID}/rigs…` operations. Rigs are upstream's
+/// autoscaled node pools; vibemon has none, so admins get the spec's answer
+/// for such deployments.
+async fn rigs_unsupported(_: AdminAuth) -> ApiError {
+	ApiError::not_implemented("Not implemented by this deployment")
 }
 
 async fn create_key(

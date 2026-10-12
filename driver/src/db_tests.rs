@@ -434,6 +434,27 @@ async fn cli_login_jwt_expiry_refresh_rotation_and_revoke() {
 			.unwrap()
 			.starts_with("E2B_ACCESS_TOKEN is deprecated")
 	);
+
+	// Rigs: admin-only, then the spec's 501 for deployments without rigs.
+	let rigs = [
+		("GET", "/clusters/c1/rigs"),
+		("PUT", "/clusters/c1/rigs/r1/capacity"),
+		("GET", "/clusters/c1/rigs/r1/instances"),
+		("GET", "/clusters/c1/rigs/r1/errors"),
+		("DELETE", "/clusters/c1/rigs/instances/i1?decrementDesired=true"),
+	];
+	for (method, uri) in rigs {
+		let (status, ..) = app.json(req(method, uri, &[], None)).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+		let (status, _, body) = app
+			.json(req(method, uri, &[("x-admin-token", ADMIN_TOKEN)], None))
+			.await;
+		assert_eq!(
+			(status, body["message"].as_str()),
+			(StatusCode::NOT_IMPLEMENTED, Some("Not implemented by this deployment")),
+			"{method} {uri}"
+		);
+	}
 	app.finish().await;
 }
 

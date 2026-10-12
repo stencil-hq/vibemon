@@ -1,4 +1,4 @@
-//! E2B egress policy engine (ARCHITECTURE.md §8.4, e2b-api Part F §8).
+//! E2B egress policy engine (ARCHITECTURE.md §8.4).
 //!
 //! Pure and platform-independent: the driver calls [`validate`]/[`normalize`]
 //! on API input, the Linux transparent proxy calls [`Compiled::decide`] per

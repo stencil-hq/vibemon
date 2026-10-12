@@ -1,5 +1,5 @@
-//! Responses synthesized by the ingress proxy (e2b-api Part F §5.3–5.4) and
-//! the CORS policy shared with the API (Part H.1).
+//! Responses synthesized by the ingress proxy (ARCHITECTURE.md §9.5) and the
+//! CORS policy shared with the API.
 
 use axum::{
 	body::Body,

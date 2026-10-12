@@ -1,4 +1,4 @@
-//! CLI login (E2B Part D §9.1) and the removed `/access-tokens` routes.
+//! CLI login (ARCHITECTURE.md §9.2) and the removed `/access-tokens` routes.
 //!
 //! `GET /docs/api/cli` serves a login page; the email + password form POST
 //! redirects to the CLI's localhost callback with OAuth-style tokens.
