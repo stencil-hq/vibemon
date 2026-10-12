@@ -2,6 +2,84 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added (S3 filesystems)
+
+- S3-backed filesystems: bring-your-own-bucket mounts (`vmonS3Mounts` on `POST /sandboxes` and `/v2/sandboxes`, modes `ro`, `overlay`, `writeback`, inline or team-secret credentials) and, with `--object-store`, E2B volumes stored under `volumes/<id>/` in the object store, mountable on any node, with the volume-content API served from S3
+- Writable VMM remote virtio-fs (`--remote-fs TAG:SOCK:rw`): create, write, setattr, sync, unlink, rmdir, and rename forwarded to the host proxy; read-only devices are unchanged
+- `vmon serve --s3-mounts-allow-private` lets S3 mount endpoints resolve to private or loopback addresses
+
+### Breaking Changes
+
+- Replaced the `vmond` server, its gRPC/WebSocket API, the Python/TypeScript/Go SDKs, the web UI, the mesh/orchestration layer, and the deployment stacks with an E2B-compatible platform; the official E2B SDKs and `e2b` CLI are now the clients
+- Removed the `vmon run/snapshot/restore/fork/…` user CLI; `vmon` now has `serve`, `admin`, and `vmm`
+- Snapshot format version is 4 (HVF vCPU state records the frozen guest counter); v3 snapshots are rejected with recapture required, so existing templates must be rebuilt
+
+### Added
+
+- Lazy cross-node resume (`vmon serve --lazy-resume`, default on): a node
+  resuming another node's paused sandbox from the object store boots it
+  without downloading the rootfs — the VMM fetches 1 MiB block-image frames
+  on first touch — and, on Linux, pages guest RAM in through
+  `--remote-page-url` from a loopback page server. Re-pausing materializes the
+  disk; any lazy failure falls back to the full download.
+- `vmon vmm --rootfs-remote-*` (lazy remote rootfs) now works on macOS; the
+  block-image format is `vmm::block_image` (frames carry zstd checksums), and
+  `disk_snapshot` of a remote disk writes the whole guest-visible disk.
+- `vmon vmm --restore --remote-page-url` accepts delta snapshots (the page
+  source serves the reconstructed RAM).
+- Added `vmon serve --role node,driver`: one binary runs the node role, the driver role, or both, discovering peers through gossip (`--join`)
+- Added `vmon-cluster`: an in-house SWIM gossip memberlist with authenticated packets and a raft-replicated KV store (openraft) with transactions, TTLs, watches, and leader-confirmed bootstrap and membership driven by gossip
+- Added `vmon-driver`: the E2B REST API (sandboxes, snapshots, fork, templates and v2 builds, tags and aliases, volumes and volume content, secrets, teams, API keys, events, webhooks, admin, nodes), MySQL persistence, the scheduler, the sandbox lifecycle with auto-pause and auto-resume, the leader-only reaper and reconciler, the build supervisor, CLI login, and sandbox ingress (`<port>-<id>.<domain>` or `E2b-Sandbox-*` headers, TLS with h2, WebSocket passthrough, traffic tokens, masked hosts, HTTPS guest ports)
+- Added the `vmon-node` runtime: `vmon vmm` launch/fork/restore, GC4 host client with flow-controlled TCP tunnels, sandbox create/pause/resume/kill/snapshot-as-build, restart recovery, Linux TAP networking, envd metrics/log history, volumes and volume-content API, and build file-context storage behind `/node/v1`
+- Added template builds on nodes: a native OCI registry client (Docker Hub, ECR, GCR auth), in-guest layer unpacking, upstream-equivalent provisioning (systemd/OpenRC, user `user`, envd service), v2 build steps with a chained step cache, start/ready commands, snapshot capture, and extent-aware peer artifact transfer
+- Added egress enforcement: a transparent proxy on Linux (CIDR/domain rules, SOCKS5 upstreams, HTTPS header rules) and an in-VMM user-net filter on macOS (`--user-net-policy`, live `set_net_policy`, DNS-learned domains)
+- Added an envd reimplementation to `vmon-agent` (Connect process/filesystem services, `/files`, `/init`, `/envs`, `/metrics`, pause hooks; reports envd 0.6.6), GC4 tunnels, OCI unpack, and provisioning ops
+- Added `vmon admin` for teams, system teams, users, API keys, and limits
+- Added the vmon guest kernel (`kernel/`, `just kernel`) with netfilter, IPv6, cgroup v2, overlay, and NFS support; nodes prefer it over the cloud-hypervisor download
+- Added default templates (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`) under `templates/` with `just templates`, published by a system team so unqualified aliases resolve for every team
+- Added `e2e/`, which runs the upstream E2B Python and JS SDK suites against a live server (`just e2e`), and `tests/cluster.rs` for distributed failover (`just cluster-e2e`)
+- Added `vmon serve --registry-mirror <url>` (`VMON_REGISTRY_MIRROR`, e.g. `https://mirror.gcr.io`): a Docker Hub pull-through mirror tried first for anonymous `docker.io` base images, falling back to Docker Hub
+- Added portable paused sandboxes (`vmon serve --object-store s3://bucket/prefix` or `https://endpoint/bucket/prefix`, `VMON_OBJECT_STORE`): a committed pause uploads its memory snapshot and disk to S3-compatible storage in the background, and `connect`/resume continues it on any compatible node when its own node is gone (rootfs-only cold boot across CPU baselines); kill removes the stored state
+- With `--object-store`, template builds are published to the object store after they finish, so sandboxes can be created, and paused forks resumed, after every node holding a template is gone; deleting a template removes its published artifacts
+- Added `vmon_cloud::s3`, an async SigV4 S3 client (path-style and virtual-hosted endpoints, ranged reads, conditional and multipart uploads, listings, copies, pre-signed URLs) with an in-process fake server for tests
+- A sandbox's envd access token (`X-Access-Token`) now authorizes `GET /sandboxes/{id}`, `POST /sandboxes/{id}/timeout` and `POST /sandboxes/{id}/refreshes` for that same sandbox only, so a guest can keep itself alive without team credentials
+- Added the `ubuntu-systemd` reference template: stock Ubuntu 24.04 with systemd as PID 1, an enabled probe unit, and a start command captured in the snapshot
+
+### Security
+
+- Restored sandboxes (template forks, resumes, and the source of a snapshot) get 64 bytes of fresh host entropy and a kernel CRNG reseed before envd starts, so forks of one memory snapshot no longer share early kernel randomness
+
+### Changed
+
+- Disk overlays (`--disk-overlay-of`) on Linux and macOS are now block-level copy-on-write overlays over a hard-linked raw base (`<rootfs>.base`), so sandbox create, kill, pause, resume, and fork no longer copy the template rootfs on filesystems without reflinks (ext4); overlay clones reflink when possible and otherwise copy only written extents, and guest flushes on these VM-private overlays no longer fsync the host
+- Template builds resolve image tags with `HEAD` (not counted against Docker Hub pull limits) and serve manifests and image configs from a content-addressed cache, so rebuilding from a cached image no longer re-downloads manifests; registry rate limits (HTTP 429) now fail with the registry's message and `Retry-After`
+- Image layer downloads retry transient failures and resume interrupted transfers with HTTP `Range`
+- Sandbox pause writes guest RAM as a delta against the snapshot the sandbox was forked from (hard-linked as its RAM base; candidates from `/proc/self/pagemap` private copies, verified against the base) and tears down the VMM and network after replying, cutting pause from ~0.5–1 s to tens of milliseconds; `--fork-from` now accepts such delta snapshots, so resume keeps sharing the template's page cache
+- Linux nodes keep a pool of pre-created TAPs (one per boot slot, up to 32) that creates and resumes take instead of creating a TAP and its NAT rules on the request path; released TAPs are recycled, and idle ones are removed on shutdown and on the next start
+- Pooled TAPs carry their egress hooks (proxy `REDIRECT`, `INPUT` rules, IPv6 drops) from creation with policy chains closed until a sandbox attaches; attach is one add-only `iptables-restore` that runs while the guest configures its network, detach resets the chains to closed in the background, and the hooks go only when the TAP is torn down. Released TAPs return to the pool up to twice its target, so a create/kill cycle no longer sets up and tears down a TAP. Template-build VMs get a fresh TAP without egress hooks
+- Raft KV writes do one `fdatasync` instead of three: the committed index is no longer fsync'd (openraft re-learns a stale or torn one)
+- TAP networking and egress enforcement install and remove each sandbox's iptables rules in one `iptables-restore` transaction per table instead of one process per rule, so creates and background kill teardown no longer contend on the xtables lock
+- Sandbox RAM restored from a snapshot (create, resume, fork) is backed by 2 MiB hugetlb pages when the host's pool has room (`vmon serve --hugepage-pool-mb`, `VMON_HUGEPAGE_POOL_MB`), filled lazily from the memory file through userfaultfd and write-tracked for pause deltas; this removes ~2000 first-touch page faults after restore, so the first command after create takes about as long as later ones (~4.5 ms instead of ~23 ms under nested KVM; resume to first command ~25 ms faster). It costs page-cache sharing between sandboxes (each reserves its RAM in huge pages), ~150 ms per fork, and ~12 ms per pause. Hosts without huge pages keep the page-cache-shared 4 KiB mapping
+- envd remounts cgroup v2 with `favordynmods`, so moving a new process into its workload cgroup no longer waits for an RCU grace period after the guest idled (~15–20 ms off the first command after create or after idle)
+- Agent and envd log lines go to a dedicated `vmon.log` virtio-console port that the VMM appends to `console.log`, instead of the UART (one VM exit per byte, ~400 per envd command)
+- GC4 (agent channel and sandbox tunnels) moved from the `hvc0` tty to a dedicated multiport virtio-console port `vmon.gc4` with suppressed RX doorbells, a 1 MiB tunnel window, and 64 KiB tunnel frames: 64 MiB `files.write` uploads go from ~50 MB/s to ~350–700 MB/s (first upload into fresh guest memory ~150 MB/s), and the tty's poll backoff that stretched uploads by seconds is gone. Snapshots captured before keep the legacy `hvc0` console
+- Sandbox kill replies once the VMM is SIGKILLed and the route is gone (one compare-and-delete instead of four KV writes); reaping, egress rules, TAP, and disk removal finish in the background, cutting `DELETE /sandboxes/{id}` from ~130–170 ms to ~7–10 ms
+
+### Fixed
+
+- Fixed recycled TAP leases keeping the previous sandbox's conntrack entries (NAT mappings, `ESTABLISHED` UDP state) for the next sandbox on the same address: guest flows carry a per-lease connection mark and are flushed through ctnetlink (no conntrack-tools) before the lease is reused or freed
+- Fixed a guest reaching the network unfiltered between VM start and egress attach (resumed sandboxes run user code in that window): TAP policy chains are closed until the sandbox's policy is in place
+- Fixed ~40 ms added to every SDK call routed through the cluster listener (envd commands, file reads): its accepted sockets lacked `TCP_NODELAY`, so multi-segment responses waited on Nagle and delayed ACKs; gossip push-pull sockets now set it too
+- Fixed HVF forks and resumes that intermittently never answered the guest agent: pauses no longer capture a vCPU inside a guest interrupt handler, whose restored GIC priority could stay stuck and block every later device interrupt
+- Fixed multi-vCPU HVF forks and restores that intermittently wedged (NETDEV WATCHDOG on `eth0`, dead guest agent, `vm … failed to start`): vCPUs are now created in id order, because Hypervisor.framework keys each vCPU's GIC state in a snapshot by creation order and concurrent creation handed pending IPIs and active interrupts to the wrong vCPU on restore
+- Fixed the HVF guest clock jumping forward by the whole time between snapshot and restore (instant guest timeouts, RCU stalls, systemd watchdog kills): every vCPU now shares one guest counter that stops while paused and resumes from the captured value
+- Fixed hidden fork templates and their builds (rootfs and memory snapshot) never being deleted: a fork retires its template once its children start (or the fork fails), artifact GC reclaims the build when no running or paused child uses it, and the template and build rows are then removed
+- Fixed creates, forks, and resumes stranding admission slots, transitional routes, or VMs when they failed midway or the client disconnected: lifecycle operations now finish in their own task, every create failure after admission rolls back, the reaper ends sandboxes a dead driver left mid-transition, and the reconciler kills copies of a VM on nodes other than its route's
+- Fixed a sandbox whose VMM exited on its own (guest poweroff, crash) staying listed on its node: its cleanup cancelled itself
+- Fixed a resume whose reply was lost (timeout) after the node resumed the sandbox: the driver dropped the route and the reconciler killed the VM along with its paused state; failed resumes now check the node, and the reconciler re-pauses a running VM whose row is paused instead of killing it
+
 ## 0.3.2
 
 ### Fixed

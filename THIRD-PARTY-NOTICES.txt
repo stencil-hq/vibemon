@@ -322,6 +322,18 @@ binary, and are not relicensed by the host binary's MIT license. Generated
 guest initramfs/rootfs images contain their guest components and remain subject
 to those components' own terms.
 
+vmon guest kernel (vmon-assets-<arch>.tar.gz: vmon-kernel-<arch>)
+------------------------------------------------------------------
+- Built by kernel/build.sh from the Cloud Hypervisor Linux tree, tag
+  ch-release-v6.16.9-20260508
+  (https://github.com/cloud-hypervisor/linux, source tarball pinned by SHA-256
+  in kernel/build.sh), configured with ch_defconfig plus kernel/config/; the
+  resolved configuration ships as vmon-kernel-<arch>.config.
+- Upstream project: https://kernel.org/
+- License: Linux kernel GPL-2.0-only, with the Linux-syscall-note applying to
+  the UAPI headers. This is a guest kernel shipped beside, not linked into,
+  the host binary.
+
 Pinned integration-test assets (demo/fetch-test-assets.sh)
 ---------------------------------------------------------
 Linux x86_64 kernel image
