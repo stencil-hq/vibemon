@@ -40,15 +40,15 @@ impl EventFd {
 			return Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32));
 		}
 
-		// SAFETY: null security attributes/name request a private, non-inheritable
-		// manual-reset event. The returned handle is checked before ownership is
-		// transferred to `OwnedHandle`.
+		// SAFETY: null security attributes/name request a private,
+		// non-inheritable manual-reset event. The returned handle is checked
+		// before ownership is transferred to `OwnedHandle`.
 		let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
 		if handle.is_null() {
 			return Err(io::Error::last_os_error());
 		}
-		// SAFETY: `CreateEventW` returned a fresh live kernel handle uniquely owned
-		// by this value.
+		// SAFETY: `CreateEventW` returned a fresh live kernel handle uniquely
+		// owned by this value.
 		let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
 
 		Ok(Self {
@@ -97,7 +97,8 @@ impl EventFd {
 				if state.value != 0 {
 					let total = state.value;
 					state.value = 0;
-					// SAFETY: `handle` is a live event handle for the duration of the call.
+					// SAFETY: `handle` is a live event handle for the duration of
+					// the call.
 					if unsafe { ResetEvent(self.handle.as_raw_handle() as HANDLE) } == 0 {
 						return Err(io::Error::last_os_error());
 					}

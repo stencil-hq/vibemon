@@ -159,7 +159,8 @@ pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 	} else {
 		let legacy = vcpu.get_xsave()?;
 		let mut x = Xsave::new(0).map_err(|e| err(format!("alloc xsave: {e:?}")))?;
-		// SAFETY: the pointer is valid; we only overwrite the embedded fixed kvm_xsave.
+		// SAFETY: the pointer is valid; we only overwrite the embedded fixed
+		// kvm_xsave.
 		unsafe { (*x.as_mut_fam_struct_ptr()).xsave = legacy };
 		x
 	};
@@ -211,12 +212,13 @@ pub fn restore_vcpu(vcpu: &Vcpu, st: &VcpuState) -> Result<()> {
 	// migration users: KVM_SET_XSAVE copies the raw xstate image, then
 	// KVM_SET_XCRS restores which components the guest has enabled.
 	if st.xsave.as_slice().is_empty() {
-		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of this
-		// same host, so its buffer matches this host's legacy XSAVE layout.
+		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of
+		// this same host, so its buffer matches this host's legacy XSAVE
+		// layout.
 		unsafe { vcpu.set_xsave(&st.xsave.as_fam_struct_ref().xsave)? };
 	} else {
-		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of this
-		// same host, so its buffer matches this host's XSAVE2 layout.
+		// SAFETY: `st.xsave` was produced by get_xsave2/get_xsave on a vCPU of
+		// this same host, so its buffer matches this host's XSAVE2 layout.
 		unsafe { vcpu.set_xsave2(&st.xsave)? };
 	}
 	vcpu.set_xcrs(&st.xcrs)?;

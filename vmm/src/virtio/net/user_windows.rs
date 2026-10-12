@@ -351,8 +351,8 @@ fn run_slirp(
 		if pollfds.is_empty() {
 			thread::sleep(Duration::from_millis(timeout.max(0) as u64));
 		} else {
-			// SAFETY: `pollfds` is writable for its supplied length and Winsock was
-			// initialized before entering the worker loop.
+			// SAFETY: `pollfds` is writable for its supplied length and Winsock
+			// was initialized before entering the worker loop.
 			if unsafe { WSAPoll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout) } == SOCKET_ERROR
 			{
 				tracing::warn!("libslirp WSAPoll failed: {}", io::Error::last_os_error());

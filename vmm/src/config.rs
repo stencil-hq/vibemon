@@ -69,13 +69,15 @@ pub struct FsMount {
 	pub read_only: bool,
 }
 
-/// A read-only virtio-fs mount served by a per-VM object proxy.
+/// A virtio-fs mount served by a per-VM object proxy.
 #[derive(Clone)]
 pub struct RemoteFsMount {
 	/// Guest-visible virtio-fs tag.
-	pub tag:  String,
+	pub tag:      String,
 	/// Absolute host Unix socket path for the proxy.
-	pub sock: PathBuf,
+	pub sock:     PathBuf,
+	/// `:rw`: forward mutations to the proxy (otherwise they fail `EROFS`).
+	pub writable: bool,
 }
 
 #[derive(Clone)]
@@ -126,6 +128,9 @@ pub struct Config {
 	/// TCP port on the slirp virtual gateway allowed by restricted user
 	/// networking.
 	pub user_net_allow_host_port: Option<u16>,
+	/// JSON egress policy document (`--user-net-policy`) enforced on guest
+	/// user-net traffic and replaceable through `set_net_policy`.
+	pub user_net_policy: Option<PathBuf>,
 	/// Whether `--mac` was explicitly supplied (used for snapshot restore
 	/// overrides).
 	pub mac_specified: bool,
@@ -164,11 +169,13 @@ pub struct Config {
 	pub restore: Option<PathBuf>,
 	/// Fork (`CoW`) from a template snapshot directory instead of booting.
 	pub fork_from: Option<PathBuf>,
-	/// Create a `CoW` overlay of this base disk and serve it as `--rootfs`.
+	/// Create a `CoW` overlay of this base disk and serve it as `--rootfs`
+	/// (Unix: a [`crate::disk_overlay`] image plus `<rootfs>.base`).
 	pub disk_overlay_of: Option<PathBuf>,
 	/// Number of children to spawn with `--fork-from` (default 1).
 	pub count: u32,
-	/// Attach a virtio-console agent channel (/dev/hvc0) for warm-boot exec.
+	/// Attach a virtio-console agent channel (port `vmon.gc4`) for warm-boot
+	/// exec.
 	pub console_agent: bool,
 	/// Attach a virtio-rng entropy device (/dev/hwrng) seeded from
 	/// `/dev/urandom`.
@@ -339,6 +346,11 @@ struct CliArgs {
 	#[arg(long, value_name = "PORT")]
 	user_net_allow_host_port: Option<u16>,
 
+	/// Enforce a JSON egress policy on user-net guest traffic (macOS); live
+	/// updates through the `set_net_policy` control method.
+	#[arg(long, value_name = "FILE")]
+	user_net_policy: Option<PathBuf>,
+
 	/// Guest MAC (default: 02:00:00:00:00:01)
 	#[arg(long, value_name = "ADDR", value_parser = parse_mac)]
 	mac: Option<[u8; 6]>,
@@ -367,8 +379,9 @@ struct CliArgs {
 	#[arg(long = "volume", value_name = "T:D[:RO]", value_parser = parse_volume)]
 	volumes: Vec<FsMount>,
 
-	/// Read-only virtio-fs mount <tag>:<absolute_proxy_socket>; repeatable
-	#[arg(long = "remote-fs", value_name = "T:SOCK", value_parser = parse_remote_fs)]
+	/// Proxy-backed virtio-fs mount <tag>:<absolute_proxy_socket>[:rw]
+	/// (read-only unless :rw); repeatable
+	#[arg(long = "remote-fs", value_name = "T:SOCK[:RW]", value_parser = parse_remote_fs)]
 	remote_fs: Vec<RemoteFsMount>,
 
 	/// Unix control socket (pause/resume/snapshot/quit)
@@ -394,7 +407,8 @@ struct CliArgs {
 	#[arg(long, value_name = "DIR")]
 	fork_from: Option<PathBuf>,
 
-	/// Create a new no-overwrite CoW overlay at --rootfs
+	/// Create a new no-overwrite CoW overlay at --rootfs (block overlay with a
+	/// hard-linked <rootfs>.base on Unix; guest flushes skip the host fsync)
 	#[arg(long, value_name = "BASE")]
 	disk_overlay_of: Option<PathBuf>,
 
@@ -402,7 +416,7 @@ struct CliArgs {
 	#[arg(long, value_name = "N", default_value_t = 1)]
 	count: u64,
 
-	/// Attach a virtio-console agent channel (/dev/hvc0)
+	/// Attach a virtio-console agent channel (port `vmon.gc4`)
 	#[arg(long)]
 	console_agent: bool,
 
@@ -728,9 +742,9 @@ impl Config {
 		{
 			bail!("--rootfs-remote-cache must differ from --rootfs");
 		}
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(target_os = "windows")]
 		if remote_rootfs {
-			bail!("--rootfs-remote-url requires a Linux host");
+			bail!("--rootfs-remote-url requires a Linux or macOS host");
 		}
 		if let Some(n) = cli.timeout_secs
 			&& !(1..=86_400).contains(&n)
@@ -821,6 +835,15 @@ impl Config {
 		}
 		if !cli.user_net_restricted && cli.user_net_allow_host_port.is_some() {
 			bail!("--user-net-allow-host-port requires --user-net-restricted");
+		}
+		if cli.user_net_policy.is_some() && !user_net {
+			bail!("--user-net-policy requires --net user");
+		}
+		if cli.user_net_policy.is_some() && !cfg!(target_os = "macos") {
+			bail!("--user-net-policy is currently supported only on macOS");
+		}
+		if cli.user_net_policy.is_some() && cli.user_net_restricted {
+			bail!("--user-net-policy cannot be combined with --user-net-restricted");
 		}
 		if user_net && !cfg!(any(target_os = "macos", target_os = "windows")) {
 			bail!("--net user is currently supported only on macOS and Windows");
@@ -1001,6 +1024,7 @@ impl Config {
 			user_net,
 			user_net_restricted: cli.user_net_restricted,
 			user_net_allow_host_port: cli.user_net_allow_host_port,
+			user_net_policy: cli.user_net_policy,
 			mac_specified,
 			mac,
 			transport,
@@ -1208,9 +1232,13 @@ fn parse_volume(s: &str) -> Result<FsMount> {
 }
 
 fn parse_remote_fs(s: &str) -> Result<RemoteFsMount> {
-	let (tag, sock) = s
-		.split_once(':')
-		.ok_or_else(|| err(format!("invalid --remote-fs {s} (expected <tag>:<absolute-socket>)")))?;
+	let (tag, sock) = s.split_once(':').ok_or_else(|| {
+		err(format!("invalid --remote-fs {s} (expected <tag>:<absolute-socket>[:rw])"))
+	})?;
+	let (sock, writable) = match sock.strip_suffix(":rw") {
+		Some(sock) => (sock, true),
+		None => (sock.strip_suffix(":ro").unwrap_or(sock), false),
+	};
 	if tag.is_empty() || sock.is_empty() {
 		bail!("invalid --remote-fs {s} (expected <tag>:<absolute-socket>)");
 	}
@@ -1221,7 +1249,7 @@ fn parse_remote_fs(s: &str) -> Result<RemoteFsMount> {
 	if !sock.is_absolute() {
 		bail!("--remote-fs socket path must be absolute (got {})", sock.display());
 	}
-	Ok(RemoteFsMount { tag: tag.to_owned(), sock })
+	Ok(RemoteFsMount { tag: tag.to_owned(), sock, writable })
 }
 
 fn is_valid_volume_tag(tag: &str) -> bool {
@@ -1372,6 +1400,23 @@ mod tests {
 
 	use super::*;
 
+	#[test]
+	fn remote_fs_mode_suffix() {
+		let ro = parse_remote_fs("data:/run/s3.sock").expect("read-only binding");
+		assert_eq!(
+			(ro.tag.as_str(), ro.sock.as_path(), ro.writable),
+			("data", Path::new("/run/s3.sock"), false)
+		);
+		let rw = parse_remote_fs("data:/run/s3.sock:rw").expect("writable binding");
+		assert_eq!((rw.sock.as_path(), rw.writable), (Path::new("/run/s3.sock"), true));
+		let explicit_ro = parse_remote_fs("data:/run/s3.sock:ro").expect("explicit read-only");
+		assert_eq!(
+			(explicit_ro.sock.as_path(), explicit_ro.writable),
+			(Path::new("/run/s3.sock"), false)
+		);
+		assert!(parse_remote_fs("data::rw").is_err());
+	}
+
 	static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
 	struct TestDir {
@@ -1442,7 +1487,7 @@ mod tests {
 		);
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_remote_rootfs_contract() {
 		let cfg = parse_config(&[
@@ -1533,7 +1578,7 @@ mod tests {
 		assert_config_err_contains(&malformed_url, "invalid --rootfs-remote-url");
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(not(target_os = "windows"))]
 	#[test]
 	fn parses_aws_remote_rootfs_contract() {
 		let cfg = parse_config(&[
@@ -1991,7 +2036,8 @@ mod tests {
 	#[test]
 	fn rejects_invalid_sandbox_identity_flags() {
 		// The sandbox is default-on, so identity flags only require an enabled
-		// sandbox unless it is explicitly disabled (--no-sandbox) and --jail is unset.
+		// sandbox unless it is explicitly disabled (--no-sandbox) and --jail is
+		// unset.
 		assert_config_err_contains(
 			&["vmon", "--kernel", "k", "--no-sandbox", "--sandbox-uid", "1000"],
 			"require the sandbox",

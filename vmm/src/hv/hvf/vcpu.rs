@@ -8,13 +8,14 @@ use std::{
 	time::Duration,
 };
 
-use applevisor::prelude::{ExitReason, Reg, SysReg as HvSysReg};
+use applevisor::prelude::{ExitReason, GicIccReg, Reg, SysReg as HvSysReg};
 
 use crate::{
 	bail,
 	hv::{
 		Exit, SysReg,
 		hvf::{
+			clock::GuestClock,
 			psci::{
 				PSCI_AFFINITY_INFO_32, PSCI_AFFINITY_INFO_64, PSCI_CPU_OFF, PSCI_CPU_ON_32,
 				PSCI_CPU_ON_64, PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_NOT_SUPPORTED,
@@ -87,19 +88,17 @@ impl Drop for HvRunGuard<'_> {
 
 /// A thread-owned HVF vCPU with userspace MMIO completion state.
 pub struct Vcpu {
-	id:                u8,
-	inner:             applevisor::prelude::Vcpu,
-	psci:              Arc<PsciCoordinator>,
-	ioevents:          IoEvents,
-	pending_mmio:      Option<PendingMmio>,
-	mmio_buf:          [u8; 8],
+	id:           u8,
+	inner:        applevisor::prelude::Vcpu,
+	psci:         Arc<PsciCoordinator>,
+	ioevents:     IoEvents,
+	pending_mmio: Option<PendingMmio>,
+	mmio_buf:     [u8; 8],
 	/// True only while this thread is inside `hv_vcpu_run`; the pause kicker
 	/// must not target a vCPU parked or running host-side emulation.
-	hv_run:            Arc<AtomicBool>,
-	/// Host `CNTVCT_EL0` captured when this vCPU parked for a pause, used to
-	/// keep guest virtual time continuous across the pause (see
-	/// `freeze_vtimer`).
-	vtimer_pause_mark: Option<u64>,
+	hv_run:       Arc<AtomicBool>,
+	/// The VM's guest counter, shared by every vCPU (see `freeze_vtimer`).
+	clock:        Arc<GuestClock>,
 }
 
 impl Vcpu {
@@ -109,18 +108,10 @@ impl Vcpu {
 		inner: applevisor::prelude::Vcpu,
 		psci: Arc<PsciCoordinator>,
 		ioevents: IoEvents,
+		clock: Arc<GuestClock>,
 		hv_run: Arc<AtomicBool>,
 	) -> Self {
-		Self {
-			id,
-			inner,
-			psci,
-			ioevents,
-			pending_mmio: None,
-			mmio_buf: [0; 8],
-			hv_run,
-			vtimer_pause_mark: None,
-		}
+		Self { id, inner, psci, ioevents, pending_mmio: None, mmio_buf: [0; 8], hv_run, clock }
 	}
 
 	/// Run the vCPU until HVF exits to userspace.
@@ -190,6 +181,19 @@ impl Vcpu {
 				}
 			},
 		}
+	}
+
+	/// Whether the guest is inside an interrupt handler: an acknowledged
+	/// interrupt whose priority has not been dropped (`ICC_AP{0,1}R0_EL1`).
+	///
+	/// A snapshot captured in that window restores unreliably: the in-kernel
+	/// GIC sometimes never drops the restored active priority when the guest
+	/// EOIs, so the vCPU stops taking device interrupts. The run loop
+	/// therefore only parks a pausing vCPU outside handlers.
+	pub(crate) fn mid_interrupt(&self) -> bool {
+		[GicIccReg::AP0R0_EL1, GicIccReg::AP1R0_EL1]
+			.into_iter()
+			.any(|reg| self.inner.get_icc_reg(reg).is_ok_and(|value| value != 0))
 	}
 
 	/// Mark this vCPU as the initially powered-on boot CPU.
@@ -269,24 +273,30 @@ impl Vcpu {
 		cnt
 	}
 
-	/// Record the host counter as this vCPU parks for a pause. HVF keeps the
-	/// virtual timer running while a vCPU is parked (unlike KVM, which freezes
-	/// it), so without this the guest would see the entire wall-clock pause as a
+	/// Freeze the VM's guest counter as this vCPU parks for a pause. HVF keeps
+	/// the virtual counter running while a vCPU is parked (unlike KVM, which
+	/// stops it), so without this the guest would see the entire pause as a
 	/// forward `CNTVCT` jump on resume and stall or panic seconds later.
-	pub(crate) fn freeze_vtimer(&mut self) {
-		self.vtimer_pause_mark = Some(Self::host_cntvct());
+	pub(crate) fn freeze_vtimer(&self) {
+		self.clock.freeze(Self::host_cntvct());
 	}
 
-	/// Advance the vtimer offset by the host counter ticks elapsed during the
-	/// pause so the guest's `CNTVCT` resumes without a jump. No-op if the vCPU
-	/// was not frozen.
-	pub(crate) fn thaw_vtimer(&mut self) -> Result<()> {
-		if let Some(mark) = self.vtimer_pause_mark.take() {
-			let elapsed = Self::host_cntvct().wrapping_sub(mark);
-			let offset = self.inner.get_vtimer_offset()?;
-			self.inner.set_vtimer_offset(offset.wrapping_add(elapsed))?;
-		}
+	/// Resume the VM's guest counter as this vCPU leaves a pause (or starts
+	/// from a restored snapshot): apply the offset every vCPU shares, which
+	/// continues the counter from where it was frozen.
+	pub(crate) fn thaw_vtimer(&self) -> Result<()> {
+		self
+			.inner
+			.set_vtimer_offset(self.clock.thaw(Self::host_cntvct()))?;
 		Ok(())
+	}
+
+	/// The guest counter value the VM is frozen at while paused.
+	pub(crate) fn frozen_guest_counter(&self) -> Result<u64> {
+		self
+			.clock
+			.frozen()
+			.ok_or_else(|| err("HVF vCPU state captured while the guest counter is running"))
 	}
 
 	/// Save HVF vCPU state into the backend-neutral snapshot form.

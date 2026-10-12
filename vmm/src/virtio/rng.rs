@@ -81,8 +81,8 @@ impl Rng {
 		#[cfg(target_os = "windows")]
 		{
 			let _ = source;
-			// SAFETY: `buffer` is valid for `buffer.len()` writable bytes for the duration
-			// of the call.
+			// SAFETY: `buffer` is valid for `buffer.len()` writable bytes for the
+			// duration of the call.
 			let ok = unsafe {
 				windows_sys::Win32::Security::Cryptography::ProcessPrng(
 					buffer.as_mut_ptr(),
@@ -340,7 +340,8 @@ mod tests {
 	#[test]
 	fn queue_states_reflect_activation() {
 		let rng = Rng::new().expect("rng");
-		assert!(rng.queue_states().is_empty());
+		let states = rng.queue_states();
+		assert!(states.is_empty(), "unexpected queue states: {states:?}");
 
 		let mem = guest_mem();
 		let queue = queue_with_descs(&mem, &[SplitDescriptor::new(

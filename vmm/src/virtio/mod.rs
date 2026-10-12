@@ -6,10 +6,12 @@
 //! 64 handles.
 
 pub mod block;
-// The backend serves Linux guests only; its positional file I/O is unix-only,
-// so Windows test builds must not pull it in.
-#[cfg(any(target_os = "linux", all(test, unix)))]
+// Remote rootfs serves Linux and macOS hosts; its positional file I/O is
+// unix-only, so Windows builds must not pull it in.
+#[cfg(unix)]
 mod block_remote;
+#[cfg(unix)]
+pub use block_remote::materialize_remote_disk;
 pub mod console;
 #[cfg(not(target_os = "windows"))]
 pub mod fs;

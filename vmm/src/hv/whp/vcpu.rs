@@ -567,19 +567,20 @@ impl RunCallbacks {
 	}
 
 	const fn vp(&self) -> &VirtualProcessor {
-		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `vp` alive.
+		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `vp`
+		// alive.
 		unsafe { &*self.vp }
 	}
 
 	const fn pio_bus(&self) -> &Bus {
-		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `pio_bus`
-		// alive.
+		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps
+		// `pio_bus` alive.
 		unsafe { &*self.pio_bus }
 	}
 
 	const fn mmio_bus(&self) -> &Bus {
-		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps `mmio_bus`
-		// alive.
+		// SAFETY: callbacks are invoked synchronously while `run_whp` keeps
+		// `mmio_bus` alive.
 		unsafe { &*self.mmio_bus }
 	}
 }

@@ -337,8 +337,9 @@ impl VfioPciDevice {
 					.get_region_offset(bar.region)
 					.checked_add(area.offset)
 					.ok_or_else(|| err("NVIDIA VFIO BAR mmap offset overflow"))?;
-				// SAFETY: VFIO advertises this page-aligned subrange as mmap-capable;
-				// the returned mapping is retained until its KVM memory slot is removed.
+				// SAFETY: VFIO advertises this page-aligned subrange as
+				// mmap-capable; the returned mapping is retained until its KVM
+				// memory slot is removed.
 				let mut mapping = unsafe {
 					MmapOptions::new()
 						.offset(file_offset)
@@ -630,7 +631,8 @@ impl Drop for VfioPciDevice {
 				userspace_addr:  0,
 				flags:           0,
 			};
-			// SAFETY: a zero-sized KVM region removes the slot before its mmap is dropped.
+			// SAFETY: a zero-sized KVM region removes the slot before its mmap is
+			// dropped.
 			if let Err(cause) = unsafe { self.vm.fd.set_user_memory_region(region) } {
 				warn!(gpu = %self.label, slot = mapping.slot, error = %cause, "failed to remove NVIDIA BAR memory slot");
 			}
@@ -743,7 +745,8 @@ pub fn attach_gpu_devices(
 	);
 	for region in vm.memory().iter() {
 		// SAFETY: guest memory is mmap-backed for the VM lifetime. Device DMA and
-		// VMM accesses use volatile/atomic guest-memory operations until IOAS drop.
+		// VMM accesses use volatile/atomic guest-memory operations until IOAS
+		// drop.
 		unsafe {
 			vfio_ops.vfio_dma_map(
 				region.start_addr().raw_value(),

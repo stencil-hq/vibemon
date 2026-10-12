@@ -12,7 +12,7 @@ use std::os::unix::io::AsRawFd;
 #[cfg(not(target_os = "windows"))]
 use std::{
 	fs,
-	os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
+	os::unix::fs::{MetadataExt, OpenOptionsExt},
 };
 use std::{
 	fs::{File, OpenOptions},
@@ -38,8 +38,14 @@ use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress, GuestMemory};
 use vmon_cloud::ObjectAuth;
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 use super::block_remote::RemoteBlockSource;
+#[cfg(target_os = "macos")]
+use crate::disk_overlay::macos;
+#[cfg(target_os = "linux")]
+use crate::disk_overlay::try_reflink;
+#[cfg(not(target_os = "windows"))]
+use crate::disk_overlay::{Overlay, sparse_copy};
 #[cfg(target_os = "linux")]
 use crate::os::EventFd;
 use crate::{
@@ -137,6 +143,17 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		return Err(err(format!("base disk {} changed while creating overlay", base.display())));
 	}
 
+	// APFS clones the whole file in O(metadata); `fclonefileat` creates the
+	// destination itself (failing on any existing entry, symlinks included),
+	// so it runs before the exclusive create below.
+	#[cfg(target_os = "macos")]
+	let clone_err = match macos::clone_into_new(&src, &opened_base_meta, dest)
+		.map_err(|e| err(format!("cloning {} -> {}: {e}", base.display(), dest.display())))?
+	{
+		macos::CloneOutcome::Cloned(file) => return Ok(file),
+		macos::CloneOutcome::Unsupported(error) => error,
+	};
+
 	let dst = OpenOptions::new()
 		.read(true)
 		.write(true)
@@ -158,17 +175,12 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 
 	#[cfg(target_os = "linux")]
 	let clone_err = {
-		let clone_err = linux::try_reflink(&src, &dst);
+		let clone_err = try_reflink(&src, &dst);
 		if clone_err.is_none() {
 			return Ok(dst);
 		}
 		clone_err.expect("reflink error recorded")
 	};
-	#[cfg(target_os = "macos")]
-	let clone_err = io::Error::new(
-		io::ErrorKind::Unsupported,
-		"macOS clonefile fast path disabled because it cannot return the created fd",
-	);
 
 	// Reflink unsupported on this filesystem: fall back to a sparse-aware copy
 	// through the already-open no-follow source and exclusive destination fds
@@ -187,115 +199,6 @@ pub fn create_cow_overlay(base: &Path, dest: &Path) -> Result<File> {
 		))
 	})?;
 	Ok(dst)
-}
-
-/// Copy `src` into `dst` without materializing holes, then size `dst` to the
-/// full logical length.
-#[cfg(not(target_os = "windows"))]
-fn sparse_copy(src: &mut File, dst: &File) -> io::Result<()> {
-	#[cfg(target_os = "linux")]
-	if sparse_copy_extents(src, dst)? {
-		return Ok(());
-	}
-	sparse_copy_by_scanning(src, dst)
-}
-
-/// Copy only filesystem-allocated extents. This keeps cloning a large sparse
-/// remote-rootfs overlay proportional to its dirtied data rather than its
-/// logical disk size.
-#[cfg(target_os = "linux")]
-fn sparse_copy_extents(src: &File, dst: &File) -> io::Result<bool> {
-	const BLOCK: usize = 1024 * 1024;
-	let logical_len = src.metadata()?.len();
-	let mut offset = 0u64;
-	let mut copied_extent = false;
-	let mut buf = vec![0u8; BLOCK];
-	while offset < logical_len {
-		let data = match seek_extent(src, offset, libc::SEEK_DATA) {
-			Ok(Some(data)) => data,
-			Ok(None) => break,
-			Err(e) if !copied_extent && extent_seeking_unsupported(&e) => return Ok(false),
-			Err(e) => return Err(e),
-		};
-		let hole = seek_extent(src, data, libc::SEEK_HOLE)?
-			.unwrap_or(logical_len)
-			.min(logical_len);
-		let mut at = data;
-		while at < hole {
-			let count = usize::try_from((hole - at).min(BLOCK as u64))
-				.map_err(|_| io::Error::other("sparse extent length exceeds usize"))?;
-			let mut filled = 0usize;
-			while filled < count {
-				let read = src.read_at(&mut buf[filled..count], at + filled as u64)?;
-				if read == 0 {
-					return Err(io::Error::new(
-						io::ErrorKind::UnexpectedEof,
-						"sparse extent ended before SEEK_HOLE",
-					));
-				}
-				filled += read;
-			}
-			dst.write_all_at(&buf[..count], at)?;
-			at += count as u64;
-		}
-		copied_extent = true;
-		offset = hole;
-	}
-	dst.set_len(logical_len)?;
-	Ok(true)
-}
-
-#[cfg(target_os = "linux")]
-fn seek_extent(file: &File, offset: u64, whence: libc::c_int) -> io::Result<Option<u64>> {
-	let offset = libc::off_t::try_from(offset)
-		.map_err(|_| io::Error::other("sparse extent offset exceeds off_t"))?;
-	// SAFETY: `file` owns a valid descriptor and lseek does not dereference memory.
-	let result = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
-	if result >= 0 {
-		return Ok(Some(result as u64));
-	}
-	let error = io::Error::last_os_error();
-	if error.raw_os_error() == Some(libc::ENXIO) {
-		Ok(None)
-	} else {
-		Err(error)
-	}
-}
-
-#[cfg(target_os = "linux")]
-fn extent_seeking_unsupported(error: &io::Error) -> bool {
-	matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP))
-}
-#[cfg(not(target_os = "windows"))]
-fn sparse_copy_by_scanning(src: &mut File, dst: &File) -> io::Result<()> {
-	use std::io::Read;
-	const BLOCK: usize = 64 * 1024;
-	src.seek(SeekFrom::Start(0))?;
-	dst.set_len(0)?;
-	let mut buf = vec![0u8; BLOCK];
-	let mut offset = 0u64;
-	loop {
-		let mut filled = 0usize;
-		while filled < BLOCK {
-			let n = src.read(&mut buf[filled..])?;
-			if n == 0 {
-				break;
-			}
-			filled += n;
-		}
-		if filled == 0 {
-			break;
-		}
-		if !crate::memory::is_zero(&buf[..filled]) {
-			dst.write_all_at(&buf[..filled], offset)?;
-		}
-		offset += filled as u64;
-		if filled < BLOCK {
-			break;
-		}
-	}
-	dst.set_len(offset)?;
-	Ok(())
 }
 
 /// Clone the already-open active backing file into a new recovery artifact.
@@ -334,7 +237,7 @@ fn clone_open_disk(source: &File, destination: &Path) -> Result<DiskCapture> {
 		.len();
 
 	#[cfg(target_os = "linux")]
-	if linux::try_reflink(source, &destination).is_none() {
+	if try_reflink(source, &destination).is_none() {
 		destination
 			.sync_all()
 			.map_err(|e| err(format!("syncing reflinked disk recovery image: {e}")))?;
@@ -401,12 +304,14 @@ const DEVICE_ID_LEN: usize = 20;
 /// One in-flight `io_uring` request, parked until its completion is reaped.
 ///
 /// `iovecs` hold raw host pointers into guest memory and back the `readv`/
-/// `writev` submitted for this request; the kernel dereferences them after we
-/// return from `process_queue_notify`, so the `Vec` must live here (its heap
-/// buffer address is stable across the moves into the table) until the matching
-/// completion arrives. `guest_ranges` mirrors the IN-request iovecs as GPA
-/// ranges (empty for OUT) so the reaper can mark the kernel's raw-pointer
-/// writes in the dirty bitmap (migration-delta contract).
+/// `writev` SQEs submitted for this request; the kernel dereferences them after
+/// we return from `process_queue_notify`, so the `Vec` must live here (its heap
+/// buffer address is stable across the moves into the table) until the last
+/// completion arrives. A read that spans overlay and base clusters is split
+/// into one SQE per layer run (`ops_left` > 1), each over a contiguous slice of
+/// `iovecs`. `guest_ranges` mirrors the IN-request iovecs as GPA ranges (empty
+/// for OUT) so the reaper can mark the kernel's raw-pointer writes in the dirty
+/// bitmap (migration-delta contract).
 #[cfg(target_os = "linux")]
 struct PendingReq {
 	head:         u16,
@@ -415,6 +320,43 @@ struct PendingReq {
 	req_type:     u32,
 	iovecs:       Vec<libc::iovec>,
 	guest_ranges: Vec<(GuestAddress, u32)>,
+	/// SQEs of this request still in flight.
+	ops_left:     usize,
+	/// Whether the request was split into several SQEs.
+	split:        bool,
+	/// Bytes transferred by the completed SQEs.
+	done:         u64,
+	/// Some SQE failed.
+	failed:       bool,
+	/// Overlay byte range to record in the allocation bitmap once the write
+	/// completes.
+	mark:         Option<(u64, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl PendingReq {
+	/// Folds one completion in; `true` once every SQE has completed.
+	const fn complete_op(&mut self, res: i32) -> bool {
+		if res < 0 {
+			self.failed = true;
+		} else {
+			self.done += res as u64;
+		}
+		self.ops_left -= 1;
+		self.ops_left == 0
+	}
+
+	/// Guest bytes the kernel wrote for an IN request: the reported prefix
+	/// for a single SQE, every range once any byte of a split read arrived.
+	const fn dma_written(&self) -> usize {
+		if self.req_type != VIRTIO_BLK_T_IN || self.done == 0 {
+			0
+		} else if self.split {
+			self.data_len as usize
+		} else {
+			self.done as usize
+		}
+	}
 }
 
 // SAFETY: each `iov_base` points into the device's guest-memory mapping, which
@@ -460,10 +402,42 @@ enum Outcome {
 	Synchronous,
 }
 
+/// The local file backing of one queue pass, borrowed from [`Block`].
+pub(super) struct Backing<'a> {
+	/// Raw image, or the overlay file of `cow`.
+	disk:     &'a File,
+	/// Copy-on-write overlay layered over a raw base.
+	#[cfg(not(target_os = "windows"))]
+	cow:      Option<&'a mut Overlay>,
+	/// Guest flushes complete without a host fsync (see [`Block::new_overlay`]).
+	volatile: bool,
+}
+
+impl Backing<'_> {
+	/// Services a guest flush; `false` on host I/O failure.
+	fn flush(&mut self) -> bool {
+		if self.volatile {
+			return true;
+		}
+		#[cfg(not(target_os = "windows"))]
+		if let Some(cow) = self.cow.as_deref_mut() {
+			return cow.sync().is_ok();
+		}
+		self.disk.sync_all().is_ok()
+	}
+}
+
 pub struct Block {
 	disk:             File,
+	/// Copy-on-write overlay; `disk` is then a clone of its overlay file.
+	#[cfg(not(target_os = "windows"))]
+	cow:              Option<Overlay>,
+	/// Guest flushes skip the host fsync (VMM-private overlay).
+	volatile:         bool,
 	capacity_sectors: u64,
-	#[cfg(target_os = "linux")]
+	/// Lazy remote base under a private sparse overlay; requests are then
+	/// serviced synchronously on the device worker with positioned I/O.
+	#[cfg(not(target_os = "windows"))]
 	remote:           Option<RemoteBlockSource>,
 	read_only:        bool,
 	features:         u64,
@@ -492,13 +466,55 @@ pub struct Block {
 }
 
 impl Block {
+	/// Opens the disk image at `path` in place. An overlay image is opened
+	/// with its hard-linked base; guest flushes stay durable either way.
 	pub fn new(path: &Path, read_only: bool) -> Result<Self> {
+		#[cfg(not(target_os = "windows"))]
+		if crate::disk_overlay::is_overlay(path)
+			.map_err(|e| err(format!("opening disk {}: {e}", path.display())))?
+		{
+			let overlay = Overlay::open(path, read_only)
+				.map_err(|e| err(format!("opening overlay disk {}: {e}", path.display())))?;
+			return Self::from_overlay(overlay, read_only, false);
+		}
 		let disk = OpenOptions::new()
 			.read(true)
 			.write(!read_only)
 			.open(path)
 			.map_err(|e| err(format!("opening disk {}: {e}", path.display())))?;
 		Self::from_file(disk, read_only)
+	}
+
+	/// Creates `path` as a copy-on-write overlay of `base`
+	/// ([`crate::disk_overlay`]) and serves it.
+	///
+	/// The overlay is private to this VM run, so guest flushes complete
+	/// without a host fsync: the disk only has to outlive the VMM through a
+	/// pause/snapshot, which persists the allocation bitmap when the device
+	/// quiesces, and the node syncs paused disks itself.
+	#[cfg(not(target_os = "windows"))]
+	pub fn new_overlay(base: &Path, path: &Path) -> Result<Self> {
+		let overlay = Overlay::create(base, path).map_err(|e| {
+			err(format!("creating overlay {} of {}: {e}", path.display(), base.display()))
+		})?;
+		Self::from_overlay(overlay, false, true)
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	fn from_overlay(overlay: Overlay, read_only: bool, volatile: bool) -> Result<Self> {
+		let disk = overlay
+			.file()
+			.try_clone()
+			.map_err(|e| err(format!("cloning overlay descriptor: {e}")))?;
+		let len = overlay.disk_size();
+		#[cfg(target_os = "linux")]
+		let mut block =
+			Self::from_file_with_capacity(disk, read_only, len, None, Self::create_linux_io()?);
+		#[cfg(not(target_os = "linux"))]
+		let mut block = Self::from_file_with_capacity(disk, read_only, len);
+		block.cow = Some(overlay);
+		block.volatile = volatile;
+		Ok(block)
 	}
 
 	pub fn from_file(disk: File, read_only: bool) -> Result<Self> {
@@ -514,7 +530,7 @@ impl Block {
 
 	/// Builds a lazy immutable remote base plus private overlay so guest writes
 	/// never mutate either the shared object or its persistent chunk cache.
-	#[cfg(target_os = "linux")]
+	#[cfg(not(target_os = "windows"))]
 	pub fn new_remote(
 		url: String,
 		cache_path: &Path,
@@ -557,12 +573,22 @@ impl Block {
 			.overlay()
 			.try_clone()
 			.map_err(|e| err(format!("cloning remote block overlay descriptor: {e}")))?;
-		let io = Self::create_linux_io()?;
-		Ok(Self::from_file_with_capacity(disk, false, len, Some(source), io))
+		#[cfg(target_os = "linux")]
+		{
+			let io = Self::create_linux_io()?;
+			Ok(Self::from_file_with_capacity(disk, false, len, Some(source), io))
+		}
+		#[cfg(target_os = "macos")]
+		{
+			let mut block = Self::from_file_with_capacity(disk, false, len);
+			block.remote = Some(source);
+			Ok(block)
+		}
 	}
 
-	/// Rejects remote block construction on hosts without the Linux data path.
-	#[cfg(not(target_os = "linux"))]
+	/// Rejects remote block construction on hosts without a positioned-I/O
+	/// remote data path.
+	#[cfg(target_os = "windows")]
 	pub fn new_remote(
 		_url: String,
 		_cache_path: &Path,
@@ -575,7 +601,7 @@ impl Block {
 		_etag: Option<String>,
 		_preopened_overlay: Option<File>,
 	) -> Result<Self> {
-		Err(err("remote rootfs requires Linux"))
+		Err(err("remote rootfs requires Linux or macOS"))
 	}
 
 	#[cfg(target_os = "linux")]
@@ -613,8 +639,13 @@ impl Block {
 		let (ring, io_uring_evt) = io;
 		Self {
 			disk,
+			#[cfg(not(target_os = "windows"))]
+			cow: None,
+			volatile: false,
 			#[cfg(target_os = "linux")]
 			remote,
+			#[cfg(target_os = "macos")]
+			remote: None,
 			capacity_sectors,
 			read_only,
 			features,
@@ -635,7 +666,7 @@ impl Block {
 		}
 	}
 
-	#[cfg(all(test, target_os = "linux"))]
+	#[cfg(all(test, not(target_os = "windows")))]
 	pub(crate) const fn is_remote_backed_for_test(&self) -> bool {
 		self.remote.is_some()
 	}
@@ -667,28 +698,33 @@ impl Block {
 		};
 		let ring = &mut self.ring;
 		let pending = &mut self.pending;
+		let cow = &mut self.cow;
 
 		let mut completed = false;
 		for cqe in ring.completion() {
 			let token = cqe.user_data();
-			let Some(req) = pending.get(&token) else {
+			let Some(req) = pending.get_mut(&token) else {
 				continue;
 			};
-			let head = req.head;
-			let status_addr = req.status_addr;
-			let data_len = req.data_len;
-			let req_type = req.req_type;
-			let res = cqe.result();
-			// A read completion means the kernel wrote guest RAM through the raw
-			// iovec pointers, invisibly to vm-memory's bitmap; mark exactly the
-			// bytes it reported written (migration-delta contract).
-			if req_type == VIRTIO_BLK_T_IN && res > 0 {
-				mark_guest_ranges_dirty(&mem, &req.guest_ranges, res as usize);
+			if !req.complete_op(cqe.result()) {
+				continue;
 			}
+			let Some(req) = pending.remove(&token) else {
+				continue;
+			};
+			let (head, status_addr, data_len, req_type) =
+				(req.head, req.status_addr, req.data_len, req.req_type);
+			// A read completion means the kernel wrote guest RAM through the raw
+			// iovec pointers, invisibly to vm-memory's bitmap; mark the bytes it
+			// reported written (migration-delta contract).
+			mark_guest_ranges_dirty(&mem, &req.guest_ranges, req.dma_written());
 			// io_uring data ops must transfer the full request length; a short
 			// count means partial/stale guest data -> IOERR (the old synchronous
 			// path used read_exact_at / write_all_at).
-			let ok = res >= 0 && (res as u32) >= data_len;
+			let ok = !req.failed && req.done >= u64::from(data_len);
+			if ok && let (Some(cow), Some((offset, len))) = (cow.as_mut(), req.mark) {
+				cow.mark_written(offset, len);
+			}
 			let status = if ok {
 				VIRTIO_BLK_S_OK
 			} else {
@@ -705,7 +741,6 @@ impl Block {
 			queue.add_used(&mem, head, data_written + 1).map_err(|e| {
 				err(format!("vmm: virtio-blk {context} failed adding used descriptor: {e}"))
 			})?;
-			pending.remove(&token);
 			completed = true;
 		}
 		if completed {
@@ -723,15 +758,26 @@ impl Block {
 	fn discard_completed(&mut self) {
 		let mem = self.mem.clone();
 		for cqe in self.ring.completion() {
-			let Some(req) = self.pending.remove(&cqe.user_data()) else {
+			let token = cqe.user_data();
+			let Some(req) = self.pending.get_mut(&token) else {
 				continue;
 			};
-			let res = cqe.result();
-			if req.req_type == VIRTIO_BLK_T_IN
-				&& res > 0
-				&& let Some(mem) = &mem
+			if !req.complete_op(cqe.result()) {
+				continue;
+			}
+			let Some(req) = self.pending.remove(&token) else {
+				continue;
+			};
+			if let Some(mem) = &mem {
+				mark_guest_ranges_dirty(mem, &req.guest_ranges, req.dma_written());
+			}
+			// A write that fully landed may be recorded; one that did not
+			// leaves its clusters on the base, as if it never happened.
+			if !req.failed
+				&& req.done >= u64::from(req.data_len)
+				&& let (Some(cow), Some((offset, len))) = (self.cow.as_mut(), req.mark)
 			{
-				mark_guest_ranges_dirty(mem, &req.guest_ranges, res as usize);
+				cow.mark_written(offset, len);
 			}
 		}
 	}
@@ -840,7 +886,12 @@ impl VirtioDevice for Block {
 		let Some(queue) = self.queue.as_mut() else {
 			return Ok(QueuePass::Drained);
 		};
-		let disk = &self.disk;
+		let mut backing = Backing {
+			disk: &self.disk,
+			#[cfg(not(target_os = "windows"))]
+			cow: self.cow.as_mut(),
+			volatile: self.volatile,
+		};
 		let capacity = self.capacity_sectors;
 		let read_only = self.read_only;
 		// Bound one pass: inline completions recycle descriptors, so a spinning
@@ -866,7 +917,8 @@ impl VirtioDevice for Block {
 					interrupt.signal_used_queue()?;
 				}
 			} else {
-				// Disjoint field borrows: backend/config fields vs. queue/ring/pending.
+				// Disjoint field borrows: backend/config fields vs.
+				// queue/ring/pending.
 				let ring = &mut self.ring;
 				let pending = &mut self.pending;
 				let next_token = &mut self.next_token;
@@ -879,7 +931,15 @@ impl VirtioDevice for Block {
 					};
 					budget -= 1;
 					match linux::process_chain(
-						disk, capacity, read_only, &mem, queue, ring, pending, next_token, chain,
+						&mut backing,
+						capacity,
+						read_only,
+						&mem,
+						queue,
+						ring,
+						pending,
+						next_token,
+						chain,
 					)? {
 						Outcome::Submitted => any_submitted = true,
 						Outcome::Synchronous => sync_used = true,
@@ -891,8 +951,9 @@ impl VirtioDevice for Block {
 						.submit()
 						.map_err(|e| err(format!("virtio-blk submit failed: {e}")))?;
 				}
-				// Inline completions (errors, flush, get-id, unsupported) need their own
-				// IRQ; asynchronous ones are signalled from `process_worker_source`.
+				// Inline completions (errors, flush, get-id, unsupported) need
+				// their own IRQ; asynchronous ones are signalled from
+				// `process_worker_source`.
 				if sync_used {
 					interrupt.signal_used_queue()?;
 				}
@@ -907,7 +968,16 @@ impl VirtioDevice for Block {
 					break;
 				};
 				budget -= 1;
-				match sync_io::process_chain(disk, capacity, read_only, &mem, queue, chain)? {
+				#[cfg(target_os = "macos")]
+				let outcome = match self.remote.as_mut() {
+					Some(remote) => sync_io::process_remote_chain(remote, capacity, &mem, queue, chain)?,
+					None => {
+						sync_io::process_chain(&mut backing, capacity, read_only, &mem, queue, chain)?
+					},
+				};
+				#[cfg(target_os = "windows")]
+				let outcome = sync_io::process_chain(&mut backing, capacity, read_only, &mem, queue, chain)?;
+				match outcome {
 					Outcome::Synchronous => sync_used = true,
 				}
 			}
@@ -949,6 +1019,13 @@ impl VirtioDevice for Block {
 				self.reap("snapshot drain")?;
 			}
 		}
+		// Whoever reads the overlay next (pause, snapshot-as-template clone,
+		// a restore) needs the allocation bitmap in the file.
+		#[cfg(not(target_os = "windows"))]
+		if let Some(cow) = self.cow.as_mut() {
+			cow.persist()
+				.map_err(|e| err(format!("persisting overlay allocation bitmap: {e}")))?;
+		}
 		Ok(())
 	}
 
@@ -957,17 +1034,31 @@ impl VirtioDevice for Block {
 		// Repeat the drain here so this primitive remains safe if it is used by
 		// a future control path that has acquired the device lock directly.
 		self.drain()?;
-		#[cfg(target_os = "linux")]
-		if let Some(remote) = &self.remote {
-			remote
-				.sync_all()
-				.map_err(|e| err(format!("syncing remote virtio-block disk: {e}")))?;
-		} else {
-			self.disk.sync_all().map_err(|e| {
-				err(format!("syncing active virtio-block disk before recovery capture: {e}"))
-			})?;
+		#[cfg(not(target_os = "windows"))]
+		if let Some(cow) = &self.cow {
+			// A recovery point is a standalone raw image: the base clone plus
+			// every overlay cluster.
+			let reflinked = cow
+				.materialize(destination)
+				.map_err(|e| err(format!("materializing overlay disk recovery image: {e}")))?;
+			return Ok(DiskCapture {
+				bytes:  self.capacity_sectors * SECTOR_SIZE,
+				method: if reflinked {
+					DiskCaptureMethod::Reflink
+				} else {
+					DiskCaptureMethod::SparseCopy
+				},
+			});
 		}
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(not(target_os = "windows"))]
+		if let Some(remote) = self.remote.as_mut() {
+			// The overlay file alone is sparse by design: the recovery image is
+			// the guest-visible disk, so untouched remote chunks are fetched.
+			let bytes = remote
+				.materialize(destination)
+				.map_err(|e| err(format!("materializing remote disk recovery image: {e}")))?;
+			return Ok(DiskCapture { bytes, method: DiskCaptureMethod::SparseCopy });
+		}
 		self.disk.sync_all().map_err(|e| {
 			err(format!("syncing active virtio-block disk before recovery capture: {e}"))
 		})?;
@@ -1038,25 +1129,121 @@ const fn io_status(ok: bool) -> u32 {
 		VIRTIO_BLK_S_IOERR
 	}
 }
+
 #[cfg(target_os = "linux")]
 pub(super) mod linux {
+	use std::os::fd::RawFd;
+
 	use io_uring::{opcode, types};
 
 	use super::*;
-	use crate::os::libc_abi::IoctlRequest;
+	use crate::disk_overlay::Run;
 
-	/// `FICLONE` ioctl: `_IOW(0x94, 9, int)`. Reflinks one file's extents into
-	/// another (instant copy-on-write on btrfs/XFS).
-	const FICLONE: IoctlRequest = 0x4004_9409;
+	/// Most SQEs one fragmented overlay read is split into; reads spanning
+	/// more layer runs are served synchronously through a bounce buffer.
+	const MAX_SPLIT_OPS: usize = 32;
 
-	pub(super) fn try_reflink(src: &File, dst: &File) -> Option<io::Error> {
-		// SAFETY: both fds are valid open files; FICLONE clones src's extents into dst.
-		let ret = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) };
-		if ret == 0 {
-			None
-		} else {
-			Some(io::Error::last_os_error())
+	/// One SQE: `count` iovecs from index `start`, at `offset` of file `fd`.
+	struct Op {
+		fd:     RawFd,
+		offset: u64,
+		start:  usize,
+		count:  usize,
+	}
+
+	impl Op {
+		/// The whole request (`count` iovecs) as one SQE.
+		const fn all(fd: RawFd, offset: u64, count: usize) -> Self {
+			Self { fd, offset, start: 0, count }
 		}
+	}
+
+	/// SQE plan of one request (no allocation for the unsplit case).
+	enum Ops {
+		One(Op),
+		Many(Vec<Op>),
+	}
+
+	/// Free submission-queue slots.
+	fn sq_room(ring: &mut IoUring) -> usize {
+		let sq = ring.submission();
+		sq.capacity() - sq.len()
+	}
+
+	/// Re-slices `iovecs` at layer-run boundaries: returns the new iovec list
+	/// and one [`Op`] per run, each over a contiguous range of it.
+	fn split_iovecs(
+		iovecs: &[libc::iovec],
+		runs: impl Iterator<Item = Run>,
+		layer_fd: impl Fn(Run) -> RawFd,
+	) -> (Vec<libc::iovec>, Vec<Op>) {
+		let mut out = Vec::with_capacity(iovecs.len() + 4);
+		let mut ops = Vec::new();
+		let (mut index, mut within) = (0usize, 0usize);
+		for run in runs {
+			let start = out.len();
+			let mut need = run.len as usize;
+			while need > 0 {
+				let iov = iovecs[index];
+				let take = (iov.iov_len - within).min(need);
+				out.push(libc::iovec {
+					iov_base: iov.iov_base.cast::<u8>().wrapping_add(within).cast(),
+					iov_len:  take,
+				});
+				need -= take;
+				within += take;
+				if within == iov.iov_len {
+					index += 1;
+					within = 0;
+				}
+			}
+			ops.push(Op { fd: layer_fd(run), offset: run.offset, start, count: out.len() - start });
+		}
+		(out, ops)
+	}
+
+	/// Synchronous overlay write for requests that need a cluster copy-up.
+	fn copy_up_write(
+		cow: &mut Overlay,
+		mem: &GuestMemoryMmap,
+		data_descs: &[virtio_queue::desc::split::Descriptor],
+		offset: u64,
+		total_len: u32,
+	) -> bool {
+		let mut buf = vec![0u8; total_len as usize];
+		let mut pos = 0usize;
+		for d in data_descs {
+			let n = d.len() as usize;
+			if mem.read_slice(&mut buf[pos..pos + n], d.addr()).is_err() {
+				return false;
+			}
+			pos += n;
+		}
+		cow.write_at(&buf, offset).is_ok()
+	}
+
+	/// Synchronous overlay read through a bounce buffer (very fragmented
+	/// requests); `write_slice` records the guest-memory writes as dirty.
+	fn bounce_read(
+		cow: &Overlay,
+		mem: &GuestMemoryMmap,
+		data_descs: &[virtio_queue::desc::split::Descriptor],
+		offset: u64,
+		total_len: u32,
+	) -> bool {
+		let mut buf = vec![0u8; total_len as usize];
+		if cow.read_at(&mut buf, offset).is_err() {
+			return false;
+		}
+		let mut pos = 0usize;
+		for d in data_descs {
+			let n = d.len() as usize;
+			if mem.write_slice(&buf[pos..pos + n], d.addr()).is_err() {
+				return false;
+			}
+			pos += n;
+		}
+		true
 	}
 
 	fn next_unused_token(pending: &HashMap<u64, PendingReq>, next_token: &mut u64) -> Result<u64> {
@@ -1079,12 +1266,16 @@ pub(super) mod linux {
 	/// memory) and reaped later; every other result (errors, flush, get-id,
 	/// unsupported, malformed) is finished inline with its used-ring entry added
 	/// here. The returned [`Outcome`] tells the caller which path was taken.
+	///
+	/// On an overlay, writes go to the overlay file (sub-cluster writes into
+	/// clusters still on the base are copied up inline) and reads are split
+	/// into one SQE per overlay/base run.
 	#[allow(
 		clippy::too_many_arguments,
 		reason = "virtio-blk request submission touches split device state"
 	)]
 	pub(super) fn process_chain(
-		disk: &File,
+		backing: &mut Backing<'_>,
 		capacity_sectors: u64,
 		read_only: bool,
 		mem: &GuestMemoryMmap,
@@ -1140,10 +1331,11 @@ pub(super) mod linux {
 					return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 				}
 
-				// Build iovecs pointing straight at guest-memory host addresses — no
-				// bounce buffer, no copy. For reads, keep the matching GPA ranges:
-				// the kernel's completion writes bypass vm-memory's dirty tracking,
-				// so the reaper must mark them itself (migration-delta contract).
+				// Build iovecs pointing straight at guest-memory host addresses —
+				// no bounce buffer, no copy. For reads, keep the matching GPA
+				// ranges: the kernel's completion writes bypass vm-memory's
+				// dirty tracking, so the reaper must mark them itself
+				// (migration-delta contract).
 				let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(data_descs.len());
 				let mut guest_ranges: Vec<(GuestAddress, u32)> =
 					Vec::with_capacity(if is_read { data_descs.len() } else { 0 });
@@ -1175,6 +1367,52 @@ pub(super) mod linux {
 				}
 
 				let file_offset = sector * SECTOR_SIZE;
+				let len = u64::from(total_len);
+				let disk_fd = backing.disk.as_raw_fd();
+				let mut mark = None;
+				let count = iovecs.len();
+				let (iovecs, ops) = match backing.cow.as_deref_mut() {
+					None => (iovecs, Ops::One(Op::all(disk_fd, file_offset, count))),
+					Some(cow) if !is_read => {
+						if cow.needs_copy_up(file_offset, len) {
+							let ok = copy_up_write(cow, mem, data_descs, file_offset, total_len);
+							return complete_sync(queue, mem, head, status_addr, io_status(ok), 0);
+						}
+						mark = Some((file_offset, len));
+						(iovecs, Ops::One(Op::all(disk_fd, file_offset, count)))
+					},
+					Some(cow) => {
+						let base_fd = cow.base().as_raw_fd();
+						let layer_fd = |run: Run| if run.overlay { disk_fd } else { base_fd };
+						let runs = cow.runs(file_offset, len).count();
+						if runs == 1 {
+							let run = cow.runs(file_offset, len).next().expect("one run");
+							(iovecs, Ops::One(Op::all(layer_fd(run), file_offset, count)))
+						} else if runs > MAX_SPLIT_OPS {
+							let ok = bounce_read(cow, mem, data_descs, file_offset, total_len);
+							let written = if ok { total_len } else { 0 };
+							return complete_sync(queue, mem, head, status_addr, io_status(ok), written);
+						} else {
+							let (split, ops) = split_iovecs(&iovecs, cow.runs(file_offset, len), layer_fd);
+							(split, Ops::Many(ops))
+						}
+					},
+				};
+				let ops = match &ops {
+					Ops::One(op) => std::slice::from_ref(op),
+					Ops::Many(ops) => ops.as_slice(),
+				};
+
+				// Make room for every SQE of the request up front so it is never
+				// half-submitted.
+				if sq_room(ring) < ops.len() {
+					ring
+						.submit()
+						.map_err(|e| err(format!("virtio-blk submit failed: {e}")))?;
+					if sq_room(ring) < ops.len() {
+						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
+					}
+				}
 				let token = next_unused_token(pending, next_token)?;
 				pending.insert(token, PendingReq {
 					head,
@@ -1183,62 +1421,53 @@ pub(super) mod linux {
 					req_type,
 					iovecs,
 					guest_ranges,
+					ops_left: ops.len(),
+					split: ops.len() > 1,
+					done: 0,
+					failed: false,
+					mark,
 				});
 
 				// Read the now-stable iovec backing back out of the table to build
-				// the SQE (moving the `Vec` into the map did not move its heap data).
-				let (iov_ptr, iov_len, single) = {
-					let req = pending.get(&token).expect("pending entry just inserted");
-					let single = if req.iovecs.len() == 1 {
-						Some((req.iovecs[0].iov_base, req.iovecs[0].iov_len))
+				// the SQEs (moving the `Vec` into the map did not move its heap
+				// data).
+				let req = pending.get(&token).expect("pending entry just inserted");
+				for op in ops {
+					let fd = types::Fd(op.fd);
+					let entry = if op.count == 1 {
+						let iov = req.iovecs[op.start];
+						if is_read {
+							opcode::Read::new(fd, iov.iov_base.cast::<u8>(), iov.iov_len as u32)
+								.offset(op.offset)
+								.build()
+						} else {
+							opcode::Write::new(
+								fd,
+								iov.iov_base.cast_const().cast::<u8>(),
+								iov.iov_len as u32,
+							)
+							.offset(op.offset)
+							.build()
+						}
 					} else {
-						None
-					};
-					(req.iovecs.as_ptr(), req.iovecs.len() as u32, single)
-				};
-				let fd = types::Fd(disk.as_raw_fd());
-				let entry = match (is_read, single) {
-					(true, Some((base, len))) => opcode::Read::new(fd, base as *mut u8, len as u32)
-						.offset(file_offset)
-						.build()
-						.user_data(token),
-					(false, Some((base, len))) => opcode::Write::new(fd, base as *const u8, len as u32)
-						.offset(file_offset)
-						.build()
-						.user_data(token),
-					(true, None) => opcode::Readv::new(fd, iov_ptr, iov_len)
-						.offset(file_offset)
-						.build()
-						.user_data(token),
-					(false, None) => opcode::Writev::new(fd, iov_ptr, iov_len)
-						.offset(file_offset)
-						.build()
-						.user_data(token),
-				};
-
-				// SAFETY: the entry's buffers (iovecs / single host pointer) live in
-				// `pending[token]` and reference guest memory held for the VM's life,
-				// so they stay valid until the completion removes the entry.
-				let mut pushed = unsafe { ring.submission().push(&entry) }.is_ok();
-				if !pushed {
-					// Ring full: flush what we have to free slots, then retry once.
-					ring
-						.submit()
-						.map_err(|e| err(format!("virtio-blk retry submit failed: {e}")))?;
-					// SAFETY: identical to the first push: `entry` references request
-					// buffers kept alive in `pending[token]`, and `submit()` above only
-					// makes room in the SQ without invalidating them.
-					pushed = unsafe { ring.submission().push(&entry) }.is_ok();
-				}
-				if !pushed {
-					if let Some(req) = pending.remove(&token) {
-						mem.write_slice(&[VIRTIO_BLK_S_IOERR as u8], req.status_addr)
-							.map_err(|e| err(format!("virtio-blk status write failed: {e}")))?;
-						queue
-							.add_used(mem, req.head, 1)
-							.map_err(|e| err(format!("virtio-blk used-ring update failed: {e}")))?;
+						let iov = req.iovecs[op.start..].as_ptr();
+						if is_read {
+							opcode::Readv::new(fd, iov, op.count as u32)
+								.offset(op.offset)
+								.build()
+						} else {
+							opcode::Writev::new(fd, iov, op.count as u32)
+								.offset(op.offset)
+								.build()
+						}
 					}
-					return Ok(Outcome::Synchronous);
+					.user_data(token);
+					// SAFETY: the entry's buffers (iovecs / single host pointer)
+					// live in `pending[token]` and reference guest memory held
+					// for the VM's life, so they stay valid until the last
+					// completion removes the entry.
+					unsafe { ring.submission().push(&entry) }
+						.map_err(|_| err("virtio-blk submission queue full after making room"))?;
 				}
 				Ok(Outcome::Submitted)
 			},
@@ -1246,7 +1475,7 @@ pub(super) mod linux {
 				if !data_descs.is_empty() {
 					return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 				}
-				let status = io_status(disk.sync_all().is_ok());
+				let status = io_status(backing.flush());
 				complete_sync(queue, mem, head, status_addr, status, 0)
 			},
 			VIRTIO_BLK_T_GET_ID => {
@@ -1296,24 +1525,29 @@ pub(super) mod sync_io {
 	}
 
 	#[cfg(not(target_os = "linux"))]
-	struct LocalBackend<'a>(&'a File);
-
-	#[cfg(not(target_os = "linux"))]
-	impl Backend for LocalBackend<'_> {
+	impl Backend for Backing<'_> {
 		fn read(&mut self, dst: &mut [u8], offset: u64) -> bool {
-			read_exact_at(self.0, dst, offset).is_ok()
+			#[cfg(not(target_os = "windows"))]
+			if let Some(cow) = self.cow.as_deref() {
+				return cow.read_at(dst, offset).is_ok();
+			}
+			read_exact_at(self.disk, dst, offset).is_ok()
 		}
 
 		fn write(&mut self, src: &[u8], offset: u64) -> bool {
-			write_all_at(self.0, src, offset).is_ok()
+			#[cfg(not(target_os = "windows"))]
+			if let Some(cow) = self.cow.as_deref_mut() {
+				return cow.write_at(src, offset).is_ok();
+			}
+			write_all_at(self.disk, src, offset).is_ok()
 		}
 
 		fn sync(&mut self) -> bool {
-			self.0.sync_all().is_ok()
+			self.flush()
 		}
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(not(target_os = "windows"))]
 	impl Backend for RemoteBlockSource {
 		fn read(&mut self, dst: &mut [u8], offset: u64) -> bool {
 			self.read_exact_at(dst, offset).is_ok()
@@ -1331,17 +1565,17 @@ pub(super) mod sync_io {
 	/// Process one local-file virtio-blk request chain.
 	#[cfg(not(target_os = "linux"))]
 	pub(super) fn process_chain(
-		disk: &File,
+		backing: &mut Backing<'_>,
 		capacity_sectors: u64,
 		read_only: bool,
 		mem: &GuestMemoryMmap,
 		queue: &mut Queue,
 		chain: DescriptorChain<&GuestMemoryMmap>,
 	) -> Result<Outcome> {
-		process_chain_backend(&mut LocalBackend(disk), capacity_sectors, read_only, mem, queue, chain)
+		process_chain_backend(backing, capacity_sectors, read_only, mem, queue, chain)
 	}
 
-	#[cfg(target_os = "linux")]
+	#[cfg(not(target_os = "windows"))]
 	pub(super) fn process_remote_chain(
 		remote: &mut RemoteBlockSource,
 		capacity_sectors: u64,
@@ -1417,13 +1651,15 @@ pub(super) mod sync_io {
 						return complete_sync(queue, mem, head, status_addr, VIRTIO_BLK_S_IOERR, 0);
 					};
 					let ok = if is_read {
-						// SAFETY: descriptor validation above proved this guest-memory range exists
-						// and is writable by the device for a read request.
+						// SAFETY: descriptor validation above proved this
+						// guest-memory range exists and is writable by the
+						// device for a read request.
 						let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
 						backend.read(dst, file_offset)
 					} else {
-						// SAFETY: descriptor validation above proved this guest-memory range exists
-						// and is readable by the device for a write request.
+						// SAFETY: descriptor validation above proved this
+						// guest-memory range exists and is readable by the
+						// device for a write request.
 						let src = unsafe { std::slice::from_raw_parts(ptr, len) };
 						backend.write(src, file_offset)
 					};
@@ -1661,48 +1897,51 @@ mod tests {
 		assert_eq!(std::fs::read(&base).expect("read base"), b"base");
 	}
 
-	#[cfg(target_os = "linux")]
+	/// The APFS fast path must clone (not copy) a large sparse base and give
+	/// the caller an fd whose writes never reach the base.
+	#[cfg(target_os = "macos")]
 	#[test]
-	fn sparse_extent_copy_preserves_large_logical_holes_and_data() {
+	fn create_cow_overlay_clones_on_apfs_and_isolates_writes() {
+		use std::os::unix::fs::FileExt;
 		let tmp = TestDir::new();
-		let base_path = tmp.path().join("sparse-base.img");
-		let dest_path = tmp.path().join("sparse-overlay.img");
-		let base = OpenOptions::new()
-			.read(true)
-			.write(true)
-			.create_new(true)
-			.open(&base_path)
-			.expect("create sparse base");
-		let logical_len = 8u64 << 30;
-		base.set_len(logical_len).expect("size sparse base");
-		base
-			.write_all_at(b"front", 4096)
-			.expect("write front extent");
-		base
-			.write_all_at(b"back", logical_len - 4096)
-			.expect("write back extent");
-		let dest = OpenOptions::new()
-			.read(true)
-			.write(true)
-			.create_new(true)
-			.open(&dest_path)
-			.expect("create sparse destination");
+		let base_path = tmp.path().join("base.img");
+		let dest_path = tmp.path().join("overlay.img");
+		let logical_len = 4u64 << 30;
+		{
+			let base = File::create(&base_path).expect("create base");
+			base.set_len(logical_len).expect("size base");
+			base.write_all_at(b"front", 0).expect("write front");
+			base
+				.write_all_at(b"back", logical_len - 4)
+				.expect("write back");
+		}
+		let base = File::open(&base_path).expect("open base");
+		let base_meta = base.metadata().expect("stat base");
+		let overlay = match macos::clone_into_new(&base, &base_meta, &dest_path).expect("clone") {
+			macos::CloneOutcome::Cloned(file) => file,
+			macos::CloneOutcome::Unsupported(error) => panic!("temp dir must be on APFS: {error}"),
+		};
+		overlay.write_all_at(b"FRONT", 0).expect("write overlay");
+		let mut head = [0u8; 5];
+		base.read_exact_at(&mut head, 0).expect("read base");
+		assert_eq!(&head, b"front", "overlay writes leaked into the base");
+		let mut tail = [0u8; 4];
+		overlay
+			.read_exact_at(&mut tail, logical_len - 4)
+			.expect("read overlay tail");
+		assert_eq!(&tail, b"back");
+		assert_eq!(overlay.metadata().expect("stat overlay").len(), logical_len);
 
-		assert!(
-			sparse_copy_extents(&base, &dest).expect("copy sparse extents"),
-			"test filesystem must support SEEK_DATA/SEEK_HOLE"
-		);
-		assert_eq!(dest.metadata().expect("stat destination").len(), logical_len);
-		let mut front = [0u8; 5];
-		let mut back = [0u8; 4];
-		dest
-			.read_exact_at(&mut front, 4096)
-			.expect("read front extent");
-		dest
-			.read_exact_at(&mut back, logical_len - 4096)
-			.expect("read back extent");
-		assert_eq!(&front, b"front");
-		assert_eq!(&back, b"back");
+		// A second clone onto the now-existing entry must refuse, not clobber.
+		let Err(error) = macos::clone_into_new(&base, &base_meta, &dest_path) else {
+			panic!("clone onto an existing entry must fail")
+		};
+		assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+		let mut still = [0u8; 5];
+		overlay
+			.read_exact_at(&mut still, 0)
+			.expect("reread overlay");
+		assert_eq!(&still, b"FRONT");
 	}
 
 	#[cfg(unix)]

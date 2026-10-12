@@ -8,6 +8,13 @@
 //! (DHCP lease, ARP/NAT tables) on the slirp thread. Host-side sockets are not
 //! carried across restore, so in-flight TCP connections reset; new permitted
 //! connections work after restore.
+//!
+//! Policy mode (`--user-net-policy`, see [`filter`]) instead runs every
+//! guest frame through a live-replaceable egress filter and lets it learn
+//! addresses from slirp-DNS answers. Without it the backend behaves exactly
+//! as above.
+
+pub mod filter;
 
 use std::{
 	cell::RefCell,
@@ -25,11 +32,16 @@ use flume::{Receiver, Sender, TryRecvError, TrySendError};
 use libslirp::{Context, Handler, PollEvents, state_version};
 use parking_lot::Mutex;
 
+use self::filter::Filter;
 use crate::{
 	os::{EFD_NONBLOCK, EventFd},
 	result::{Result, err},
 	tap::VNET_HDR_SIZE,
 };
+
+/// Egress filter shared by the TX path, the slirp thread, and the VMM
+/// control loop (`set_net_policy`).
+pub type SharedFilter = Arc<Mutex<Filter>>;
 
 const USER_NET: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 0);
 const USER_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
@@ -58,6 +70,7 @@ pub struct UserNet {
 	thread:            Option<JoinHandle<()>>,
 	allowed_host_port: Option<u16>,
 	restricted_egress: bool,
+	filter:            Option<SharedFilter>,
 }
 
 enum Command {
@@ -79,6 +92,7 @@ struct SlirpHandler {
 	packet_evt: EventFd,
 	loop_evt:   EventFd,
 	timers:     Vec<Option<SlirpTimer>>,
+	filter:     Option<SharedFilter>,
 }
 
 impl UserNet {
@@ -86,7 +100,17 @@ impl UserNet {
 	/// its serialized guest-visible libslirp state before the backend is exposed
 	/// to vCPUs.
 	pub fn new_with_state(mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
-		Self::new_with_restricted_egress(mac, false, None, state)
+		Self::new_with_restricted_egress(mac, false, None, None, state)
+	}
+
+	/// Start a user-mode NAT backend whose guest egress is governed by
+	/// `filter` (see [`filter`]).
+	pub fn new_filtered_with_state(
+		mac: [u8; 6],
+		filter: SharedFilter,
+		state: Option<Vec<u8>>,
+	) -> Result<Self> {
+		Self::new_with_restricted_egress(mac, false, None, Some(filter), state)
 	}
 
 	/// Start a user-mode backend that permits only DHCP and one TCP service on
@@ -99,17 +123,21 @@ impl UserNet {
 		if allowed_host_port == 0 {
 			return Err(err("restricted user-net host port must be nonzero"));
 		}
-		Self::new_with_restricted_egress(mac, true, Some(allowed_host_port), state)
+		Self::new_with_restricted_egress(mac, true, Some(allowed_host_port), None, state)
 	}
 
 	fn new_with_restricted_egress(
 		_mac: [u8; 6],
 		restricted_egress: bool,
 		allowed_host_port: Option<u16>,
+		filter: Option<SharedFilter>,
 		state: Option<Vec<u8>>,
 	) -> Result<Self> {
 		let (restricted_egress, allowed_host_port) =
 			restriction_for_state(restricted_egress, allowed_host_port, state.as_deref())?;
+		if restricted_egress && filter.is_some() {
+			return Err(err("a user-net policy cannot be combined with restricted user-net egress"));
+		}
 		let state = state
 			.map(|state| split_user_net_state(&state).map(|(_, _, slirp_state)| slirp_state.to_vec()))
 			.transpose()?;
@@ -130,6 +158,7 @@ impl UserNet {
 			.try_clone()
 			.map_err(|e| err(format!("cloning user-net packet eventfd: {e}")))?;
 		let thread_packets = packets.clone();
+		let thread_filter = filter.clone();
 		let (ready_tx, ready_rx) = flume::bounded(1);
 		let thread = thread::Builder::new()
 			.name("vmon-slirp".to_string())
@@ -141,6 +170,7 @@ impl UserNet {
 					handler_packet_evt,
 					thread_packets,
 					restricted_egress,
+					thread_filter,
 					state,
 					ready_tx,
 				);
@@ -158,6 +188,7 @@ impl UserNet {
 				packets,
 				allowed_host_port,
 				restricted_egress,
+				filter,
 				thread: Some(thread),
 			}),
 			Err(e) => {
@@ -168,10 +199,17 @@ impl UserNet {
 	}
 
 	/// Read one vnet-header-prefixed Ethernet frame produced by libslirp.
+	///
+	/// The wake token stays armed while frames remain queued, so the worker's
+	/// poll is level-triggered like a TAP fd: a bounded RX pass that stops
+	/// early is re-run instead of stranding the rest of the queue until
+	/// libslirp happens to emit another frame. The token is cleared only under
+	/// the queue lock after observing an empty queue; libslirp re-arms it
+	/// after every push, so a queued frame always has a pending wake.
 	pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-		let _ = self.packet_evt.read();
 		let mut packets = self.packets.lock();
 		let Some(packet) = packets.front() else {
+			let _ = self.packet_evt.read();
 			return Err(io::Error::from(io::ErrorKind::WouldBlock));
 		};
 		let len = VNET_HDR_SIZE + packet.len();
@@ -184,7 +222,35 @@ impl UserNet {
 		buf[..VNET_HDR_SIZE].fill(0);
 		buf[VNET_HDR_SIZE..len].copy_from_slice(packet);
 		packets.pop_front();
+		if packets.is_empty() {
+			let _ = self.packet_evt.read();
+		}
 		Ok(len)
+	}
+
+	/// Park RX while the guest has no receive buffers: queued frames are
+	/// kept (libslirp's TCP is not built for a lossy link; dropped segments
+	/// stall flows on its retransmission backoff) and the wake token is
+	/// cleared so the worker does not spin. The device resumes RX from the
+	/// guest's queue notification when it posts buffers again.
+	pub fn defer_rx(&self) {
+		let _ = self.packet_evt.read();
+	}
+
+	/// Queue a frame exactly as libslirp's `send_packet` does (push, then
+	/// wake), for device-level tests.
+	#[cfg(test)]
+	pub(in crate::virtio) fn push_test_frame(&self, frame: &[u8]) {
+		self.packets.lock().push_back(frame.to_vec());
+		self.packet_evt.write(1).expect("wake");
+	}
+
+	/// Whether the worker's wait source would currently fire.
+	#[cfg(test)]
+	pub(in crate::virtio) fn rx_wake_armed(&self) -> bool {
+		let mut fd = libc::pollfd { fd: self.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+		// SAFETY: `fd` is one valid pollfd and the timeout is zero.
+		unsafe { libc::poll(&raw mut fd, 1, 0) == 1 }
 	}
 
 	/// Send one vnet-header-prefixed Ethernet frame from the guest into
@@ -198,6 +264,11 @@ impl UserNet {
 		}
 		if self.restricted_egress
 			&& !allows_restricted_egress(&buf[VNET_HDR_SIZE..], self.allowed_host_port)
+		{
+			return Ok(buf.len());
+		}
+		if let Some(filter) = &self.filter
+			&& !filter.lock().admit(&buf[VNET_HDR_SIZE..], Instant::now())
 		{
 			return Ok(buf.len());
 		}
@@ -293,6 +364,9 @@ impl Handler for SlirpHandler {
 	}
 
 	fn send_packet(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if let Some(filter) = &self.filter {
+			filter.lock().observe(buf, Instant::now());
+		}
 		let mut packets = self.packets.lock();
 		if packets.len() >= MAX_PENDING_RX_FRAMES {
 			packets.pop_front();
@@ -386,6 +460,7 @@ fn run_slirp(
 	packet_evt: EventFd,
 	packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
 	restricted_egress: bool,
+	filter: Option<SharedFilter>,
 	state: Option<Vec<u8>>,
 	ready: Sender<Result<()>>,
 ) {
@@ -395,6 +470,7 @@ fn run_slirp(
 		packet_evt,
 		loop_evt: handler_loop_evt,
 		timers: Vec::new(),
+		filter,
 	}));
 	let context = Context::new(
 		restricted_egress,
@@ -752,6 +828,31 @@ mod tests {
 			&ipv4_frame(IPPROTO_TCP, [8, 8, 8, 8], 1, 443),
 			allowed_host_port
 		));
+	}
+
+	/// Regression: reading one frame used to clear the wake token even with
+	/// frames left, so a budget-limited RX pass stranded the rest of the
+	/// queue until libslirp happened to emit again (its retransmit timer:
+	/// multi-second TCP stalls under load).
+	#[test]
+	fn rx_wake_stays_armed_until_queue_is_drained() {
+		let net = UserNet::new_with_state([0x02, 0, 0, 0, 0, 1], None).expect("user net");
+		let mut buf = vec![0u8; 2048];
+		net.push_test_frame(b"one");
+		net.push_test_frame(b"two");
+		assert!(net.rx_wake_armed());
+		assert_eq!(net.read(&mut buf).expect("first"), VNET_HDR_SIZE + 3);
+		assert!(net.rx_wake_armed(), "a frame is still queued");
+		assert_eq!(&buf[VNET_HDR_SIZE..VNET_HDR_SIZE + 3], b"one");
+		assert_eq!(net.read(&mut buf).expect("second"), VNET_HDR_SIZE + 3);
+		assert!(!net.rx_wake_armed(), "drained queue must not keep waking the worker");
+		assert_eq!(net.read(&mut buf).expect_err("empty").kind(), io::ErrorKind::WouldBlock);
+
+		// Parking RX keeps the frames but stops the wakeups.
+		net.push_test_frame(b"three");
+		net.defer_rx();
+		assert!(!net.rx_wake_armed());
+		assert_eq!(net.read(&mut buf).expect("kept frame"), VNET_HDR_SIZE + 5);
 	}
 
 	#[test]

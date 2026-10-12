@@ -30,16 +30,16 @@ pub fn fork_into_jail(config: &Config) -> Result<()> {
 	make_jail_root_mount(&chroot)?;
 	bind_configured_paths(config, &chroot)?;
 
-	// SAFETY: no Rust locks are held across fork; both parent and child immediately
-	// follow simple, checked control-flow paths.
+	// SAFETY: no Rust locks are held across fork; both parent and child
+	// immediately follow simple, checked control-flow paths.
 	let pid = unsafe { libc::fork() };
 	if pid < 0 {
 		return Err(os_error("fork jail child"));
 	}
 	if pid > 0 {
 		if let Err(e) = cgroup.place(pid) {
-			// SAFETY: the child pid came from `fork`; best-effort kill/reap is confined
-			// to that child after cgroup placement failed.
+			// SAFETY: the child pid came from `fork`; best-effort kill/reap is
+			// confined to that child after cgroup placement failed.
 			unsafe {
 				libc::kill(pid, libc::SIGKILL);
 				let mut status = 0;
@@ -282,6 +282,7 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 	bind_optional(chroot, config.fork_from.as_deref(), true)?;
 	bind_optional(chroot, config.zram_swap_file.as_deref(), false)?;
 	bind_optional(chroot, config.disk_overlay_of.as_deref(), true)?;
+	bind_overlay_bases(config, chroot)?;
 	bind_optional(chroot, config.fs_dir.as_deref(), true)?;
 	for m in &config.volumes {
 		bind_path(chroot, &m.dir, m.read_only)?;
@@ -330,6 +331,30 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 		bind_path(chroot, tun, false)?;
 	} else if config.tap.is_some() {
 		return Err(err("--tap requires /dev/net/tun in the jail"));
+	}
+	Ok(())
+}
+
+/// Block overlays reference their raw base through a `<overlay>.base` hard
+/// link. Links cannot cross the jail's bind mounts, so the new overlay's link
+/// is created on the host before the chroot and bound in read-only, together
+/// with the base overlay's own link when the base is itself an overlay.
+fn bind_overlay_bases(config: &Config, chroot: &Path) -> Result<()> {
+	let (Some(base), Some(rootfs)) = (&config.disk_overlay_of, &config.rootfs) else {
+		return Ok(());
+	};
+	if config.rootfs_remote_url.is_some() {
+		return Ok(());
+	}
+	let base_link = crate::disk_overlay::base_path(base);
+	if base_link.exists() {
+		bind_path(chroot, &base_link, true)?;
+	}
+	if !rootfs.exists() {
+		crate::disk_overlay::link_base(base, rootfs).map_err(|e| {
+			err(format!("linking the overlay base of {} for the jail: {e}", rootfs.display()))
+		})?;
+		bind_path(chroot, &crate::disk_overlay::base_path(rootfs), true)?;
 	}
 	Ok(())
 }
@@ -418,8 +443,8 @@ fn mount_bind(source: &Path, target: &Path, readonly: bool) -> Result<()> {
 	let source_c = cstring_path(source)?;
 	let target_c = cstring_path(target)?;
 	let recursive = if source.is_dir() { libc::MS_REC } else { 0 };
-	// SAFETY: source and target are valid C strings for the duration of the call;
-	// null fstype/data are the documented bind-mount form.
+	// SAFETY: source and target are valid C strings for the duration of the
+	// call; null fstype/data are the documented bind-mount form.
 	let rc = unsafe {
 		libc::mount(
 			source_c.as_ptr(),
@@ -496,7 +521,8 @@ fn pivot_into(chroot: &Path) -> Result<()> {
 		return Err(os_error("chdir(/) after pivot_root"));
 	}
 	let old = CString::new("/.pivot_old").expect("literal has no NUL");
-	// SAFETY: the old-root C string is valid and names the detached old root mount.
+	// SAFETY: the old-root C string is valid and names the detached old root
+	// mount.
 	if unsafe { libc::umount2(old.as_ptr(), libc::MNT_DETACH) } != 0 {
 		return Err(os_error("umount old root"));
 	}
@@ -614,7 +640,8 @@ fn cleanup_jail_runtime_sockets(paths: &[PathBuf]) {
 fn wait_for_child_and_exit(pid: libc::pid_t, cleanup_paths: &[PathBuf]) -> ! {
 	let mut status = 0;
 	loop {
-		// SAFETY: `pid` is the forked child and `status` points to initialized storage.
+		// SAFETY: `pid` is the forked child and `status` points to initialized
+		// storage.
 		let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
 		if rc == pid {
 			break;

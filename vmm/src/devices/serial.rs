@@ -19,16 +19,17 @@ use crate::{
 
 const UART_REGISTER_COUNT: u64 = 8;
 
-/// Unbuffered writer to the host stdout file descriptor.
-struct ConsoleOut;
+/// Unbuffered writer to the host stdout file descriptor (the console log),
+/// shared by the UART and the virtio-console log port.
+pub struct ConsoleOut;
 
 impl Write for ConsoleOut {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 		#[cfg(unix)]
 		{
 			loop {
-				// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is a
-				// process-global fd, and `write` does not retain the pointer.
+				// SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes, stdout is
+				// a process-global fd, and `write` does not retain the pointer.
 				let n = unsafe { libc::write(libc::STDOUT_FILENO, buf.as_ptr().cast(), buf.len()) };
 				if n >= 0 {
 					return Ok(n as usize);

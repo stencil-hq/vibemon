@@ -1,32 +1,28 @@
 //! Lazy HTTP range-backed block source with persistent sparse caches.
-#![cfg_attr(
-	not(target_os = "linux"),
-	allow(
-		dead_code,
-		reason = "production callers are Linux/KVM-only; non-Linux builds compile this module \
-		          solely to run its platform-independent tests"
-	)
-)]
+//!
+//! The remote object is a [`crate::block_image`]: one zstd frame per 1 MiB
+//! block plus a local seek index. Requests are serviced synchronously with
+//! positioned file I/O on the device worker (Linux and macOS).
 
 use std::{
 	fs::{File, OpenOptions},
 	io::{self, Read},
-	os::unix::fs::FileExt,
+	os::unix::fs::{FileExt, OpenOptionsExt},
 	path::Path,
 	thread,
 	time::Duration,
 };
 
 use reqwest::{StatusCode, Url, blocking::Client, header};
-use serde::Deserialize;
 use vmon_cloud::{ObjectAuth, aws, google};
 
-use crate::result::{Result, err};
+use crate::{
+	block_image::{BLOCK_SIZE, BlockIndex, MAX_INDEX_BYTES, decompress_block},
+	result::{Result, err},
+};
 
-/// One MiB amortizes request latency without pulling a large fraction of a
-/// sparse 100 GB image for each filesystem metadata touch. It is also a
-/// multiple of the 512-byte virtio sector size.
-pub(super) const REMOTE_CHUNK_SIZE: u64 = 1024 * 1024;
+/// Cache granularity: one block-image block.
+pub(super) const REMOTE_CHUNK_SIZE: u64 = BLOCK_SIZE;
 const SECTOR_SIZE: u64 = 512;
 const HEADER_SIZE: u64 = 32;
 const CACHE_KIND: u8 = 1;
@@ -35,112 +31,30 @@ const MAGIC: &[u8; 8] = b"VMONBLK1";
 const MAX_ATTEMPTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const INDEX_VERSION: u32 = 3;
-const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_COMPRESSED_BLOCK_SIZE: u64 = REMOTE_CHUNK_SIZE * 2;
+/// Compressed bytes fetched per range request while materializing a whole
+/// disk; zero-chunk runs (tiny frames) collapse into few requests.
+const MATERIALIZE_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(Deserialize)]
-struct RemoteIndex {
-	version:           u32,
-	compressed_size:   u64,
-	uncompressed_size: u64,
-	original_size:     u64,
-	block_size:        u64,
-	blocks:            Vec<(u64, u64)>,
+/// Loads a block-image index and checks it fits a `logical_size` disk.
+fn load_index(path: &Path, logical_size: u64) -> Result<BlockIndex> {
+	let file = File::open(path)
+		.map_err(|e| err(format!("opening remote block index {}: {e}", path.display())))?;
+	let mut bytes = Vec::new();
+	file
+		.take(MAX_INDEX_BYTES + 1)
+		.read_to_end(&mut bytes)
+		.map_err(|e| err(format!("reading remote block index {}: {e}", path.display())))?;
+	let index = BlockIndex::from_json(&bytes)
+		.map_err(|e| err(format!("remote block index {}: {e}", path.display())))?;
+	validate_logical_size(logical_size, index.uncompressed_size)?;
+	Ok(index)
 }
 
-impl RemoteIndex {
-	fn load(path: &Path, logical_size: u64) -> Result<Self> {
-		let file = File::open(path)
-			.map_err(|e| err(format!("opening remote block index {}: {e}", path.display())))?;
-		let metadata = file
-			.metadata()
-			.map_err(|e| err(format!("inspecting remote block index {}: {e}", path.display())))?;
-		if metadata.len() > MAX_INDEX_BYTES {
-			return Err(err(format!(
-				"remote block index {} exceeds the {MAX_INDEX_BYTES}-byte limit",
-				path.display()
-			)));
-		}
-		let mut bytes = Vec::with_capacity(metadata.len() as usize);
-		file
-			.take(MAX_INDEX_BYTES + 1)
-			.read_to_end(&mut bytes)
-			.map_err(|e| err(format!("reading remote block index {}: {e}", path.display())))?;
-		if bytes.len() as u64 > MAX_INDEX_BYTES {
-			return Err(err(format!(
-				"remote block index {} exceeds the {MAX_INDEX_BYTES}-byte limit",
-				path.display()
-			)));
-		}
-		let index: Self = serde_json::from_slice(&bytes)
-			.map_err(|e| err(format!("parsing remote block index {}: {e}", path.display())))?;
-		index.validate(logical_size)?;
-		Ok(index)
-	}
-
-	fn validate(&self, logical_size: u64) -> Result<()> {
-		if self.version != INDEX_VERSION {
-			return Err(err(format!(
-				"unsupported remote block index version {}; expected {INDEX_VERSION}",
-				self.version
-			)));
-		}
-		if self.block_size == 0 || !self.block_size.is_multiple_of(SECTOR_SIZE) {
-			return Err(err(format!(
-				"remote block index block_size {} must be nonzero and 512-byte aligned",
-				self.block_size
-			)));
-		}
-		if self.block_size != REMOTE_CHUNK_SIZE {
-			return Err(err(format!(
-				"remote block index block_size {} is unsupported; expected {REMOTE_CHUNK_SIZE}",
-				self.block_size
-			)));
-		}
-		validate_logical_size(logical_size, self.uncompressed_size)?;
-		let expected = self.uncompressed_size.div_ceil(self.block_size);
-		if self.blocks.len() as u64 != expected {
-			return Err(err(format!(
-				"remote block index has {} blocks, expected {expected} for {} uncompressed bytes",
-				self.blocks.len(),
-				self.uncompressed_size
-			)));
-		}
-		if self.compressed_size == 0 {
-			return Err(err("remote block index compressed_size must be greater than zero"));
-		}
-		if self.original_size < self.uncompressed_size {
-			return Err(err(
-				"remote block index original_size must not be smaller than uncompressed_size",
-			));
-		}
-		let mut expected_offset = 0_u64;
-		for (block, &(offset, length)) in self.blocks.iter().enumerate() {
-			let valid = offset == expected_offset
-				&& length != 0
-				&& length <= MAX_COMPRESSED_BLOCK_SIZE
-				&& offset
-					.checked_add(length)
-					.is_some_and(|end| end <= self.compressed_size);
-			if !valid {
-				return Err(err(format!(
-					"remote block index block {block} range [{offset}, {}) is not the next contiguous \
-					 range within compressed_size {}",
-					offset.saturating_add(length),
-					self.compressed_size
-				)));
-			}
-			expected_offset += length;
-		}
-		if expected_offset != self.compressed_size {
-			return Err(err(format!(
-				"remote block index covers {expected_offset} compressed bytes, expected {}",
-				self.compressed_size
-			)));
-		}
-		Ok(())
-	}
+fn validate_index(index: &BlockIndex, logical_size: u64) -> Result<()> {
+	index
+		.validate()
+		.map_err(|e| err(format!("remote block index: {e}")))?;
+	validate_logical_size(logical_size, index.uncompressed_size)
 }
 
 #[derive(Debug)]
@@ -380,6 +294,67 @@ impl RangeFetcher for HttpRangeFetcher {
 		}
 		Ok(FetchResponse { bytes: bytes.to_vec(), total_len })
 	}
+}
+
+/// Range source backed by a caller closure (the node's own object client).
+struct FnFetcher<F> {
+	fetch:     F,
+	total_len: u64,
+}
+
+impl<F> RangeFetcher for FnFetcher<F>
+where
+	F: FnMut(u64, u64) -> io::Result<Vec<u8>> + Send,
+{
+	fn fetch(&mut self, start: u64, end: u64) -> std::result::Result<FetchResponse, FetchFailure> {
+		let bytes = (self.fetch)(start, end).map_err(|e| FetchFailure {
+			transient: e.kind() != io::ErrorKind::InvalidData,
+			message:   e.to_string(),
+		})?;
+		if bytes.len() as u64 != end - start {
+			return Err(FetchFailure {
+				message:   format!("short range: got {} bytes, expected {}", bytes.len(), end - start),
+				transient: true,
+			});
+		}
+		Ok(FetchResponse { bytes, total_len: self.total_len })
+	}
+}
+
+/// Writes the guest-visible disk of a stopped remote-backed VM as the new raw
+/// image `destination`.
+///
+/// See [`RemoteBlockSource::materialize`]: `overlay` and `cache` are the
+/// files the VMM used, `index` the image's seek index, and
+/// `fetch(start, end)` returns the object's bytes `[start, end)` (it must pin
+/// the object version itself). Returns the image length.
+pub fn materialize_remote_disk<F>(
+	overlay: &Path,
+	cache: &Path,
+	index: &Path,
+	logical_size: u64,
+	fetch: F,
+	destination: &Path,
+) -> Result<u64>
+where
+	F: FnMut(u64, u64) -> io::Result<Vec<u8>> + Send + 'static,
+{
+	let index = load_index(index, logical_size)?;
+	let overlay_file = OpenOptions::new()
+		.read(true)
+		.write(true)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(overlay)
+		.map_err(|e| err(format!("opening remote block overlay {}: {e}", overlay.display())))?;
+	let total_len = index.compressed_size;
+	let mut source = RemoteBlockSource::with_fetcher_and_overlay(
+		cache,
+		overlay_file,
+		index,
+		logical_size,
+		Box::new(FnFetcher { fetch, total_len }),
+	)?;
+	source.materialize(destination)
 }
 
 fn is_refreshable_aws_auth_error(body: &str) -> bool {
@@ -673,7 +648,7 @@ pub(super) struct RemoteBlockSource {
 	resident:          Vec<u8>,
 	written:           Vec<u8>,
 	image_len:         u64,
-	index:             RemoteIndex,
+	index:             BlockIndex,
 	fetcher:           Box<dyn RangeFetcher>,
 	cache_bitmap_at:   u64,
 	overlay_bitmap_at: u64,
@@ -691,7 +666,7 @@ impl RemoteBlockSource {
 		region: Option<String>,
 		etag: Option<String>,
 	) -> Result<Self> {
-		let index = RemoteIndex::load(index_path, logical_size)?;
+		let index = load_index(index_path, logical_size)?;
 		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer, auth, region, etag)?);
 		Self::with_index(cache_path, overlay_path, index, logical_size, fetcher)
 	}
@@ -707,7 +682,7 @@ impl RemoteBlockSource {
 		region: Option<String>,
 		etag: Option<String>,
 	) -> Result<Self> {
-		let index = RemoteIndex::load(index_path, logical_size)?;
+		let index = load_index(index_path, logical_size)?;
 		let fetcher = Box::new(HttpRangeFetcher::new(url, bearer, auth, region, etag)?);
 		Self::with_fetcher_and_overlay(cache_path, overlay, index, logical_size, fetcher)
 	}
@@ -715,7 +690,7 @@ impl RemoteBlockSource {
 	fn with_index(
 		cache_path: &Path,
 		overlay_path: &Path,
-		index: RemoteIndex,
+		index: BlockIndex,
 		logical_size: u64,
 		fetcher: Box<dyn RangeFetcher>,
 	) -> Result<Self> {
@@ -736,11 +711,11 @@ impl RemoteBlockSource {
 	fn with_fetcher_and_overlay(
 		cache_path: &Path,
 		overlay: File,
-		index: RemoteIndex,
+		index: BlockIndex,
 		logical_size: u64,
 		fetcher: Box<dyn RangeFetcher>,
 	) -> Result<Self> {
-		index.validate(logical_size)?;
+		validate_index(&index, logical_size)?;
 		let uncompressed_size = index.uncompressed_size;
 		let (cache, resident) =
 			open_backing(cache_path, uncompressed_size, CACHE_KIND, REMOTE_CHUNK_SIZE)?;
@@ -786,37 +761,43 @@ impl RemoteBlockSource {
 		Ok(())
 	}
 
-	fn ensure_chunk(&mut self, start: u64) -> Result<()> {
-		let chunk = (start / REMOTE_CHUNK_SIZE) as usize;
-		if self.resident[chunk] != 0 {
-			return Ok(());
-		}
-		let &(compressed_offset, compressed_length) = &self.index.blocks[chunk];
-		let compressed_end = compressed_offset
-			.checked_add(compressed_length)
-			.ok_or_else(|| err(format!("remote block {chunk} compressed range overflow")))?;
-		let response =
-			fetch_with_retry(self.fetcher.as_mut(), compressed_offset, compressed_end, thread::sleep)?;
+	/// Fetches the frames of chunks `first..=last` with one range request
+	/// (frames are contiguous in the object) and returns them in order.
+	fn fetch_frames(&mut self, first: usize, last: usize) -> Result<Vec<Vec<u8>>> {
+		let start = self.index.blocks[first].0;
+		let (last_offset, last_length) = self.index.blocks[last];
+		let end = last_offset
+			.checked_add(last_length)
+			.ok_or_else(|| err(format!("remote block {last} compressed range overflow")))?;
+		let response = fetch_with_retry(self.fetcher.as_mut(), start, end, thread::sleep)?;
 		if response.total_len != self.index.compressed_size {
 			return Err(err(format!(
 				"remote compressed object length changed from {} to {}",
 				self.index.compressed_size, response.total_len
 			)));
 		}
-		let expected = (self.index.uncompressed_size - start).min(REMOTE_CHUNK_SIZE);
-		let decoder = zstd::stream::read::Decoder::new(response.bytes.as_slice())
-			.map_err(|e| err(format!("opening zstd frame for remote block {chunk}: {e}")))?;
-		let mut decoded = Vec::with_capacity(expected as usize);
-		decoder
-			.take(expected + 1)
-			.read_to_end(&mut decoded)
-			.map_err(|e| err(format!("decompressing remote block {chunk}: {e}")))?;
-		if decoded.len() as u64 != expected {
-			return Err(err(format!(
-				"remote block {chunk} decompressed to {} bytes, expected {expected}",
-				decoded.len()
-			)));
+		Ok(self.index.blocks[first..=last]
+			.iter()
+			.map(|&(offset, length)| {
+				let at = (offset - start) as usize;
+				response.bytes[at..at + length as usize].to_vec()
+			})
+			.collect())
+	}
+
+	fn decode_chunk(&self, chunk: usize, frame: &[u8], out: &mut Vec<u8>) -> Result<()> {
+		decompress_block(frame, self.index.block_len(chunk), out)
+			.map_err(|e| err(format!("decompressing remote block {chunk}: {e}")))
+	}
+
+	fn ensure_chunk(&mut self, start: u64) -> Result<()> {
+		let chunk = (start / REMOTE_CHUNK_SIZE) as usize;
+		if self.resident[chunk] != 0 {
+			return Ok(());
 		}
+		let frames = self.fetch_frames(chunk, chunk)?;
+		let mut decoded = Vec::with_capacity(REMOTE_CHUNK_SIZE as usize);
+		self.decode_chunk(chunk, &frames[0], &mut decoded)?;
 		self.cache.write_all_at(&decoded, start)?;
 		self.cache.sync_data()?;
 		self.resident[chunk] = 1;
@@ -848,19 +829,122 @@ impl RemoteBlockSource {
 			.checked_add(out.len() as u64)
 			.filter(|end| *end <= self.image_len)
 			.ok_or_else(|| err("remote block read exceeds image"))?;
+		let last_sector = end.saturating_sub(1) / SECTOR_SIZE;
 		while offset < end {
+			// One read per run of sectors served by the same layer.
 			let sector = offset / SECTOR_SIZE;
-			let sector_end = ((sector + 1) * SECTOR_SIZE).min(end);
-			let count = (sector_end - offset) as usize;
-			let (head, tail) = out.split_at_mut(count);
-			if self.sector_written(sector) {
+			let written = self.sector_written(sector);
+			let mut next = sector + 1;
+			while next <= last_sector && self.sector_written(next) == written {
+				next += 1;
+			}
+			let run_end = (next * SECTOR_SIZE).min(end);
+			let (head, tail) = out.split_at_mut((run_end - offset) as usize);
+			if written {
 				self.overlay.read_exact_at(head, offset)?;
 			} else {
 				self.read_base(head, offset)?;
 			}
 			out = tail;
-			offset = sector_end;
+			offset = run_end;
 		}
+		Ok(())
+	}
+
+	/// Writes the guest-visible disk as the new raw image `destination`
+	/// (sparse: all-zero chunks stay holes) and returns its length.
+	///
+	/// Non-resident chunks are fetched in batched range requests and decoded
+	/// straight into the image without populating the cache, so a recovery
+	/// capture costs one pass over the object instead of a request and two
+	/// cache syncs per chunk.
+	pub(super) fn materialize(&mut self, destination: &Path) -> Result<u64> {
+		let file = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create_new(true)
+			.custom_flags(libc::O_NOFOLLOW)
+			.open(destination)
+			.map_err(|e| err(format!("creating remote disk image {}: {e}", destination.display())))?;
+		let result = self.materialize_into(&file);
+		if result.is_err() {
+			drop(file);
+			let _ = std::fs::remove_file(destination);
+		}
+		result.map(|()| self.image_len)
+	}
+
+	fn materialize_into(&mut self, file: &File) -> Result<()> {
+		file.set_len(self.image_len)?;
+		let chunks = self.index.blocks.len();
+		let mut base = Vec::with_capacity(REMOTE_CHUNK_SIZE as usize);
+		let mut chunk = 0;
+		while chunk < chunks {
+			// Batch the run of non-resident chunks starting here.
+			let frames = if self.resident[chunk] == 0 {
+				let mut last = chunk;
+				let mut bytes = self.index.blocks[chunk].1;
+				while last + 1 < chunks
+					&& self.resident[last + 1] == 0
+					&& bytes + self.index.blocks[last + 1].1 <= MATERIALIZE_BATCH_BYTES
+				{
+					last += 1;
+					bytes += self.index.blocks[last].1;
+				}
+				self.fetch_frames(chunk, last)?
+			} else {
+				Vec::new()
+			};
+			let batch = frames.len().max(1);
+			for slot in 0..batch {
+				let current = chunk + slot;
+				let start = current as u64 * REMOTE_CHUNK_SIZE;
+				if let Some(frame) = frames.get(slot) {
+					self.decode_chunk(current, frame, &mut base)?;
+				} else {
+					base.resize(self.index.block_len(current) as usize, 0);
+					self.cache.read_exact_at(&mut base, start)?;
+				}
+				// Overlay sectors win over the base inside this chunk.
+				let chunk_end = (start + REMOTE_CHUNK_SIZE).min(self.image_len);
+				base.resize((chunk_end - start) as usize, 0);
+				let mut sector = start / SECTOR_SIZE;
+				while sector * SECTOR_SIZE < chunk_end {
+					if !self.sector_written(sector) {
+						sector += 1;
+						continue;
+					}
+					let run_start = sector;
+					while sector * SECTOR_SIZE < chunk_end && self.sector_written(sector) {
+						sector += 1;
+					}
+					let from = (run_start * SECTOR_SIZE - start) as usize;
+					let to = ((sector * SECTOR_SIZE).min(chunk_end) - start) as usize;
+					self
+						.overlay
+						.read_exact_at(&mut base[from..to], run_start * SECTOR_SIZE)?;
+				}
+				if base.iter().any(|&byte| byte != 0) {
+					file.write_all_at(&base, start)?;
+				}
+			}
+			chunk += batch;
+		}
+		// Logical capacity past the indexed image reads from the overlay only.
+		let mut offset = self
+			.index
+			.uncompressed_size
+			.next_multiple_of(REMOTE_CHUNK_SIZE);
+		while offset < self.image_len {
+			let len = (self.image_len - offset).min(REMOTE_CHUNK_SIZE);
+			base.resize(len as usize, 0);
+			self.read_exact_at(&mut base, offset)?;
+			if base.iter().any(|&byte| byte != 0) {
+				file.write_all_at(&base, offset)?;
+			}
+			offset += len;
+		}
+		file.sync_all()?;
 		Ok(())
 	}
 
@@ -955,7 +1039,7 @@ mod tests {
 			let _ = std::fs::remove_dir_all(&self.0);
 		}
 	}
-	fn framed_image(blocks: &[Vec<u8>]) -> (Vec<u8>, RemoteIndex) {
+	fn framed_image(blocks: &[Vec<u8>]) -> (Vec<u8>, BlockIndex) {
 		let mut compressed = Vec::new();
 		let mut ranges = Vec::with_capacity(blocks.len());
 		let mut uncompressed_size = 0u64;
@@ -965,8 +1049,8 @@ mod tests {
 			compressed.extend_from_slice(&frame);
 			uncompressed_size += block.len() as u64;
 		}
-		let index = RemoteIndex {
-			version: INDEX_VERSION,
+		let index = BlockIndex {
+			version: crate::block_image::INDEX_VERSION,
 			compressed_size: compressed.len() as u64,
 			uncompressed_size,
 			original_size: uncompressed_size,
@@ -1092,6 +1176,180 @@ mod tests {
 		assert_eq!(&out[..32], &[0x7b; 32]);
 		assert_eq!(&out[32..], &[0; 32]);
 		assert_eq!(calls.load(Ordering::SeqCst), 1);
+	}
+
+	#[test]
+	fn reads_spanning_overlay_and_base_coalesce_into_layer_runs() {
+		let dir = TestDir::new();
+		let blocks = [vec![0x11; REMOTE_CHUNK_SIZE as usize], vec![0x22; REMOTE_CHUNK_SIZE as usize]];
+		let (compressed, index) = framed_image(&blocks);
+		let calls = Arc::new(AtomicUsize::new(0));
+		let fetcher = FakeFetcher {
+			calls:   calls.clone(),
+			ranges:  Arc::new(Mutex::new(Vec::new())),
+			results: VecDeque::new(),
+			image:   compressed,
+		};
+		let mut source = RemoteBlockSource::with_index(
+			&dir.0.join("cache"),
+			&dir.0.join("overlay"),
+			index,
+			2 * REMOTE_CHUNK_SIZE,
+			Box::new(fetcher),
+		)
+		.expect("source");
+		source
+			.write_all_at(&[0xee; 1024], REMOTE_CHUNK_SIZE - 512)
+			.expect("write across chunk boundary");
+		let mut out = vec![0u8; 4096];
+		source
+			.read_exact_at(&mut out, REMOTE_CHUNK_SIZE - 2048)
+			.expect("mixed read");
+		assert_eq!(&out[..1536], &[0x11; 1536]);
+		assert_eq!(&out[1536..2560], &[0xee; 1024]);
+		assert_eq!(&out[2560..], &[0x22; 1536]);
+		assert_eq!(calls.load(Ordering::SeqCst), 2, "one fetch per touched chunk");
+	}
+
+	#[test]
+	fn materialize_merges_overlay_cache_and_batched_remote_chunks() {
+		let dir = TestDir::new();
+		let blocks = [
+			vec![0x31; REMOTE_CHUNK_SIZE as usize],
+			vec![0; REMOTE_CHUNK_SIZE as usize],
+			vec![0x33; REMOTE_CHUNK_SIZE as usize],
+			vec![0x34; 4096],
+		];
+		let (compressed, index) = framed_image(&blocks);
+		let uncompressed = index.uncompressed_size;
+		let calls = Arc::new(AtomicUsize::new(0));
+		let ranges = Arc::new(Mutex::new(Vec::new()));
+		let fetcher = FakeFetcher {
+			calls:   calls.clone(),
+			ranges:  ranges.clone(),
+			results: VecDeque::new(),
+			image:   compressed.clone(),
+		};
+		// Logical capacity extends one chunk past the indexed image.
+		let logical = uncompressed.next_multiple_of(REMOTE_CHUNK_SIZE) + REMOTE_CHUNK_SIZE;
+		let mut source = RemoteBlockSource::with_index(
+			&dir.0.join("cache"),
+			&dir.0.join("overlay"),
+			index,
+			logical,
+			Box::new(fetcher),
+		)
+		.expect("source");
+		// Chunk 0 becomes resident through a guest read; chunk 2 gets an
+		// overlay write; the tail past the image gets a write too.
+		let mut probe = [0u8; 512];
+		source.read_exact_at(&mut probe, 0).expect("warm chunk 0");
+		source
+			.write_all_at(&[0xaa; 512], 2 * REMOTE_CHUNK_SIZE + 4096)
+			.expect("overlay write");
+		source
+			.write_all_at(&[0xbb; 512], logical - 512)
+			.expect("tail write");
+		let before = calls.load(Ordering::SeqCst);
+		ranges.lock().expect("ranges").clear();
+
+		let image = dir.0.join("disk.img");
+		assert_eq!(source.materialize(&image).expect("materialize"), logical);
+		// Chunks 1..=3 are non-resident and contiguous: one range request.
+		assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
+		assert_eq!(*ranges.lock().expect("ranges"), vec![(
+			source.index.blocks[1].0,
+			compressed.len() as u64
+		)]);
+		let bytes = std::fs::read(&image).expect("read image");
+		assert_eq!(bytes.len() as u64, logical);
+		let chunk = REMOTE_CHUNK_SIZE as usize;
+		assert!(bytes[..chunk].iter().all(|&b| b == 0x31));
+		assert!(bytes[chunk..2 * chunk].iter().all(|&b| b == 0));
+		assert!(
+			bytes[2 * chunk..2 * chunk + 4096]
+				.iter()
+				.all(|&b| b == 0x33)
+		);
+		assert!(
+			bytes[2 * chunk + 4096..2 * chunk + 4608]
+				.iter()
+				.all(|&b| b == 0xaa)
+		);
+		assert!(
+			bytes[2 * chunk + 4608..3 * chunk]
+				.iter()
+				.all(|&b| b == 0x33)
+		);
+		assert!(
+			bytes[3 * chunk..3 * chunk + 4096]
+				.iter()
+				.all(|&b| b == 0x34)
+		);
+		assert!(
+			bytes[3 * chunk + 4096..logical as usize - 512]
+				.iter()
+				.all(|&b| b == 0)
+		);
+		assert!(bytes[logical as usize - 512..].iter().all(|&b| b == 0xbb));
+		// Materializing never populates the cache.
+		assert_eq!(source.resident, vec![1, 0, 0, 0]);
+		assert!(source.materialize(&image).is_err(), "destination must be new");
+	}
+
+	#[test]
+	fn stopped_vm_disk_materializes_from_its_overlay_cache_and_closure_fetches() {
+		let dir = TestDir::new();
+		let blocks = [vec![0x41; REMOTE_CHUNK_SIZE as usize], vec![0x42; 8192]];
+		let (compressed, index) = framed_image(&blocks);
+		let index_path = dir.0.join("index.json");
+		std::fs::write(&index_path, serde_json::to_vec(&index).expect("index json"))
+			.expect("write index");
+		let logical = index.sector_aligned_size();
+		let (overlay, cache) = (dir.0.join("overlay"), dir.0.join("cache"));
+		{
+			// The "VMM run": one write, chunk 1 cached by a read.
+			let fetcher = FakeFetcher {
+				calls:   Arc::new(AtomicUsize::new(0)),
+				ranges:  Arc::new(Mutex::new(Vec::new())),
+				results: VecDeque::new(),
+				image:   compressed.clone(),
+			};
+			let mut source =
+				RemoteBlockSource::with_index(&cache, &overlay, index, logical, Box::new(fetcher))
+					.expect("source");
+			source.write_all_at(&[7; 512], 1024).expect("write");
+			let mut probe = [0u8; 512];
+			source
+				.read_exact_at(&mut probe, REMOTE_CHUNK_SIZE)
+				.expect("read chunk 1");
+		}
+		let fetched = Arc::new(Mutex::new(Vec::new()));
+		let image = dir.0.join("disk.img");
+		let fetch = {
+			let fetched = fetched.clone();
+			move |start: u64, end: u64| {
+				fetched.lock().expect("fetched").push((start, end));
+				Ok(compressed[start as usize..end as usize].to_vec())
+			}
+		};
+		let len = materialize_remote_disk(&overlay, &cache, &index_path, logical, fetch, &image)
+			.expect("materialize");
+		assert_eq!(len, logical);
+		assert_eq!(fetched.lock().expect("fetched").len(), 1, "only chunk 0 is not cached");
+		let bytes = std::fs::read(&image).expect("image");
+		assert!(bytes[..1024].iter().all(|&b| b == 0x41));
+		assert!(bytes[1024..1536].iter().all(|&b| b == 7));
+		assert!(
+			bytes[1536..REMOTE_CHUNK_SIZE as usize]
+				.iter()
+				.all(|&b| b == 0x41)
+		);
+		assert!(
+			bytes[REMOTE_CHUNK_SIZE as usize..]
+				.iter()
+				.all(|&b| b == 0x42)
+		);
 	}
 
 	#[test]

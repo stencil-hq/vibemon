@@ -156,7 +156,8 @@ pub fn save_vcpu(vcpu: &Vcpu, _: usize) -> Result<VcpuState> {
 	let registers = values
 		.iter()
 		.map(|value| {
-			// SAFETY: every WHP register value occupies the common 128-bit union storage.
+			// SAFETY: every WHP register value occupies the common 128-bit union
+			// storage.
 			let value = unsafe { value.Reg128 };
 			[value.Low64, value.High64]
 		})

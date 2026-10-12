@@ -2,6 +2,7 @@
 
 use std::io;
 
+pub(super) const EPERM: i32 = 1;
 pub(super) const ENOENT: i32 = 2;
 pub(super) const EINTR: i32 = 4;
 pub(super) const EIO: i32 = 5;

@@ -1192,7 +1192,7 @@ impl FsState {
 					continue;
 				};
 				let stored = if md.file_type().is_symlink() {
-					child.clone()
+					child
 				} else {
 					fs::canonicalize(&child).unwrap_or_else(|_| child.clone())
 				};
@@ -2023,7 +2023,8 @@ impl VirtioDevice for Fs {
 	}
 
 	fn queue_states(&self) -> Vec<virtio_queue::QueueState> {
-		// Order must mirror the transport's queue vec: hiprio (0) then request (1).
+		// Order must mirror the transport's queue vec: hiprio (0) then request
+		// (1).
 		let mut v = Vec::new();
 		if let Some(q) = &self.hiprio_queue {
 			v.push(q.state());

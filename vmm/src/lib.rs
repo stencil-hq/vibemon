@@ -7,9 +7,12 @@
 //! hands the remaining flags to [`run_cli`].
 
 mod arch;
+pub mod block_image;
 mod config;
 mod control;
 mod devices;
+#[cfg(unix)]
+pub mod disk_overlay;
 mod disk_snapshot;
 mod hv;
 #[cfg(target_os = "linux")]
@@ -45,6 +48,9 @@ use tracing_subscriber::EnvFilter;
 /// Create a no-follow copy-on-write disk overlay, falling back to a
 /// sparse-aware copy when reflinking is unavailable.
 pub use virtio::block::create_cow_overlay;
+/// Materialize the disk a stopped `--rootfs-remote-*` VMM left behind.
+#[cfg(unix)]
+pub use virtio::materialize_remote_disk;
 
 /// Run the per-VM monitor: parse `args` (flags only, no argv[0]), init
 /// tracing, boot or restore, block until shutdown.

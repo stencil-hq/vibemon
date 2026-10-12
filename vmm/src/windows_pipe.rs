@@ -52,7 +52,8 @@ pub struct NamedPipeServer {
 impl NamedPipeServer {
 	pub(super) fn bind(path: &Path) -> io::Result<Self> {
 		let name = pipe_name(path);
-		// SAFETY: `name` is NUL-terminated and optional security attributes are null.
+		// SAFETY: `name` is NUL-terminated and optional security attributes are
+		// null.
 		let handle = unsafe {
 			CreateNamedPipeW(
 				name.as_ptr(),
@@ -85,11 +86,12 @@ impl NamedPipeServer {
 				return Err(error);
 			}
 		}
-		// SAFETY: retrieving the current-process pseudo-handle has no preconditions.
+		// SAFETY: retrieving the current-process pseudo-handle has no
+		// preconditions.
 		let process = unsafe { GetCurrentProcess() };
 		let mut duplicate = std::ptr::null_mut();
-		// SAFETY: `process` is the current-process pseudo-handle, `handle` is live,
-		// and `duplicate` points to writable handle storage.
+		// SAFETY: `process` is the current-process pseudo-handle, `handle` is
+		// live, and `duplicate` points to writable handle storage.
 		if unsafe {
 			DuplicateHandle(process, handle, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
 		} == 0
@@ -117,7 +119,8 @@ pub struct NamedPipeClient {
 impl NamedPipeClient {
 	pub(super) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		let mut transferred = 0;
-		// SAFETY: buffer is writable for the supplied length and handle is connected.
+		// SAFETY: buffer is writable for the supplied length and handle is
+		// connected.
 		let ok = unsafe {
 			ReadFile(
 				self.handle.as_raw_handle() as HANDLE,
@@ -139,7 +142,8 @@ impl NamedPipeClient {
 
 	pub(super) fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 		let mut transferred = 0;
-		// SAFETY: buffer is readable for the supplied length and handle is connected.
+		// SAFETY: buffer is readable for the supplied length and handle is
+		// connected.
 		let ok = unsafe {
 			WriteFile(
 				self.handle.as_raw_handle() as HANDLE,

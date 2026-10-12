@@ -10,6 +10,7 @@ use tracing::warn;
 
 use crate::{
 	hv::hvf::{
+		clock::GuestClock,
 		gic::{Gic, IrqLine},
 		memory::map_guest_memory,
 		psci::PsciCoordinator,
@@ -37,6 +38,7 @@ pub struct VcpuFactory {
 	vm:       VirtualMachineInstance<GicEnabled>,
 	psci:     Arc<PsciCoordinator>,
 	ioevents: IoEvents,
+	clock:    Arc<GuestClock>,
 }
 
 /// Owns the HVF VM handle, guest RAM and shared backend state.
@@ -46,6 +48,7 @@ pub struct Vm {
 	ioevents: IoEvents,
 	gic:      Mutex<Option<Gic>>,
 	psci:     Arc<PsciCoordinator>,
+	clock:    Arc<GuestClock>,
 }
 
 impl Vm {
@@ -81,6 +84,7 @@ impl Vm {
 			ioevents: Arc::new(Mutex::new(Vec::new())),
 			gic: Mutex::new(None),
 			psci: Arc::new(PsciCoordinator::new(max_vcpus)),
+			clock: Arc::new(GuestClock::running(0)),
 		})
 	}
 
@@ -117,7 +121,24 @@ impl Vm {
 
 	/// Create a vCPU on the caller's thread and report when it is inside HVF.
 	pub fn create_vcpu(&self, id: u8, hv_run: Arc<AtomicBool>) -> Result<Vcpu> {
-		create_vcpu(&self.instance, self.psci.clone(), self.ioevents.clone(), id, hv_run)
+		create_vcpu(
+			&self.instance,
+			self.psci.clone(),
+			self.ioevents.clone(),
+			self.clock.clone(),
+			id,
+			hv_run,
+		)
+	}
+
+	/// Freeze the guest counter at the value the snapshot's vCPUs were
+	/// captured at, before they are restored; each vCPU then resumes it from
+	/// there (see [`GuestClock`]).
+	pub fn restore_guest_clock(&self, vcpus: &[crate::arch::state::VcpuState]) -> Result<()> {
+		self
+			.clock
+			.restore(crate::hv::hvf::state::captured_guest_counter(vcpus)?);
+		Ok(())
 	}
 
 	/// Return a triggerable GIC SPI interrupt line.
@@ -155,6 +176,7 @@ impl Vm {
 			vm:       self.instance.clone(),
 			psci:     self.psci.clone(),
 			ioevents: self.ioevents.clone(),
+			clock:    self.clock.clone(),
 		}
 	}
 
@@ -174,7 +196,14 @@ impl VcpuFactory {
 	/// Create a thread-local HVF vCPU with the VM's shared PSCI/ioevent state.
 	#[allow(dead_code, reason = "part of public API platform abstraction")]
 	pub fn create_vcpu(&self, id: u8, hv_run: Arc<AtomicBool>) -> Result<Vcpu> {
-		create_vcpu(&self.vm, self.psci.clone(), self.ioevents.clone(), id, hv_run)
+		create_vcpu(
+			&self.vm,
+			self.psci.clone(),
+			self.ioevents.clone(),
+			self.clock.clone(),
+			id,
+			hv_run,
+		)
 	}
 }
 
@@ -182,6 +211,7 @@ fn create_vcpu(
 	vm: &VirtualMachineInstance<GicEnabled>,
 	psci: Arc<PsciCoordinator>,
 	ioevents: IoEvents,
+	clock: Arc<GuestClock>,
 	id: u8,
 	hv_run: Arc<AtomicBool>,
 ) -> Result<Vcpu> {
@@ -194,7 +224,9 @@ fn create_vcpu(
 	let mpidr = mpidr_for_id(id);
 	inner.set_sys_reg(HvSysReg::MPIDR_EL1, mpidr)?;
 	psci.register_mpidr(usize::from(id), mpidr)?;
-	Ok(Vcpu::new(id, inner, psci, ioevents, hv_run))
+	// Every vCPU of the VM shares one guest counter from the start.
+	inner.set_vtimer_offset(clock.offset())?;
+	Ok(Vcpu::new(id, inner, psci, ioevents, clock, hv_run))
 }
 fn mpidr_for_id(id: u8) -> u64 {
 	let id = u64::from(id);

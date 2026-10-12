@@ -19,7 +19,6 @@ virtio-bindings = "0.2"
 virtio-queue = "0.17"
 vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap", "backend-bitmap"] }
 vmm-sys-util = { version = "0.15", features = ["with-serde"] }
-linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 vm-superio = "0.8.1"
 parking_lot = "0.12.5"
 memmap2 = "0.9"
@@ -29,7 +28,6 @@ serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-miniz_oxide = "0.8"
 rayon = "1"
 flume = { version = "0.11", default-features = false }
 vmon-agent = { path = "../agent" }
@@ -46,7 +44,11 @@ kvm-ioctls = "0.25"
 io-uring = "0.7"
 landlock = "0.4"
 seccompiler = "0.5"
+miniz_oxide = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 iommufd-ioctls = "0.2"
@@ -60,9 +62,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 libslirp = { version = "4.3.2", default-features = false }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = { version = "1.0", default-features = false, features = ["macos-15-0"] }
 applevisor-sys = { version = "1.0", default-features = false, features = ["macos-15-0"] }
-squib-gic = "0.2"

@@ -158,8 +158,8 @@ pub fn map_uefi_firmware(
 			userspace_addr: region.as_ptr() as u64,
 			flags: 0,
 		};
-		// SAFETY: `firmware` owns the mmap backing `userspace_addr` and is retained
-		// by the VMM for at least as long as the VM can run.
+		// SAFETY: `firmware` owns the mmap backing `userspace_addr` and is
+		// retained by the VMM for at least as long as the VM can run.
 		unsafe { vm_fd.set_user_memory_region(kvm_region)? };
 		Ok(firmware)
 	}
@@ -257,7 +257,8 @@ pub fn configure_system(
 	}
 
 	// e820 map: usable RAM in [0, EBDA_START), then each RAM region above 1 MiB.
-	// The [EBDA_START, HIMEM_START) hole is left reserved (MP table lives there).
+	// The [EBDA_START, HIMEM_START) hole is left reserved (MP table lives
+	// there).
 	add_e820_entry(&mut params, 0, EBDA_START, E820_RAM)?;
 	let himem = GuestAddress(HIMEM_START);
 	for region in mem.iter() {

@@ -39,10 +39,13 @@ use crate::{
 	result::{Result, err},
 };
 
-/// Snapshot format version (postcard-encoded). Bumped to 3 to add serialized
-/// libslirp state for virtio user-mode networking; older snapshots are
-/// unsupported and must be recaptured.
-pub const SNAPSHOT_VERSION: u32 = 3;
+/// Snapshot format version (postcard-encoded).
+///
+/// Bumped to 3 to add serialized libslirp state for virtio user-mode
+/// networking, and to 4 because HVF vCPU state now records the frozen guest
+/// counter instead of a raw vtimer offset; older snapshots are unsupported and
+/// must be recaptured.
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 const DELTA_PAGE_SIZE: u64 = 4096;
 const DELTA_PAGE_USIZE: usize = DELTA_PAGE_SIZE as usize;
@@ -419,8 +422,9 @@ pub fn read_snapshot(dir: &Path) -> Result<SnapshotImage> {
 /// Read and validate snapshot metadata without requiring the memory file.
 ///
 /// Lazy remote restore uses this when guest RAM is supplied page-by-page by a
-/// mesh peer. Only full snapshots are accepted; deltas require reconstructing a
-/// base chain locally before individual pages can be addressed.
+/// page source. A delta's descriptor is validated but not applied: the page
+/// source must serve the reconstructed full image (base chain plus delta),
+/// addressed by full-image page index.
 pub fn read_snapshot_metadata(dir: &Path) -> Result<SnapshotImage> {
 	let layout = selected_layout(dir)?;
 	let snapshot = read_state_file(&layout.state_file)?;
@@ -693,12 +697,23 @@ fn validate_snapshot_metadata_only(image: &SnapshotImage) -> Result<()> {
 			snap.serial.in_buffer.len()
 		)));
 	}
-	validate_region_layout(snap)?;
-	if snap.delta.is_some() {
-		return Err(err("remote page-in does not support delta snapshots"));
+	let total_ram = validate_region_layout(snap)?;
+	if let Some(delta) = &snap.delta {
+		validate_delta_descriptor(delta, total_ram)?;
 	}
 	validate_devices(snap)?;
 	Ok(())
+}
+
+/// [`validate_delta_memory`] without a memory file: the bitmap is checked
+/// against itself (a remote page source serves the pages).
+fn validate_delta_descriptor(delta: &DeltaMemory, total_ram: u64) -> Result<()> {
+	let changed = delta
+		.changed
+		.iter()
+		.map(|byte| u64::from(byte.count_ones()))
+		.sum::<u64>();
+	validate_delta_memory(delta, total_ram, changed.saturating_mul(delta.page_size))
 }
 
 fn snapshot_memory_len(path: &Path) -> Result<u64> {
@@ -874,7 +889,9 @@ fn validate_device_states(devices: &[DeviceState], mem_regions: &[MemRegion]) ->
 		let expected_queues = match (&device.kind, &device.backend) {
 			(DeviceKind::Block, BackendHint::Block { .. }) => 1,
 			(DeviceKind::Net, BackendHint::Net { .. } | BackendHint::UserNet { .. }) => 2,
-			(DeviceKind::Console, BackendHint::Console) => 2,
+			(DeviceKind::Console, BackendHint::Console) => {
+				crate::virtio::console::queue_count(device.acked_features, device.activated)
+			},
 			(DeviceKind::Fs, BackendHint::Fs { .. }) => 2,
 			(DeviceKind::RemoteFs, BackendHint::RemoteFs { .. }) => 2,
 			(DeviceKind::Rng, BackendHint::Rng) => 1,
@@ -1296,7 +1313,8 @@ impl FileMap {
 			return Err(err(format!("base memory file {} is empty", path.display())));
 		}
 		// SAFETY: the file remains unchanged for the lifetime of this private,
-		// read-only mapping; snapshot generations are immutable after publication.
+		// read-only mapping; snapshot generations are immutable after
+		// publication.
 		let map = unsafe { memmap2::MmapOptions::new().map(&file) }
 			.map_err(|e| err(format!("mapping {}: {e}", path.display())))?;
 		Ok(Self { map })
@@ -1383,9 +1401,19 @@ fn dump_delta_memory_file(
 		BaseView::Scratch(scratch)
 	};
 	let specs = region_diff_specs(&base_view, live, &live_regions)?;
+	// RAM forked from this very base file only diverges in private copies.
+	#[cfg(target_os = "linux")]
+	let private_log = match (guest_dirty, &base_view) {
+		(None, BaseView::Mapped(_)) => {
+			private_copy_log(live, &live_regions, base_image.memory_file())
+		},
+		_ => None,
+	};
+	#[cfg(not(target_os = "linux"))]
+	let private_log: Option<Vec<Vec<u64>>> = None;
 
 	let mut file = create_snapshot_file(path)?;
-	let changed = match guest_dirty {
+	let changed = match guest_dirty.or(private_log.as_deref()) {
 		Some(log) => diff_dirty_pages(&specs, live, log, &mut file)?,
 		None => diff_pages_parallel(&specs, &mut file)?,
 	};
@@ -1393,6 +1421,65 @@ fn dump_delta_memory_file(
 		.sync_all()
 		.map_err(|e| err(format!("syncing {}: {e}", path.display())))?;
 	Ok((live_regions, DeltaMemory { base: base.to_owned(), page_size: DELTA_PAGE_SIZE, changed }))
+}
+
+/// Pages of `live` that may differ from `base_memory` when guest RAM is a
+/// `MAP_PRIVATE` mapping of that same file at the snapshot layout (a fork or
+/// lazy restore of it): a page that was never written still reads the file's
+/// bytes, so only private copies (present or swapped anonymous pages, per
+/// `/proc/self/pagemap`) can differ. Returns one word bitmap of host pages per
+/// region — the shape of the hypervisor dirty log — or `None` when RAM is not
+/// such a mapping or [`memory::pagemap`] is unavailable, leaving the caller to
+/// compare every page. Lazily populated 2 MiB RAM restored from the same file
+/// reports its written huge pages instead ([`memory::lazy_written_log`]).
+#[cfg(target_os = "linux")]
+fn private_copy_log(
+	live: &GuestMemoryMmap,
+	regions: &[MemRegion],
+	base_memory: &Path,
+) -> Option<Vec<Vec<u64>>> {
+	use std::os::unix::fs::{FileExt, MetadataExt};
+
+	const PM_PRESENT: u64 = 1 << 63;
+	const PM_SWAP: u64 = 1 << 62;
+	const PM_FILE: u64 = 1 << 61;
+	const ENTRY_BYTES: usize = size_of::<u64>();
+
+	if let Some(log) = memory::lazy_written_log(live, base_memory) {
+		return Some(log);
+	}
+	let base = fs::metadata(base_memory).ok()?;
+	let host_page = host_page_size().ok()?;
+	let pagemap = memory::pagemap()?;
+	let mut log = Vec::with_capacity(regions.len());
+	let mut entries = Vec::new();
+	for (region, mapped) in regions.iter().zip(live.iter()) {
+		let backing = mapped.file_offset()?;
+		let file = backing.file().metadata().ok()?;
+		if mapped.flags() & libc::MAP_PRIVATE == 0
+			|| file.dev() != base.dev()
+			|| file.ino() != base.ino()
+			|| backing.start() != region.file_offset
+		{
+			return None;
+		}
+		let pages = usize::try_from(region.len.div_ceil(host_page)).ok()?;
+		entries.clear();
+		entries.resize(pages * ENTRY_BYTES, 0u8);
+		let first_page = u64::try_from(mapped.as_ptr().addr()).ok()? / host_page;
+		pagemap
+			.read_exact_at(&mut entries, first_page.checked_mul(ENTRY_BYTES as u64)?)
+			.ok()?;
+		let mut words = vec![0u64; pages.div_ceil(64)];
+		for (page, entry) in entries.as_chunks::<ENTRY_BYTES>().0.iter().enumerate() {
+			let entry = u64::from_ne_bytes(*entry);
+			if entry & (PM_PRESENT | PM_SWAP) != 0 && entry & PM_FILE == 0 {
+				words[page / 64] |= 1 << (page % 64);
+			}
+		}
+		log.push(words);
+	}
+	Some(log)
 }
 
 fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -> Result<()> {
@@ -1422,27 +1509,6 @@ fn load_memory_file(path: &Path, mem: &GuestMemoryMmap, regions: &[MemRegion]) -
 			.map_err(|e| err(format!("reading region {:#x}: {e}", r.gpa)))?;
 	}
 	Ok(())
-}
-
-/// Translate a global page index (across all regions in ascending order) to the
-/// guest physical address it represents.
-fn page_index_to_gpa(page: u64, regions: &[MemRegion]) -> Result<u64> {
-	let byte = page
-		.checked_mul(DELTA_PAGE_SIZE)
-		.ok_or_else(|| err(format!("delta page index {page} byte offset overflows")))?;
-	for region in regions {
-		let end = region
-			.file_offset
-			.checked_add(region.len)
-			.ok_or_else(|| err("snapshot memory region file offset overflows"))?;
-		if byte >= region.file_offset && byte < end {
-			return region
-				.gpa
-				.checked_add(byte - region.file_offset)
-				.ok_or_else(|| err(format!("delta page index {page} guest address overflows")));
-		}
-	}
-	Err(err(format!("delta page index {page} is outside region table")))
 }
 
 /// Compare live RAM against the base view across the rayon pool, then stream
@@ -1619,7 +1685,8 @@ fn diff_dirty_pages(
 }
 
 /// Read changed pages from `memory_file` and apply them to `mem`. Pages are
-/// read sequentially in ascending order and mapped to their GPAs via `regions`.
+/// stored back-to-back in ascending order, so the file is read sequentially,
+/// one `read` per run of consecutive changed pages within a region.
 fn apply_delta_pages(
 	memory_file: &Path,
 	mem: &GuestMemoryMmap,
@@ -1631,31 +1698,41 @@ fn apply_delta_pages(
 	let memory_len = snapshot_memory_len(memory_file)?;
 	validate_delta_memory(d, total_ram, memory_len)?;
 	let mut file = open_snapshot_file(memory_file)?;
-	let total_pages = total_ram / DELTA_PAGE_SIZE;
-	let mut file_offset = 0u64;
-	for page in 0..total_pages {
-		let byte_idx = (page / 8) as usize;
-		let bit_idx = (page % 8) as u8;
-		if d.changed[byte_idx] & (1 << bit_idx) == 0 {
-			continue;
-		}
-		let gpa = page_index_to_gpa(page, regions)?;
-		file
-			.seek(SeekFrom::Start(file_offset))
-			.map_err(|e| err(format!("seeking to delta page {page}: {e}")))?;
+	let changed = |page: u64| {
+		usize::try_from(page / 8)
+			.ok()
+			.and_then(|byte| d.changed.get(byte))
+			.is_some_and(|bits| bits & (1u8 << (page % 8)) != 0)
+	};
+	let mut first_page = 0u64;
+	for region in regions {
+		let pages = region.len / DELTA_PAGE_SIZE;
 		let ptr = mem
-			.get_host_address(GuestAddress(gpa))
-			.map_err(|e| err(format!("host address for {gpa:#x}: {e}")))?;
-		// SAFETY: `gpa` was translated from the validated region table for a
-		// changed page, so the destination mapping contains one full delta page;
-		// the mutable slice is consumed by this single `read_exact`.
-		let dst = unsafe { std::slice::from_raw_parts_mut(ptr, DELTA_PAGE_SIZE as usize) };
-		file
-			.read_exact(dst)
-			.map_err(|e| err(format!("reading delta page {page}: {e}")))?;
-		file_offset = file_offset
-			.checked_add(DELTA_PAGE_SIZE)
-			.ok_or_else(|| err(format!("delta memory file offset for page {page} overflows")))?;
+			.get_host_address(GuestAddress(region.gpa))
+			.map_err(|e| err(format!("host address for {:#x}: {e}", region.gpa)))?;
+		let mut page = 0u64;
+		while page < pages {
+			if !changed(first_page + page) {
+				page += 1;
+				continue;
+			}
+			let start = page;
+			while page < pages && changed(first_page + page) {
+				page += 1;
+			}
+			let offset = usize::try_from(start * DELTA_PAGE_SIZE)
+				.map_err(|_| err("delta page offset exceeds usize"))?;
+			let len = usize::try_from((page - start) * DELTA_PAGE_SIZE)
+				.map_err(|_| err("delta run length exceeds usize"))?;
+			// SAFETY: `ptr` maps this whole region (layout checked above against
+			// `regions`) and `[offset, offset + len)` lies within its `len`
+			// bytes; the mutable slice is consumed by this single `read_exact`.
+			let dst = unsafe { std::slice::from_raw_parts_mut(ptr.add(offset), len) };
+			file.read_exact(dst).map_err(|e| {
+				err(format!("reading delta pages {}..{}: {e}", first_page + start, first_page + page))
+			})?;
+		}
+		first_page += pages;
 	}
 	Ok(())
 }
@@ -1732,10 +1809,19 @@ pub fn load_memory_chain(dir: &Path, image: &SnapshotImage, mem: &GuestMemoryMma
 /// applied on top, faulting private copies of only the changed pages, so
 /// restore cost scales with the delta instead of guest RAM.
 ///
-/// The chain directories MUST outlive the VM — the live-migration receiver
-/// keeps both installed — because unfaulted pages are read from the base file
-/// on demand.
-pub fn map_memory_chain_private(dir: &Path, image: &SnapshotImage) -> Result<GuestMemoryMmap> {
+/// The base memory file MUST stay unmodified while the VM runs, because
+/// unfaulted pages are read from it on demand (unlinking it is fine: the
+/// mapping pins the inode). A later delta against the same base file finds
+/// the applied pages as private copies (see `private_copy_log`).
+///
+/// `huge` selects lazily populated 2 MiB RAM for the base when the host
+/// supports it (see `memory::create_guest_memory_private`); delta pages applied
+/// on top then count as written for the next delta (`private_copy_log`).
+pub fn map_memory_chain_private(
+	dir: &Path,
+	image: &SnapshotImage,
+	huge: bool,
+) -> Result<GuestMemoryMmap> {
 	let expected = image.snapshot().mem_regions.clone();
 	// Walk to the deepest full layer, remembering the delta layers on the way.
 	let mut deltas: Vec<SnapshotImage> = Vec::new();
@@ -1761,7 +1847,7 @@ pub fn map_memory_chain_private(dir: &Path, image: &SnapshotImage) -> Result<Gue
 		.iter()
 		.map(|r| (r.gpa, r.len, r.file_offset))
 		.collect();
-	let mem = memory::create_guest_memory_private(layer.memory_file(), &regions)?;
+	let mem = memory::create_guest_memory_private(layer.memory_file(), &regions, huge)?;
 	for delta_layer in deltas.iter().rev() {
 		let descriptor = delta_layer
 			.snapshot()
@@ -2195,7 +2281,7 @@ mod tests {
 		let snap = snapshot_with_devices(vec![device]);
 		let bytes = postcard::to_allocvec(&snap).unwrap();
 		let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
-		assert!(rest.is_empty());
+		assert!(rest.is_empty(), "trailing bytes after decode: {rest:?}");
 
 		let restored = &decoded.devices[0];
 		assert_eq!(restored.transport, DeviceTransportKind::Pci);
@@ -2232,7 +2318,7 @@ mod tests {
 		let snap = snapshot_with_devices(vec![device]);
 		let bytes = postcard::to_allocvec(&snap).unwrap();
 		let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
-		assert!(rest.is_empty());
+		assert!(rest.is_empty(), "trailing bytes after decode: {rest:?}");
 		assert_eq!(decoded.devices[0].user_net_state.as_deref(), Some(state.as_slice()));
 	}
 
@@ -2259,7 +2345,7 @@ mod tests {
 		let snap = snapshot_with_devices(vec![device]);
 		let bytes = postcard::to_allocvec(&snap).unwrap();
 		let (decoded, rest) = postcard::take_from_bytes::<Snapshot>(&bytes).unwrap();
-		assert!(rest.is_empty());
+		assert!(rest.is_empty(), "trailing bytes after decode: {rest:?}");
 
 		let fs_ser = decoded.devices[0]
 			.fs
@@ -2328,6 +2414,22 @@ mod tests {
 			.unwrap_err()
 			.to_string();
 		assert!(err.contains("layout differs"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn delta_descriptor_validates_without_memory_file_for_remote_page_in() {
+		let total_ram = 1u64 << 20;
+		let pages = total_ram / DELTA_PAGE_SIZE;
+		let mut changed = vec![0u8; pages.div_ceil(8) as usize];
+		changed[0] = 0b101;
+		let mut delta = DeltaMemory { base: "base".into(), page_size: DELTA_PAGE_SIZE, changed };
+		validate_delta_descriptor(&delta, total_ram).expect("consistent delta descriptor");
+
+		delta.changed.push(0);
+		let err = validate_delta_descriptor(&delta, total_ram)
+			.unwrap_err()
+			.to_string();
+		assert!(err.contains("bitmap length"), "unexpected error: {err}");
 	}
 
 	#[test]
@@ -2522,5 +2624,101 @@ mod tests {
 		assert!(!bit(silent), "unflagged page is skipped by contract");
 		let set = bitmap.iter().map(|b| b.count_ones()).sum::<u32>();
 		assert_eq!(set, 2, "false positives must be verified away");
+	}
+
+	/// Pause of a fork: only pages written since the fork are candidates (a
+	/// rewrite with identical bytes is verified away, a read is never one), and
+	/// a fork of that delta still reports the applied pages, so the next pause
+	/// against the same base keeps them.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn private_fork_delta_tracks_written_pages_across_pauses() {
+		use vm_memory::Bytes;
+
+		const MIB: usize = 4;
+		memory::open_pagemap();
+		let regions = mem_regions_for_mib(MIB);
+		let total = regions_total_len(&regions).unwrap();
+		let tuples: Vec<(u64, u64, u64)> = regions
+			.iter()
+			.map(|r| (r.gpa, r.len, r.file_offset))
+			.collect();
+		let image: Vec<u8> = (0..total)
+			.map(|i| u8::try_from(i / DELTA_PAGE_SIZE % 251 + 1).unwrap())
+			.collect();
+		let base_path = unique_temp_path("vmon-private-base");
+		fs::write(&base_path, &image).unwrap();
+		assert_eq!(regions.len(), 1, "{MIB} MiB of RAM is one region");
+		let gpa_of = |page: u64| GuestAddress(regions[0].gpa + page * DELTA_PAGE_SIZE);
+		let page_bytes = |page: u64| {
+			let start = usize::try_from(page * DELTA_PAGE_SIZE).unwrap();
+			image[start..start + DELTA_PAGE_USIZE].to_vec()
+		};
+		let read_all = |mem: &GuestMemoryMmap| {
+			let mut out = vec![0u8; usize::try_from(total).unwrap()];
+			for region in &regions {
+				let start = usize::try_from(region.file_offset).unwrap();
+				let end = start + usize::try_from(region.len).unwrap();
+				mem.read_slice(&mut out[start..end], GuestAddress(region.gpa))
+					.unwrap();
+			}
+			out
+		};
+		// Diffs `live` against the base the way a delta pause does and
+		// returns the changed-page bitmap plus the delta memory file.
+		let delta_of = |live: &GuestMemoryMmap| {
+			let log = private_copy_log(live, &regions, &base_path).expect("private fork log");
+			let base_view = BaseView::Mapped(FileMap::open(&base_path, total).unwrap());
+			let specs = region_diff_specs(&base_view, live, &regions).unwrap();
+			let path = unique_temp_path("vmon-private-delta");
+			let mut file = File::create(&path).unwrap();
+			let changed = diff_dirty_pages(&specs, live, &log, &mut file).unwrap();
+			(changed, path)
+		};
+		let bit = |bitmap: &[u8], page: u64| {
+			bitmap[usize::try_from(page / 8).unwrap()] & (1 << (page % 8)) != 0
+		};
+
+		let (written, rewritten, read, later) = (3u64, 7u64, 9u64, 11u64);
+		let fork = memory::create_guest_memory_private(&base_path, &tuples, false).unwrap();
+		let mut scratch = vec![0u8; DELTA_PAGE_USIZE];
+		fork.read_slice(&mut scratch, gpa_of(read)).unwrap();
+		fork
+			.write_slice(&[0xee; DELTA_PAGE_USIZE], gpa_of(written))
+			.unwrap();
+		fork
+			.write_slice(&page_bytes(rewritten), gpa_of(rewritten))
+			.unwrap();
+
+		let (changed, delta_path) = delta_of(&fork);
+		assert!(bit(&changed, written), "a written page must be stored");
+		assert!(!bit(&changed, rewritten), "an identical rewrite must be verified away");
+		assert!(!bit(&changed, read), "a read must not be a candidate");
+		assert_eq!(changed.iter().map(|b| b.count_ones()).sum::<u32>(), 1);
+
+		// Resume: the base mapped again, the delta applied on top.
+		let resumed = memory::create_guest_memory_private(&base_path, &tuples, false).unwrap();
+		let delta = DeltaMemory { base: "base".into(), page_size: DELTA_PAGE_SIZE, changed };
+		apply_delta_pages(&delta_path, &resumed, &delta, &regions).unwrap();
+		assert_eq!(read_all(&resumed), read_all(&fork));
+		resumed
+			.write_slice(&[0x11; DELTA_PAGE_USIZE], gpa_of(later))
+			.unwrap();
+
+		let (changed, second_path) = delta_of(&resumed);
+		assert!(bit(&changed, written), "applied delta pages must stay in the next delta");
+		assert!(bit(&changed, later));
+		assert_eq!(changed.iter().map(|b| b.count_ones()).sum::<u32>(), 2);
+
+		// Anonymous RAM or a different base file is not a fork of the base.
+		let anonymous = memory::create_guest_memory(MIB << 20).unwrap();
+		assert!(private_copy_log(&anonymous, &regions, &base_path).is_none());
+		let other_path = unique_temp_path("vmon-private-other");
+		fs::write(&other_path, &image).unwrap();
+		assert!(private_copy_log(&fork, &regions, &other_path).is_none());
+
+		for path in [base_path, delta_path, second_path, other_path] {
+			let _ = fs::remove_file(path);
+		}
 	}
 }

@@ -1,5 +1,6 @@
 //! Apple Hypervisor.framework backend for aarch64 macOS hosts.
 
+pub mod clock;
 pub mod gic;
 pub mod memory;
 pub mod psci;

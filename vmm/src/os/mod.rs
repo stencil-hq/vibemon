@@ -20,6 +20,9 @@ mod eventfd;
 #[cfg(target_os = "macos")]
 pub use eventfd::EventFd;
 
+#[cfg(target_os = "linux")]
+pub mod hugemem;
+
 #[cfg(target_os = "windows")]
 mod windows_eventfd;
 #[cfg(target_os = "windows")]

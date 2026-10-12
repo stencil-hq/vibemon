@@ -25,7 +25,7 @@ use crate::{
 	},
 };
 #[cfg(target_os = "macos")]
-mod user;
+pub mod user;
 #[cfg(target_os = "windows")]
 mod user_windows;
 #[cfg(target_os = "windows")]
@@ -118,6 +118,35 @@ impl Backend {
 		}
 	}
 
+	/// Whether undeliverable RX frames must stay queued in the backend until
+	/// the guest posts receive buffers (macOS libslirp) rather than being
+	/// dropped (TAP: the host kernel's queue and TCP stacks absorb loss).
+	const fn holds_rx(&self) -> bool {
+		match self {
+			Self::Tap(_) => false,
+			#[cfg(target_os = "macos")]
+			Self::User(_) => true,
+			#[cfg(target_os = "windows")]
+			Self::User(_) => false,
+		}
+	}
+
+	/// Stop waking the worker for queued RX frames until the next guest queue
+	/// notification (only called when [`Self::holds_rx`]).
+	#[cfg_attr(
+		not(target_os = "macos"),
+		expect(clippy::missing_const_for_fn, reason = "only the macOS arm calls into libslirp")
+	)]
+	fn defer_rx(&self) {
+		match self {
+			Self::Tap(_) => {},
+			#[cfg(target_os = "macos")]
+			Self::User(user) => user.defer_rx(),
+			#[cfg(target_os = "windows")]
+			Self::User(_) => {},
+		}
+	}
+
 	#[allow(
 		clippy::unnecessary_wraps,
 		reason = "user networking state serialization can fail on macOS and Windows"
@@ -139,6 +168,20 @@ impl Net {
 	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	pub fn new_user_with_state(mac: [u8; 6], state: Option<Vec<u8>>) -> Result<Self> {
 		Ok(Self::with_backend(Backend::User(user::UserNet::new_with_state(mac, state)?), mac))
+	}
+
+	/// Construct a user-net backend whose guest egress is governed by the
+	/// live policy filter (`--user-net-policy`).
+	#[cfg(target_os = "macos")]
+	pub fn new_filtered_user_with_state(
+		mac: [u8; 6],
+		filter: user::SharedFilter,
+		state: Option<Vec<u8>>,
+	) -> Result<Self> {
+		Ok(Self::with_backend(
+			Backend::User(user::UserNet::new_filtered_with_state(mac, filter, state)?),
+			mac,
+		))
 	}
 
 	/// Construct a user-net backend that blocks guest egress except slirp
@@ -233,38 +276,7 @@ impl Net {
 			drain_backend(&self.backend);
 			return Ok(());
 		};
-		let backend = &mut self.backend;
-		let buf = &mut self.rx_buf;
-		let mut signalled = false;
-		// One bounded pass on unix: the tap/user backend wait source is a
-		// level-triggered fd, so returning early re-fires poll and lets the
-		// shared device loop service other devices in between. Windows keeps
-		// one worker thread per device with an auto-reset event source and
-		// drains fully, exactly as before.
-		#[cfg(unix)]
-		let mut budget = QUEUE_PASS_BUDGET;
-		loop {
-			#[cfg(unix)]
-			{
-				if budget == 0 {
-					break;
-				}
-				budget -= 1;
-			}
-			match backend.read(buf) {
-				Ok(0) => break,
-				Ok(n) => {
-					// If no RX buffer is available the frame is dropped (and the
-					// backend is still drained, so we never busy-loop on epoll).
-					if n >= VNET_HDR_SIZE && deliver_rx(&mem, rx_queue, &buf[..n], mergeable)? {
-						signalled = true;
-					}
-				},
-				Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-				Err(e) => return Err(err(format!("virtio-net backend read failed: {e}"))),
-			}
-		}
-		if signalled {
+		if rx_pass(&self.backend, &mem, rx_queue, &mut self.rx_buf, mergeable)? {
 			interrupt.signal_used_queue()?;
 		}
 		Ok(())
@@ -337,9 +349,15 @@ impl VirtioDevice for Net {
 
 	fn process_queue_notify(&mut self) -> Result<QueuePass> {
 		// A single ioeventfd backs both queues; the driver notifies after
-		// queueing TX frames (and RX buffers). RX is driven by tap readability.
+		// queueing TX frames (and RX buffers). RX is driven by backend
+		// readability, except that a backend holding frames for an empty RX
+		// ring resumes when the guest posts buffers (this notification).
 		let _ = (RX_QUEUE, TX_QUEUE);
-		self.process_tx()
+		let pass = self.process_tx()?;
+		if self.backend.holds_rx() {
+			self.process_rx()?;
+		}
+		Ok(pass)
 	}
 
 	fn process_worker_source(&mut self, _index: usize) -> Result<()> {
@@ -489,6 +507,60 @@ fn deliver_rx(
 	Ok(true)
 }
 
+/// Move backend frames into guest RX buffers; returns whether any used
+/// entry was added (the caller then signals the guest).
+fn rx_pass(
+	backend: &Backend,
+	mem: &GuestMemoryMmap,
+	rx_queue: &mut Queue,
+	buf: &mut [u8],
+	mergeable: bool,
+) -> Result<bool> {
+	let mut signalled = false;
+	// One bounded pass on unix: the tap/user backend wait source is a
+	// level-triggered fd, so returning early re-fires poll and lets the
+	// shared device loop service other devices in between. Windows keeps
+	// one worker thread per device with an auto-reset event source and
+	// drains fully, exactly as before.
+	#[cfg(unix)]
+	let mut budget = QUEUE_PASS_BUDGET;
+	loop {
+		#[cfg(unix)]
+		{
+			if budget == 0 {
+				break;
+			}
+			budget -= 1;
+		}
+		if backend.holds_rx() && !rx_buffer_available(mem, rx_queue) {
+			// Keep the frames; process_queue_notify resumes RX once the
+			// guest refills the ring.
+			backend.defer_rx();
+			break;
+		}
+		match backend.read(buf) {
+			Ok(0) => break,
+			Ok(n) => {
+				// A TAP frame without an RX buffer is dropped (and the backend
+				// is still drained, so we never busy-loop on epoll).
+				if n >= VNET_HDR_SIZE && deliver_rx(mem, rx_queue, &buf[..n], mergeable)? {
+					signalled = true;
+				}
+			},
+			Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+			Err(e) => return Err(err(format!("virtio-net backend read failed: {e}"))),
+		}
+	}
+	Ok(signalled)
+}
+
+/// Whether the guest has posted at least one RX buffer not yet consumed.
+/// An unreadable ring counts as available so the read path reports it.
+fn rx_buffer_available(mem: &GuestMemoryMmap, rx_queue: &Queue) -> bool {
+	rx_queue
+		.avail_idx(mem, std::sync::atomic::Ordering::Acquire)
+		.map_or(true, |avail| avail.0 != rx_queue.next_avail())
+}
 fn pop_rx_buffer(mem: &GuestMemoryMmap, rx_queue: &mut Queue) -> Option<RxBuffer> {
 	let chain = rx_queue.pop_descriptor_chain(mem)?;
 	let head = chain.head_index();
@@ -521,8 +593,8 @@ fn write_packet(
 	header.copy_from_slice(&packet[..VNET_HDR_SIZE]);
 	// The TAP fills flags/gso_type/hdr_len/gso_size/csum_start/csum_offset; the
 	// device owns num_buffers (device-write-only on RX). Always stamp it: the
-	// merge count under MRG_RXBUF, or 1 per the VERSION_1 header rule — never the
-	// stale value left in the read buffer.
+	// merge count under MRG_RXBUF, or 1 per the VERSION_1 header rule — never
+	// the stale value left in the read buffer.
 	header[NUM_BUFFERS_OFFSET..VNET_HDR_SIZE].copy_from_slice(&num_buffers.to_le_bytes());
 
 	for b in buffers {
@@ -853,6 +925,53 @@ mod tests {
 		assert!(deliver_rx(&mem, &mut queue, &packet, false).expect("deliver_rx"));
 		assert_eq!(used_idx(&mem), 1);
 		assert_eq!(used_len(&mem), 0);
+	}
+
+	/// Regression: with the guest RX ring empty, user-net frames used to be
+	/// read and dropped; libslirp's TCP then stalled for its retransmission
+	/// backoff (pip/curl body truncations, 20–150 s stalls under load). The
+	/// frame must stay queued without waking the worker, and be delivered
+	/// once the guest posts a buffer.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn user_rx_keeps_frames_while_guest_ring_is_empty() {
+		let mem = guest_mem();
+		let desc = SplitDescriptor::new(0x4000, 2048, VRING_DESC_F_WRITE as u16, 0);
+		let mut queue = queue_with_heads(&mem, &[desc], &[]);
+		let net = Net::new_user_with_state([0x02, 0, 0, 0, 0, 1], None).expect("user net");
+		let Backend::User(user) = &net.backend else {
+			unreachable!("user backend")
+		};
+		user.push_test_frame(b"frame");
+		let mut buf = vec![0u8; FRAME_BUF_SIZE];
+
+		assert!(!rx_pass(&net.backend, &mem, &mut queue, &mut buf, true).expect("rx pass"));
+		assert_eq!(used_idx(&mem), 0);
+		assert!(!user.rx_wake_armed(), "an empty ring must not make the worker spin");
+
+		// The guest posts a buffer (and notifies): the kept frame is delivered.
+		mem.write_obj(u16::to_le(0), GuestAddress(AVAIL_RING + 4))
+			.expect("avail head");
+		mem.write_obj(u16::to_le(1), GuestAddress(AVAIL_RING + 2))
+			.expect("avail idx");
+		assert!(rx_pass(&net.backend, &mem, &mut queue, &mut buf, true).expect("rx pass"));
+		assert_eq!(used_idx(&mem), 1);
+		assert_eq!(used_len(&mem), (VNET_HDR_SIZE + 5) as u32);
+		let mut payload = [0u8; 5];
+		mem.read_slice(&mut payload, GuestAddress(0x4000 + VNET_HDR_SIZE as u64))
+			.expect("read");
+		assert_eq!(&payload, b"frame");
+	}
+
+	#[test]
+	fn rx_buffer_available_tracks_avail_ring() {
+		let mem = guest_mem();
+		let desc = SplitDescriptor::new(0x4000, 64, VRING_DESC_F_WRITE as u16, 0);
+		assert!(!rx_buffer_available(&mem, &queue_with_heads(&mem, &[desc], &[])));
+		let mut queue = queue_with_heads(&mem, &[desc], &[0]);
+		assert!(rx_buffer_available(&mem, &queue));
+		assert!(deliver_rx(&mem, &mut queue, &rx_packet(b"x"), false).expect("deliver"));
+		assert!(!rx_buffer_available(&mem, &queue), "consumed buffer is no longer available");
 	}
 
 	#[test]

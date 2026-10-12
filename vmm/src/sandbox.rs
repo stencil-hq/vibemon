@@ -169,7 +169,8 @@ fn get_limit(resource: RlimitResource, context: &str) -> Result<libc::rlimit> {
 }
 
 fn set_rlimit(resource: RlimitResource, limit: libc::rlimit, context: &str) -> Result<()> {
-	// SAFETY: `limit` points to a valid `rlimit`; libc copies it during the call.
+	// SAFETY: `limit` points to a valid `rlimit`; libc copies it during the
+	// call.
 	let rc = unsafe { libc::setrlimit(resource, &limit) };
 	if rc != 0 {
 		return Err(os_error(context));
@@ -410,7 +411,8 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 			return Err(err(format!("--sandbox-uid {uid} does not match current uid {euid}")));
 		}
 		if let Some(gid) = config.gid {
-			// SAFETY: `getegid` has no preconditions and only reads process credentials.
+			// SAFETY: `getegid` has no preconditions and only reads process
+			// credentials.
 			let egid = unsafe { libc::getegid() as u32 };
 			if gid != egid {
 				return Err(err(format!("--sandbox-gid {gid} does not match current gid {egid}")));
@@ -439,7 +441,8 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 
 	let gid = gid as libc::gid_t;
 	// SAFETY: `setresgid` changes only this process' real/effective/saved gid;
-	// all three are set to the same non-root target to make the drop irreversible.
+	// all three are set to the same non-root target to make the drop
+	// irreversible.
 	let rc = unsafe { libc::setresgid(gid, gid, gid) };
 	if rc != 0 {
 		return Err(os_error("setresgid(--sandbox-gid)"));
@@ -459,7 +462,8 @@ pub fn drop_root_privileges(config: &SandboxConfig) -> Result<()> {
 
 	let uid = uid as libc::uid_t;
 	// SAFETY: `setresuid` changes only this process' real/effective/saved uid;
-	// all three are set to the same non-root target to make the drop irreversible.
+	// all three are set to the same non-root target to make the drop
+	// irreversible.
 	let rc = unsafe { libc::setresuid(uid, uid, uid) };
 	if rc != 0 {
 		return Err(os_error("setresuid(--sandbox-uid)"));
@@ -511,8 +515,8 @@ fn clear_ambient_capabilities() -> Result<()> {
 
 fn drop_capability_bounding_set() -> Result<()> {
 	for cap in 0..=last_capability() {
-		// SAFETY: `prctl` is called with scalar arguments only; the return value is
-		// checked.
+		// SAFETY: `prctl` is called with scalar arguments only; the return value
+		// is checked.
 		let rc = unsafe {
 			libc::prctl(
 				PR_CAPBSET_DROP,
@@ -565,8 +569,9 @@ mod tests {
 		let pid = unsafe { libc::fork() };
 		assert!(pid >= 0, "fork failed");
 		if pid == 0 {
-			// SAFETY: the child passes constant arguments to libc and raw syscalls,
-			// checks each return value, and applies the parent-compiled seccomp program.
+			// SAFETY: the child passes constant arguments to libc and raw
+			// syscalls, checks each return value, and applies the
+			// parent-compiled seccomp program.
 			let code = unsafe {
 				if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
 					10
@@ -584,8 +589,8 @@ mod tests {
 					0
 				}
 			};
-			// SAFETY: this is the forked child path; `_exit` terminates immediately
-			// without running inherited parent destructors.
+			// SAFETY: this is the forked child path; `_exit` terminates
+			// immediately without running inherited parent destructors.
 			unsafe { libc::_exit(code) };
 		}
 		let mut status = 0i32;

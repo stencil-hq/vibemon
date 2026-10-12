@@ -203,14 +203,14 @@ struct HostMem {
 
 impl libwhp::memory::Memory for HostMem {
 	fn as_slice_mut(&mut self) -> &mut [u8] {
-		// SAFETY: `ptr..ptr+len` names a live guest-memory mmap for the duration of
-		// this call.
+		// SAFETY: `ptr..ptr+len` names a live guest-memory mmap for the duration
+		// of this call.
 		unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
 	}
 
 	fn as_slice(&self) -> &[u8] {
-		// SAFETY: `ptr..ptr+len` names a live guest-memory mmap for the duration of
-		// this call.
+		// SAFETY: `ptr..ptr+len` names a live guest-memory mmap for the duration
+		// of this call.
 		unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
 	}
 

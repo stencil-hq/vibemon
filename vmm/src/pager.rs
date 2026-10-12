@@ -288,9 +288,9 @@ mod linux {
 		clippy::non_send_fields_in_send_ty,
 		reason = "raw region pointers reference guest memory mappings owned for the Pager lifetime"
 	)]
-	// SAFETY: PagerRegion raw pointers point into GuestMemoryMmap mappings owned by
-	// Vmm. Vmm holds that memory for at least as long as the Pager and stops the
-	// handler before drop.
+	// SAFETY: PagerRegion raw pointers point into GuestMemoryMmap mappings owned
+	// by Vmm. Vmm holds that memory for at least as long as the Pager and stops
+	// the handler before drop.
 	unsafe impl Send for Pager {}
 	// SAFETY: same as `Send`; shared access is synchronized through atomics and
 	// mutexes, and raw mapping pointers remain valid for the pager lifetime.
@@ -928,7 +928,7 @@ mod linux {
 		fn try_reserve_store(&self, len: usize) -> bool {
 			self
 				.store_bytes
-				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+				.try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
 					current
 						.checked_add(len)
 						.filter(|next| *next <= self.store_max_bytes)

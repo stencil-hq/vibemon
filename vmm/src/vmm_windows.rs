@@ -436,7 +436,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// Pre-open status.json while still privileged (before the drop + Landlock),
 	// so the exit-time write lands through this held fd even after dropping to
 	// the sandbox uid and installing path-based Landlock rules. The socket
-	// parent dir already exists here (bound above, or pre-created by the jailer).
+	// parent dir already exists here (bound above, or pre-created by the
+	// jailer).
 	let mut status_file = open_status_file(status_sock.as_deref());
 
 	#[cfg(not(target_os = "windows"))]
@@ -536,7 +537,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 		vmm.pager = Some(pager);
 	}
 
-	// Installed before any vCPU can be asked to pause; harmless without a socket.
+	// Installed before any vCPU can be asked to pause; harmless without a
+	// socket.
 	if let Err(e) = control::pause_signal::install() {
 		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
@@ -545,7 +547,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	}
 
 	// Filter phase: tighten rlimits, then Landlock then seccomp. MUST be applied
-	// before vmm.start() spawns the vCPU/device-worker threads so they inherit it.
+	// before vmm.start() spawns the vCPU/device-worker threads so they inherit
+	// it.
 	#[cfg(target_os = "linux")]
 	if filters_enabled && let Err(e) = crate::sandbox::apply_filter_phase(&sandbox_config) {
 		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
@@ -583,7 +586,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	if warm {
 		info!("warm-boot reconstruct took {:?}", t0.elapsed());
 	}
-	// Hand the entrypoint to the in-guest agent over the console (warm-boot exec).
+	// Hand the entrypoint to the in-guest agent over the console (warm-boot
+	// exec).
 	if let Some(cmd) = &agent_exec {
 		if let Err(e) = vmm.agent_send(cmd) {
 			let shutdown = vmm.shutdown_threads();
@@ -1498,8 +1502,8 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 	}
 
 	let exe = std::env::current_exe()?;
-	// Base disk to clone per child: an explicit --disk-overlay-of base wins, then
-	// --rootfs, then the disk recorded in the template snapshot.
+	// Base disk to clone per child: an explicit --disk-overlay-of base wins,
+	// then --rootfs, then the disk recorded in the template snapshot.
 	let snap = snapshot::read_state(dir)?;
 	if snap.delta.is_some() {
 		return Err(err("cannot fork from a delta snapshot; restore it instead"));
@@ -2005,7 +2009,8 @@ impl Vmm {
 		}
 
 		for m in &config.remote_fs {
-			let remote_fs = Arc::new(Mutex::new(RemoteFs::new(m.tag.clone(), m.sock.clone())));
+			let remote_fs =
+				Arc::new(Mutex::new(RemoteFs::new(m.tag.clone(), m.sock.clone(), m.writable)));
 			let fs_handle = FsSave::Remote(remote_fs.clone());
 			let device: Arc<Mutex<dyn VirtioDevice>> = remote_fs;
 			let backend = BackendHint::RemoteFs {
@@ -2168,7 +2173,8 @@ impl Vmm {
 			.iter()
 			.map(|r| (r.gpa, r.len, r.file_offset))
 			.collect();
-		let memory = crate::memory::create_guest_memory_private(image.memory_file(), &regions)?;
+		let memory =
+			crate::memory::create_guest_memory_private(image.memory_file(), &regions, false)?;
 		let vm = Rc::new(Vm::with_memory(memory)?);
 		if config.ksm {
 			crate::memory::advise_mergeable(vm.memory());
@@ -2319,9 +2325,16 @@ impl Vmm {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
 						err("snapshot remote virtio-fs backend is missing serialized fs state")
 					})?;
+					// Writability is a launch decision (`--remote-fs …:rw`), never
+					// snapshot state.
+					let writable = config
+						.remote_fs
+						.iter()
+						.any(|mount| mount.tag == *tag && mount.writable);
 					let remote_fs = Arc::new(Mutex::new(RemoteFs::restore(
 						tag.clone(),
 						PathBuf::from(sock),
+						writable,
 						fs_state,
 					)?));
 					fs_handle = Some(FsSave::Remote(remote_fs.clone()));
@@ -2739,7 +2752,8 @@ impl Vmm {
 						break VmmExit::from_u8(self.exit_reason.load(Ordering::SeqCst));
 					},
 				}
-				// Hard wall-clock deadline reached: drive the same teardown as Quit.
+				// Hard wall-clock deadline reached: drive the same teardown as
+				// Quit.
 				if let Some(deadline) = self.deadline
 					&& Instant::now() >= deadline
 				{
@@ -2975,6 +2989,9 @@ impl Vmm {
 				let deadline_unix = deadline_to_unix(deadline);
 				Ok(json!({ "deadline_unix": deadline_unix }))
 			},
+			ControlKind::SetNetPolicy { .. } => Err(control::ApiError::bad_request(
+				"set_net_policy requires a VM launched with --user-net-policy",
+			)),
 			ControlKind::RearmOwnerLease { secs } => {
 				if !(1..=86_400).contains(&secs) {
 					return Err(control::ApiError::bad_request(
@@ -3606,7 +3623,8 @@ impl Vmm {
 #[cfg(unix)]
 fn wait_eventfd_read(evt: &EventFd, timeout: Duration) -> Result<bool> {
 	let mut pfd = libc::pollfd { fd: evt.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-	// SAFETY: `pfd` points to one initialized pollfd for the duration of the call.
+	// SAFETY: `pfd` points to one initialized pollfd for the duration of the
+	// call.
 	let rc = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(timeout)) };
 	if rc == 0 {
 		return Ok(false);

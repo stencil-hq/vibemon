@@ -289,6 +289,10 @@ pub enum ControlKind {
 	RearmOwnerLease {
 		secs: u64,
 	},
+	/// Replace the live user-net egress policy (`--user-net-policy` document).
+	SetNetPolicy {
+		policy: serde_json::Value,
+	},
 }
 
 /// JSON error object returned by the lifecycle API.
@@ -623,7 +627,8 @@ fn create_control_pipe(pipe_name: &[u16], first: bool) -> Result<std::fs::File> 
 			&attributes,
 		)
 	};
-	// SAFETY: ConvertStringSecurityDescriptor allocated descriptor with LocalAlloc.
+	// SAFETY: ConvertStringSecurityDescriptor allocated descriptor with
+	// LocalAlloc.
 	unsafe { LocalFree(descriptor.cast()) };
 	if handle == INVALID_HANDLE_VALUE {
 		return Err(io::Error::last_os_error().into());
@@ -636,8 +641,8 @@ fn create_control_pipe(pipe_name: &[u16], first: bool) -> Result<std::fs::File> 
 fn connect_named_pipe(pipe: &std::fs::File) -> io::Result<()> {
 	use std::os::windows::io::AsRawHandle;
 	let handle = pipe.as_raw_handle() as HANDLE;
-	// SAFETY: handle is a live named-pipe server handle and synchronous operation
-	// requires no OVERLAPPED storage.
+	// SAFETY: handle is a live named-pipe server handle and synchronous
+	// operation requires no OVERLAPPED storage.
 	if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
 		return Ok(());
 	}
@@ -1328,6 +1333,12 @@ fn parse_request(request: &str) -> std::result::Result<(u64, ControlKind), ApiEr
 				})?;
 			ControlKind::RearmOwnerLease { secs }
 		},
+		"set_net_policy" => match request.params.get("policy") {
+			Some(policy @ serde_json::Value::Object(_)) => {
+				ControlKind::SetNetPolicy { policy: policy.clone() }
+			},
+			_ => return Err(ApiError::bad_request("set_net_policy params.policy must be an object")),
+		},
 		method => return Err(ApiError::unknown_method(format!("unknown lifecycle method {method}"))),
 	};
 	Ok((request.id, kind))
@@ -1383,6 +1394,20 @@ mod tests {
 			parse_request(r#"{"id":11,"method":"rearm_owner_lease","params":{"secs":15}}"#).unwrap();
 		assert_eq!(id, 11);
 		assert!(matches!(kind, ControlKind::RearmOwnerLease { secs: 15 }));
+	}
+
+	#[test]
+	fn json_parse_set_net_policy_requires_policy_object() {
+		let (_, kind) =
+			parse_request(r#"{"id":1,"method":"set_net_policy","params":{"policy":{"dns":true}}}"#)
+				.unwrap();
+		assert!(matches!(kind, ControlKind::SetNetPolicy { policy } if policy["dns"] == true));
+		for params in ["{}", r#"{"policy":null}"#, r#"{"policy":"x"}"#, "null"] {
+			let err =
+				parse_request(&format!(r#"{{"id":1,"method":"set_net_policy","params":{params}}}"#))
+					.expect_err("missing policy object");
+			assert_eq!(err.code, "bad_request");
+		}
 	}
 
 	#[test]
@@ -1525,9 +1550,9 @@ mod tests {
 		let listener = UnixListener::bind(&sock).unwrap();
 		let live = fs::symlink_metadata(&sock).unwrap();
 		// A recorded identity from a *previous* socket at this path. Craft it to
-		// differ from the live inode rather than relying on the filesystem to hand
-		// a replacement a fresh inode number — Linux readily recycles it, which
-		// would make a stale identity spuriously match the live socket.
+		// differ from the live inode rather than relying on the filesystem to
+		// hand a replacement a fresh inode number — Linux readily recycles it,
+		// which would make a stale identity spuriously match the live socket.
 		let stale = SocketIdentity { dev: live.dev(), ino: live.ino().wrapping_add(1) };
 		cleanup_socket_for_uid(&sock, live.uid(), Some(stale));
 

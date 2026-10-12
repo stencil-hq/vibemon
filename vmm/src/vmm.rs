@@ -90,6 +90,10 @@ const PAUSE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PAUSE_VCPU_PARK_TIMEOUT: Duration = Duration::from_secs(5);
 const PAUSE_WORKER_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_VCPU_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// HVF: how long a vCPU asked to park keeps running while it is inside a
+/// guest interrupt handler (see `Vcpu::mid_interrupt`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PAUSE_QUIESCE_BUDGET: Duration = Duration::from_secs(1);
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 type PreopenedGpuResources = Option<PreopenedVfio>;
@@ -100,6 +104,16 @@ type PreopenedGpuResources = ();
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1";
 #[cfg(target_arch = "aarch64")]
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 earlycon=uart8250,mmio,0x9000000";
+
+/// Restored/forked RAM may use lazily populated 2 MiB pages unless another
+/// feature needs 4 KiB file-backed RAM: KSM merges small anonymous pages, the
+/// zram/remote pagers own the memory's userfaultfd, and VFIO pins all of it.
+const fn huge_ram_eligible(config: &Config) -> bool {
+	!config.ksm
+		&& config.mem_target_mib.is_none()
+		&& config.remote_page_url.is_none()
+		&& config.vfio_gpus.is_empty()
+}
 
 /// Saved host terminal settings, restored on shutdown. Captured at runtime
 /// (not known at declaration), so `OnceLock` — not `LazyLock` — is correct.
@@ -232,6 +246,9 @@ pub struct Vmm {
 	api_sock:         Option<PathBuf>,
 	/// VMM-level exit reason; the first thread to stop the VM records it.
 	exit_reason:      Arc<AtomicU8>,
+	/// Live user-net egress filter (`--user-net-policy`), replaced by the
+	/// `set_net_policy` control method.
+	net_filter:       Option<NetFilterHandle>,
 	#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 	gic:              Gic,
 	#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -457,7 +474,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// Pre-open status.json while still privileged (before the drop + Landlock),
 	// so the exit-time write lands through this held fd even after dropping to
 	// the sandbox uid and installing path-based Landlock rules. The socket
-	// parent dir already exists here (bound above, or pre-created by the jailer).
+	// parent dir already exists here (bound above, or pre-created by the
+	// jailer).
 	let mut status_file = open_status_file(status_sock.as_deref());
 
 	enum PagerSetup {
@@ -516,6 +534,15 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// uid access to the bind-mounted /dev/kvm. The drop is a no-op when the
 	// process is not root. (rlimit tightening is deferred to the filter phase
 	// so the NOFILE clamp can account for the fds Vmm::build opens.)
+	// Still privileged and dumpable: snapshots read RAM residency from it.
+	#[cfg(target_os = "linux")]
+	crate::memory::open_pagemap();
+	// Also still privileged: unprivileged processes usually cannot create the
+	// userfaultfd that fills 2 MiB restored RAM.
+	#[cfg(target_os = "linux")]
+	if (restoring || forking) && huge_ram_eligible(&config) {
+		crate::memory::prepare_huge_backing();
+	}
 	#[cfg(target_os = "linux")]
 	if filters_enabled && let Err(e) = crate::sandbox::apply_privilege_phase(&sandbox_config) {
 		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
@@ -600,7 +627,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 		}
 	}
 
-	// Installed before any vCPU can be asked to pause; harmless without a socket.
+	// Installed before any vCPU can be asked to pause; harmless without a
+	// socket.
 	if let Err(e) = control::pause_signal::install() {
 		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
 		cleanup_agent_socket(agent_socket.as_ref());
@@ -609,7 +637,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	}
 
 	// Filter phase: tighten rlimits, then Landlock then seccomp. MUST be applied
-	// before vmm.start() spawns the vCPU/device-worker threads so they inherit it.
+	// before vmm.start() spawns the vCPU/device-worker threads so they inherit
+	// it.
 	#[cfg(target_os = "linux")]
 	if filters_enabled && let Err(e) = crate::sandbox::apply_filter_phase(&sandbox_config) {
 		write_final_status(status_file.as_mut(), status_sock.as_deref(), VmmExit::Killed);
@@ -656,8 +685,8 @@ pub fn run_inner_with_prebound(config: Config, mut prebound: PreboundSockets) ->
 	// Frame the --agent-exec entrypoint hand-off. Warm boots deliver it
 	// immediately (the restored agent already owns the channel); cold boots
 	// hand it to the agent bridge, which defers delivery until the agent's
-	// readiness marker appears (input queued before the agent opens /dev/hvc0
-	// is dropped by the guest tty layer).
+	// readiness marker appears (input queued before the agent opens its
+	// virtio-console port is dropped by the guest).
 	if let Some(frames) = &immediate_exec {
 		if let Err(e) = vmm.agent_send(frames) {
 			let shutdown = vmm.shutdown_threads();
@@ -1332,8 +1361,7 @@ fn open_configured_block(config: &Config, path: &Path, read_only: bool) -> Resul
 		);
 	}
 	if let Some(base) = &config.disk_overlay_of {
-		let overlay = crate::virtio::block::create_cow_overlay(base, path)?;
-		Block::from_file(overlay, read_only)
+		Block::new_overlay(base, path)
 	} else {
 		Block::new(path, read_only)
 	}
@@ -1607,9 +1635,6 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 	// Never trust a disk path embedded in snapshot state. Fork children receive
 	// only an operator-supplied base from this launch.
 	let snap = snapshot::read_state(dir)?;
-	if snap.delta.is_some() {
-		return Err(err("cannot fork from a delta snapshot; restore it instead"));
-	}
 	let base_disk: Option<String> = config
 		.disk_overlay_of
 		.as_ref()
@@ -1649,11 +1674,15 @@ fn spawn_fork_children(dir: &Path, config: &Config) -> Result<()> {
 		cmd.arg("vmm");
 		cmd.arg("--fork-from").arg(dir).arg("--count").arg("1");
 		// Only attach networking to a clone when the snapshot actually has a net
-		// device (or the operator forced user-net); a no-net snapshot's clone must
-		// not be handed a TAP it never had — a non-root host cannot create one.
+		// device (or the operator forced user-net); a no-net snapshot's clone
+		// must not be handed a TAP it never had — a non-root host cannot create
+		// one.
 		if snap_has_net || config.user_net {
 			if fork_user_net {
 				cmd.arg("--net").arg("user");
+				if let Some(policy) = &config.user_net_policy {
+					cmd.arg("--user-net-policy").arg(policy);
+				}
 			} else {
 				cmd.arg("--tap").arg(format!("tap{i}"));
 			}
@@ -2159,7 +2188,8 @@ impl Vmm {
 		}
 
 		for m in &config.remote_fs {
-			let remote_fs = Arc::new(Mutex::new(RemoteFs::new(m.tag.clone(), m.sock.clone())));
+			let remote_fs =
+				Arc::new(Mutex::new(RemoteFs::new(m.tag.clone(), m.sock.clone(), m.writable)));
 			let fs_handle = FsSave::Remote(remote_fs.clone());
 			let device: Arc<Mutex<dyn VirtioDevice>> = remote_fs;
 			let backend = BackendHint::RemoteFs {
@@ -2215,11 +2245,17 @@ impl Vmm {
 			gsi += 1;
 		}
 
+		let net_filter = load_user_net_filter(&config)?;
 		if let Some(backend) = fresh_net_backend(&config) {
+			#[cfg_attr(
+				not(target_os = "macos"),
+				expect(clippy::clone_on_copy, reason = "the filter handle is an Arc only on macOS")
+			)]
 			let device = open_fresh_net_device(
 				&backend,
 				config.user_net_restricted,
 				config.user_net_allow_host_port,
+				net_filter.clone(),
 			)?;
 			match config.transport {
 				Transport::Mmio => {
@@ -2378,6 +2414,7 @@ impl Vmm {
 			owner_deadline: None,
 			api_sock: config.api_sock,
 			exit_reason: Arc::new(AtomicU8::new(0)),
+			net_filter,
 			#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 			gic,
 			#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2387,11 +2424,11 @@ impl Vmm {
 
 	/// Restore a previously snapshotted VM (no kernel boot).
 	///
-	/// A delta snapshot (only produced by live migration) restores lazily: the
-	/// base memory file is mapped `MAP_PRIVATE` and the delta pages fault
-	/// private copies, so restore cost scales with the delta instead of guest
-	/// RAM. Lazy remote paging and pager eviction manage RAM themselves and
-	/// keep the eager path.
+	/// A delta snapshot (live migration, or a pause against its fork base)
+	/// restores lazily: the base memory file is mapped `MAP_PRIVATE` and the
+	/// delta pages fault private copies, so restore cost scales with the delta
+	/// instead of guest RAM. Lazy remote paging and pager eviction manage RAM
+	/// themselves and keep the eager path.
 	fn restore(dir: &Path, config: &Config) -> Result<Self> {
 		let image = if config.remote_page_url.is_some() {
 			snapshot::read_snapshot_metadata(dir)?
@@ -2402,7 +2439,8 @@ impl Vmm {
 			&& config.remote_page_url.is_none()
 			&& config.mem_target_mib.is_none();
 		let vm = if lazy {
-			Arc::new(Vm::with_memory(snapshot::map_memory_chain_private(dir, &image)?)?)
+			let memory = snapshot::map_memory_chain_private(dir, &image, huge_ram_eligible(config))?;
+			Arc::new(Vm::with_memory(memory)?)
 		} else {
 			let mem_bytes = image
 				.snapshot()
@@ -2424,20 +2462,23 @@ impl Vmm {
 	/// Fork (`CoW`) from a template snapshot: child RAM is a `MAP_PRIVATE`
 	/// mapping of the manifest-selected memory file, so clean pages are shared
 	/// via the host page cache across children while writes fault to private
-	/// copies.
+	/// copies. A delta snapshot (a pause against its fork base) maps the chain's
+	/// full base the same way and copies the delta pages on top.
 	fn fork_from(dir: &Path, config: &Config) -> Result<Self> {
 		let image = snapshot::read_snapshot(dir)?;
 		snapshot::validate_snapshot(&image)?;
-		if image.snapshot().delta.is_some() {
-			return Err(err("cannot fork from a delta snapshot; restore it instead"));
-		}
-		let regions: Vec<(u64, u64, u64)> = image
-			.snapshot()
-			.mem_regions
-			.iter()
-			.map(|r| (r.gpa, r.len, r.file_offset))
-			.collect();
-		let memory = crate::memory::create_guest_memory_private(image.memory_file(), &regions)?;
+		let huge = huge_ram_eligible(config);
+		let memory = if image.snapshot().delta.is_some() {
+			snapshot::map_memory_chain_private(dir, &image, huge)?
+		} else {
+			let regions: Vec<(u64, u64, u64)> = image
+				.snapshot()
+				.mem_regions
+				.iter()
+				.map(|r| (r.gpa, r.len, r.file_offset))
+				.collect();
+			crate::memory::create_guest_memory_private(image.memory_file(), &regions, huge)?
+		};
 		let vm = Arc::new(Vm::with_memory(memory)?);
 		if config.ksm {
 			crate::memory::advise_mergeable(vm.memory());
@@ -2537,9 +2578,14 @@ impl Vmm {
 		let mut workers: Vec<DeviceWorker> = Vec::new();
 		let mut console_input = None;
 		let mut console_output = None;
+		let net_filter = load_user_net_filter(config)?;
 		for ds in &snap.devices {
 			let backend = resolve_backend(ds, config)?;
 			let mut fs_handle = None;
+			#[cfg_attr(
+				not(target_os = "macos"),
+				expect(clippy::clone_on_copy, reason = "the filter handle is an Arc only on macOS")
+			)]
 			let device: Arc<Mutex<dyn VirtioDevice>> = match &backend {
 				BackendHint::Block { path, read_only } => {
 					let block = open_configured_block(config, Path::new(path), *read_only)?;
@@ -2550,6 +2596,7 @@ impl Vmm {
 					ds.user_net_state.as_deref(),
 					config.user_net_restricted,
 					config.user_net_allow_host_port,
+					net_filter.clone(),
 				)?,
 				BackendHint::Fs { tag, shared_dir, read_only } => {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
@@ -2568,9 +2615,16 @@ impl Vmm {
 					let fs_state = ds.fs.as_ref().ok_or_else(|| {
 						err("snapshot remote virtio-fs backend is missing serialized fs state")
 					})?;
+					// Writability is a launch decision (`--remote-fs …:rw`), never
+					// snapshot state.
+					let writable = config
+						.remote_fs
+						.iter()
+						.any(|mount| mount.tag == *tag && mount.writable);
 					let remote_fs = Arc::new(Mutex::new(RemoteFs::restore(
 						tag.clone(),
 						PathBuf::from(sock.as_str()),
+						writable,
 						fs_state,
 					)?));
 					fs_handle = Some(FsSave::Remote(remote_fs.clone()));
@@ -2688,6 +2742,7 @@ impl Vmm {
 			owner_deadline: None,
 			api_sock: config.api_sock.clone(),
 			exit_reason: Arc::new(AtomicU8::new(0)),
+			net_filter,
 			#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 			gic,
 			#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2729,8 +2784,8 @@ impl Vmm {
 		}
 
 		// XSAVE2 buffer size for full extended-state capture. `Cap::Xsave2` is an
-		// x86-only kvm-ioctls variant; on aarch64/HVF there is no XSAVE so it is 0
-		// (arm's save_state ignores it).
+		// x86-only kvm-ioctls variant; on aarch64/HVF there is no XSAVE so it is
+		// 0 (arm's save_state ignores it).
 		#[cfg(target_arch = "x86_64")]
 		let xsave_size = self
 			.vm
@@ -2773,7 +2828,6 @@ impl Vmm {
 	fn start_macos_vcpus(&mut self, xsave_size: usize) -> Result<()> {
 		let cpus = self.cpus as usize;
 		let rxs = std::mem::take(&mut self.vcpu_cmd_rxs);
-		let (mpidr_tx, mpidr_rx) = flume::unbounded::<(u8, Result<u64>)>();
 		let (ack_tx, ack_rx) = flume::unbounded::<(u8, Result<()>)>();
 		let hv_vcpu_ids = Arc::new(Mutex::new(vec![None; cpus]));
 		let hv_run_states = Arc::new(
@@ -2805,8 +2859,9 @@ impl Vmm {
 		}));
 		let mut phase_txs = Vec::with_capacity(cpus);
 		let mut go_txs = Vec::with_capacity(cpus);
+		let mut handles = Vec::with_capacity(cpus);
 
-		for (id, rx) in rxs.into_iter().enumerate() {
+		let created = spawn_vcpu_threads_in_order(rxs, |id, rx, created_tx| {
 			let (phase_tx, phase_rx) = flume::unbounded::<MacosPhaseB>();
 			let (go_tx, go_rx) = flume::unbounded::<()>();
 			phase_txs.push(phase_tx);
@@ -2817,11 +2872,10 @@ impl Vmm {
 			let mmio = self.mmio_bus.clone();
 			let gate = self.gate.clone();
 			let exit_reason = self.exit_reason.clone();
-			let mpidr_tx = mpidr_tx.clone();
 			let ack_tx = ack_tx.clone();
 			let hv_vcpu_ids = hv_vcpu_ids.clone();
 			let hv_run_state = hv_run_states[id].clone();
-			self.vcpu_handles.push(thread::spawn(move || {
+			handles.push(thread::spawn(move || {
 				let vcpu = match vm.create_vcpu(id as u8, hv_run_state).and_then(|vcpu| {
 					if id == 0 {
 						vcpu.init_boot()?;
@@ -2830,17 +2884,15 @@ impl Vmm {
 					}
 					hv_vcpu_ids.lock()[id] = Some(vcpu.hv_vcpu_id());
 					let mpidr = arch::regs::read_mpidr(&vcpu)?;
-					mpidr_tx
-						.send((id as u8, Ok(mpidr)))
+					created_tx
+						.send(Ok(mpidr))
 						.map_err(|e| err(format!("reporting vCPU {id} MPIDR: {e}")))?;
 					Ok(vcpu)
 				}) {
 					Ok(vcpu) => vcpu,
 					Err(e) => {
-						let _ = mpidr_tx.send((
-							id as u8,
-							Err(err(format!("creating/configuring HVF vCPU {id}: {e}"))),
-						));
+						let _ =
+							created_tx.send(Err(err(format!("creating/configuring HVF vCPU {id}: {e}"))));
 						set_exit_reason(&exit_reason, VmmExit::Killed);
 						gate.set_state(RunState::Stopping);
 						gate.signal_all_vcpus();
@@ -2862,17 +2914,10 @@ impl Vmm {
 				}
 				run_vcpu(vcpu, pio, mmio, id as u8, gate, exit_reason, rx, xsave_size);
 			}));
-		}
-		drop(mpidr_tx);
+		});
+		self.vcpu_handles.extend(handles);
+		let mpidrs = created?;
 		drop(ack_tx);
-
-		let mut mpidrs = vec![0u64; cpus];
-		for _ in 0..cpus {
-			let (id, mpidr) = mpidr_rx
-				.recv()
-				.map_err(|e| err(format!("waiting for HVF vCPU init: {e}")))?;
-			mpidrs[id as usize] = mpidr?;
-		}
 
 		match &self.macos_startup {
 			MacosStartup::Boot { entry, initrd, virtio_infos } => {
@@ -2893,6 +2938,7 @@ impl Vmm {
 					.as_ref()
 					.ok_or_else(|| err("restore failed: GIC is not created"))?;
 				gic.restore_state(&machine.gic)?;
+				self.vm.restore_guest_clock(vcpus)?;
 				for (tx, state) in phase_txs.iter().zip(vcpus.iter()) {
 					tx.send(MacosPhaseB::Restore(state.clone()))
 						.map_err(|e| err(format!("sending HVF restore state: {e}")))?;
@@ -3173,6 +3219,7 @@ impl Vmm {
 				let deadline_unix = deadline_to_unix(deadline);
 				Ok(json!({ "deadline_unix": deadline_unix }))
 			},
+			ControlKind::SetNetPolicy { policy } => self.set_net_policy(policy),
 			ControlKind::RearmOwnerLease { secs } => {
 				if !(1..=86_400).contains(&secs) {
 					return Err(control::ApiError::bad_request(
@@ -3184,6 +3231,27 @@ impl Vmm {
 				self.owner_deadline = Some(deadline);
 				Ok(json!({ "deadline_unix": deadline_to_unix(deadline) }))
 			},
+		}
+	}
+
+	/// Swap the live user-net egress policy; new flows see it immediately.
+	fn set_net_policy(&self, policy: serde_json::Value) -> control::ControlReply {
+		let Some(filter) = &self.net_filter else {
+			return Err(control::ApiError::bad_request(
+				"set_net_policy requires a VM launched with --user-net-policy",
+			));
+		};
+		#[cfg(target_os = "macos")]
+		{
+			let policy = crate::virtio::net::user::filter::Policy::from_value(policy)
+				.map_err(|e| control::ApiError::bad_request(e.to_string()))?;
+			filter.lock().set_policy(policy);
+			Ok(json!({}))
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			let _ = (policy, filter);
+			unreachable!("NetFilterHandle is uninhabited off macOS")
 		}
 	}
 
@@ -3509,8 +3577,9 @@ impl Vmm {
 				for &index in &blocks {
 					let device = &self.devices[index];
 					self.ensure_not_stopping("disk snapshot worker signal")?;
-					// Publish the intent before the event, allowing a timeout cleanup
-					// to cancel a worker which has not consumed the event yet.
+					// Publish the intent before the event, allowing a timeout
+					// cleanup to cancel a worker which has not consumed the
+					// event yet.
 					let generation = device.pause_generation.fetch_add(1, Ordering::AcqRel) + 1;
 					device.pause_requested.store(true, Ordering::Release);
 					requested.push(index);
@@ -3808,7 +3877,8 @@ impl Vmm {
 
 fn wait_eventfd_read(evt: &EventFd, timeout: Duration) -> Result<bool> {
 	let mut pfd = libc::pollfd { fd: evt.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-	// SAFETY: `pfd` points to one initialized pollfd for the duration of the call.
+	// SAFETY: `pfd` points to one initialized pollfd for the duration of the
+	// call.
 	let rc = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms(timeout)) };
 	if rc == 0 {
 		return Ok(false);
@@ -3873,11 +3943,38 @@ fn fresh_net_backend(config: &Config) -> Option<BackendHint> {
 	}
 }
 
+/// Live user-net egress filter handle (`--user-net-policy`); uninhabited
+/// where user-net policy is unsupported.
+#[cfg(target_os = "macos")]
+type NetFilterHandle = crate::virtio::net::user::SharedFilter;
+/// Live user-net egress filter handle (`--user-net-policy`); uninhabited
+/// where user-net policy is unsupported.
+#[cfg(not(target_os = "macos"))]
+type NetFilterHandle = std::convert::Infallible;
+
+/// Read and validate the `--user-net-policy` document, if configured.
+fn load_user_net_filter(config: &Config) -> Result<Option<NetFilterHandle>> {
+	let Some(path) = &config.user_net_policy else {
+		return Ok(None);
+	};
+	#[cfg(target_os = "macos")]
+	{
+		use crate::virtio::net::user::filter::{Filter, Policy};
+		let bytes = std::fs::read(path)
+			.map_err(|e| err(format!("reading --user-net-policy {}: {e}", path.display())))?;
+		let policy = Policy::from_json(&bytes)?;
+		Ok(Some(Arc::new(Mutex::new(Filter::new(policy)))))
+	}
+	#[cfg(not(target_os = "macos"))]
+	Err(err(format!("--user-net-policy {} is currently supported only on macOS", path.display())))
+}
+
 fn open_net_device(
 	backend: &BackendHint,
 	user_net_state: Option<&[u8]>,
 	user_net_restricted: bool,
 	user_net_allow_host_port: Option<u16>,
+	net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	match backend {
 		BackendHint::Net { tap, mac } => {
@@ -3885,9 +3982,13 @@ fn open_net_device(
 			let mac = tap.mac();
 			Ok(Arc::new(Mutex::new(Net::new(tap, mac))))
 		},
-		BackendHint::UserNet { mac } => {
-			open_user_net_device(*mac, user_net_state, user_net_restricted, user_net_allow_host_port)
-		},
+		BackendHint::UserNet { mac } => open_user_net_device(
+			*mac,
+			user_net_state,
+			user_net_restricted,
+			user_net_allow_host_port,
+			net_filter,
+		),
 		_ => Err(err("backend is not a virtio-net device")),
 	}
 }
@@ -3896,6 +3997,7 @@ fn open_fresh_net_device(
 	backend: &BackendHint,
 	user_net_restricted: bool,
 	user_net_allow_host_port: Option<u16>,
+	net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	match backend {
 		BackendHint::Net { tap, mac } => {
@@ -3904,7 +4006,7 @@ fn open_fresh_net_device(
 			Ok(Arc::new(Mutex::new(Net::new(tap, mac))))
 		},
 		BackendHint::UserNet { mac } => {
-			open_fresh_user_net_device(*mac, user_net_restricted, user_net_allow_host_port)
+			open_fresh_user_net_device(*mac, user_net_restricted, user_net_allow_host_port, net_filter)
 		},
 		_ => Err(err("backend is not a virtio-net device")),
 	}
@@ -3915,7 +4017,11 @@ fn open_fresh_user_net_device(
 	mac: [u8; 6],
 	user_net_restricted: bool,
 	user_net_allow_host_port: Option<u16>,
+	net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	if let Some(filter) = net_filter {
+		return Ok(Arc::new(Mutex::new(Net::new_filtered_user_with_state(mac, filter, None)?)));
+	}
 	let net = if user_net_restricted {
 		let allowed_host_port = user_net_allow_host_port
 			.filter(|port| *port != 0)
@@ -3934,6 +4040,7 @@ fn open_fresh_user_net_device(
 	_mac: [u8; 6],
 	_user_net_restricted: bool,
 	_user_net_allow_host_port: Option<u16>,
+	_net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	Err(err("--net user is currently supported only on macOS"))
 }
@@ -3944,7 +4051,15 @@ fn open_user_net_device(
 	user_net_state: Option<&[u8]>,
 	user_net_restricted: bool,
 	user_net_allow_host_port: Option<u16>,
+	net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
+	if let Some(filter) = net_filter {
+		return Ok(Arc::new(Mutex::new(Net::new_filtered_user_with_state(
+			mac,
+			filter,
+			user_net_state.map(<[u8]>::to_vec),
+		)?)));
+	}
 	let net = if user_net_restricted {
 		let allowed_host_port = user_net_allow_host_port
 			.filter(|port| *port != 0)
@@ -3968,6 +4083,7 @@ fn open_user_net_device(
 	_user_net_state: Option<&[u8]>,
 	_user_net_restricted: bool,
 	_user_net_allow_host_port: Option<u16>,
+	_net_filter: Option<NetFilterHandle>,
 ) -> Result<Arc<Mutex<dyn VirtioDevice>>> {
 	Err(err("--net user is currently supported only on macOS"))
 }
@@ -4443,6 +4559,39 @@ fn configure_and_boot(
 	Ok(())
 }
 
+/// Spawn one owner thread per vCPU, strictly one after another.
+///
+/// `spawn(id, item, created)` starts the thread for vCPU `id`; the thread
+/// creates its hypervisor vCPU first and reports through `created`. The next
+/// thread is spawned only after that report, so vCPUs are created in id
+/// order. Returns the reports in id order, or the first failure (also when a
+/// thread exits without reporting).
+///
+/// HVF requires this: it numbers vCPUs in creation order and keys every
+/// per-vCPU part of the GIC state blob (redistributor SGI/PPI state, IPIs
+/// still pending, the vCPU an active SPI is held by) by that number, not by
+/// MPIDR. Created concurrently, the number drifts from the vCPU id between
+/// snapshot capture and restore, and the restore hands one vCPU's in-flight
+/// interrupts to another: IPIs are lost and an SPI stays active forever,
+/// wedging the guest. Creating in id order at boot and on restore alike keeps
+/// the number equal to the vCPU id.
+#[cfg(any(target_os = "macos", test))]
+fn spawn_vcpu_threads_in_order<I, T>(
+	items: impl IntoIterator<Item = I>,
+	mut spawn: impl FnMut(usize, I, Sender<Result<T>>),
+) -> Result<Vec<T>> {
+	let mut created = Vec::new();
+	for (id, item) in items.into_iter().enumerate() {
+		let (tx, rx) = flume::bounded(1);
+		spawn(id, item, tx);
+		let report = rx
+			.recv()
+			.map_err(|_| err(format!("vCPU {id} thread exited before creating its vCPU")))?;
+		created.push(report?);
+	}
+	Ok(created)
+}
+
 /// Park a vCPU before it can enter the hypervisor and wait for its resume.
 ///
 /// Returning `true` grants one pass through the vCPU run loop; `false` means
@@ -4476,10 +4625,30 @@ fn run_vcpu(
 	xsave_size: usize,
 ) {
 	gate.register_tid(id as usize);
+	// HVF: when a pause began while this vCPU was inside a guest interrupt
+	// handler, park only once it has left the handler (or the budget ran out).
+	#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+	let mut quiesce_deadline: Option<Instant> = None;
 	loop {
 		match gate.state() {
 			RunState::Stopping => return,
+			#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+			RunState::Paused
+				if vcpu.mid_interrupt()
+					&& Instant::now()
+						< *quiesce_deadline
+							.get_or_insert_with(|| Instant::now() + PAUSE_QUIESCE_BUDGET) => {},
 			RunState::Paused => {
+				#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+				if quiesce_deadline
+					.take()
+					.is_some_and(|deadline| Instant::now() >= deadline)
+				{
+					warn!(
+						vcpu = id,
+						"parking inside a guest interrupt handler after {PAUSE_QUIESCE_BUDGET:?}"
+					);
+				}
 				// HVF keeps the virtual timer running while a vCPU is parked, so
 				// freeze guest virtual time across the pause and restore it on
 				// resume. Otherwise the guest sees the wall-clock pause as a
@@ -4668,6 +4837,49 @@ mod backend_restore_tests {
 		assert_eq!(run_calls.load(Ordering::SeqCst), 1);
 	}
 
+	#[test]
+	fn vcpu_threads_create_in_id_order_even_when_later_threads_start_first() {
+		const CPUS: u64 = 4;
+		let order = Arc::new(Mutex::new(Vec::new()));
+		let mut handles = Vec::new();
+		let created = spawn_vcpu_threads_in_order(0..CPUS, |id, item, created| {
+			let order = order.clone();
+			handles.push(thread::spawn(move || {
+				// Lower ids start slower, so concurrently spawned threads
+				// would create their vCPUs in reverse order.
+				thread::sleep(Duration::from_millis(20 * (CPUS - item)));
+				order.lock().push(id);
+				let _ = created.send(Ok(item * 10));
+			}));
+		})
+		.expect("all vCPU threads report");
+		for handle in handles {
+			handle.join().expect("vCPU thread exits");
+		}
+		assert_eq!(*order.lock(), [0, 1, 2, 3], "vCPUs must be created in id order");
+		assert_eq!(created, [0, 10, 20, 30]);
+	}
+
+	#[test]
+	fn vcpu_thread_creation_failure_stops_spawning() {
+		let mut spawned = Vec::new();
+		let failure = spawn_vcpu_threads_in_order::<_, u64>([(); 4], |id, (), created| {
+			spawned.push(id);
+			let _ = created.send(if id == 1 {
+				Err(err("vCPU 1 failed"))
+			} else {
+				Ok(0)
+			});
+		})
+		.expect_err("a failing vCPU aborts startup");
+		assert_eq!(spawned, [0, 1], "no vCPU thread is spawned after a failure");
+		assert!(failure.to_string().contains("vCPU 1 failed"), "{failure}");
+
+		let silent = spawn_vcpu_threads_in_order::<_, u64>([()], |_, (), created| drop(created))
+			.expect_err("a thread that never reports fails instead of hanging");
+		assert!(silent.to_string().contains("before creating its vCPU"), "{silent}");
+	}
+
 	fn config(extra: &[&str]) -> Config {
 		Config::from_args(
 			["--restore", "/snapshot"]
@@ -4677,7 +4889,6 @@ mod backend_restore_tests {
 		)
 		.expect("restore config")
 	}
-	#[cfg(target_os = "linux")]
 	#[test]
 	fn restored_remote_block_keeps_remote_base_instead_of_serving_sparse_holes() {
 		let dir =
@@ -4814,8 +5025,8 @@ mod backend_restore_tests {
 	#[test]
 	fn restricted_fresh_user_net_persists_its_policy_for_restore() {
 		let mac = [0x02, 0, 0, 0, 0, 1];
-		let fresh =
-			open_fresh_user_net_device(mac, true, Some(8443)).expect("fresh restricted user network");
+		let fresh = open_fresh_user_net_device(mac, true, Some(8443), None)
+			.expect("fresh restricted user network");
 		let state = fresh
 			.lock()
 			.user_net_state()
@@ -4825,12 +5036,45 @@ mod backend_restore_tests {
 		drop(fresh);
 
 		let restored =
-			open_user_net_device(mac, Some(&state), false, None).expect("restore user network");
+			open_user_net_device(mac, Some(&state), false, None, None).expect("restore user network");
 		let restored_state = restored
 			.lock()
 			.user_net_state()
 			.expect("save restored user network")
 			.expect("user network state");
 		assert_eq!(&restored_state[..8], b"VMUN\x02\x01\x20\xfb");
+
+		// A policy filter must not silently replace a persisted restriction.
+		let filter = Arc::new(Mutex::new(crate::virtio::net::user::filter::Filter::new(
+			crate::virtio::net::user::filter::Policy::from_json(
+				br#"{"blocked":[],"exempt":[],"allow":[],"deny":[],"domains":[],"dns":true}"#,
+			)
+			.expect("policy"),
+		)));
+		assert!(open_user_net_device(mac, Some(&state), false, None, Some(filter)).is_err());
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn filtered_user_net_snapshot_state_is_unrestricted() {
+		let mac = [0x02, 0, 0, 0, 0, 1];
+		let filter = || {
+			Arc::new(Mutex::new(crate::virtio::net::user::filter::Filter::new(
+				crate::virtio::net::user::filter::Policy::from_json(
+					br#"{"blocked":["10.0.0.0/8"],"exempt":[],"allow":[],"deny":[],"domains":[],"dns":true}"#,
+				)
+				.expect("policy"),
+			)))
+		};
+		let fresh = open_fresh_user_net_device(mac, false, None, Some(filter()))
+			.expect("filtered user network");
+		let state = fresh.lock().user_net_state().expect("save").expect("state");
+		// Same on-disk header as an unfiltered backend: the filter is not
+		// persisted and is re-supplied on restore.
+		assert_eq!(&state[..8], b"VMUN\x02\x00\x00\x00");
+		drop(fresh);
+		open_user_net_device(mac, Some(&state), false, None, Some(filter()))
+			.expect("filtered restore");
+		open_user_net_device(mac, Some(&state), false, None, None).expect("unfiltered restore");
 	}
 }

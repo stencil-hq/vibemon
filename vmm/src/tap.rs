@@ -113,7 +113,8 @@ mod platform {
 
 	fn set_vnet_hdr_size(fd: RawFd, size: usize) -> Result<()> {
 		let mut size = size as libc::c_int;
-		// SAFETY: fd is valid, request expects a pointer to an int-sized header length.
+		// SAFETY: fd is valid, request expects a pointer to an int-sized header
+		// length.
 		let ret = unsafe { libc::ioctl(fd, TUNSETVNETHDRSZ, &mut size) };
 		if ret < 0 {
 			return Err(
@@ -368,8 +369,9 @@ mod platform {
 
 	impl Drop for Tap {
 		fn drop(&mut self) {
-			// SAFETY: self.interface is the live vmnet interface owned by this Tap,
-			// and null queue/callback unregisters packet notifications before stop.
+			// SAFETY: self.interface is the live vmnet interface owned by this
+			// Tap, and null queue/callback unregisters packet notifications
+			// before stop.
 			let _ = unsafe {
 				vmnet_interface_set_event_callback(
 					self.interface,
@@ -401,7 +403,8 @@ mod platform {
 			desc.set_uint64(unsafe { vmnet_operation_mode_key }, VMNET_SHARED_MODE);
 			// SAFETY: vmnet_mtu_key is a process-provided static C key.
 			desc.set_uint64(unsafe { vmnet_mtu_key }, DEFAULT_MTU);
-			// SAFETY: vmnet_max_packet_size_key is a process-provided static C key.
+			// SAFETY: vmnet_max_packet_size_key is a process-provided static C
+			// key.
 			desc.set_uint64(unsafe { vmnet_max_packet_size_key }, MAX_PACKET_SIZE);
 			// SAFETY: vmnet_start_address_key is a process-provided static C key.
 			desc.set_string(unsafe { vmnet_start_address_key }, DEFAULT_START_ADDRESS)?;
@@ -415,7 +418,8 @@ mod platform {
 			);
 			// SAFETY: vmnet_mac_address_key is a process-provided static C key.
 			desc.set_string(unsafe { vmnet_mac_address_key }, &mac_address)?;
-			// SAFETY: vmnet_allocate_mac_address_key is a process-provided static C key.
+			// SAFETY: vmnet_allocate_mac_address_key is a process-provided static
+			// C key.
 			desc.set_bool(unsafe { vmnet_allocate_mac_address_key }, false);
 			if let Some(key) = dynamic_vmnet_key(b"vmnet_enable_virtio_header_key\0") {
 				desc.set_bool(key, true);
@@ -429,22 +433,25 @@ mod platform {
 		}
 
 		fn set_bool(&self, key: *const c_char, value: bool) {
-			// SAFETY: self.xpc is a live mutable dictionary retained by InterfaceDesc,
-			// key is a valid vmnet C string key, and value is copied by XPC.
+			// SAFETY: self.xpc is a live mutable dictionary retained by
+			// InterfaceDesc, key is a valid vmnet C string key, and value is
+			// copied by XPC.
 			unsafe { xpc_dictionary_set_bool(self.xpc, key, value) };
 		}
 
 		fn set_uint64(&self, key: *const c_char, value: u64) {
-			// SAFETY: self.xpc is a live mutable dictionary retained by InterfaceDesc,
-			// key is a valid vmnet C string key, and value is copied by XPC.
+			// SAFETY: self.xpc is a live mutable dictionary retained by
+			// InterfaceDesc, key is a valid vmnet C string key, and value is
+			// copied by XPC.
 			unsafe { xpc_dictionary_set_uint64(self.xpc, key, value) };
 		}
 
 		fn set_string(&mut self, key: *const c_char, value: &str) -> Result<()> {
 			let value = CString::new(value)
 				.map_err(|_| err(format!("vmnet string value {value:?} contains NUL")))?;
-			// SAFETY: self.xpc is a live mutable dictionary, key is a valid vmnet C
-			// string key, and value.as_ptr() remains alive because value is stored.
+			// SAFETY: self.xpc is a live mutable dictionary, key is a valid vmnet
+			// C string key, and value.as_ptr() remains alive because value is
+			// stored.
 			unsafe { xpc_dictionary_set_string(self.xpc, key, value.as_ptr()) };
 			self.strings.push(value);
 			Ok(())
@@ -453,8 +460,8 @@ mod platform {
 
 	impl Drop for InterfaceDesc {
 		fn drop(&mut self) {
-			// SAFETY: self.xpc is the retained XPC object created for this descriptor
-			// and has not been released elsewhere.
+			// SAFETY: self.xpc is the retained XPC object created for this
+			// descriptor and has not been released elsewhere.
 			unsafe { xpc_release(self.xpc) };
 		}
 	}
@@ -472,8 +479,9 @@ mod platform {
 		});
 		let block = block.copy();
 		let interface = {
-			// SAFETY: xpc and queue are live for the call, and block is copied so the
-			// Objective-C callback object remains valid until completion is received.
+			// SAFETY: xpc and queue are live for the call, and block is copied so
+			// the Objective-C callback object remains valid until completion is
+			// received.
 			unsafe { vmnet_start_interface(xpc, queue, &*block as *const _ as *mut c_void) }
 		};
 		if interface.is_null() {
@@ -562,7 +570,8 @@ mod platform {
 		let block = block.copy();
 		let status = {
 			// SAFETY: interface and queue identify the live vmnet interface being
-			// stopped, and block remains alive until the completion status is read.
+			// stopped, and block remains alive until the completion status is
+			// read.
 			unsafe { vmnet_stop_interface(interface, queue, &*block as *const _ as *mut c_void) }
 		};
 		if status == VMNET_SUCCESS {
@@ -703,7 +712,8 @@ mod platform {
 		reason = "OVERLAPPED is pinned in a Box and all access is serialized until completion"
 	)]
 	// SAFETY: the boxed `OVERLAPPED` stays at a stable address, its embedded raw
-	// pointer is always null, and callers serialize every access to an operation.
+	// pointer is always null, and callers serialize every access to an
+	// operation.
 	unsafe impl Send for OverlappedOp {}
 
 	impl OverlappedOp {

@@ -35,19 +35,21 @@ pub enum VcpuState {
 	Hvf {
 		/// `(index, value)`; `0..=30` = X0..X30, `31` = PC, `32` = CPSR,
 		/// `33` = FPCR, `34` = FPSR.
-		regs:          Vec<(u8, u64)>,
+		regs:           Vec<(u8, u64)>,
 		/// `(encoding, value)` for the curated migratable system registers.
-		sys_regs:      Vec<(crate::hv::SysReg, u64)>,
+		sys_regs:       Vec<(crate::hv::SysReg, u64)>,
 		/// `(encoding, value)` for the GIC CPU-interface registers.
-		icc_regs:      Vec<(u64, u64)>,
+		icc_regs:       Vec<(u64, u64)>,
 		/// `(index, value)`; `0..=31` = Q0..Q31 as little-endian 128-bit lanes.
-		simd_fp_regs:  Vec<(u8, u128)>,
+		simd_fp_regs:   Vec<(u8, u128)>,
 		/// PSCI powered/runnable state for this vCPU.
-		powered:       bool,
-		/// `CNTVOFF_EL2` virtual-timer offset.
-		vtimer_offset: u64,
+		powered:        bool,
+		/// Guest virtual counter (`CNTVCT_EL0`) value the paused VM was frozen
+		/// at, identical on every vCPU. A restore continues the counter from
+		/// here, so time between capture and restore is not guest time.
+		vtimer_counter: u64,
 		/// Whether the virtual timer is masked.
-		vtimer_masked: bool,
+		vtimer_masked:  bool,
 	},
 }
 

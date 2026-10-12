@@ -260,10 +260,15 @@ fn size_file(file: &File, len: usize) -> Result<()> {
 /// `CoW` fork: clean pages are shared via the host page cache across every
 /// child process, while a write faults a private copy. `regions` is `(gpa, len,
 /// file_offset)` matching the snapshot's contiguous region table.
+///
+/// With `huge` on Linux, RAM is instead private 2 MiB hugetlb memory filled
+/// lazily from the file (see `os::hugemem`) when the host supports it, which
+/// cuts post-restore page faults ~500x at the cost of page-cache sharing.
 #[cfg(target_os = "windows")]
 pub fn create_guest_memory_private(
 	mem_file: &std::path::Path,
 	regions: &[(u64, u64, u64)],
+	_huge: bool,
 ) -> Result<GuestMemoryMmap> {
 	use std::os::windows::fs::FileExt;
 
@@ -311,6 +316,7 @@ pub fn create_guest_memory_private(
 pub fn create_guest_memory_private(
 	mem_file: &std::path::Path,
 	regions: &[(u64, u64, u64)],
+	huge: bool,
 ) -> Result<GuestMemoryMmap> {
 	use vm_memory::mmap::{GuestRegionMmap, MmapRegion};
 
@@ -330,7 +336,6 @@ pub fn create_guest_memory_private(
 		return Err(crate::result::err("snapshot has no memory regions"));
 	}
 	let mut next_file_offset = 0u64;
-	let mut gregions = Vec::with_capacity(regions.len());
 	for (idx, &(gpa, len, file_offset)) in regions.iter().enumerate() {
 		if gpa % PAGE_SIZE as u64 != 0 {
 			return Err(crate::result::err(format!(
@@ -365,6 +370,22 @@ pub fn create_guest_memory_private(
 			)));
 		}
 		next_file_offset = end;
+	}
+	if next_file_offset != file_len {
+		return Err(crate::result::err(format!(
+			"snapshot memory regions cover {next_file_offset} bytes but memory file is {file_len} \
+			 bytes"
+		)));
+	}
+	#[cfg(target_os = "linux")]
+	if huge && let Some(lazy) = crate::os::hugemem::map(&mem, regions) {
+		return GuestMemoryMmap::from_regions(lazy)
+			.map_err(|e| crate::result::err(format!("assembling hugetlb guest memory: {e}")));
+	}
+	#[cfg(not(target_os = "linux"))]
+	let _ = huge;
+	let mut gregions = Vec::with_capacity(regions.len());
+	for &(gpa, len, file_offset) in regions {
 		let len = usize::try_from(len).map_err(|_| {
 			crate::result::err(format!("snapshot memory region @ {gpa:#x} is too large"))
 		})?;
@@ -383,14 +404,46 @@ pub fn create_guest_memory_private(
 			GuestRegionMmap::new(region, GuestAddress(gpa)).ok_or("guest region address overflow")?;
 		gregions.push(greg);
 	}
-	if next_file_offset != file_len {
-		return Err(crate::result::err(format!(
-			"snapshot memory regions cover {next_file_offset} bytes but memory file is {file_len} \
-			 bytes"
-		)));
-	}
 	GuestMemoryMmap::from_regions(gregions)
 		.map_err(|e| crate::result::err(format!("assembling private guest memory: {e}")))
+}
+
+/// This process's `/proc/self/pagemap` (best-effort).
+#[cfg(target_os = "linux")]
+static PAGEMAP: std::sync::LazyLock<Option<File>> =
+	std::sync::LazyLock::new(|| File::open("/proc/self/pagemap").ok());
+
+/// Opens `/proc/self/pagemap` for later [`pagemap`] callers. Must run before
+/// the sandbox uid drop and Landlock: afterwards the process is non-dumpable
+/// (its `/proc/self` entries belong to root) and `/proc` is not in the
+/// Landlock allow list. A failure only disables the users' fast paths.
+#[cfg(target_os = "linux")]
+pub fn open_pagemap() {
+	std::sync::LazyLock::force(&PAGEMAP);
+}
+
+/// This process's pagemap fd, if it could be opened.
+#[cfg(target_os = "linux")]
+pub fn pagemap() -> Option<&'static File> {
+	PAGEMAP.as_ref()
+}
+
+/// Creates what lazily populated 2 MiB guest RAM needs (a `userfaultfd`) while
+/// still privileged; see `os::hugemem`. Best-effort.
+#[cfg(target_os = "linux")]
+pub fn prepare_huge_backing() {
+	crate::os::hugemem::prepare();
+}
+
+/// Pages of `live` written since it was restored from `base_memory` as lazily
+/// populated 2 MiB RAM (one 4 KiB-page word bitmap per region, 2 MiB
+/// granular); `None` for any other RAM.
+#[cfg(target_os = "linux")]
+pub fn lazy_written_log(
+	live: &GuestMemoryMmap,
+	base_memory: &std::path::Path,
+) -> Option<Vec<Vec<u64>>> {
+	crate::os::hugemem::written_log(live, base_memory)
 }
 
 #[cfg(test)]
@@ -454,7 +507,7 @@ mod tests {
 		use vm_memory::Bytes;
 
 		let (path, expected) = private_memory_fixture();
-		let memory = create_guest_memory_private(&path, &[(0, expected.len() as u64, 0)])
+		let memory = create_guest_memory_private(&path, &[(0, expected.len() as u64, 0)], false)
 			.expect("private snapshot mapping");
 		let mut actual = vec![0u8; expected.len()];
 		memory
@@ -471,10 +524,10 @@ mod tests {
 
 		let (path, expected) = private_memory_fixture();
 		let regions = [(0, expected.len() as u64, 0)];
-		let first =
-			create_guest_memory_private(&path, &regions).expect("first private snapshot mapping");
-		let second =
-			create_guest_memory_private(&path, &regions).expect("second private snapshot mapping");
+		let first = create_guest_memory_private(&path, &regions, false)
+			.expect("first private snapshot mapping");
+		let second = create_guest_memory_private(&path, &regions, false)
+			.expect("second private snapshot mapping");
 		let replacement = [0x7eu8; 32];
 		first
 			.write_slice(&replacement, GuestAddress(PAGE_SIZE as u64))
@@ -502,7 +555,7 @@ mod tests {
 				.as_nanos()
 		));
 		std::fs::write(&path, vec![0; PAGE_SIZE * 2]).unwrap();
-		let err = result_err(create_guest_memory_private(&path, &[(0, PAGE_SIZE as u64, 0)]));
+		let err = result_err(create_guest_memory_private(&path, &[(0, PAGE_SIZE as u64, 0)], false));
 		let _ = std::fs::remove_file(&path);
 		assert!(err.contains("memory file is"), "unexpected error: {err}");
 	}
