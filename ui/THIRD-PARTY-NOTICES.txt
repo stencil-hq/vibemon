@@ -1,0 +1,25 @@
+THIRD-PARTY NOTICES FOR THE EMBEDDED ADMIN DASHBOARD
+
+The admin dashboard is built by Vite from ui/ into driver/web/ and embedded
+into the vmon binary. The generated JavaScript and CSS distribute code from
+these runtime dependencies (versions resolved by ui/bun.lock):
+
+- @xterm/xterm 6.0.0
+  Source: https://github.com/xtermjs/xterm.js
+  License: MIT
+  Copyright (c) 2017-2019, The xterm.js authors
+  Copyright (c) 2014-2016, SourceLair Private Company
+  Copyright (c) 2012-2013, Christopher Jeffrey
+- @xterm/addon-fit 0.11.0
+  Source: https://github.com/xtermjs/xterm.js
+  License: MIT
+  Copyright (c) 2019, The xterm.js authors
+- React and React DOM 19.3.0, scheduler 0.28.0
+  Source: https://github.com/facebook/react
+  License: MIT
+  Copyright (c) Meta Platforms, Inc. and affiliates.
+
+The project license does not replace these third-party terms. Installed
+ui/node_modules retains source-package metadata and upstream license texts
+during builds; node_modules is not part of the binary release. Release
+archives carry the tracked aggregate notice and the companion MIT text.

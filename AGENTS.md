@@ -61,6 +61,9 @@ guest: systemd/OpenRC + vmon-agent installed as /usr/bin/envd (envd on :49983)
 - `driver/`: `vmon-driver`. `api/` (E2B routes), `store/` + `migrations/`
   (MySQL; migrations are registered by hand in `store/mod.rs`), `lifecycle/`,
   `scheduler.rs`, `builds/`, `ingress/`, `auth.rs`, `crypto.rs`, `admin.rs`.
+- `ui/`: the admin dashboard (React + Vite, `bun`). `just ui` builds it into
+  `driver/web/`, which `driver/src/dashboard.rs` embeds at `/dashboard/`;
+  commit the built files with the sources.
 - `src/`: the binary (`main.rs`, `serve.rs`, `admin.rs`).
 - `templates/`: default template definitions (E2B v2 builder scripts) and `build.py`.
 - `kernel/`: guest kernel config fragments and `build.sh`.

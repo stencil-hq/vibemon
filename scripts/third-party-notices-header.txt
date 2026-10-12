@@ -37,21 +37,17 @@ statically embedded in the vmon host binaries.
 SHIPPED WEB UI RUNTIME
 ----------------------
 
-The production UI is built into vmond/web and embedded in the vmon server
+The admin dashboard is built into driver/web and embedded in the vmon
 binary. Its locked runtime graph is:
 
-- @bufbuild/protobuf 2.12.1 (Apache-2.0 AND BSD-3-Clause)
-- @connectrpc/connect 2.1.2 (Apache-2.0)
-- @xterm/addon-fit 0.10.0 (MIT)
-- @xterm/xterm 5.5.0 (MIT)
-- js-tokens 4.0.0 (MIT)
-- loose-envify 1.4.0 (MIT)
-- react 18.3.1 (MIT)
-- react-dom 18.3.1 (MIT)
-- scheduler 0.23.2 (MIT)
+- @xterm/addon-fit 0.11.0 (MIT)
+- @xterm/xterm 6.0.0 (MIT)
+- react 19.3.0 (MIT)
+- react-dom 19.3.0 (MIT)
+- scheduler 0.28.0 (MIT)
 
 The complete UI attribution and applicable texts are preserved in the tracked
-vmond/web/THIRD-PARTY-NOTICES.txt notice concatenated below.
+ui/THIRD-PARTY-NOTICES.txt notice concatenated below.
 
 NATIVE AND VENDORED COMPONENTS
 ------------------------------

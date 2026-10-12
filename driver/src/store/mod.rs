@@ -96,6 +96,7 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
 	(3, "sandboxes", include_str!("../../migrations/0003_sandboxes.sql")),
 	(4, "system_teams", include_str!("../../migrations/0004_system_teams.sql")),
 	(5, "s3_mounts", include_str!("../../migrations/0005_s3_mounts.sql")),
+	(6, "sandbox_state_index", include_str!("../../migrations/0006_sandbox_state_index.sql")),
 ];
 
 fn migrator() -> Migrator {

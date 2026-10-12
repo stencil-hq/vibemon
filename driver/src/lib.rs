@@ -9,11 +9,13 @@ pub mod api;
 pub mod auth;
 pub mod builds;
 pub mod crypto;
+pub mod dashboard;
 pub mod error;
 pub mod ingress;
 pub mod lifecycle;
 pub mod scheduler;
 pub mod state;
+pub mod stats;
 pub mod store;
 pub mod webhooks;
 
@@ -31,7 +33,7 @@ pub struct Driver {
 
 impl Driver {
 	/// Connects to `MySQL`, applies migrations, and starts background work
-	/// (reaper, reconciler, build supervisor, webhook delivery).
+	/// (reaper, reconciler, build supervisor, webhook delivery, fleet sampler).
 	pub async fn start(
 		config: DriverConfig,
 		mysql_url: &str,
@@ -44,13 +46,15 @@ impl Driver {
 		lifecycle::spawn_background(state.clone());
 		builds::spawn_supervisor(state.clone());
 		webhooks::spawn_delivery(state.clone());
+		stats::spawn_sampler(state.clone());
 		Ok(Self { state })
 	}
 
 	/// Public router: sandbox ingress (by Host / `E2b-Sandbox-*` headers) in
-	/// front of the E2B API.
+	/// front of the E2B API and the admin dashboard.
 	pub fn public_router(&self) -> axum::Router {
-		ingress::wrap(self.state.clone(), api::router(self.state.clone()))
+		let api = api::router(self.state.clone()).merge(dashboard::router());
+		ingress::wrap(self.state.clone(), api)
 	}
 
 	/// Shared state (used by the `vmon` binary for admin wiring and tests).

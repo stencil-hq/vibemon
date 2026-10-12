@@ -1,4 +1,5 @@
-//! Admin node endpoints: `GET /nodes`, `GET|POST /nodes/{nodeID}`.
+//! Admin node endpoints: `GET /nodes`, `GET|POST /nodes/{nodeID}`, and the
+//! dashboard's `GET /admin/cluster` (vmon extension).
 //!
 //! Nodes are gossip members with the node role (E2B `Node`, `NodeDetail`,
 //! `NodeStatusChange`); the admin status override lives in KV
@@ -14,7 +15,7 @@ use axum::{
 	routing::get,
 };
 use serde::{Deserialize, Serialize};
-use vmon_cluster::{MemberMeta, NodeId, gossip::MemberState};
+use vmon_cluster::{MemberMeta, NodeId, RaftStatus, Roles, gossip::MemberState};
 use vmon_node::api::SandboxInfo;
 
 use crate::{
@@ -26,11 +27,13 @@ use crate::{
 		self, MEMORY_OVERCOMMIT, NOMINAL_SANDBOX_MEMORY_MB, NodeCounters, NodeStatus, status_key,
 	},
 	state::AppState,
+	stats::FleetSample,
 };
 
 /// Node routes (merged by [`crate::api::router`]).
 pub fn routes() -> Router<AppState> {
 	Router::new()
+		.route("/admin/cluster", get(cluster))
 		.route("/nodes", get(list))
 		.route("/nodes/{node_id}", get(detail).post(set_status))
 }
@@ -98,6 +101,61 @@ struct StatusChange {
 	status:      Option<String>,
 	#[serde(rename = "clusterID")]
 	_cluster_id: Option<String>,
+}
+
+/// `GET /admin/cluster` body.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterDto {
+	#[serde(rename = "clusterID")]
+	cluster_id: String,
+	#[serde(rename = "localID")]
+	local_id:   String,
+	members:    Vec<MemberDto>,
+	history:    Vec<FleetSample>,
+}
+
+/// One gossip member.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberDto {
+	id:          String,
+	state:       MemberState,
+	roles:       Roles,
+	version:     String,
+	started_at:  String,
+	#[serde(rename = "clusterURL")]
+	cluster_url: String,
+	#[serde(rename = "publicURL")]
+	public_url:  Option<String>,
+	raft:        Option<RaftStatus>,
+	node:        Option<MemberNodeDto>,
+}
+
+/// Capacity and placement view of a node member.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberNodeDto {
+	status:           &'static str,
+	arch:             String,
+	os:               String,
+	backend:          String,
+	cpu_baseline:     String,
+	cpus:             u32,
+	vcpus_used:       u32,
+	#[serde(rename = "memoryMB")]
+	memory_mb:        u64,
+	#[serde(rename = "memoryUsedMB")]
+	memory_used_mb:   u64,
+	#[serde(rename = "diskFreeMB")]
+	disk_free_mb:     u64,
+	sandboxes:        u32,
+	builds:           u32,
+	features:         Vec<String>,
+	cached_builds:    usize,
+	create_successes: u64,
+	create_fails:     u64,
+	inflight:         u32,
 }
 
 /// Public status: gossip liveness first, then the admin override / node drain
@@ -180,6 +238,71 @@ fn cluster_id(state: &AppState) -> String {
 
 async fn statuses(state: &AppState) -> ApiResult<HashMap<NodeId, NodeStatus>> {
 	Ok(scheduler::load_statuses(&state.cluster.kv).await?)
+}
+
+fn member_dto(
+	id: NodeId,
+	member_state: MemberState,
+	meta: MemberMeta,
+	admin: Option<NodeStatus>,
+	counters: NodeCounters,
+) -> MemberDto {
+	let node = meta
+		.node
+		.as_ref()
+		.filter(|_| meta.roles.node)
+		.map(|cap| MemberNodeDto {
+			status:           effective_status(member_state, &meta, admin),
+			arch:             cap.arch.clone(),
+			os:               cap.os.clone(),
+			backend:          cap.backend.clone(),
+			cpu_baseline:     cap.cpu_baseline.clone(),
+			cpus:             cap.cpus,
+			vcpus_used:       cap.vcpus_used,
+			memory_mb:        cap.memory_mb,
+			memory_used_mb:   cap.memory_used_mb,
+			disk_free_mb:     cap.disk_free_mb,
+			sandboxes:        cap.sandboxes,
+			builds:           cap.builds,
+			features:         cap.features.clone(),
+			cached_builds:    cap.cached_builds.len(),
+			create_successes: counters.successes,
+			create_fails:     counters.fails,
+			inflight:         counters.inflight,
+		});
+	MemberDto {
+		id: id.to_string(),
+		state: member_state,
+		roles: meta.roles,
+		version: meta.version,
+		started_at: rfc3339_ms(meta.started_at_ms),
+		cluster_url: meta.cluster_url,
+		public_url: meta.public_url,
+		raft: meta.raft.filter(|_| meta.roles.driver),
+		node,
+	}
+}
+
+/// `GET /admin/cluster`: every gossip member plus this driver's fleet history.
+async fn cluster(State(state): State<AppState>, _admin: AdminAuth) -> ApiResult<Json<ClusterDto>> {
+	let statuses = statuses(&state).await?;
+	let counters = state.scheduler.counters();
+	let mut members: Vec<MemberDto> = state
+		.cluster
+		.members()
+		.into_iter()
+		.map(|(member, meta)| {
+			let c = counters.get(&member.id).copied().unwrap_or_default();
+			member_dto(member.id, member.state, meta, statuses.get(&member.id).copied(), c)
+		})
+		.collect();
+	members.sort_by(|a, b| a.id.cmp(&b.id));
+	Ok(Json(ClusterDto {
+		cluster_id: cluster_id(&state),
+		local_id: state.cluster.local_id().to_string(),
+		members,
+		history: state.stats.snapshot(),
+	}))
 }
 
 async fn list(State(state): State<AppState>, _admin: AdminAuth) -> ApiResult<Json<Vec<NodeDto>>> {

@@ -2,7 +2,7 @@
 //! sandbox. Written by [`crate::lifecycle`]; read by the sandbox API and the
 //! reconciler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
@@ -149,7 +149,8 @@ pub enum ListOrder {
 /// Filters for [`Store::list_sandboxes`] / [`Store::count_sandboxes`].
 #[derive(Clone, Debug, Default)]
 pub struct SandboxFilter<'a> {
-	pub team_id:       &'a str,
+	/// `None` lists every team (admin listings only).
+	pub team_id:       Option<&'a str>,
 	/// Non-empty subset of `running`/`paused`.
 	pub states:        Vec<SandboxState>,
 	/// Every pair must be present in `metadata`.
@@ -157,6 +158,13 @@ pub struct SandboxFilter<'a> {
 	pub started_after: Option<DateTime<Utc>>,
 	/// Template ID or alias.
 	pub template:      Option<&'a str>,
+}
+
+/// Durable running/paused counts of one team ([`Store::live_counts_by_team`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct LiveCounts {
+	pub running: u64,
+	pub paused:  u64,
 }
 
 /// Input of [`Store::mark_sandbox_resumed`]: the new execution of a sandbox.
@@ -357,7 +365,7 @@ impl Store {
 		Ok(())
 	}
 
-	/// One page of a team's sandboxes. Returns up to `limit` rows after `after`.
+	/// One page of sandboxes. Returns up to `limit` rows after `after`.
 	pub async fn list_sandboxes(
 		&self,
 		filter: &SandboxFilter<'_>,
@@ -406,6 +414,28 @@ impl Store {
 		.await
 	}
 
+	/// Running/paused row counts per team (one grouped query); teams without
+	/// live sandboxes are absent.
+	pub async fn live_counts_by_team(&self) -> sqlx::Result<HashMap<String, LiveCounts>> {
+		let rows: Vec<(String, String, i64)> = sqlx::query_as(
+			"SELECT team_id, state, COUNT(*) FROM sandboxes WHERE state IN ('running', 'paused') \
+			 GROUP BY team_id, state",
+		)
+		.fetch_all(self.pool())
+		.await?;
+		let mut counts: HashMap<String, LiveCounts> = HashMap::new();
+		for (team_id, state, n) in rows {
+			let entry = counts.entry(team_id).or_default();
+			let n = u64::try_from(n).unwrap_or_default();
+			match SandboxState::parse(&state) {
+				SandboxState::Running => entry.running = n,
+				SandboxState::Paused => entry.paused = n,
+				SandboxState::Killed => {},
+			}
+		}
+		Ok(counts)
+	}
+
 	/// `(id, state, node_id)` of every running or paused sandbox (reconciler).
 	pub async fn live_sandboxes(&self) -> sqlx::Result<Vec<(String, String, String)>> {
 		sqlx::query_as(
@@ -417,9 +447,7 @@ impl Store {
 }
 
 fn push_filter(query: &mut QueryBuilder<MySql>, filter: &SandboxFilter<'_>) {
-	query.push(" WHERE team_id = ");
-	query.push_bind(filter.team_id);
-	query.push(" AND state IN (");
+	query.push(" WHERE state IN (");
 	let mut states = query.separated(", ");
 	for state in &filter.states {
 		states.push_bind(state.as_str());
@@ -428,6 +456,10 @@ fn push_filter(query: &mut QueryBuilder<MySql>, filter: &SandboxFilter<'_>) {
 		states.push("'running', 'paused'");
 	}
 	query.push(")");
+	if let Some(team_id) = filter.team_id {
+		query.push(" AND team_id = ");
+		query.push_bind(team_id);
+	}
 	if !filter.metadata.is_empty() {
 		query.push(" AND JSON_CONTAINS(metadata, CAST(");
 		query.push_bind(serde_json::to_string(&filter.metadata).unwrap_or_default());
@@ -666,7 +698,7 @@ mod tests {
 			event_types::KILLED
 		]);
 
-		let all = SandboxFilter { team_id: &team.id, ..SandboxFilter::default() };
+		let all = SandboxFilter { team_id: Some(&team.id), ..SandboxFilter::default() };
 		let listed = store
 			.list_sandboxes(&all, ListOrder::Desc, None, 10)
 			.await
@@ -719,6 +751,87 @@ mod tests {
 
 		let live = store.team_live_sandboxes(&team.id).await.unwrap();
 		assert_eq!(live.len(), 3);
+		db.drop_db().await;
+	}
+
+	#[tokio::test]
+	async fn listing_without_team_spans_teams_and_counts_group_by_team() {
+		let Some(db) = TestDb::create().await else {
+			return;
+		};
+		let store = db.store.clone();
+		let a = store
+			.create_team("list-a", TeamLimits::default())
+			.await
+			.unwrap();
+		let b = store
+			.create_team("list-b", TeamLimits::default())
+			.await
+			.unwrap();
+		let base = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+		let net = NetworkConfig::default();
+		let meta = BTreeMap::new();
+		let rows = [("ilista0", &a.id), ("ilista1", &a.id), ("ilistb0", &b.id), ("ilistb1", &b.id)];
+		for (i, (id, team)) in rows.iter().enumerate() {
+			let at = base + Duration::seconds(i64::try_from(i).unwrap());
+			store
+				.insert_sandbox(
+					&new_row(id, team, at, &meta, &net),
+					&event(id, team, event_types::CREATED),
+				)
+				.await
+				.unwrap();
+		}
+		assert!(
+			store
+				.mark_sandbox_paused("ilista1", base, &event("ilista1", &a.id, event_types::PAUSED))
+				.await
+				.unwrap()
+		);
+		assert!(
+			store
+				.mark_sandbox_killed("ilistb1", base, &event("ilistb1", &b.id, event_types::KILLED))
+				.await
+				.unwrap()
+		);
+
+		let ids = |rows: Vec<SandboxRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+		let every = SandboxFilter::default();
+		let listed = store
+			.list_sandboxes(&every, ListOrder::Desc, None, 10)
+			.await
+			.unwrap();
+		assert_eq!(ids(listed), ["ilistb0", "ilista1", "ilista0"]);
+		let page = store
+			.list_sandboxes(&every, ListOrder::Desc, None, 1)
+			.await
+			.unwrap();
+		let after = ListAfter { started_at: page[0].started_at, id: page[0].id.clone() };
+		let rest = store
+			.list_sandboxes(&every, ListOrder::Desc, Some(&after), 10)
+			.await
+			.unwrap();
+		assert_eq!(ids(rest), ["ilista1", "ilista0"]);
+		let running = SandboxFilter { states: vec![SandboxState::Running], ..every };
+		assert_eq!(store.count_sandboxes(&running).await.unwrap(), 2);
+
+		let only_a = SandboxFilter { team_id: Some(&a.id), ..SandboxFilter::default() };
+		let listed = store
+			.list_sandboxes(&only_a, ListOrder::Desc, None, 10)
+			.await
+			.unwrap();
+		assert_eq!(ids(listed), ["ilista1", "ilista0"]);
+		let a_running = SandboxFilter { states: vec![SandboxState::Running], ..only_a };
+		assert_eq!(store.count_sandboxes(&a_running).await.unwrap(), 1);
+
+		let counts = store.live_counts_by_team().await.unwrap();
+		assert_eq!(
+			counts,
+			HashMap::from([
+				(a.id.clone(), LiveCounts { running: 1, paused: 1 }),
+				(b.id.clone(), LiveCounts { running: 1, paused: 0 }),
+			])
+		);
 		db.drop_db().await;
 	}
 

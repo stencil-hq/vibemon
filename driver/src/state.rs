@@ -5,7 +5,10 @@ use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 use vmon_cluster::{Cluster, MemberMeta, NodeId, gossip::MemberState};
 use vmon_node::client::NodeClient;
 
-use crate::{auth::AuthCache, crypto::Keys, error::ApiError, scheduler::Scheduler, store::Store};
+use crate::{
+	auth::AuthCache, crypto::Keys, error::ApiError, scheduler::Scheduler, stats::FleetStats,
+	store::Store,
+};
 
 /// Driver configuration resolved by the `vmon serve` front end.
 #[derive(Clone, Debug)]
@@ -77,6 +80,8 @@ pub struct Inner {
 	pub auth_cache: AuthCache,
 	/// Driver-local placement counters (inflight creates, per-node outcomes).
 	pub scheduler:  Scheduler,
+	/// Recent fleet samples ([`crate::stats`]).
+	pub stats:      FleetStats,
 }
 
 impl Deref for AppState {
@@ -103,6 +108,7 @@ impl AppState {
 			http,
 			auth_cache: AuthCache::default(),
 			scheduler: Scheduler::default(),
+			stats: FleetStats::default(),
 		}))
 	}
 

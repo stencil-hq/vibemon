@@ -4,6 +4,12 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+### Added (admin dashboard)
+
+- Admin dashboard at `/dashboard/` on the driver's public listeners (`/` redirects there), signed in with `--admin-token`: fleet capacity and activity charts, cluster members, every team's sandboxes with an in-browser terminal (PTY login shell over envd), file browser (preview, upload, download, rename, delete), metrics, and logs, plus create, pause, resume, kill, timeouts, node draining, and team-wide kills; built from `ui/` with `just ui` and embedded in the binary
+- Admin API extensions behind `X-Admin-Token`: `GET /admin/cluster` (members, raft view, node capacity and status, and a 1 h in-memory fleet history sampled every 5 s), `GET /admin/teams` (limits and running/paused counts), and `GET /admin/sandboxes` (every team's sandboxes with team and node, filterable by `state`, `team`, and `id`, paginated)
+- Migration 0006 indexes `sandboxes (state, started_at, id)` for team-less listings and the reconciler
+
 ### Added (S3 filesystems)
 
 - S3-backed filesystems: bring-your-own-bucket mounts (`vmonS3Mounts` on `POST /sandboxes` and `/v2/sandboxes`, modes `ro`, `overlay`, `writeback`, inline or team-secret credentials) and, with `--object-store`, E2B volumes stored under `volumes/<id>/` in the object store, mountable on any node, with the volume-content API served from S3

@@ -241,6 +241,22 @@ impl Store {
 		Ok(max.unwrap_or(0))
 	}
 
+	/// Cluster-wide start events (created + resumed) with `seq > after_seq`,
+	/// and the highest `seq` of any type (`after_seq` when none); one PK range
+	/// scan, used as the fleet sampler's cursor.
+	pub async fn start_events_after(&self, after_seq: u64) -> sqlx::Result<(u64, u64)> {
+		let (starts, max): (i64, Option<u64>) = sqlx::query_as(
+			"SELECT COUNT(CASE WHEN type IN (?, ?) THEN 1 END), MAX(seq) FROM sandbox_events WHERE \
+			 seq > ?",
+		)
+		.bind(event_types::CREATED)
+		.bind(event_types::RESUMED)
+		.bind(after_seq)
+		.fetch_one(self.pool())
+		.await?;
+		Ok((u64::try_from(starts).unwrap_or_default(), max.unwrap_or(after_seq)))
+	}
+
 	/// `(ts, type)` of a team's start/stop events in `[start, end]`, oldest
 	/// first, plus the net running count before `start` (team metrics).
 	pub async fn lifecycle_timeline(
@@ -291,4 +307,52 @@ pub fn is_start(event_type: &str) -> bool {
 /// Whether an event type ends an execution (−1 running sandbox).
 pub fn is_stop(event_type: &str) -> bool {
 	event_type == event_types::PAUSED || event_type == event_types::KILLED
+}
+
+#[cfg(test)]
+mod tests {
+	//! Gated on `VMON_MYSQL_TEST_URL` (see [`crate::store::testdb`]).
+
+	use super::*;
+	use crate::store::testdb::TestDb;
+
+	async fn record(store: &Store, event_type: &'static str) {
+		store
+			.record_event(&NewSandboxEvent {
+				team_id: "00000000-0000-4000-8000-0000000000aa",
+				sandbox_id: "icursor",
+				execution_id: "00000000-0000-4000-8000-000000000001",
+				template_id: "tpl00000000000000000",
+				build_id: "00000000-0000-4000-8000-000000000000",
+				event_type,
+				data: json!({}),
+			})
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn start_cursor_counts_creates_and_resumes_and_advances_past_other_types() {
+		let Some(db) = TestDb::create().await else {
+			return;
+		};
+		let store = db.store.clone();
+		let start = store.max_event_seq().await.unwrap();
+		assert_eq!(store.start_events_after(start).await.unwrap(), (0, start));
+
+		for ty in
+			[event_types::CREATED, event_types::PAUSED, event_types::RESUMED, event_types::KILLED]
+		{
+			record(&store, ty).await;
+		}
+		let max = store.max_event_seq().await.unwrap();
+		assert_eq!(store.start_events_after(start).await.unwrap(), (2, max));
+		assert_eq!(store.start_events_after(max).await.unwrap(), (0, max));
+
+		record(&store, event_types::UPDATED).await;
+		let (starts, next) = store.start_events_after(max).await.unwrap();
+		assert_eq!(starts, 0);
+		assert!(next > max, "non-start events still advance the cursor");
+		db.drop_db().await;
+	}
 }

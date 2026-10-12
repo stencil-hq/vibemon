@@ -7,7 +7,10 @@
 pub mod dto;
 pub mod listing;
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+	collections::{BTreeMap, HashMap},
+	time::Duration,
+};
 
 use axum::{
 	Json, Router,
@@ -23,10 +26,10 @@ use vmon_cluster::kv::{Compare, Op, Txn};
 use vmon_node::api::{LogQuery, MetricSample, RouteState, SandboxRoute};
 
 use self::dto::{
-	AdminKillDto, AdminSandboxDto, ConnectBody, ErrorDto, ForkBody, ForkResultDto, LifecycleDto,
-	ListedSandboxDto, LogEntryDto, LogLineDto, LogsV1Dto, LogsV2Dto, MetricDto, MountDto,
-	NewSandboxBody, PauseBody, RefreshBody, ResumeBody, SandboxDetailDto, SandboxDto,
-	SandboxesWithMetricsDto, SnapshotBody, TimeoutBody, rfc3339,
+	AdminKillDto, AdminListedSandboxDto, AdminSandboxDto, ConnectBody, ErrorDto, ForkBody,
+	ForkResultDto, LifecycleDto, ListedSandboxDto, LogEntryDto, LogLineDto, LogsV1Dto, LogsV2Dto,
+	MetricDto, MountDto, NewSandboxBody, PauseBody, RefreshBody, ResumeBody, SandboxDetailDto,
+	SandboxDto, SandboxesWithMetricsDto, SnapshotBody, TimeoutBody, rfc3339,
 };
 use crate::{
 	auth::{AdminAuth, TeamAuth},
@@ -37,13 +40,13 @@ use crate::{
 		limits::{self, CLIENT_ID, V1_DEFAULT_TIMEOUT_S, V2_DEFAULT_TIMEOUT_S, normalize_sandbox_id},
 		network::NetworkUpdate,
 		now_ms,
-		routes::{get_route, team_prefix},
+		routes::{get_route, list_routes, team_prefix},
 		unix_ms,
 	},
 	state::AppState,
 	store::{
 		Team,
-		sandboxes::{ListAfter, SandboxFilter, SandboxRow, SandboxState},
+		sandboxes::{ListAfter, ListOrder, SandboxFilter, SandboxRow, SandboxState},
 	},
 };
 
@@ -79,6 +82,7 @@ pub fn routes() -> Router<AppState> {
 		.route("/sandboxes/{sandbox_id}/snapshots", post(snapshot))
 		.route("/snapshots", get(list_snapshots))
 		.route("/admin/teams/{team_id}/sandboxes/kill", post(admin_kill_team))
+		.route("/admin/sandboxes", get(admin_list))
 		.route("/admin/sandboxes/running-counts", get(admin_running_counts))
 		.route("/admin/sandboxes/{sandbox_id}", get(admin_sandbox))
 }
@@ -370,15 +374,19 @@ enum Live {
 }
 
 async fn live_state(state: &AppState, row: &SandboxRow) -> ApiResult<Live> {
-	let route = get_route(&state.cluster.kv, &row.id).await?;
-	Ok(match (route, row.state()) {
+	Ok(live_view(get_route(&state.cluster.kv, &row.id).await?, row))
+}
+
+/// Overlays a row's KV route (if any) on its durable state.
+fn live_view(route: Option<SandboxRoute>, row: &SandboxRow) -> Live {
+	match (route, row.state()) {
 		(Some(route), _) if route.state == RouteState::Killing => Live::Hidden,
 		(Some(route), _) if route.state == RouteState::Pausing => Live::Paused,
 		(Some(route), _) => Live::Running(Some(Box::new(route))),
 		(None, SandboxState::Paused) => Live::Paused,
 		(None, SandboxState::Running) => Live::Running(None),
 		(None, SandboxState::Killed) => Live::Hidden,
-	})
+	}
 }
 
 fn listed(row: &SandboxRow, live: &Live) -> Option<ListedSandboxDto> {
@@ -413,7 +421,7 @@ async fn list_v1(
 ) -> ApiResult<Response> {
 	let pairs = query_pairs(raw.as_deref());
 	let filter = SandboxFilter {
-		team_id: &auth.team.id,
+		team_id: Some(&auth.team.id),
 		states: vec![SandboxState::Running],
 		metadata: listing::parse_metadata_filter(query_first(&pairs, "metadata"))?,
 		..SandboxFilter::default()
@@ -458,7 +466,7 @@ async fn list_v2(
 		.map(|t| listing::decode_token(t, order))
 		.transpose()?;
 	let filter = SandboxFilter {
-		team_id:       &auth.team.id,
+		team_id:       Some(&auth.team.id),
 		states:        states.clone(),
 		metadata:      listing::parse_metadata_filter(query_first(&pairs, "metadata"))?,
 		started_after: listing::parse_started_after(query_first(&pairs, "startedAfter"))?,
@@ -938,6 +946,103 @@ async fn admin_kill_team(
 	}
 	let (killed_count, failed_count) = lifecycle::kill_team(&state, &team_id).await?;
 	Ok(Json(AdminKillDto { killed_count, failed_count }))
+}
+
+/// `GET /admin/sandboxes` item of `row` with its live overlay; `None` when
+/// hidden.
+fn admin_listed(
+	row: &SandboxRow,
+	route: Option<SandboxRoute>,
+	team_name: String,
+) -> Option<AdminListedSandboxDto> {
+	let node_id = route
+		.as_ref()
+		.map_or_else(|| row.node_id.clone(), |r| r.node_id.to_string());
+	listed(row, &live_view(route, row)).map(|sandbox| AdminListedSandboxDto {
+		sandbox,
+		team_id: row.team_id.clone(),
+		team_name,
+		node_id,
+	})
+}
+
+/// `GET /admin/sandboxes` (vmon extension): every team's running/paused
+/// sandboxes, newest first, keyset paginated like `/v2/sandboxes`; `id`
+/// narrows it to that one sandbox (no pagination).
+async fn admin_list(
+	State(state): State<AppState>,
+	_admin: AdminAuth,
+	RawQuery(raw): RawQuery,
+) -> ApiResult<Response> {
+	let pairs = query_pairs(raw.as_deref());
+	let filter = SandboxFilter {
+		team_id: query_first(&pairs, "team").filter(|t| !t.is_empty()),
+		states: listing::parse_states(Some(query_list(&pairs, "state").join(",")).as_deref())?,
+		..SandboxFilter::default()
+	};
+	if let Some(raw_id) = query_first(&pairs, "id").filter(|id| !id.is_empty()) {
+		return Ok(Json(admin_one(&state, &filter, raw_id).await?).into_response());
+	}
+	let order = ListOrder::Desc;
+	let limit = listing::parse_admin_limit(query_int(&pairs, "limit")?)?;
+	let after = query_first(&pairs, "nextToken")
+		.filter(|t| !t.is_empty())
+		.map(|t| listing::decode_token(t, order))
+		.transpose()?;
+	let mut rows = state
+		.store
+		.list_sandboxes(&filter, order, after.as_ref(), limit + 1)
+		.await?;
+	let more = rows.len() > limit as usize;
+	rows.truncate(limit as usize);
+	let mut routes: HashMap<String, SandboxRoute> =
+		list_routes(&state.cluster.kv).await?.into_iter().collect();
+	let team_names: HashMap<String, String> = state
+		.store
+		.list_teams()
+		.await?
+		.into_iter()
+		.map(|team| (team.id, team.name))
+		.collect();
+	let out: Vec<AdminListedSandboxDto> = rows
+		.iter()
+		.filter_map(|row| {
+			let team_name = team_names.get(&row.team_id).cloned().unwrap_or_default();
+			admin_listed(row, routes.remove(&row.id), team_name)
+		})
+		.collect();
+	let mut response = Json(out).into_response();
+	if more && let Some(last) = rows.last() {
+		let token = listing::encode_token(
+			&ListAfter { started_at: last.started_at, id: last.id.clone() },
+			order,
+		);
+		response = with_header(response, "x-next-token", &token);
+	}
+	Ok(response)
+}
+
+/// `GET /admin/sandboxes?id=`: `[row]` when the sandbox passes `filter` (same
+/// durable-state/team semantics as the listing) and is not hidden, else `[]`.
+async fn admin_one(
+	state: &AppState,
+	filter: &SandboxFilter<'_>,
+	raw_id: &str,
+) -> ApiResult<Vec<AdminListedSandboxDto>> {
+	let id = normalize_sandbox_id(raw_id)?;
+	let Some(row) = state.store.sandbox(&id).await?.filter(|row| {
+		filter.states.contains(&row.state()) && filter.team_id.is_none_or(|t| t == row.team_id)
+	}) else {
+		return Ok(Vec::new());
+	};
+	let route = get_route(&state.cluster.kv, &id).await?;
+	let team_name = state
+		.store
+		.team_by_id(&row.team_id)
+		.await?
+		.map(|team| team.name)
+		.unwrap_or_default();
+	Ok(admin_listed(&row, route, team_name).into_iter().collect())
 }
 
 /// Counts admission-index entries per team (`team/<t>/sbx/<id>`).

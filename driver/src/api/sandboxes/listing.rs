@@ -93,6 +93,15 @@ pub fn parse_limit(raw: Option<i64>) -> ApiResult<u32> {
 	}
 }
 
+/// `limit` of `GET /admin/sandboxes` (default 500, 1..=1000).
+pub fn parse_admin_limit(raw: Option<i64>) -> ApiResult<u32> {
+	match raw {
+		None => Ok(500),
+		Some(n @ 1..=1000) => Ok(u32::try_from(n).unwrap_or(500)),
+		Some(_) => Err(ApiError::bad_request("limit must be between 1 and 1000")),
+	}
+}
+
 /// `startedAfter` (RFC 3339).
 pub fn parse_started_after(raw: Option<&str>) -> ApiResult<Option<DateTime<Utc>>> {
 	raw.filter(|r| !r.is_empty())
@@ -204,6 +213,10 @@ mod tests {
 		assert_eq!(parse_limit(Some(1)).unwrap(), 1);
 		assert!(parse_limit(Some(0)).is_err());
 		assert!(parse_limit(Some(101)).is_err());
+		assert_eq!(parse_admin_limit(None).unwrap(), 500);
+		assert_eq!(parse_admin_limit(Some(1000)).unwrap(), 1000);
+		assert!(parse_admin_limit(Some(0)).is_err());
+		assert!(parse_admin_limit(Some(1001)).is_err());
 	}
 
 	#[test]

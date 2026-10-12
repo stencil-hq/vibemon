@@ -89,7 +89,7 @@ each request.
 Public request dispatch (driver), in order:
 1. Host `<port>-<sandboxID>.<domain>` (left-most label split on the first `-`) → ingress.
 2. Headers `E2b-Sandbox-Id` + `E2b-Sandbox-Port` present → ingress.
-3. Otherwise → E2B API router (also serves `/health`, CLI login pages, `/volumecontent/…`).
+3. Otherwise → E2B API router (also serves `/health`, CLI login pages, `/volumecontent/…`, and the admin dashboard at `/dashboard/`).
 
 `--domain` (`VMON_DOMAIN`) is the sandbox domain; the API is expected at
 `api.<domain>` but the router never requires that Host.
@@ -335,7 +335,7 @@ Migrations embedded with `sqlx::migrate!` (`driver/migrations/`). Tables
 - `template_tags(template_id, tag, build_id, created_at)` PK `(template_id, tag)`
 - `builds(id, template_id, team_id, status('waiting'|'building'|'ready'|'error'), kind('build'|'snapshot'|'pause'), vcpus, memory_mb, disk_mb, min_free_disk_mb, envd_version, vmm_version, kernel, arch, node_id, tags JSON (requested; assigned when ready), spec JSON (no credentials), template_version, start_cmd, ready_cmd, reason JSON, artifact JSON (ArtifactInfo), created_at, updated_at, started_at, finished_at, artifacts_gc_at)`
 - `build_logs(build_id, seq, ts, level, step, message)` PK `(build_id, seq)`
-- `sandboxes(id, team_id, template_id, build_id, alias, node_id, state('running'|'paused'|'killed'), execution_id, vcpus, memory_mb, disk_mb, metadata JSON, env_enc, auto_pause, auto_pause_memory, auto_resume, allow_internet_access, network JSON (redacted E2B config), egress_enc (encrypted node NetworkPolicy), volume_mounts JSON, lifecycle JSON, envd_version, started_at, end_at, paused_at, ended_at, snapshot_build_id, s3_mounts JSON (`vmonS3Mounts` without credentials), s3_mounts_enc (encrypted inline credentials by index))`
+- `sandboxes(id, team_id, template_id, build_id, alias, node_id, state('running'|'paused'|'killed'), execution_id, vcpus, memory_mb, disk_mb, metadata JSON, env_enc, auto_pause, auto_pause_memory, auto_resume, allow_internet_access, network JSON (redacted E2B config), egress_enc (encrypted node NetworkPolicy), volume_mounts JSON, lifecycle JSON, envd_version, started_at, end_at, paused_at, ended_at, snapshot_build_id, s3_mounts JSON (`vmonS3Mounts` without credentials), s3_mounts_enc (encrypted inline credentials by index))`; keys `(team_id, state, started_at, id)` (team listings), `(state, started_at, id)` (team-less admin listings, reconciler), `(node_id, state)`
 - `sandbox_events(seq AUTO_INCREMENT PK, id UNIQUE, team_id, sandbox_id, execution_id, template_id, build_id, type, ts, data JSON)` — written via `Store::record_event`; types `sandbox.lifecycle.{created,killed,updated,paused,resumed,checkpointed}`; `seq` is the webhook delivery cursor; team metrics derive running counts from created/resumed (+1) and paused/killed (−1)
 - `volumes(id, team_id, name, node_id, created_at, object_store)` UNIQUE `(team_id, name)` (`object_store`: lives under `volumes/<id>/` in the operator store, `node_id` NULL)
 - `secrets(id 'sec_…', team_id, name (lower-cased) UNIQUE per team, current_version, metadata JSON, created_at, updated_at)` + `secret_versions(secret_id, version, value_enc, created_at)`
@@ -884,11 +884,34 @@ Every operation in `spec/e2b/infra/spec/openapi.yml` is served
 `{"code": <http status>, "message": "...", "error_code"?: "..."}`.
 Pagination: `limit` (≤ 100) + `nextToken`, cursor in `X-Next-Token`.
 
+Admin dashboard API (vmon extensions, `X-Admin-Token`; the static panel is
+served at `/dashboard/` on the public listeners):
+
+- `GET /admin/cluster`: `clusterID`, `localID`, every gossip member sorted by
+  id (`state`, `roles`, `version`, `startedAt`, `clusterURL`, `publicURL`,
+  `raft` for drivers, `node` for nodes: `GET /nodes` status precedence,
+  capacity, `cachedBuilds` count, this driver's create counters), and
+  `history`: the driver's in-memory fleet samples (every 5 s, newest 720,
+  oldest first; `nodes` and capacity sums over alive node members, `starts` =
+  `sandbox.lifecycle.created|resumed` events since the previous sample via a
+  `sandbox_events.seq` cursor; a DB error yields `starts: 0`).
+- `GET /admin/teams`: every team (limits, `blocked`, `system`) with its
+  running/paused `sandboxes` counts from MySQL, sorted by name.
+- `GET /admin/sandboxes`: every team's running/paused sandboxes, newest
+  first (`state` CSV, `team`, `limit` 1..=1000 default 500, `nextToken` /
+  `X-Next-Token` as `/v2/sandboxes`); `ListedSandbox` fields plus `teamID`,
+  `teamName`, and `nodeID` (route node, else the row's). Live state overlays
+  the KV routes as in `/v2/sandboxes`, read once per request. `id=<sandboxID>`
+  returns just that sandbox (`[row]`, or `[]` when killed, unknown, hidden,
+  or filtered out by `state`/`team`; malformed → 400), reads its single route,
+  and ignores `limit`/`nextToken`.
+
 ### 9.2 Auth
 
 - `X-API-Key` → team (SHA-256 lookup, cached 30 s).
 - `Authorization: Bearer <JWT>` (+ `X-Team-ID`) → user (+ team membership).
-- `X-Admin-Token` == `--admin-token` → admin.
+- `X-Admin-Token` == `--admin-token` → admin (`/nodes*`, `/admin/*`,
+  including the dashboard API of §9.1).
 - `X-Access-Token` == the sandbox's envd access token (vmon extension,
   `docs/e2b-compat.md` §5) → that sandbox's team, only on
   `GET /sandboxes/{id}`, `POST /sandboxes/{id}/timeout` and

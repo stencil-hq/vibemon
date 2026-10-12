@@ -211,6 +211,12 @@ cluster-e2e: agent-musl fetch-assets mysql
 templates *args: build
     VMON_BIN="$({{just_executable()}} _bin {{profile}})" uv run templates/build.py "$@"
 
+# Rebuild the admin dashboard (ui/, React + Vite) into driver/web, which the
+# driver embeds at /dashboard/; commit the output with the sources.
+# `cd ui && bun run dev` serves it on :5173 against `just serve`.
+ui:
+    cd ui && bun install --frozen-lockfile && bun run check && bun run build
+
 # Driver tests that need MySQL (`just mysql` first).
 test-db:
     VMON_MYSQL_TEST_URL=mysql://root:vmon@127.0.0.1:13306/vmon cargo test -p vmon-driver

@@ -212,6 +212,20 @@ pub struct ListedSandboxDto {
 	pub volume_mounts: Vec<MountDto>,
 }
 
+/// `GET /admin/sandboxes` item (vmon extension): `ListedSandbox` plus owner
+/// and placement.
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminListedSandboxDto {
+	#[serde(flatten)]
+	pub sandbox:   ListedSandboxDto,
+	#[serde(rename = "teamID")]
+	pub team_id:   String,
+	#[serde(rename = "teamName")]
+	pub team_name: String,
+	#[serde(rename = "nodeID")]
+	pub node_id:   String,
+}
+
 /// `SandboxMetric`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

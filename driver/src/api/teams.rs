@@ -1,4 +1,5 @@
-//! `GET /teams` (CLI login) and team metrics derived from `sandbox_events`.
+//! `GET /teams` (CLI login), team metrics derived from `sandbox_events`, and
+//! the admin team overview `GET /admin/teams` (vmon extension).
 
 use axum::{
 	Json, Router,
@@ -10,10 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	admin,
-	auth::{TeamAuth, UserAuth},
+	api::sandboxes::dto,
+	auth::{AdminAuth, TeamAuth, UserAuth},
 	error::{ApiError, ApiResult},
-	state::AppState,
-	store::events::{is_start, is_stop},
+	state::{AppState, TeamLimits},
+	store::{
+		events::{is_start, is_stop},
+		sandboxes::LiveCounts,
+	},
 };
 
 /// Default metrics window when `start` is omitted.
@@ -29,6 +34,7 @@ pub fn routes() -> Router<AppState> {
 		.route("/teams", get(list_teams))
 		.route("/teams/{team_id}/metrics", get(team_metrics))
 		.route("/teams/{team_id}/metrics/max", get(team_metrics_max))
+		.route("/admin/teams", get(admin_list_teams))
 }
 
 /// E2B `Team`.
@@ -63,6 +69,75 @@ async fn list_teams(
 		out.push(TeamDto { team_id: team.id, name: team.name, api_key, is_default });
 	}
 	Ok(Json(out))
+}
+
+/// `TeamLimits` on the wire.
+#[derive(Serialize)]
+#[allow(clippy::struct_field_names, reason = "wire field names")]
+#[serde(rename_all = "camelCase")]
+struct LimitsDto {
+	max_concurrent_sandboxes: u32,
+	max_concurrent_builds:    u32,
+	max_vcpus:                u32,
+	#[serde(rename = "maxMemoryMB")]
+	max_memory_mb:            u64,
+	#[serde(rename = "maxDiskMB")]
+	max_disk_mb:              u64,
+	max_length_hours:         u32,
+}
+
+impl From<TeamLimits> for LimitsDto {
+	fn from(l: TeamLimits) -> Self {
+		Self {
+			max_concurrent_sandboxes: l.max_concurrent_sandboxes,
+			max_concurrent_builds:    l.max_concurrent_builds,
+			max_vcpus:                l.max_vcpus,
+			max_memory_mb:            l.max_memory_mb,
+			max_disk_mb:              l.max_disk_mb,
+			max_length_hours:         l.max_length_hours,
+		}
+	}
+}
+
+/// `GET /admin/teams` item.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminTeamDto {
+	#[serde(rename = "teamID")]
+	team_id:    String,
+	name:       String,
+	slug:       String,
+	blocked:    bool,
+	system:     bool,
+	created_at: String,
+	limits:     LimitsDto,
+	sandboxes:  LiveCounts,
+}
+
+/// `GET /admin/teams`: every team with its limits and durable running/paused
+/// sandbox counts, sorted by name.
+async fn admin_list_teams(
+	State(state): State<AppState>,
+	_admin: AdminAuth,
+) -> ApiResult<Json<Vec<AdminTeamDto>>> {
+	let mut counts = state.store.live_counts_by_team().await?;
+	let mut teams = state.store.list_teams().await?;
+	teams.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+	Ok(Json(
+		teams
+			.into_iter()
+			.map(|team| AdminTeamDto {
+				sandboxes:  counts.remove(&team.id).unwrap_or_default(),
+				team_id:    team.id,
+				name:       team.name,
+				slug:       team.slug,
+				blocked:    team.blocked,
+				system:     team.system,
+				created_at: dto::rfc3339(team.created_at),
+				limits:     team.limits.into(),
+			})
+			.collect(),
+	))
 }
 
 #[derive(Deserialize)]
