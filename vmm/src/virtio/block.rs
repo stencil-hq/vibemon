@@ -415,6 +415,13 @@ pub(super) struct Backing<'a> {
 
 impl Backing<'_> {
 	/// Services a guest flush; `false` on host I/O failure.
+	#[cfg_attr(
+		target_os = "windows",
+		allow(
+			clippy::needless_pass_by_ref_mut,
+			reason = "only the non-Windows overlay flush needs `&mut`"
+		)
+	)]
 	fn flush(&mut self) -> bool {
 		if self.volatile {
 			return true;
