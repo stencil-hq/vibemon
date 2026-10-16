@@ -215,7 +215,10 @@ Details and the fixes made are listed in [`e2e/README.md`](https://github.com/st
   package set and init setup, vendored under
   `spec/e2b/infra/packages/orchestrator/pkg/template/build/phases/`). Images
   with an unknown distribution, which upstream rejects, boot the agent as
-  PID 1 instead.
+  PID 1 instead. When the apt install fails on sources using `deb.debian.org`
+  or `security.debian.org`, provisioning switches them to `archive.debian.org`
+  and retries once, so end-of-life Debian releases still provision; upstream
+  fails the build.
 - **No Firecracker MMDS.** Identity (`E2B_SANDBOX_ID`, `E2B_TEMPLATE_ID`,
   access-token hash) is delivered through `/init`; there is no
   `169.254.169.254` service.

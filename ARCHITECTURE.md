@@ -802,6 +802,9 @@ pub struct ArtifactInfo { pub build_id: String, pub node_id: NodeId, pub arch: S
    install the profile's packages (systemd/OpenRC, sudo, chrony, ssh, curl,
    git, iptables, …), register the agent as the `envd` service, link
    `/usr/sbin/init` to the distro init. Unknown distros keep the agent as PID 1.
+   apt installs run `apt-get update` first; a failed install on sources using
+   `deb.debian.org`/`security.debian.org` switches them to `archive.debian.org`
+   (end-of-life releases) and retries once.
    Template and sandbox boots use `init=/usr/sbin/init` (or
    `init=/usr/bin/envd`), recorded as `ArtifactMeta.boot_init`.
 4. **Steps** (same VM as step 3: agent as PID 1, network, guest clock set

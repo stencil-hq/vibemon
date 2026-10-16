@@ -8,6 +8,11 @@
 //!   `envd` service (systemd unit / `OpenRC` script); it serves GC4 on its
 //!   `vmon.gc4` virtio-console port and envd on :49983, PID 1 or not.
 //! - No PHC clock: chrony gets an NTP pool line directly.
+//! - Debian/Ubuntu installs that fail on an image using `deb.debian.org` /
+//!   `security.debian.org` switch those sources to `archive.debian.org` and
+//!   retry once (`APT_INSTALL`). Debian moves end-of-life releases there, while
+//!   the default hosts can keep serving indexes whose pool files are gone
+//!   (Debian 11 after its 2026-08-31 EOL).
 //! - Images without a known profile (NixOS, distroless, no os-release, and the
 //!   upstream-rejected RHEL/OL/Amazon IDs) are not rejected: they boot with the
 //!   agent as PID 1 (`init=/usr/bin/envd`) and skip package setup.
@@ -82,7 +87,7 @@ const PROFILES: &[Profile] = &[
 			"iproute2",
 		],
 		pkg_query:     r#"dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed""#,
-		pkg_install:   r#"apt-get -q update && DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get -qq -o=Dpkg::Use-Pty=0 install -y --no-install-recommends "$@""#,
+		pkg_install:   r#"e2b_apt_install "$@""#,
 		init_binary:   "/lib/systemd/systemd",
 		timesync_unit: "chrony",
 		ssh_unit:      "ssh",
@@ -191,6 +196,35 @@ const PROFILES: &[Profile] = &[
 	},
 ];
 
+/// apt install for the Debian/Ubuntu profile: upstream's update and install
+/// (`apt-get update && apt-get install`), and if that fails on an image whose
+/// sources use Debian's own hosts, the same again after pointing them at
+/// `archive.debian.org`.
+/// Debian moves end-of-life releases there, and `deb.debian.org` /
+/// `security.debian.org` keep serving such a release's indexes after its pool
+/// files are gone, so a fresh index still lists `.deb`s that 404. The switch
+/// stays in the template so its own `apt-get` steps work too. Without such
+/// hosts, apt's exit code is returned unchanged.
+const APT_INSTALL: &str = r#"e2b_apt_update_install() {
+  apt-get -q update && DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get -qq -o=Dpkg::Use-Pty=0 install -y --no-install-recommends "$@"
+}
+e2b_apt_install() {
+  e2b_apt_update_install "$@" && return 0
+  e2b_apt_rc=$?
+  e2b_apt_archived=
+  for e2b_apt_src in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$e2b_apt_src" ] && grep -qE 'https?://(deb|security)\.debian\.org/' "$e2b_apt_src" || continue
+    e2b_apt_new=$(sed -E 's#(https?)://(deb|security)\.debian\.org/#\1://archive.debian.org/#g' "$e2b_apt_src") || return "$e2b_apt_rc"
+    printf '%s\n' "$e2b_apt_new" >"$e2b_apt_src" || return "$e2b_apt_rc"
+    e2b_apt_archived=1
+  done
+  [ -n "$e2b_apt_archived" ] || return "$e2b_apt_rc"
+  echo "[provision] WARNING: apt install failed (exit code $e2b_apt_rc); retrying with deb.debian.org/security.debian.org sources switched to archive.debian.org, where Debian keeps end-of-life releases." >&2
+  e2b_apt_update_install "$@"
+}
+
+"#;
+
 /// systemd unit running the agent as envd.
 const ENVD_UNIT: &str = "[Unit]
 Description=envd (vibemon guest agent)
@@ -273,9 +307,11 @@ rc-update add envd default
 echo "Enable sshd"
 if [ -e /etc/init.d/sshd ]; then rc-update add sshd default; else echo "sshd service not present on this image; skipping"; fi"#;
 
-/// Renders the distro selector (upstream `ShellSelector`) with our fallback.
+/// Renders the apt helpers and the distro selector (upstream `ShellSelector`)
+/// with our fallback.
 fn selector() -> String {
-	let mut b = String::from("e2b_select_profile() {\n  e2b_profile_matched=\n  case \"$1\" in\n");
+	let mut b = String::from(APT_INSTALL);
+	b.push_str("e2b_select_profile() {\n  e2b_profile_matched=\n  case \"$1\" in\n");
 	for p in PROFILES {
 		let _ = writeln!(b, "  {})", p.ids.join("|"));
 		let _ = writeln!(b, "    E2B_PACKAGES={}", sh_quote(&p.packages.join(" ")));
@@ -506,7 +542,121 @@ echo "Finished configuration script"
 
 #[cfg(test)]
 mod tests {
+	use std::{os::unix::fs::PermissionsExt as _, process::Command};
+
 	use super::*;
+
+	/// `apt-get` stand-in: logs its arguments; `update` exits `$STUB_UPDATE_RC`;
+	/// `install` succeeds only while the sources mention `$STUB_SERVING_HOST`,
+	/// like a mirror whose index lists pool files it no longer serves.
+	const APT_GET_STUB: &str = r#"#!/bin/sh
+echo "$*" >>"$STUB_LOG"
+case " $* " in
+*" update "*) exit "$STUB_UPDATE_RC" ;;
+*" install "*)
+    grep -q "^deb http://$STUB_SERVING_HOST/" "$STUB_SOURCES" && exit 0
+    echo "E: Failed to fetch http://deb.debian.org/debian-security/pool/updates/main/j/jq/jq_1.6-2.1%2bdeb11u3_amd64.deb  404  Not Found" >&2
+    exit 100 ;;
+esac
+exit 1
+"#;
+
+	/// Debian 11 image sources (snapshot lines commented out, as in the
+	/// SWE-bench images that hit the bullseye-security 404s).
+	const BULLSEYE_SOURCES: &str = r"# deb http://snapshot.debian.org/archive/debian/20250428T000000Z bullseye main
+deb http://deb.debian.org/debian bullseye main
+deb http://deb.debian.org/debian-security bullseye-security main
+deb http://deb.debian.org/debian bullseye-updates main
+";
+
+	struct AptRun {
+		code:    Option<i32>,
+		calls:   Vec<String>,
+		sources: String,
+	}
+
+	/// Runs the Debian profile's `e2b_pkg_install jq less` under `sh` with
+	/// [`APT_GET_STUB`] on `PATH` and `/etc/apt` redirected to a temp dir.
+	fn debian_install(sources: &str, serving_host: &str, update_rc: u8) -> AptRun {
+		let dir = tempfile::tempdir().unwrap();
+		let etc_apt = dir.path().join("etc/apt");
+		std::fs::create_dir_all(etc_apt.join("sources.list.d")).unwrap();
+		let sources_path = etc_apt.join("sources.list");
+		std::fs::write(&sources_path, sources).unwrap();
+		let bin = dir.path().join("bin");
+		std::fs::create_dir(&bin).unwrap();
+		let stub = bin.join("apt-get");
+		std::fs::write(&stub, APT_GET_STUB).unwrap();
+		std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+		let log = dir.path().join("apt.log");
+		let selector = selector().replace("/etc/apt/", &format!("{}/", etc_apt.display()));
+		let script = format!(
+			"set -eu\nE2B_DISTRO_ID=debian\nE2B_ID_LIKE=\n{selector}\ne2b_pkg_install jq less\n"
+		);
+		let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+		let output = Command::new("sh")
+			.arg("-c")
+			.arg(script)
+			.env("PATH", path)
+			.env("STUB_LOG", &log)
+			.env("STUB_SOURCES", &sources_path)
+			.env("STUB_SERVING_HOST", serving_host)
+			.env("STUB_UPDATE_RC", update_rc.to_string())
+			.output()
+			.unwrap();
+		AptRun {
+			code:    output.status.code(),
+			calls:   std::fs::read_to_string(&log)
+				.unwrap_or_default()
+				.lines()
+				.map(|l| {
+					if l.contains(" install ") {
+						"install".into()
+					} else {
+						l.to_owned()
+					}
+				})
+				.collect(),
+			sources: std::fs::read_to_string(&sources_path).unwrap(),
+		}
+	}
+
+	#[test]
+	fn debian_install_refreshes_indexes_first_and_keeps_apt_failures() {
+		let ok = debian_install(BULLSEYE_SOURCES, "deb.debian.org", 0);
+		assert_eq!(ok.code, Some(0));
+		assert_eq!(ok.calls, ["-q update", "install"], "indexes are refreshed before installing");
+		assert_eq!(ok.sources, BULLSEYE_SOURCES, "a working mirror keeps the image's sources");
+
+		let ubuntu = "deb http://archive.ubuntu.com/ubuntu jammy main\n";
+		let failed = debian_install(ubuntu, "nowhere.invalid", 0);
+		assert_eq!(failed.code, Some(100), "apt's exit code reaches the build");
+		assert_eq!(failed.calls, ["-q update", "install"]);
+		assert_eq!(failed.sources, ubuntu, "only Debian's own hosts are redirected");
+
+		let no_update = debian_install(BULLSEYE_SOURCES, "archive.debian.org", 100);
+		assert_eq!(no_update.code, Some(100), "a failed index refresh fails provisioning");
+		assert!(
+			!no_update.calls.iter().any(|c| c == "install"),
+			"nothing is installed from unrefreshed indexes: {:?}",
+			no_update.calls
+		);
+	}
+
+	#[test]
+	fn debian_install_retries_from_archive_when_the_mirror_dropped_the_release() {
+		let run = debian_install(BULLSEYE_SOURCES, "archive.debian.org", 0);
+		assert_eq!(run.code, Some(0));
+		assert_eq!(run.calls, ["-q update", "install", "-q update", "install"]);
+		assert_eq!(
+			run.sources,
+			r"# deb http://snapshot.debian.org/archive/debian/20250428T000000Z bullseye main
+deb http://archive.debian.org/debian bullseye main
+deb http://archive.debian.org/debian-security bullseye-security main
+deb http://archive.debian.org/debian bullseye-updates main
+"
+		);
+	}
 
 	#[test]
 	fn boot_init_follows_recorded_init_system() {
