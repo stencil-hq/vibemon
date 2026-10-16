@@ -737,7 +737,7 @@ DTOs in `node::api` (serde, camelCase). Client: `node::client::NodeClient`.
 | DELETE | `/builds/{id}` | cancel → 204 |
 | GET | `/artifacts/{buildId}/manifest` | → `ArtifactManifest{files:[{path,size,sha256,extents}]}` (`extents` = data extents `[offset,len]` via `SEEK_DATA`/`SEEK_HOLE`; `sha256` = SHA-256 over each extent as `offset‖len‖bytes`, then the size) |
 | GET | `/artifacts/{buildId}/files/{path}` | stream file (Range supported); `?sparse=true` streams only the manifest's extents, concatenated (peer fetch: O(data), destination stays sparse) |
-| DELETE | `/artifacts/{buildId}` | GC → 204 |
+| DELETE | `/artifacts/{buildId}` | GC: cancels a build of that id still running here and waits for it, then deletes `builds/<buildId>/` → 204 |
 | PUT | `/files/{templateId}/{hash}` | build file-context archive upload (driver → node) |
 | GET | `/files/{templateId}/{hash}` | fetch archive (peer/builder) |
 | POST/DELETE | `/volumes/{id}` | create/delete volume dir |

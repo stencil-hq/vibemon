@@ -87,7 +87,7 @@ async fn artifact_manifest(State(builder): State<Builder>, Path(id): Path<String
 }
 
 async fn delete_artifact(State(builder): State<Builder>, Path(id): Path<String>) -> Response {
-	match builder.artifacts().delete(&id).await {
+	match builder.delete_artifacts(&id).await {
 		Ok(_) => StatusCode::NO_CONTENT.into_response(),
 		Err(e) => internal(&e),
 	}

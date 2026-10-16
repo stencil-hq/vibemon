@@ -103,9 +103,11 @@ struct Inner {
 
 /// One build known to this process.
 struct BuildHandle {
-	state:  Mutex<HandleState>,
-	log:    BuildLog,
-	cancel: CancellationToken,
+	state:    Mutex<HandleState>,
+	log:      BuildLog,
+	cancel:   CancellationToken,
+	/// Cancelled once the build stopped and discarded its partial outputs.
+	finished: CancellationToken,
 }
 
 struct HandleState {
@@ -203,13 +205,14 @@ impl Builder {
 			}
 			std::fs::create_dir_all(&dir).context("creating build dir")?;
 			let handle = Arc::new(BuildHandle {
-				state:  Mutex::new(HandleState {
+				state:    Mutex::new(HandleState {
 					status:   BuildState::Waiting,
 					reason:   None,
 					artifact: None,
 				}),
-				log:    BuildLog::create(&dir.join(BUILD_LOG)),
-				cancel: CancellationToken::new(),
+				log:      BuildLog::create(&dir.join(BUILD_LOG)),
+				cancel:   CancellationToken::new(),
+				finished: CancellationToken::new(),
 			});
 			builds.insert(req.build_id.clone(), handle.clone());
 			handle
@@ -220,6 +223,7 @@ impl Builder {
 	}
 
 	async fn run(self, req: StartBuild, handle: Arc<BuildHandle>) {
+		let _finished = handle.finished.clone().drop_guard();
 		let inner = &self.inner;
 		let started = Instant::now();
 		let permit = tokio::select! {
@@ -315,6 +319,31 @@ impl Builder {
 		})
 	}
 
+	/// Deletes a build's local artifacts (`DELETE /artifacts/{id}`, GC). A
+	/// build of that ID still running here is cancelled and awaited first, so
+	/// it cannot write into the directory once it is gone, and is forgotten
+	/// (closing its log) once the directory is deleted; until then it stays
+	/// registered, so a start of the same ID cannot write into the directory
+	/// being torn down. Returns whether anything existed.
+	pub async fn delete_artifacts(&self, build_id: &str) -> Result<bool> {
+		let handle = self.inner.builds.lock().get(build_id).cloned();
+		if let Some(handle) = &handle {
+			handle.cancel.cancel();
+			handle.finished.cancelled().await;
+		}
+		let deleted = self.inner.store.delete(build_id).await;
+		if let Some(handle) = handle {
+			let mut builds = self.inner.builds.lock();
+			if builds
+				.get(build_id)
+				.is_some_and(|h| Arc::ptr_eq(h, &handle))
+			{
+				builds.remove(build_id);
+			}
+		}
+		deleted
+	}
+
 	/// Cancels a waiting or running build; the build VM is killed. Returns
 	/// `false` for unknown builds.
 	pub fn cancel(&self, build_id: &str) -> bool {
@@ -408,4 +437,95 @@ fn validate(req: &StartBuild) -> Result<()> {
 		bail!("invalid templateID");
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{path::Path, time::Duration};
+
+	use super::*;
+	use crate::{
+		api::BuildBase,
+		net::{NetManager, NetMode},
+		vm::{VmRuntimeConfig, VmmIsolation},
+	};
+
+	fn builder(dir: &Path) -> Builder {
+		let agent = dir.join("agent");
+		std::fs::write(&agent, b"agent").unwrap();
+		let vms = VmRuntime::new(VmRuntimeConfig {
+			vmon_bin:         dir.join("vmon"),
+			run_dir:          dir.join("run"),
+			boot_concurrency: 1,
+			isolation:        VmmIsolation::Default,
+			net:              NetManager::new(NetMode::Auto, "172.20.0.0/16", None).unwrap(),
+		})
+		.unwrap();
+		Builder::new(
+			BuildConfig {
+				data_dir:        dir.join("data"),
+				node_id:         NodeId(1),
+				arch:            "aarch64".into(),
+				backend:         "hvf".into(),
+				cpu_baseline:    "b".into(),
+				envd_version:    "0.6.4".into(),
+				kernel:          dir.join("kernel"),
+				agent_binary:    agent,
+				max_parallel:    1,
+				step_cache_mb:   1024,
+				secret:          "s".into(),
+				http:            reqwest::Client::new(),
+				registry_mirror: None,
+				object_store:    None,
+			},
+			vms,
+		)
+		.unwrap()
+	}
+
+	/// A `fromTemplate` build whose parent is fetched from `source`.
+	fn request(build_id: &str, source: &str) -> StartBuild {
+		StartBuild {
+			build_id:         build_id.into(),
+			template_id:      "t".into(),
+			team_id:          "team".into(),
+			from:             BuildBase::Build {
+				build_id: "parent".into(),
+				sources:  vec![source.into()],
+			},
+			steps:            Vec::new(),
+			start_cmd:        None,
+			ready_cmd:        None,
+			vcpus:            1,
+			memory_mb:        512,
+			disk_mb:          1024,
+			file_sources:     Vec::new(),
+			force:            false,
+			template_version: crate::api::TemplateVersion::V2_1,
+		}
+	}
+
+	#[tokio::test]
+	async fn deleting_artifacts_stops_the_build_first_and_forgets_it() {
+		let dir = tempfile::tempdir().unwrap();
+		// A peer that never answers keeps the parent fetch, and so the build,
+		// running (until the 30 s request timeout).
+		let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let source = format!("http://{}", peer.local_addr().unwrap());
+		let builder = builder(dir.path());
+		builder.start(request("running", &source)).unwrap();
+		builder.start(request("queued", &source)).unwrap();
+		while builder.running() == 0 {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+		for id in ["queued", "running"] {
+			let deleted = tokio::time::timeout(Duration::from_secs(10), builder.delete_artifacts(id))
+				.await
+				.expect("the build is cancelled, not waited out");
+			assert!(deleted.unwrap(), "{id} had a build directory");
+			assert!(!builder.artifacts().build_dir(id).unwrap().exists());
+			assert!(builder.status(id, 0).is_none(), "{id} is forgotten (its log closed)");
+		}
+		assert_eq!(builder.running(), 0);
+	}
 }
