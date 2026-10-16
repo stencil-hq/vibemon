@@ -340,7 +340,8 @@ impl AgentClient {
 	/// Connects to `agent.sock` (retrying while the VMM binds it) and performs
 	/// the `hello` handshake within `timeout`. On a cold boot the VMM accepts
 	/// clients only after the guest agent announced itself, so this also waits
-	/// for the agent.
+	/// for the agent: `hello` gets the whole budget, not [`REQUEST_TIMEOUT`]
+	/// (a systemd boot on a busy host starts envd well after 30 s).
 	pub async fn connect(path: &Path, timeout: Duration) -> anyhow::Result<Self> {
 		let deadline = Instant::now() + timeout;
 		let stream = loop {
@@ -355,7 +356,7 @@ impl AgentClient {
 				},
 			}
 		};
-		tokio::time::timeout_at(deadline, Self::handshake(stream))
+		tokio::time::timeout_at(deadline, Self::handshake_within(stream, timeout))
 			.await
 			.map_err(|_| anyhow!("guest agent did not answer hello within {timeout:?}"))?
 	}
@@ -363,6 +364,14 @@ impl AgentClient {
 	/// Runs the GC4 protocol over an already-connected byte stream: SYNC,
 	/// reader/writer tasks, then `hello` with a fresh random epoch.
 	pub async fn handshake<S>(stream: S) -> anyhow::Result<Self>
+	where
+		S: AsyncRead + AsyncWrite + Send + 'static,
+	{
+		Self::handshake_within(stream, REQUEST_TIMEOUT).await
+	}
+
+	/// [`Self::handshake`] waiting up to `hello_timeout` for the `hello` reply.
+	async fn handshake_within<S>(stream: S, hello_timeout: Duration) -> anyhow::Result<Self>
 	where
 		S: AsyncRead + AsyncWrite + Send + 'static,
 	{
@@ -414,7 +423,9 @@ impl AgentClient {
 				reader,
 			}),
 		};
-		let reply = client.request(Op::Hello, json!({ "epoch": epoch })).await?;
+		let reply = client
+			.request_timeout(Op::Hello, json!({ "epoch": epoch }), hello_timeout)
+			.await?;
 		if reply.get("epoch").and_then(Value::as_u64) != Some(epoch) {
 			bail!("guest agent echoed the wrong hello epoch: {reply}");
 		}

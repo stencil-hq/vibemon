@@ -271,6 +271,54 @@ async fn exec_and_fs_read_collect_frames_until_terminal_event() {
 	assert!(error.to_string().contains("must be a JSON object"), "{error}");
 }
 
+/// Guest agent on a Unix socket (as behind the VMM's `agent.sock`) that
+/// answers `hello` after `delay`: a cold boot still starting its init
+/// services on a busy host. For paused-clock tests.
+fn slow_booting_agent(path: &std::path::Path, delay: Duration) {
+	// A paused clock jumps to the next timer whenever the runtime idles, even
+	// while the client's reader task has a reply to read: keep that timer at
+	// most 1 s away so the jump cannot skip past the client's deadline.
+	tokio::spawn(async {
+		loop {
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
+	});
+	let listener = tokio::net::UnixListener::bind(path).expect("bind agent socket");
+	tokio::spawn(async move {
+		let (stream, _) = listener.accept().await.expect("accept");
+		let (mut reader, mut writer) = tokio::io::split(stream);
+		let hello = read_frame(&mut reader).await.unwrap().unwrap();
+		let req: Value = serde_json::from_slice(&hello.payload).unwrap();
+		tokio::time::sleep(delay).await;
+		let resp = json!({ "ok": true, "epoch": req["epoch"] });
+		let frame = encode(proto::FRAME_RESP, hello.id, resp.to_string().as_bytes());
+		writer.write_all(&frame).await.expect("hello reply");
+		while let Ok(Some(_)) = read_frame(&mut reader).await {}
+	});
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_waits_for_hello_up_to_the_callers_timeout() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("agent.sock");
+	slow_booting_agent(&path, REQUEST_TIMEOUT + Duration::from_secs(15));
+	AgentClient::connect(&path, Duration::from_mins(5))
+		.await
+		.expect("hello answered within the boot budget");
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_gives_up_at_the_callers_timeout() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("agent.sock");
+	slow_booting_agent(&path, Duration::from_mins(10));
+	let error = AgentClient::connect(&path, Duration::from_mins(2))
+		.await
+		.expect_err("the agent never answered in time")
+		.to_string();
+	assert!(error.contains("hello") && error.contains("within 120s"), "{error}");
+}
+
 #[tokio::test]
 async fn lost_connection_fails_pending_streams_and_requests() {
 	let (host, guest) = tokio::io::duplex(4096);
