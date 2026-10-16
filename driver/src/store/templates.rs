@@ -370,14 +370,27 @@ impl Store {
 		Ok(purged)
 	}
 
-	/// Records one sandbox start from the template.
-	pub async fn bump_template_spawn(&self, id: &str) -> sqlx::Result<()> {
-		sqlx::query(
-			"UPDATE templates SET spawn_count = spawn_count + 1, last_spawned_at = UTC_TIMESTAMP(3) \
-			 WHERE id = ?",
-		)
-		.bind(id)
-		.execute(self.pool())
+	/// Adds `count` sandbox starts from the template, the last at
+	/// `last_spawned_at` (never moving `last_spawned_at` back, since another
+	/// driver may have written a later spawn first).
+	pub async fn add_template_spawns(
+		&self,
+		id: &str,
+		count: u64,
+		last_spawned_at: DateTime<Utc>,
+	) -> sqlx::Result<()> {
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE templates SET spawn_count = spawn_count + ?, last_spawned_at = \
+				 GREATEST(COALESCE(last_spawned_at, ?), ?) WHERE id = ?",
+			)
+			.bind(count)
+			.bind(last_spawned_at)
+			.bind(last_spawned_at)
+			.bind(id)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(())
 	}

@@ -4,15 +4,17 @@
 //! completion, resolving template references for sandbox creation, file
 //! context uploads, snapshot templates, and artifact bookkeeping.
 //!
-//! Entry points: [`spawn_supervisor`] (called by [`crate::Driver::start`]),
-//! [`resolve_template`] and the snapshot helpers (called by the sandbox API),
-//! and the build operations used by [`crate::api::templates`].
+//! Entry points: [`spawn_supervisor`] and [`spawn_spawn_writer`] (called by
+//! [`crate::Driver::start`]), [`resolve_template`] and the snapshot helpers
+//! (called by the sandbox API), and the build operations used by
+//! [`crate::api::templates`].
 
 mod artifacts;
 mod files;
 pub mod names;
 mod resolve;
 mod snapshots;
+mod spawns;
 mod start;
 mod supervisor;
 #[cfg(test)]
@@ -37,6 +39,7 @@ pub use self::{
 		SnapshotInfo, SnapshotKind, SnapshotRequest, SnapshotTarget, begin_snapshot, fail_snapshot,
 		finish_snapshot, list_snapshots, retire_fork,
 	},
+	spawns::{SpawnCounter, flush_spawns, spawn_spawn_writer},
 	start::{
 		BuildRequest, RegisteredBuild, StartRequest, cancel_build, delete_template, register_build,
 		start_build,

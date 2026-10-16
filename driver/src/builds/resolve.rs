@@ -122,7 +122,8 @@ pub async fn owned_template(
 }
 
 /// Resolves a sandbox `templateID` to a ready build with its artifact
-/// facts and alive sources, and counts the spawn.
+/// facts and alive sources, and counts the spawn (written in the background,
+/// see [`super::spawns`]).
 pub async fn resolve_template(
 	state: &AppState,
 	team: &Team,
@@ -181,9 +182,7 @@ pub async fn resolve_template(
 			.next()
 			.map(|a| a.alias),
 	};
-	if let Err(error) = state.store.bump_template_spawn(&template.id).await {
-		tracing::warn!(template = %template.id, %error, "spawn count update failed");
-	}
+	state.spawns.record(&template.id);
 	Ok(ResolvedTemplate { template_id: template.id, build_id, alias, artifact, sources })
 }
 

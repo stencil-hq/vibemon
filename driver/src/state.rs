@@ -6,8 +6,8 @@ use vmon_cluster::{Cluster, MemberMeta, NodeId, gossip::MemberState};
 use vmon_node::client::NodeClient;
 
 use crate::{
-	auth::AuthCache, crypto::Keys, error::ApiError, scheduler::Scheduler, stats::FleetStats,
-	store::Store,
+	auth::AuthCache, builds::SpawnCounter, crypto::Keys, error::ApiError, scheduler::Scheduler,
+	stats::FleetStats, store::Store,
 };
 
 /// Driver configuration resolved by the `vmon serve` front end.
@@ -82,6 +82,8 @@ pub struct Inner {
 	pub scheduler:  Scheduler,
 	/// Recent fleet samples ([`crate::stats`]).
 	pub stats:      FleetStats,
+	/// Template spawn counts awaiting their background write.
+	pub spawns:     SpawnCounter,
 }
 
 impl Deref for AppState {
@@ -109,6 +111,7 @@ impl AppState {
 			auth_cache: AuthCache::default(),
 			scheduler: Scheduler::default(),
 			stats: FleetStats::default(),
+			spawns: SpawnCounter::default(),
 		}))
 	}
 

@@ -26,6 +26,7 @@ use vmon_node::api::{
 
 mod portable;
 mod s3;
+mod spawns;
 
 use super::routes::{get_route, list_routes, team_prefix};
 use crate::{

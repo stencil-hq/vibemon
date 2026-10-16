@@ -377,6 +377,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 	}
 	cluster.shutdown().await;
 	while servers.join_next().await.is_some() {}
+	if let Some(driver) = &driver {
+		driver.shutdown().await;
+	}
 	Ok(())
 }
 

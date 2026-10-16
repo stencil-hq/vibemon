@@ -33,7 +33,8 @@ pub struct Driver {
 
 impl Driver {
 	/// Connects to `MySQL`, applies migrations, and starts background work
-	/// (reaper, reconciler, build supervisor, webhook delivery, fleet sampler).
+	/// (reaper, reconciler, build supervisor, spawn counts, webhook delivery,
+	/// fleet sampler).
 	pub async fn start(
 		config: DriverConfig,
 		mysql_url: &str,
@@ -45,6 +46,7 @@ impl Driver {
 		let state = AppState::new(config, store, cluster, keys);
 		lifecycle::spawn_background(state.clone());
 		builds::spawn_supervisor(state.clone());
+		builds::spawn_spawn_writer(state.clone());
 		webhooks::spawn_delivery(state.clone());
 		stats::spawn_sampler(state.clone());
 		Ok(Self { state })
@@ -55,6 +57,16 @@ impl Driver {
 	pub fn public_router(&self) -> axum::Router {
 		let api = api::router(self.state.clone()).merge(dashboard::router());
 		ingress::wrap(self.state.clone(), api)
+	}
+
+	/// Writes state still buffered in memory (template spawn counts) before the
+	/// process exits; bounded so a stalled `MySQL` cannot hang shutdown.
+	pub async fn shutdown(&self) {
+		const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+		let flushed = tokio::time::timeout(FLUSH_TIMEOUT, builds::flush_spawns(&self.state)).await;
+		if flushed != Ok(true) {
+			tracing::warn!("some template spawn counts were not written");
+		}
 	}
 
 	/// Shared state (used by the `vmon` binary for admin wiring and tests).
