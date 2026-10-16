@@ -7,8 +7,10 @@
 //! persists new log lines, and records the outcome: on `ready` the
 //! artifact (`MySQL` + KV `art/<build>/<node>`) and tags, on failure the
 //! reason. A build whose lease lapses (its driver died) is adopted by any
-//! driver; a builder that gossip declares dead fails the build; builds
-//! exceeding [`BUILD_TIMEOUT`] are cancelled with the upstream message.
+//! driver, and losing the lease to another driver stops supervision; a
+//! builder that gossip declares dead fails the build; builds running longer
+//! than [`BUILD_TIMEOUT`] on their builder (time queued there is free) are
+//! cancelled with the upstream message.
 //! The raft leader additionally runs artifact GC, fails snapshot builds
 //! abandoned mid-way, retires fork templates their fork never retired, and
 //! purges fork templates whose artifacts are collected.
@@ -318,7 +320,14 @@ async fn poll_once(
 			continue;
 		}
 		return match status.status {
-			BuildState::Waiting | BuildState::Building => Ok(Progress::Running),
+			BuildState::Waiting => Ok(Progress::Running),
+			BuildState::Building => {
+				// The build left the builder's queue: its time limit starts now.
+				if build.started_at.is_none() {
+					state.store.mark_build_running(build_id).await?;
+				}
+				Ok(Progress::Running)
+			},
 			BuildState::Ready => {
 				let Some(artifact) = status.artifact else {
 					fail(state, build_id, "builder reported ready without an artifact", None).await?;
@@ -348,12 +357,15 @@ async fn poll_once(
 	}
 }
 
-/// Whether a build has run longer than [`BUILD_TIMEOUT`].
+/// Whether a build has run longer than [`BUILD_TIMEOUT`] on its builder.
+/// Time spent waiting, in `MySQL` or in the builder's queue (`started_at`
+/// still unset), does not count.
 fn timed_out(build: &BuildRow, now: DateTime<Utc>) -> bool {
-	let started = build.started_at.unwrap_or(build.created_at);
-	now.signed_duration_since(started)
-		.to_std()
-		.is_ok_and(|elapsed| elapsed > BUILD_TIMEOUT)
+	build.started_at.is_some_and(|started| {
+		now.signed_duration_since(started)
+			.to_std()
+			.is_ok_and(|elapsed| elapsed > BUILD_TIMEOUT)
+	})
 }
 
 async fn fail(
@@ -432,6 +444,9 @@ mod tests {
 			!timed_out(&build(now - hour * 2, Some(now - second)), now),
 			"waiting time before start is free"
 		);
-		assert!(timed_out(&build(now - hour - second, None), now), "falls back to creation time");
+		assert!(
+			!timed_out(&build(now - hour * 3, None), now),
+			"queued on the builder: not started yet"
+		);
 	}
 }

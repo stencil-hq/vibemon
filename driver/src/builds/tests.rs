@@ -19,11 +19,13 @@ use vmon_node::api::{
 	ArtifactInfo, BuildLogEntry, BuildReason, BuildState, BuildStatus as NodeBuildStatus, StartBuild,
 };
 
-use super::{BuildRequest, StartRequest, art_key, register_build, start_build, supervisor};
+use super::{
+	BuildRequest, StartRequest, art_key, lock_key, register_build, start_build, supervisor,
+};
 use crate::{
 	crypto::Keys,
 	state::{AppState, DriverConfig, TeamLimits},
-	store::{builds::BuildStatus, testdb::TestDb},
+	store::{Team, builds::BuildStatus, testdb::TestDb},
 };
 
 const SECRET: &str = "test-secret";
@@ -33,8 +35,10 @@ const NODE_ID: NodeId = NodeId(0xb0b);
 /// Scripted builder: per build, its log lines, state, and outcome.
 #[derive(Default)]
 struct FakeNode {
-	started: Vec<StartBuild>,
-	builds:  BTreeMap<String, Script>,
+	started:      Vec<StartBuild>,
+	builds:       BTreeMap<String, Script>,
+	/// How long each status request takes (a stalled builder or host).
+	status_delay: Duration,
 }
 
 struct Script {
@@ -42,6 +46,8 @@ struct Script {
 	logs:     Vec<BuildLogEntry>,
 	reason:   Option<BuildReason>,
 	artifact: Option<ArtifactInfo>,
+	/// Status requests answered so far.
+	polls:    u64,
 }
 
 type Shared = Arc<Mutex<FakeNode>>;
@@ -53,6 +59,7 @@ async fn fake_start(State(node): State<Shared>, Json(req): Json<StartBuild>) -> 
 		logs:     Vec::new(),
 		reason:   None,
 		artifact: None,
+		polls:    0,
 	});
 	node.started.push(req);
 	StatusCode::ACCEPTED
@@ -69,8 +76,11 @@ async fn fake_status(
 	UrlPath(id): UrlPath<String>,
 	Query(query): Query<StatusQuery>,
 ) -> Result<Json<NodeBuildStatus>, StatusCode> {
-	let node = node.lock();
-	let script = node.builds.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+	let delay = node.lock().status_delay;
+	tokio::time::sleep(delay).await;
+	let mut node = node.lock();
+	let script = node.builds.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+	script.polls += 1;
 	// Pages of at most 2 lines exercise the supervisor's drain loop.
 	let from = usize::try_from(query.logs_offset)
 		.unwrap()
@@ -172,11 +182,21 @@ where
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies() {
-	let Some(db) = TestDb::create().await else {
-		return;
-	};
+/// A driver (raft leader) and a node-only gossip member served by `fake`,
+/// with one team.
+struct Fixture {
+	db:     TestDb,
+	_dir:   tempfile::TempDir,
+	driver: Cluster,
+	node:   Cluster,
+	fake:   Shared,
+	state:  AppState,
+	team:   Team,
+}
+
+/// `None` (test skipped) without `VMON_MYSQL_TEST_URL`.
+async fn fixture() -> Option<Fixture> {
+	let db = TestDb::create().await?;
 	let dir = tempfile::tempdir().unwrap();
 
 	let driver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -232,6 +252,75 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 		.create_team("Acme", TeamLimits::default())
 		.await
 		.unwrap();
+	Some(Fixture { db, _dir: dir, driver, node, fake, state, team })
+}
+
+impl Fixture {
+	/// Registers `name` and starts it on the fake builder; returns the build ID.
+	async fn start(&self, name: &str) -> String {
+		let request = BuildRequest { name: Some(name.into()), ..BuildRequest::default() };
+		let registered = register_build(&self.state, &self.team, &request)
+			.await
+			.unwrap();
+		let start =
+			StartRequest { from_image: Some("ubuntu:24.04".into()), ..StartRequest::default() };
+		start_build(
+			&self.state,
+			&self.team,
+			&registered.template_id,
+			&registered.build_id,
+			start,
+			None,
+		)
+		.await
+		.unwrap();
+		registered.build_id
+	}
+
+	async fn status(&self, build_id: &str) -> BuildStatus {
+		self
+			.db
+			.store
+			.build(build_id)
+			.await
+			.unwrap()
+			.unwrap()
+			.status()
+	}
+
+	/// The holder of `lock/build/<id>`, if any.
+	async fn lease_holder(&self, build_id: &str) -> Option<String> {
+		self
+			.driver
+			.kv
+			.get(&lock_key(build_id))
+			.await
+			.unwrap()
+			.map(|entry| String::from_utf8(entry.value).unwrap())
+	}
+
+	fn polls(&self, build_id: &str) -> u64 {
+		self.fake.lock().builds[build_id].polls
+	}
+
+	fn finish_ready(&self, build_id: &str) {
+		let mut fake = self.fake.lock();
+		let script = fake.builds.get_mut(build_id).unwrap();
+		script.state = BuildState::Ready;
+		script.artifact = Some(artifact(build_id));
+	}
+
+	async fn shutdown(self) {
+		self.driver.shutdown().await;
+		self.db.drop_db().await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies() {
+	let Some(Fixture { db, _dir, driver, node, fake, state, team }) = fixture().await else {
+		return;
+	};
 	tokio::spawn(supervisor::run(state.clone(), supervisor::Timing {
 		scan:           Duration::from_millis(100),
 		poll:           Duration::from_millis(50),
@@ -364,6 +453,104 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 
 	driver.shutdown().await;
 	db.drop_db().await;
+}
+
+/// Regression (I/O stalls on a single driver): the lease was only renewed
+/// between polls, so a poll stuck longer than the TTL let it expire, and the
+/// expired lease was then taken for another driver's; supervision stopped
+/// and the build sat in `building` until a rescan. Renewal must not depend
+/// on poll latency, a lapsed lease must be re-taken, and only a lease held
+/// by someone else stops supervision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_build_lease_survives_slow_polls_and_lapses_and_yields_only_to_another_holder() {
+	let Some(f) = fixture().await else {
+		return;
+	};
+	let me = f.driver.local_id().to_string();
+	let slow = f.start("slow").await;
+	let taken = f.start("taken").await;
+	// One scan only: supervision that stops is never restarted.
+	tokio::spawn(supervisor::run(f.state.clone(), supervisor::Timing {
+		scan:           Duration::from_hours(1),
+		poll:           Duration::from_millis(50),
+		lock_ttl:       Duration::from_secs(1),
+		renew:          Duration::from_millis(200),
+		housekeeping:   Duration::from_hours(1),
+		snapshot_stale: Duration::from_hours(1),
+	}));
+	eventually("both builds polled", || async { f.polls(&slow) > 0 && f.polls(&taken) > 0 }).await;
+
+	// Polls stall for 3 lease TTLs: the lease is renewed meanwhile.
+	f.fake.lock().status_delay = Duration::from_secs(3);
+	tokio::time::sleep(Duration::from_millis(2500)).await;
+	assert_eq!(f.lease_holder(&slow).await.as_deref(), Some(me.as_str()), "kept during slow polls");
+	f.fake.lock().status_delay = Duration::ZERO;
+
+	// A lease that lapsed (e.g. its renewal applied after the TTL) is re-taken.
+	f.driver.kv.delete(&lock_key(&slow)).await.unwrap();
+	eventually("the lapsed lease re-taken", || async {
+		f.lease_holder(&slow).await.as_deref() == Some(me.as_str())
+	})
+	.await;
+
+	// Another holder's lease stops supervision of that build.
+	f.driver
+		.kv
+		.put(&lock_key(&taken), b"another-driver".to_vec(), None)
+		.await
+		.unwrap();
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let polls = f.polls(&taken);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(f.polls(&taken), polls, "no polls after a takeover");
+	assert_eq!(f.lease_holder(&taken).await.as_deref(), Some("another-driver"));
+
+	// The build whose lease survived is still supervised to completion.
+	f.finish_ready(&slow);
+	eventually("ready build", || async { f.status(&slow).await == BuildStatus::Ready }).await;
+	f.finish_ready(&taken);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(f.status(&taken).await, BuildStatus::Building, "left to the other holder");
+	f.shutdown().await;
+}
+
+/// Regression (`--max-builds` queue on a busy builder): the hour limit
+/// counted from dispatch, so builds queued on the node for most of the hour
+/// timed out with the upstream "polling timed out" error before (or soon
+/// after) they ran. The clock starts when the builder reports `building`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn time_queued_on_the_builder_does_not_count_toward_the_build_timeout() {
+	let Some(f) = fixture().await else {
+		return;
+	};
+	let queued = f.start("queued").await;
+	f.fake.lock().builds.get_mut(&queued).unwrap().state = BuildState::Waiting;
+	tokio::spawn(supervisor::run(f.state.clone(), supervisor::Timing {
+		scan:           Duration::from_millis(100),
+		poll:           Duration::from_millis(50),
+		lock_ttl:       Duration::from_secs(5),
+		renew:          Duration::from_secs(1),
+		housekeeping:   Duration::from_hours(1),
+		snapshot_stale: Duration::from_hours(1),
+	}));
+	eventually("queued build polled", || async { f.polls(&queued) > 2 }).await;
+	let row = f.db.store.build(&queued).await.unwrap().unwrap();
+	assert_eq!(row.status(), BuildStatus::Building);
+	assert_eq!(row.started_at, None, "still queued on the builder");
+
+	f.fake.lock().builds.get_mut(&queued).unwrap().state = BuildState::Building;
+	eventually("the start recorded", || async {
+		f.db
+			.store
+			.build(&queued)
+			.await
+			.unwrap()
+			.unwrap()
+			.started_at
+			.is_some()
+	})
+	.await;
+	f.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1024,7 +1024,9 @@ holder polls the builder's `GET /node/v1/builds/{id}?logsOffset` every
 500 ms, appends new lines to `build_logs` (draining all lines before
 recording a terminal state), and on `ready` writes `art/<build>/<node>`,
 the build's `artifact`, and its tags. A builder that is `Dead`/`Left` in
-gossip (or lost the build) fails it; builds older than 1 h fail with
+gossip (or lost the build) fails it. `started_at` is set when the builder
+first reports `building` (a build waits in the node's `--max-builds` queue
+as `waiting`); builds running longer than 1 h fail with
 `build status polling timed out. Maximum build time is 1h0m0s.`
 
 Build file contexts: `GET /templates/{id}/files/{hash}` returns a URL on
