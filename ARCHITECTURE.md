@@ -997,10 +997,15 @@ or a hidden fork template. The raft-leader driver runs:
 the **reaper** (every 1 s: routes past `endAtMs` → pause or kill; a route
 still in a transitional state with its lock free was abandoned by a dead
 driver → kill), the
-**reconciler** (every 10 s: compare node `GET /sandboxes` with KV routes; routes
+**reconciler** (every 10 s, in its own task so a pass stalled on MySQL never
+delays the reaper; a sandbox whose repair fails is logged and retried next
+pass: compare node `GET /sandboxes` with KV routes; routes
 of `Dead` nodes, and of `Left` nodes that have not rejoined within 60 s — a
 gracefully restarted node keeps its VMMs and adopts them — → MySQL `killed` +
-events; VMMs a node reports without a route on that node are killed, except
+events; an unlocked running route older than 2 min whose VM its alive node
+does not list counts as lost too (younger ones may still be booting even if
+their create lock lapsed); running rows without a route, unlocked and
+started over 2 min ago, are marked killed; VMMs a node reports without a route on that node are killed, except
 a running VM whose row is paused on that node — a resume whose reply was
 lost — which is paused again; a failed resume call itself first asks the
 node whether the sandbox runs and then keeps it), and

@@ -2,6 +2,9 @@
 //!
 //! The reaper expires sandboxes past `endAt` every second; the reconciler
 //! compares node inventories with KV routes and `MySQL` every ten seconds.
+//! They run as separate tasks, so a reconciliation pass stalled on `MySQL`
+//! does not hold up expiries, and one sandbox whose repair fails does not
+//! end the pass for the others.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -28,9 +31,13 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(1);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// Bound on one node inventory call during reconciliation.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Rows marked running without a route are only declared orphaned after this
-/// long (covers the create path between admission and the `MySQL` insert).
-const ORPHAN_ROW_GRACE_MS: u64 = 120_000;
+/// How long after a (re)start a sandbox is exempt from orphan repair: a
+/// running route whose VM the node does not list yet (the node create is
+/// still booting it) or a running row without a route (the create path
+/// between admission and the `MySQL` insert). Under storage stalls both
+/// windows outlast the sandbox lock when its renewal applies late, so this
+/// is the safeguard that does not depend on the lock.
+const ORPHAN_GRACE_MS: u64 = 120_000;
 /// How long routes on a node that left gossip gracefully survive: `vmon
 /// serve` shutdown leaves the VMMs running for the restarted node to adopt
 /// (ARCHITECTURE.md §8.2), so a restart must not kill its sandboxes. `Dead`
@@ -78,26 +85,51 @@ fn node_lost(state: Option<MemberState>, left_for: Duration) -> bool {
 /// Starts the reaper and reconciler; they act only while this driver is the
 /// raft leader. Called once by [`crate::Driver::start`].
 pub fn spawn_background(state: AppState) {
-	tokio::spawn(supervise(state));
+	tokio::spawn(run_reaper(state.clone()));
+	tokio::spawn(run_reconciler(state));
 }
 
-async fn supervise(state: AppState) {
-	let mut leader = state.cluster.leader();
-	let local = state.cluster.local_id();
+/// Ticks every `period` while the cluster runs; `true` when this driver is
+/// the raft leader at that tick, `None` once the cluster shut down.
+struct LeaderTicks {
+	leader:   tokio::sync::watch::Receiver<Option<NodeId>>,
+	local:    NodeId,
+	interval: tokio::time::Interval,
+}
+
+impl LeaderTicks {
+	fn new(state: &AppState, period: Duration) -> Self {
+		let mut interval = tokio::time::interval(period);
+		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		Self { leader: state.cluster.leader(), local: state.cluster.local_id(), interval }
+	}
+
+	async fn tick(&mut self) -> Option<bool> {
+		loop {
+			tokio::select! {
+				changed = self.leader.changed() => changed.ok()?,
+				_ = self.interval.tick() => return Some(*self.leader.borrow() == Some(self.local)),
+			}
+		}
+	}
+}
+
+async fn run_reaper(state: AppState) {
 	let inflight: Arc<Mutex<HashSet<String>>> = Arc::default();
+	let mut ticks = LeaderTicks::new(&state, REAPER_INTERVAL);
+	while let Some(is_leader) = ticks.tick().await {
+		if is_leader {
+			reap(&state, &inflight).await;
+		}
+	}
+}
+
+async fn run_reconciler(state: AppState) {
 	let mut departures = Departures::default();
-	let mut reaper = tokio::time::interval(REAPER_INTERVAL);
-	let mut reconciler = tokio::time::interval(RECONCILE_INTERVAL);
-	reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-	reconciler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-	loop {
-		let is_leader = *leader.borrow() == Some(local);
-		tokio::select! {
-			changed = leader.changed() => if changed.is_err() { return },
-			_ = reaper.tick() => if is_leader { reap(&state, &inflight).await },
-			_ = reconciler.tick() => if is_leader && let Err(error) = reconcile(&state, &mut departures).await {
-				tracing::warn!(error = %error.message, "sandbox reconciliation failed");
-			},
+	let mut ticks = LeaderTicks::new(&state, RECONCILE_INTERVAL);
+	while let Some(is_leader) = ticks.tick().await {
+		if is_leader && let Err(error) = reconcile(&state, &mut departures).await {
+			tracing::warn!(error = %error.message, "sandbox reconciliation failed");
 		}
 	}
 }
@@ -128,7 +160,9 @@ async fn reap(state: &AppState, inflight: &Arc<Mutex<HashSet<String>>>) {
 	}
 }
 
-/// One reconciliation pass (see module docs).
+/// One reconciliation pass (see module docs). Fails only when routes or rows
+/// cannot be listed; a sandbox whose repair fails is logged and retried next
+/// pass.
 pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResult<()> {
 	let kv = &state.cluster.kv;
 	let members: HashMap<NodeId, (MemberState, String)> = state
@@ -169,38 +203,49 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 		.map(|(id, route)| (id.as_str(), route.node_id))
 		.collect();
 
+	let now = now_ms();
 	for (id, route) in &routes {
-		if is_locked(kv, id).await? {
-			continue;
-		}
-		let gone = match members.get(&route.node_id) {
-			// An unlocked `killing` route is a kill whose driver died (kills no
-			// longer write that state): finish it.
-			Some((MemberState::Alive, _)) if route.state == RouteState::Killing => true,
-			Some((MemberState::Alive, _)) => inventories.get(&route.node_id).is_some_and(|listed| {
-				route.state == RouteState::Running && !listed.iter().any(|info| info.sandbox_id == *id)
-			}),
-			other => node_lost(
-				other.map(|(member_state, _)| *member_state),
-				departures.left_for(route.node_id, now_instant),
-			),
+		let repaired = async {
+			if is_locked(kv, id).await? {
+				return Ok(());
+			}
+			let gone = match members.get(&route.node_id) {
+				// An unlocked `killing` route is a kill whose driver died (kills no
+				// longer write that state): finish it.
+				Some((MemberState::Alive, _)) if route.state == RouteState::Killing => true,
+				Some((MemberState::Alive, _)) => {
+					route.state == RouteState::Running
+						&& now.saturating_sub(route.started_at_ms) >= ORPHAN_GRACE_MS
+						&& inventories
+							.get(&route.node_id)
+							.is_some_and(|listed| !listed.iter().any(|info| info.sandbox_id == *id))
+				},
+				other => node_lost(
+					other.map(|(member_state, _)| *member_state),
+					departures.left_for(route.node_id, now_instant),
+				),
+			};
+			if gone {
+				tracing::warn!(sandbox = %id, node = %route.node_id, "sandbox lost with its node or VM; marking killed");
+				remove_route(kv, id, &route.team_id).await?;
+				mark_orphan_killed(state, id).await?;
+				return Ok(());
+			}
+			if let Some(info) = inventories
+				.get(&route.node_id)
+				.and_then(|l| l.iter().find(|i| i.sandbox_id == *id))
+				&& info.state == NodeSandboxState::Running
+				&& info.end_at_ms != route.end_at_ms
+				&& let Some((_, url)) = members.get(&route.node_id)
+				&& let Ok(client) = state.node_at(url)
+				&& let Err(error) = client.set_deadline(id, route.end_at_ms).await
+			{
+				tracing::debug!(%error, sandbox = %id, "deadline resync failed");
+			}
+			ApiResult::Ok(())
 		};
-		if gone {
-			tracing::warn!(sandbox = %id, node = %route.node_id, "sandbox lost with its node or VM; marking killed");
-			remove_route(kv, id, &route.team_id).await?;
-			mark_orphan_killed(state, id).await?;
-			continue;
-		}
-		if let Some(info) = inventories
-			.get(&route.node_id)
-			.and_then(|l| l.iter().find(|i| i.sandbox_id == *id))
-			&& info.state == NodeSandboxState::Running
-			&& info.end_at_ms != route.end_at_ms
-			&& let Some((_, url)) = members.get(&route.node_id)
-			&& let Ok(client) = state.node_at(url)
-			&& let Err(error) = client.set_deadline(id, route.end_at_ms).await
-		{
-			tracing::debug!(%error, sandbox = %id, "deadline resync failed");
+		if let Err(error) = repaired.await {
+			tracing::warn!(error = %error.message, sandbox = %id, "reconciling sandbox route failed");
 		}
 	}
 
@@ -214,80 +259,111 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 	for (node, listed) in &inventories {
 		for info in listed {
 			let id = info.sandbox_id.as_str();
-			// A VM is only legitimate on the node its route names: a create
-			// retried elsewhere after a timeout may have left a copy behind.
-			let legit = match info.state {
-				NodeSandboxState::Running => routed.get(id) == Some(node),
-				NodeSandboxState::Paused => rows.get(id).is_some_and(|(row_state, row_node)| {
-					*row_state == SandboxState::Paused && *row_node == node.to_string()
-				}),
-			};
-			if legit || is_locked(kv, id).await? {
-				continue;
-			}
-			if info.state == NodeSandboxState::Running
-				&& get_route_consistent(kv, id)
-					.await?
-					.is_some_and(|route| route.node_id == *node)
-			{
-				continue;
-			}
-			let Some(client) = members
-				.get(node)
-				.and_then(|(_, url)| state.node_at(url).ok())
-			else {
-				continue;
-			};
-			let paused_here = rows.get(id).is_some_and(|(row_state, row_node)| {
-				*row_state == SandboxState::Paused && *row_node == node.to_string()
-			});
-			if info.state == NodeSandboxState::Running && paused_here {
-				// A resume the driver gave up on (timeout) that the node completed:
-				// pause it again rather than kill it with its paused state.
-				tracing::warn!(sandbox = id, node = %node, "re-pausing a sandbox resumed without a route");
-				if let Err(error) = client
-					.pause_sandbox(id, &PauseSandbox { memory: true })
-					.await
-				{
-					tracing::warn!(%error, sandbox = id, "re-pausing failed");
-				}
-				continue;
-			}
-			tracing::warn!(sandbox = id, node = %node, state = ?info.state, "killing orphaned sandbox on node");
-			if let Err(error) = client.kill_sandbox(id).await {
-				tracing::warn!(%error, sandbox = id, "orphan kill failed");
+			if let Err(error) = reconcile_listed(state, &members, &routed, &rows, *node, info).await {
+				tracing::warn!(error = %error.message, sandbox = id, "reconciling node sandbox failed");
 			}
 		}
 	}
 
-	let now = now_ms();
 	for (id, (row_state, _)) in &rows {
-		if *row_state != SandboxState::Running
-			|| routed.contains_key(id.as_str())
-			|| is_locked(kv, id).await?
-		{
+		if *row_state != SandboxState::Running || routed.contains_key(id.as_str()) {
 			continue;
 		}
-		let Some(row) = state.store.sandbox(id).await? else {
-			continue;
-		};
-		if now.saturating_sub(super::unix_ms(row.started_at)) < ORPHAN_ROW_GRACE_MS
-			|| get_route_consistent(kv, id).await?.is_some()
-		{
-			continue;
+		if let Err(error) = reconcile_routeless_row(state, &members, id, now).await {
+			tracing::warn!(error = %error.message, sandbox = %id, "reconciling sandbox row failed");
 		}
-		tracing::warn!(sandbox = %id, "running row without a route; marking killed");
-		if let Ok(node) = parse_node(&row.node_id)
-			&& let Some((MemberState::Alive, url)) = members.get(&node)
-			&& let Ok(client) = state.node_at(url)
-			&& let Err(error) = client.kill_sandbox(id).await
-			&& !error.is_not_found()
-		{
-			tracing::warn!(%error, sandbox = %id, "kill of route-less sandbox failed");
-		}
-		mark_orphan_killed(state, id).await?;
 	}
 	Ok(())
+}
+
+/// Kills (or re-pauses) a VM a node lists that nothing legitimizes.
+async fn reconcile_listed(
+	state: &AppState,
+	members: &HashMap<NodeId, (MemberState, String)>,
+	routed: &HashMap<&str, NodeId>,
+	rows: &HashMap<String, (SandboxState, String)>,
+	node: NodeId,
+	info: &SandboxInfo,
+) -> ApiResult<()> {
+	let kv = &state.cluster.kv;
+	let id = info.sandbox_id.as_str();
+	// A VM is only legitimate on the node its route names: a create
+	// retried elsewhere after a timeout may have left a copy behind.
+	let legit = match info.state {
+		NodeSandboxState::Running => routed.get(id) == Some(&node),
+		NodeSandboxState::Paused => rows.get(id).is_some_and(|(row_state, row_node)| {
+			*row_state == SandboxState::Paused && *row_node == node.to_string()
+		}),
+	};
+	if legit || is_locked(kv, id).await? {
+		return Ok(());
+	}
+	if info.state == NodeSandboxState::Running
+		&& get_route_consistent(kv, id)
+			.await?
+			.is_some_and(|route| route.node_id == node)
+	{
+		return Ok(());
+	}
+	let Some(client) = members
+		.get(&node)
+		.and_then(|(_, url)| state.node_at(url).ok())
+	else {
+		return Ok(());
+	};
+	let paused_here = rows.get(id).is_some_and(|(row_state, row_node)| {
+		*row_state == SandboxState::Paused && *row_node == node.to_string()
+	});
+	if info.state == NodeSandboxState::Running && paused_here {
+		// A resume the driver gave up on (timeout) that the node completed:
+		// pause it again rather than kill it with its paused state.
+		tracing::warn!(sandbox = id, node = %node, "re-pausing a sandbox resumed without a route");
+		if let Err(error) = client
+			.pause_sandbox(id, &PauseSandbox { memory: true })
+			.await
+		{
+			tracing::warn!(%error, sandbox = id, "re-pausing failed");
+		}
+		return Ok(());
+	}
+	tracing::warn!(sandbox = id, node = %node, state = ?info.state, "killing orphaned sandbox on node");
+	if let Err(error) = client.kill_sandbox(id).await {
+		tracing::warn!(%error, sandbox = id, "orphan kill failed");
+	}
+	Ok(())
+}
+
+/// Marks killed (and stops) a sandbox whose row says running but which has
+/// no route, unless a transition holds it or it is within its start grace.
+async fn reconcile_routeless_row(
+	state: &AppState,
+	members: &HashMap<NodeId, (MemberState, String)>,
+	id: &str,
+	now: u64,
+) -> ApiResult<()> {
+	let kv = &state.cluster.kv;
+	if is_locked(kv, id).await? {
+		return Ok(());
+	}
+	let Some(row) = state.store.sandbox(id).await? else {
+		return Ok(());
+	};
+	if row.state() != SandboxState::Running
+		|| now.saturating_sub(super::unix_ms(row.started_at)) < ORPHAN_GRACE_MS
+		|| get_route_consistent(kv, id).await?.is_some()
+	{
+		return Ok(());
+	}
+	tracing::warn!(sandbox = %id, "running row without a route; marking killed");
+	if let Ok(node) = parse_node(&row.node_id)
+		&& let Some((MemberState::Alive, url)) = members.get(&node)
+		&& let Ok(client) = state.node_at(url)
+		&& let Err(error) = client.kill_sandbox(id).await
+		&& !error.is_not_found()
+	{
+		tracing::warn!(%error, sandbox = %id, "kill of route-less sandbox failed");
+	}
+	mark_orphan_killed(state, id).await
 }
 
 async fn mark_orphan_killed(state: &AppState, id: &str) -> ApiResult<()> {

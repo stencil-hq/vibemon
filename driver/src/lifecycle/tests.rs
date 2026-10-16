@@ -28,7 +28,7 @@ mod portable;
 mod s3;
 mod spawns;
 
-use super::routes::{get_route, list_routes, team_prefix};
+use super::routes::{Lease, get_route, hold_lease, list_routes, lock_key, team_prefix};
 use crate::{
 	api,
 	builds::{self, art_key},
@@ -703,6 +703,59 @@ async fn resumes_the_node_completed_despite_an_error_keep_the_sandbox() {
 	}
 	let (_, detail, _) = h.api.call("GET", &format!("/sandboxes/{id}"), None).await;
 	assert_eq!(detail["state"], "paused");
+	h.kill(&id).await;
+
+	h.finish().await;
+}
+
+/// Regression (raft commits stalled by disk I/O): a create's sandbox lock
+/// lapsed while the node was still booting the VM, and the reconciler, seeing
+/// an unlocked running route whose VM the node did not list yet, removed the
+/// route and marked the sandbox killed; the VM that came up was then killed
+/// as an orphan. A lapsed lock is re-taken by its holder, and a fresh route
+/// is never declared lost just because its VM is not listed yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_lock_lapsed_is_not_killed_while_its_vm_boots() {
+	let Some(h) = harness().await else {
+		return;
+	};
+	let kv = &h.cluster.kv;
+
+	// Lease semantics shared by sandbox locks and build supervision.
+	let ttl = Duration::from_mins(1);
+	assert_eq!(hold_lease(kv, "lease/x", b"a", ttl).await.unwrap(), Lease::Taken);
+	assert_eq!(hold_lease(kv, "lease/x", b"a", ttl).await.unwrap(), Lease::Extended);
+	assert_eq!(hold_lease(kv, "lease/x", b"b", ttl).await.unwrap(), Lease::Lost);
+	kv.delete("lease/x").await.unwrap();
+	assert_eq!(
+		hold_lease(kv, "lease/x", b"a", ttl).await.unwrap(),
+		Lease::Taken,
+		"lapsed: re-taken"
+	);
+
+	h.fake.lock().create_delay = Duration::from_secs(2);
+	let lapse_and_reconcile = async {
+		eventually("the create admitted", || async { !list_routes(kv).await.unwrap().is_empty() })
+			.await;
+		let (id, _) = list_routes(kv).await.unwrap().remove(0);
+		kv.delete(&lock_key(&id)).await.unwrap();
+		super::background::reconcile(&h.state, &mut super::background::Departures::default())
+			.await
+			.unwrap();
+		id
+	};
+	let ((status, created), id) = tokio::join!(h.create(), lapse_and_reconcile);
+	assert_eq!(status, StatusCode::CREATED, "{created}");
+	assert_eq!(created["sandboxID"], id.as_str());
+	assert_eq!(get_route(kv, &id).await.unwrap().unwrap().state, RouteState::Running);
+	super::background::reconcile(&h.state, &mut super::background::Departures::default())
+		.await
+		.unwrap();
+	let kills = h.fake.lock().kills.clone();
+	assert!(kills.is_empty(), "{kills:?}");
+	assert!(get_route(kv, &id).await.unwrap().is_some());
+	let (_, detail, _) = h.api.call("GET", &format!("/sandboxes/{id}"), None).await;
+	assert_eq!(detail["state"], "running");
 	h.kill(&id).await;
 
 	h.finish().await;
