@@ -14,14 +14,12 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::{
-	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+	io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
 	net::UnixStream,
 };
 
-/// Timeout for quick control methods.
+/// Timeout for quick control methods, and for sending any request.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Snapshots write all guest memory; the VMM itself gives up after 60 s.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Control-socket client for one VMM.
 #[derive(Debug)]
@@ -48,17 +46,36 @@ impl ControlClient {
 		params: Value,
 		timeout: Duration,
 	) -> anyhow::Result<Value> {
-		tokio::time::timeout(timeout, self.call_inner(method, params))
-			.await
-			.map_err(|_| anyhow!("vmm {method}: no reply within {timeout:?}"))?
+		tokio::time::timeout(timeout, async {
+			let lines = self.send(method, params).await?;
+			Self::reply(lines, method).await
+		})
+		.await
+		.map_err(|_| anyhow!("vmm {method}: no reply within {timeout:?}"))?
 	}
 
-	async fn call_inner(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+	/// [`Self::call`] for methods whose duration is host IO (a snapshot writes
+	/// and fsyncs guest RAM: minutes on a contended disk): sending is bounded
+	/// by [`CONTROL_TIMEOUT`], the reply has no deadline. The VMM answers a
+	/// request it could not start within its own start timeout with `busy`,
+	/// one it started when it finishes, and its exit closes the connection.
+	async fn call_to_completion(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+		let lines = tokio::time::timeout(CONTROL_TIMEOUT, self.send(method, params))
+			.await
+			.map_err(|_| anyhow!("vmm {method}: not sent within {CONTROL_TIMEOUT:?}"))??;
+		Self::reply(lines, method).await
+	}
+
+	/// Connects, checks the banner, and sends one request.
+	async fn send(
+		&self,
+		method: &str,
+		params: Value,
+	) -> anyhow::Result<Lines<BufReader<UnixStream>>> {
 		let stream = UnixStream::connect(&self.path)
 			.await
 			.with_context(|| format!("connecting vmm control socket {}", self.path.display()))?;
-		let (read, mut write) = stream.into_split();
-		let mut lines = BufReader::new(read).lines();
+		let mut lines = BufReader::new(stream).lines();
 		let banner = lines
 			.next_line()
 			.await?
@@ -70,7 +87,12 @@ impl ControlClient {
 		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 		let mut line = serde_json::to_vec(&json!({ "id": id, "method": method, "params": params }))?;
 		line.push(b'\n');
-		write.write_all(&line).await?;
+		lines.get_mut().get_mut().write_all(&line).await?;
+		Ok(lines)
+	}
+
+	/// Reads the reply of the request [`Self::send`] sent.
+	async fn reply(mut lines: Lines<BufReader<UnixStream>>, method: &str) -> anyhow::Result<Value> {
 		let reply = lines
 			.next_line()
 			.await?
@@ -122,10 +144,10 @@ impl ControlClient {
 	}
 
 	/// Writes a full snapshot to `<snapshot-root>/<name>`; the VM must be
-	/// paused.
+	/// paused. Waits as long as the VMM writes it.
 	pub async fn snapshot(&self, name: &str) -> anyhow::Result<()> {
 		self
-			.call("snapshot", json!({ "name": name }), SNAPSHOT_TIMEOUT)
+			.call_to_completion("snapshot", json!({ "name": name }))
 			.await
 			.map(drop)
 	}
@@ -134,7 +156,7 @@ impl ControlClient {
 	/// `base` (same snapshot root).
 	pub async fn snapshot_delta(&self, name: &str, base: &str) -> anyhow::Result<()> {
 		self
-			.call("snapshot", json!({ "name": name, "base": base }), SNAPSHOT_TIMEOUT)
+			.call_to_completion("snapshot", json!({ "name": name, "base": base }))
 			.await
 			.map(drop)
 	}
@@ -162,5 +184,69 @@ impl ControlClient {
 			.get("deadline_unix")
 			.and_then(Value::as_i64)
 			.ok_or_else(|| anyhow!("vmm extend returned no deadline: {result}"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tokio::net::UnixListener;
+
+	use super::*;
+
+	/// Fake VMM control socket: banner, one request, then `reply` after
+	/// `delay` (`None` closes the connection instead, as an exiting VMM does).
+	fn fake_vmm(listener: UnixListener, delay: Duration, reply: Option<Value>) {
+		tokio::spawn(async move {
+			let (stream, _) = listener.accept().await.unwrap();
+			let (read, mut write) = stream.into_split();
+			write
+				.write_all(b"{\"vmm\":\"test\",\"api\":1}\n")
+				.await
+				.unwrap();
+			let mut lines = BufReader::new(read).lines();
+			let request: Value =
+				serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+			assert_eq!(request["method"], "snapshot");
+			tokio::time::sleep(delay).await;
+			if let Some(mut reply) = reply {
+				reply["id"] = request["id"].clone();
+				let mut line = serde_json::to_vec(&reply).unwrap();
+				line.push(b'\n');
+				write.write_all(&line).await.unwrap();
+			}
+		});
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn snapshot_waits_as_long_as_the_vmm_writes_it() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("api.sock");
+		// Guest RAM written and fsynced on a contended disk.
+		fake_vmm(
+			UnixListener::bind(&path).unwrap(),
+			Duration::from_mins(10),
+			Some(json!({ "ok": true, "result": {} })),
+		);
+		ControlClient::new(path)
+			.snapshot("s")
+			.await
+			.expect("snapshot");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn snapshot_fails_when_the_vmm_exits_mid_write() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("api.sock");
+		fake_vmm(UnixListener::bind(&path).unwrap(), Duration::from_secs(1), None);
+		let error = ControlClient::new(path)
+			.snapshot("s")
+			.await
+			.expect_err("the VMM is gone");
+		assert!(
+			error
+				.to_string()
+				.contains("closed the control socket during snapshot"),
+			"{error}"
+		);
 	}
 }

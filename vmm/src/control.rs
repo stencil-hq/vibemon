@@ -10,7 +10,10 @@
 //! [`serve`] exposes a newline-delimited JSON lifecycle protocol over a Unix
 //! socket or Windows named pipe. The server thread never touches the `Vmm`
 //! directly; it forwards parsed requests to the owning thread over a channel
-//! and serializes that thread's JSON response back to the connection.
+//! and serializes that thread's JSON response back to the connection. A
+//! request the owning thread has not started within [`CONTROL_START_TIMEOUT`]
+//! is withdrawn (answered `busy`, never executed); a started one is answered
+//! when it finishes, however long its host IO takes.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
@@ -29,7 +32,10 @@ use std::{
 use std::{
 	io::{self, BufRead, BufReader, Read, Write},
 	path::PathBuf,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicU8, Ordering},
+	},
 	thread::{self, JoinHandle},
 	time::{Duration, Instant},
 };
@@ -61,7 +67,15 @@ const CONTROL_MAX_REQUEST_LINE: usize = 65_536;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
+/// How long a request may wait for the VMM thread to start it (the thread runs
+/// one request at a time, e.g. a snapshot). There is no limit once started: a
+/// snapshot's writes and fsyncs take as long as the host disk needs, and a
+/// timeout reply would claim a failure while the snapshot still completes.
+const CONTROL_START_TIMEOUT: Duration = Duration::from_mins(1);
+/// [`ControlCmd`] claim states.
+const CMD_PENDING: u8 = 0;
+const CMD_STARTED: u8 = 1;
+const CMD_WITHDRAWN: u8 = 2;
 /// Real-time signal used on Linux to kick a vCPU out of `KVM_RUN`.
 ///
 /// HVF uses the backend kicker installed on [`PauseGate`] instead of POSIX
@@ -327,6 +341,10 @@ impl ApiError {
 		Self::new("not_paused", message)
 	}
 
+	pub fn busy(message: impl Into<String>) -> Self {
+		Self::new("busy", message)
+	}
+
 	pub fn internal(message: impl Into<String>) -> Self {
 		Self::new("internal", message)
 	}
@@ -335,9 +353,61 @@ impl ApiError {
 pub type ControlReply = std::result::Result<serde_json::Value, ApiError>;
 
 /// A parsed command plus the oneshot channel its JSON reply is sent back on.
+/// The VMM thread runs it only after [`Self::start`] claims it.
 pub struct ControlCmd {
-	pub kind:  ControlKind,
-	pub reply: Sender<ControlReply>,
+	kind:  ControlKind,
+	reply: Sender<ControlReply>,
+	/// `CMD_PENDING` until the VMM thread starts the command or its connection
+	/// withdraws it; the first transition wins.
+	claim: Arc<AtomicU8>,
+}
+
+impl ControlCmd {
+	fn new(kind: ControlKind) -> (Self, PendingReply) {
+		let (reply, rx) = flume::bounded(1);
+		let claim = Arc::new(AtomicU8::new(CMD_PENDING));
+		(Self { kind, reply, claim: Arc::clone(&claim) }, PendingReply { rx, claim })
+	}
+
+	/// Claims the command for execution: its reply goes to the sender. `None`
+	/// when the connection already withdrew it (its client got `busy`), so it
+	/// must not run.
+	pub fn start(self) -> Option<(ControlKind, Sender<ControlReply>)> {
+		self
+			.claim
+			.compare_exchange(CMD_PENDING, CMD_STARTED, Ordering::AcqRel, Ordering::Acquire)
+			.ok()?;
+		Some((self.kind, self.reply))
+	}
+}
+
+/// The connection's end of a [`ControlCmd`].
+struct PendingReply {
+	rx:    flume::Receiver<ControlReply>,
+	claim: Arc<AtomicU8>,
+}
+
+impl PendingReply {
+	/// Waits up to `start_timeout` for the VMM thread to start the command,
+	/// then withdraws it with a `busy` reply; a started command is waited for
+	/// until it replies. `None` when the VMM thread is gone without replying.
+	fn wait(self, start_timeout: Duration) -> Option<ControlReply> {
+		match self.rx.recv_timeout(start_timeout) {
+			Ok(reply) => return Some(reply),
+			Err(RecvTimeoutError::Disconnected) => return None,
+			Err(RecvTimeoutError::Timeout) => {},
+		}
+		if self
+			.claim
+			.compare_exchange(CMD_PENDING, CMD_WITHDRAWN, Ordering::AcqRel, Ordering::Acquire)
+			.is_ok()
+		{
+			return Some(Err(ApiError::busy(format!(
+				"the VMM did not start the request within {start_timeout:?}"
+			))));
+		}
+		self.rx.recv().ok()
+	}
 }
 /// Shared ownership watchdog state, updated directly by the control socket so
 /// a lease renewal never waits behind a long-running lifecycle command.
@@ -502,7 +572,9 @@ impl ControlServer {
 				{
 					let tx = tx.clone();
 					let watchdog = watchdog.clone();
-					std::thread::spawn(move || handle_connection(stream, tx, watchdog));
+					std::thread::spawn(move || {
+						handle_connection(stream, tx, watchdog, CONTROL_START_TIMEOUT);
+					});
 				}
 			}
 		});
@@ -555,7 +627,9 @@ impl ControlServer {
 				listener = create_control_pipe(&pipe_name, false).ok();
 				let tx = tx.clone();
 				let watchdog = watchdog.clone();
-				std::thread::spawn(move || handle_connection(pipe, tx, watchdog));
+				std::thread::spawn(move || {
+					handle_connection(pipe, tx, watchdog, CONTROL_START_TIMEOUT);
+				});
 			}
 		});
 	}
@@ -1131,6 +1205,7 @@ fn handle_connection<S: ControlStream>(
 	stream: S,
 	tx: Sender<ControlCmd>,
 	watchdog: Option<OwnerWatchdog>,
+	start_timeout: Duration,
 ) {
 	let Ok(mut writer) = stream.duplicate() else {
 		return;
@@ -1185,16 +1260,12 @@ fn handle_connection<S: ControlStream>(
 			continue;
 		}
 
-		let (rtx, rrx) = flume::bounded::<ControlReply>(1);
-		if tx.send(ControlCmd { kind, reply: rtx }).is_err() {
+		let (cmd, pending) = ControlCmd::new(kind);
+		if tx.send(cmd).is_err() {
 			return;
 		}
-		let reply = match rrx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
-			Ok(reply) => reply,
-			Err(RecvTimeoutError::Timeout) => Err(ApiError::internal(format!(
-				"control reply timed out after {CONTROL_REPLY_TIMEOUT:?}"
-			))),
-			Err(RecvTimeoutError::Disconnected) => return,
+		let Some(reply) = pending.wait(start_timeout) else {
+			return;
 		};
 		let write_result = match reply {
 			Ok(result) => write_success(&mut writer, id, result),
@@ -1434,7 +1505,9 @@ mod tests {
 		let watchdog = OwnerWatchdog::new(Some(Instant::now() + Duration::from_secs(1)));
 		let watcher = watchdog.clone();
 		watchdog.start(|| {});
-		std::thread::spawn(move || handle_connection(server, tx, Some(watcher)));
+		std::thread::spawn(move || {
+			handle_connection(server, tx, Some(watcher), CONTROL_START_TIMEOUT);
+		});
 
 		let mut reader = BufReader::new(client.try_clone().expect("clone client stream"));
 		let mut line = String::new();
@@ -1465,6 +1538,79 @@ mod tests {
 			.expect("watchdog expires");
 		assert!(watchdog.rearm(1).is_err(), "expired watchdog cannot be resurrected");
 		watchdog.shutdown();
+	}
+
+	/// Client end (banner already read) of a `handle_connection` thread whose
+	/// VMM thread is the caller, holding `rx`.
+	fn control_pair(
+		start_timeout: Duration,
+	) -> (BufReader<UnixStream>, UnixStream, flume::Receiver<ControlCmd>) {
+		let (server, client) = UnixStream::pair().expect("create connected control streams");
+		client
+			.set_read_timeout(Some(Duration::from_secs(5)))
+			.expect("set client read timeout");
+		let (tx, rx) = flume::unbounded();
+		std::thread::spawn(move || handle_connection(server, tx, None, start_timeout));
+		let mut reader = BufReader::new(client.try_clone().expect("clone client stream"));
+		let mut banner = String::new();
+		reader.read_line(&mut banner).expect("read banner");
+		(reader, client, rx)
+	}
+
+	fn round_trip(
+		reader: &mut BufReader<UnixStream>,
+		client: &mut UnixStream,
+		request: &str,
+	) -> serde_json::Value {
+		client
+			.write_all(request.as_bytes())
+			.and_then(|()| client.write_all(b"\n"))
+			.expect("send request");
+		let mut line = String::new();
+		reader.read_line(&mut line).expect("read reply");
+		serde_json::from_str(&line).expect("parse reply")
+	}
+
+	#[test]
+	fn started_request_is_answered_when_it_finishes_however_long_it_runs() {
+		// Ample for the waiting VMM thread to take the command.
+		let start_timeout = Duration::from_millis(500);
+		let (mut reader, mut client, rx) = control_pair(start_timeout);
+		let vmm = std::thread::spawn(move || {
+			let (_, reply) = rx
+				.recv()
+				.expect("snapshot command")
+				.start()
+				.expect("pending command starts");
+			// A snapshot whose writes and fsyncs stall on a contended disk.
+			std::thread::sleep(start_timeout * 3);
+			let _ = reply.send(Ok(serde_json::json!({ "written": true })));
+		});
+		let reply = round_trip(
+			&mut reader,
+			&mut client,
+			r#"{"id":3,"method":"snapshot","params":{"name":"s"}}"#,
+		);
+		assert_eq!(reply["ok"], true, "{reply}");
+		assert_eq!(reply["id"], 3);
+		assert_eq!(reply["result"]["written"], true);
+		vmm.join().unwrap();
+	}
+
+	#[test]
+	fn request_not_started_in_time_is_withdrawn_and_never_runs() {
+		let start_timeout = Duration::from_millis(50);
+		let (mut reader, mut client, rx) = control_pair(start_timeout);
+		// The VMM thread is busy (e.g. with another snapshot) past the start
+		// timeout.
+		let reply = round_trip(&mut reader, &mut client, r#"{"id":4,"method":"pause"}"#);
+		assert_eq!(reply["ok"], false, "{reply}");
+		assert_eq!(reply["id"], 4);
+		assert_eq!(reply["error"]["code"], "busy");
+		let cmd = rx
+			.recv_timeout(Duration::from_secs(1))
+			.expect("queued pause");
+		assert!(cmd.start().is_none(), "a withdrawn pause must not run after its client gave up");
 	}
 
 	#[test]

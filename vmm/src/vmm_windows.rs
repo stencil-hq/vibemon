@@ -2733,11 +2733,14 @@ impl Vmm {
 				};
 				match rx.recv_timeout(wait) {
 					Ok(cmd) => {
-						let quit = matches!(cmd.kind, ControlKind::Quit);
-						let reply = self.handle_control(cmd.kind, snapshot_root);
-						let _ = cmd.reply.send(reply);
-						if quit {
-							break VmmExit::Quit;
+						// A command its connection withdrew (not started in time) is
+						// dropped unrun.
+						if let Some((kind, reply)) = cmd.start() {
+							let quit = matches!(kind, ControlKind::Quit);
+							let _ = reply.send(self.handle_control(kind, snapshot_root));
+							if quit {
+								break VmmExit::Quit;
+							}
 						}
 					},
 					Err(RecvTimeoutError::Timeout) => {

@@ -1562,7 +1562,18 @@ impl SandboxManager {
 	/// cleans up whatever it did not reach.
 	pub async fn kill(self: &Arc<Self>, id: &str) -> Result<(), ApiError> {
 		let entry = self.entry(id)?;
-		let ops = Arc::clone(&entry.ops).lock_owned().await;
+		let ops = if let Ok(ops) = Arc::clone(&entry.ops).try_lock_owned() {
+			ops
+		} else {
+			// An operation on the running VM holds the lock; a snapshot it
+			// waits for has no deadline and can stall on host I/O. Killing the
+			// VMM first makes that operation fail and release the lock.
+			let vm = entry.state.lock().live.as_ref().map(|live| live.vm.clone());
+			if let Some(vm) = vm {
+				vm.terminate();
+			}
+			Arc::clone(&entry.ops).lock_owned().await
+		};
 		let live = entry.state.lock().live.take();
 		self.forget(id, &entry);
 		let teardown = match live {

@@ -593,6 +593,15 @@ under the 104-byte macOS `sun_path` limit.
 - The VMM hard deadline (`extend`) is kept at `endAt + 60 s` as a safety net;
   the driver is the authority for timeouts.
 - Boot concurrency is bounded (`--boot-concurrency`, default 4 × CPUs).
+- Readiness = control `ping`, then GC4 `hello` within the VM's ready budget
+  (`VmSpec.ready_timeout`; the template VM gets 5 min); `hello` may use the
+  whole remaining budget (a systemd boot on a busy host starts envd late).
+- Control socket (`--api-sock`): the VMM runs one request at a time. A
+  request it has not started within 60 s is withdrawn (`busy`, never run
+  later); a started one is answered when it finishes. Quick methods have a
+  30 s client timeout; `snapshot` waits without one (writing and fsyncing
+  guest RAM takes minutes on a contended disk) and ends with the VMM's reply
+  or exit.
 - Restart recovery: on start the node scans `sandboxes/`, reconnects to live
   VMM sockets, kills orphans whose VMM is gone, and reports its sandbox set to
   the driver reconciler via `GET /node/v1/sandboxes`. VMMs run in their own

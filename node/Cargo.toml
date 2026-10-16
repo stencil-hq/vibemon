@@ -51,4 +51,5 @@ vmm = { path = "../vmm" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 vmon-cloud = { workspace = true, features = ["fake"] }
