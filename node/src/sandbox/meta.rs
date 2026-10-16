@@ -143,8 +143,23 @@ impl SandboxPaths {
 	}
 }
 
-/// Writes `meta.json` atomically with mode 0600.
+/// Writes `meta.json` atomically with mode 0600, durably.
 pub fn save(paths: &SandboxPaths, meta: &SandboxMeta) -> std::io::Result<()> {
+	write(paths, meta, true)
+}
+
+/// [`save`] without the fsync, for a freshly created running sandbox. Only a
+/// node process restart reads it (to adopt the VMM), and the page cache
+/// survives that; a host crash that loses it ends the VMM too, and the
+/// directory without metadata then ages out in `SandboxManager::gc`. The
+/// fsync of a new file waits for a filesystem journal commit, which takes
+/// seconds under heavy write load (ext4 `data=ordered` flushes other files'
+/// new data first) and would hold up every create.
+pub fn save_unsynced(paths: &SandboxPaths, meta: &SandboxMeta) -> std::io::Result<()> {
+	write(paths, meta, false)
+}
+
+fn write(paths: &SandboxPaths, meta: &SandboxMeta, durable: bool) -> std::io::Result<()> {
 	let tmp = paths.dir.join("meta.json.tmp");
 	{
 		let mut file = fs::OpenOptions::new()
@@ -154,7 +169,9 @@ pub fn save(paths: &SandboxPaths, meta: &SandboxMeta) -> std::io::Result<()> {
 			.mode(0o600)
 			.open(&tmp)?;
 		file.write_all(&serde_json::to_vec_pretty(meta)?)?;
-		file.sync_all()?;
+		if durable {
+			file.sync_all()?;
+		}
 	}
 	fs::rename(&tmp, paths.meta())
 }

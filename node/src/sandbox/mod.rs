@@ -1009,7 +1009,7 @@ impl SandboxManager {
 		self.install_live(&id, &entry, booted);
 		let info = {
 			let state = entry.state.lock();
-			if let Err(error) = meta::save(&entry.paths, &state.meta) {
+			if let Err(error) = meta::save_unsynced(&entry.paths, &state.meta) {
 				tracing::warn!(sandbox = %id, %error, "saving sandbox meta failed");
 			}
 			state.meta.info()
@@ -1933,8 +1933,8 @@ impl SandboxManager {
 		self.egress.attach(id, egress_net, policy).await
 	}
 
-	/// Retention: prunes metric files and deletes ended sandboxes' dirs
-	/// older than 7 days.
+	/// Retention: prunes metric files and deletes sandbox dirs that ended (or
+	/// never recorded metadata) more than 7 days ago.
 	pub fn gc(&self) {
 		let now = now_ms();
 		let retention = u64::try_from(metrics::RETENTION.as_millis()).unwrap_or(u64::MAX);
@@ -1943,16 +1943,29 @@ impl SandboxManager {
 		};
 		for dir in dirs.filter_map(Result::ok) {
 			let path = dir.path();
-			match meta::load(&path.join("meta.json")).and_then(|meta| meta.ended_at_ms) {
-				Some(ended) if now.saturating_sub(ended) > retention => remove_path(&path),
-				_ => {
-					if let Err(error) = metrics::prune(&path.join("metrics.jsonl"), now) {
-						tracing::debug!(path = %path.display(), %error, "metrics prune failed");
-					}
-				},
+			if retired(&path, now, retention) {
+				remove_path(&path);
+			} else if let Err(error) = metrics::prune(&path.join("metrics.jsonl"), now) {
+				tracing::debug!(path = %path.display(), %error, "metrics prune failed");
 			}
 		}
 	}
+}
+
+/// Whether the sandbox dir `path` is past `retention`: ended that long ago,
+/// or without readable metadata (a create that never finished, or unsynced
+/// metadata lost with the host, see [`meta::save_unsynced`]) and unchanged
+/// that long.
+fn retired(path: &Path, now_ms: u64, retention_ms: u64) -> bool {
+	let since = match meta::load(&path.join("meta.json")) {
+		Some(meta) => meta.ended_at_ms,
+		None => fs::metadata(path)
+			.and_then(|meta| meta.modified())
+			.ok()
+			.and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+			.and_then(|age| u64::try_from(age.as_millis()).ok()),
+	};
+	since.is_some_and(|since| now_ms.saturating_sub(since) > retention_ms)
 }
 
 #[cfg(test)]
@@ -1977,6 +1990,54 @@ mod tests {
 		fs::remove_file(paths.paused_rootfs()).unwrap();
 		assert!(!paths.paused_resumable(), "a marker without the disk is not resumable");
 		assert!(commit_paused(&paths).is_err(), "nothing to commit without the disk");
+	}
+
+	/// A sandbox dir whose metadata never became readable (a create cut
+	/// short, or unsynced metadata lost with the host) ages out like an ended
+	/// one; running sandboxes and fresh dirs stay.
+	#[test]
+	fn gc_retires_ended_and_metadata_less_dirs() {
+		const DAY_MS: u64 = 86_400_000;
+		let data = tempfile::tempdir().unwrap();
+		let now = now_ms();
+		let paths = SandboxPaths::new(data.path(), "igctest");
+		fs::create_dir_all(&paths.dir).unwrap();
+		assert!(!retired(&paths.dir, now, DAY_MS), "a create may still be booting");
+		fs::File::open(&paths.dir)
+			.unwrap()
+			.set_modified(SystemTime::now() - Duration::from_hours(48))
+			.unwrap();
+		assert!(retired(&paths.dir, now, DAY_MS));
+
+		let mut meta = SandboxMeta {
+			sandbox_id:        "igctest".into(),
+			team_id:           "team".into(),
+			template_id:       "tpl".into(),
+			build_id:          "build".into(),
+			state:             SandboxState::Running,
+			vcpus:             1,
+			memory_mb:         256,
+			disk_mb:           512,
+			started_at_ms:     now - 3 * DAY_MS,
+			end_at_ms:         now + DAY_MS,
+			envd_version:      String::new(),
+			envd_access_token: String::new(),
+			network:           NetworkPolicy::default(),
+			volume_mounts:     Vec::new(),
+			pid:               None,
+			tap:               None,
+			ended_at_ms:       None,
+		};
+		meta::save_unsynced(&paths, &meta).unwrap();
+		fs::File::open(&paths.dir)
+			.unwrap()
+			.set_modified(SystemTime::now() - Duration::from_hours(48))
+			.unwrap();
+		assert!(!retired(&paths.dir, now, DAY_MS), "running sandboxes stay");
+		meta.ended_at_ms = Some(now - DAY_MS / 2);
+		meta::save(&paths, &meta).unwrap();
+		assert!(!retired(&paths.dir, now, DAY_MS));
+		assert!(retired(&paths.dir, now + DAY_MS, DAY_MS));
 	}
 
 	#[test]

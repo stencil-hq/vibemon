@@ -602,6 +602,12 @@ under the 104-byte macOS `sun_path` limit.
   `GET /sandboxes`; the reconciler then marks it killed.
 - Killed sandboxes keep `console.log` + `metrics.jsonl` (served by the
   metrics/logs routes) for 7 days, then their directory is deleted.
+  A create writes `meta.json` without fsync (only a node process restart
+  reads it, and the page cache survives that; a host crash also ends the
+  VMM), so the reply never waits for a filesystem journal commit; a sandbox
+  directory without readable `meta.json` is deleted 7 days after its last
+  change. Every later update (pause, resume, deadline, network, kill) writes
+  it durably.
 - Node configuration (`node::NodeConfig`, built by `vmon serve`): `data_dir`,
   `run_dir`, `kernel: Option<PathBuf>` (None = the vmon kernel from
   `kernel/`: `vmon-kernel-<arch>` beside `vmon_bin` (release assets), else
