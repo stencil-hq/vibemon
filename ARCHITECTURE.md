@@ -241,14 +241,25 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   `WatchEvent = Put(Entry) | Delete{key, revision}`; a watch channel (capacity
   1024) is closed when its consumer lags, the consumer re-lists. Calls wait up
   to ~8 s for a reachable leader, then fail with `NoLeader`.
-- Storage (`<data>/raft/`): `log.bin` (checksummed append-only records:
-  entries, truncations, purges; torn tail dropped on replay; compacted after
-  purges), `vote.json`, `committed.json`, `snapshot.bin` (snapshot meta + full
-  map). Log appends, vote, and snapshots are fsync'd; `committed.json` is
-  replaced without fsync (openraft only uses it to re-apply logs at startup;
-  a stale or torn value reads as unknown and is re-learned), so a KV write
-  costs one `fdatasync`. The cluster UUID is written by a `SetClusterId`
-  command (first wins).
+- Storage (`<data>/raft/`): the log in two preallocated slot files `log.0`,
+  `log.1` (header page with magic + epoch + checksum, then checksummed
+  records: entries, truncations, purges; zero-filled to the end, 8 MiB
+  steps), `vote.json`, `committed.bin`, `snapshot.bin` (snapshot meta + full
+  map). Open replays the slot with the highest valid epoch up to the first
+  undecodable record and zeroes a torn tail. Appends overwrite the written
+  zeros in place and are fdatasync'd: size and block map never change, so
+  the `fdatasync` needs no filesystem journal commit (on ext4 `data=ordered`
+  a commit waits for all other newly allocated dirty data on the disk,
+  e.g. template builds' images, which held KV writes for over a minute).
+  Only growing a slot (zero-fill + fsync) commits the journal. Compaction
+  after purges writes the live records into the other slot, zeroes its stale
+  tail, syncs, then seals it with the next epoch (a crash before the seal
+  keeps the previous slot). A `log.bin`/`committed.json` of earlier versions
+  is migrated on open. Vote and snapshots are fsync'd; `committed.bin` is a
+  fixed-size checksummed record overwritten in place without fsync (openraft
+  only uses it to re-apply logs at startup; a stale or torn value reads as
+  unknown and is re-learned), so a KV write costs one `fdatasync`. The
+  cluster UUID is written by a `SetClusterId` command (first wins).
 
 ### 5.4 Raft bootstrap and membership (driven by gossip)
 

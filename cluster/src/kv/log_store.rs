@@ -1,18 +1,34 @@
 //! Durable raft log, vote, and committed index under `<data>/raft/`.
 //!
-//! The log is an append-only record file (`log.bin`): each record is
-//! `len: u32 LE | fnv1a64(payload): u64 LE | payload (JSON)`. Records are
-//! appended entries, truncations, and purges; replay rebuilds the in-memory
-//! index and drops a torn tail. The file is compacted after purges. Vote and
-//! committed id are small JSON files replaced atomically. Log and vote writes
-//! are fsync'd before openraft is told they are durable; the committed id is
-//! not (see [`LogStore::save_committed`]).
+//! The log lives in two preallocated slot files, `log.0` and `log.1`. A slot
+//! is a header page (magic, epoch, checksum), then records from [`BODY`] on
+//! (`len: u32 LE | fnv1a64(payload): u64 LE | payload (JSON)`: appended
+//! entries, truncations, and purges), then zeros up to its end. Open replays
+//! the slot with the highest valid epoch up to the first record that does not
+//! decode (the zeros, or a torn tail, which is zeroed) and rebuilds the
+//! in-memory index.
+//!
+//! Appends overwrite those zeros in place and are fdatasync'd before openraft
+//! is told they are durable. The file's size and block map stay unchanged, so
+//! that `fdatasync` needs no filesystem journal commit: on ext4
+//! (`data=ordered`) a commit also waits for every other file's newly
+//! allocated dirty data, which stalled KV writes for over a minute on a disk
+//! shared with template builds. Only growing a slot (zero-fill, fsync)
+//! commits the journal.
+//!
+//! Compaction (after purges) writes the live records into the other slot,
+//! zeroes its stale tail, syncs, and only then writes that slot's header with
+//! the next epoch, so a crash at any point leaves a complete slot with the
+//! highest valid epoch. A single-file `log.bin` of earlier versions is
+//! migrated on open. The vote is a small JSON file replaced atomically with
+//! fsync; the committed id a fixed-size record overwritten in place without
+//! fsync (see [`LogStore::save_committed`]).
 
 use std::{
 	collections::BTreeMap,
 	fmt::Debug,
 	fs::{self, File, OpenOptions},
-	io::{self, Read, Write},
+	io::{self, Seek, SeekFrom, Write},
 	ops::RangeBounds,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -28,12 +44,27 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::raft::{LogEntry, TypeConfig};
 use crate::meta::NodeId;
 
-const LOG_FILE: &str = "log.bin";
+const SLOT_FILES: [&str; 2] = ["log.0", "log.1"];
+/// The single append-only log of earlier versions (migrated on open).
+const LEGACY_LOG_FILE: &str = "log.bin";
 const VOTE_FILE: &str = "vote.json";
-const COMMITTED_FILE: &str = "committed.json";
+const COMMITTED_FILE: &str = "committed.bin";
+/// The committed id file of earlier versions (read once, then removed).
+const LEGACY_COMMITTED_FILE: &str = "committed.json";
+/// Record framing: payload length + checksum.
 const HEADER: usize = 12;
+const SLOT_MAGIC: &[u8; 8] = b"vmonrlg1";
+/// Slot header: magic, epoch, checksum of both.
+const SLOT_HEADER: usize = 24;
+/// Offset of a slot's first record (the header owns the first page).
+const BODY: u64 = 4096;
+/// Initial size and growth step of a slot.
+const SLOT_GROWTH: u64 = 8 << 20;
+/// Size of `committed.bin`: one framed record, zero-padded.
+const COMMITTED_LEN: usize = 256;
+static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 
-/// One record of `log.bin`.
+/// One record of the log.
 #[derive(Serialize, Deserialize)]
 enum Record {
 	Entry(LogEntry),
@@ -51,62 +82,135 @@ pub struct LogStore {
 }
 
 struct Inner {
-	dir:         PathBuf,
-	file:        File,
-	/// Records currently in `log.bin` (drives compaction).
-	records:     usize,
+	slots:          [Slot; 2],
+	/// The slot appends go to.
+	active:         usize,
+	/// Records in the active slot (drives compaction).
+	records:        usize,
+	entries:        BTreeMap<u64, LogEntry>,
+	last_purged:    Option<LogId<NodeId>>,
+	dir:            PathBuf,
+	vote:           Option<Vote<NodeId>>,
+	committed:      Option<LogId<NodeId>>,
+	committed_file: File,
+}
+
+/// One preallocated log file.
+struct Slot {
+	file:  File,
+	/// Epoch of its valid header; `None` when absent or torn.
+	epoch: Option<u64>,
+	/// File length; every byte up to it is written (allocated).
+	len:   u64,
+	/// End of its contents (zeros follow): the append offset of the active
+	/// slot.
+	end:   u64,
+}
+
+/// Log state rebuilt from records.
+#[derive(Default)]
+struct Replayed {
 	entries:     BTreeMap<u64, LogEntry>,
 	last_purged: Option<LogId<NodeId>>,
-	vote:        Option<Vote<NodeId>>,
-	committed:   Option<LogId<NodeId>>,
+	records:     usize,
+	/// Bytes of decodable records.
+	len:         usize,
 }
 
 impl LogStore {
-	/// Opens (or creates) the log in `dir`, replaying records and dropping a
-	/// torn tail.
+	/// Opens (or creates) the log in `dir`, replaying the newest slot,
+	/// zeroing a torn tail, and migrating a `log.bin` of earlier versions.
 	pub fn open(dir: &Path) -> io::Result<Self> {
 		fs::create_dir_all(dir)?;
-		let path = dir.join(LOG_FILE);
-		let mut file = OpenOptions::new()
-			.create(true)
+		let paths = SLOT_FILES.map(|name| dir.join(name));
+		let [first, second] = [read_optional(&paths[0])?, read_optional(&paths[1])?];
+		let epochs = [&first, &second].map(|bytes| bytes.as_deref().and_then(decode_slot_header));
+		let active = match epochs {
+			[Some(a), Some(b)] => Some(usize::from(b > a)),
+			[Some(_), None] => Some(0),
+			[None, Some(_)] => Some(1),
+			[None, None] => None,
+		};
+		let committed_file = OpenOptions::new()
 			.read(true)
-			.append(true)
-			.open(&path)?;
-		let mut bytes = Vec::new();
-		file.read_to_end(&mut bytes)?;
-		let mut entries = BTreeMap::new();
-		let mut last_purged = None;
-		let mut records = 0;
-		let mut offset = 0;
-		while let Some((record, len)) = decode_record(&bytes[offset..]) {
-			offset += len;
-			records += 1;
-			match record {
-				Record::Entry(entry) => {
-					entries.insert(entry.log_id.index, entry);
-				},
-				Record::Truncate(index) => {
-					entries.split_off(&index);
-				},
-				Record::Purge(log_id) => {
-					entries = entries.split_off(&(log_id.index + 1));
-					last_purged = Some(log_id);
-				},
-			}
-		}
-		if offset < bytes.len() {
-			tracing::warn!(dropped = bytes.len() - offset, "raft log has a torn tail; truncating");
-			file.set_len(offset as u64)?;
-			file.sync_all()?;
-		}
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(dir.join(COMMITTED_FILE))?;
+		let committed = read_committed(dir)?;
 		let vote = read_json(&dir.join(VOTE_FILE))?;
-		// Written without fsync: after a power loss it may be empty or torn.
-		let committed = read_json(&dir.join(COMMITTED_FILE)).unwrap_or_else(|error| {
-			tracing::warn!(%error, "raft committed index unreadable; re-learning it");
-			None
-		});
-		let inner =
-			Inner { dir: dir.to_owned(), file, records, entries, last_purged, vote, committed };
+		let saved = Saved { dir: dir.to_owned(), vote, committed, committed_file };
+		let legacy = dir.join(LEGACY_LOG_FILE);
+		let mut inner = if let Some(active) = active {
+			let mut state = Replayed::default();
+			let mut slots = Vec::with_capacity(2);
+			for (index, bytes) in [first, second].into_iter().enumerate() {
+				let Some(bytes) = bytes else {
+					slots.push(Slot::create(&paths[index], SLOT_GROWTH)?);
+					sync_dir(dir)?;
+					continue;
+				};
+				let body = usize::try_from(BODY)
+					.ok()
+					.and_then(|body| bytes.get(body..))
+					.unwrap_or_default();
+				let dirty = dirty_len(body);
+				let mut slot = Slot::open(&paths[index], epochs[index], bytes.len() as u64)?;
+				slot.end = BODY + dirty as u64;
+				if index == active {
+					state = replay(body);
+					if dirty > state.len {
+						tracing::warn!(
+							dropped = dirty - state.len,
+							"raft log has a torn tail; zeroing it"
+						);
+						slot.zero(BODY + state.len as u64, slot.end)?;
+						slot.file.sync_data()?;
+					}
+					slot.end = BODY + state.len as u64;
+				}
+				slots.push(slot);
+			}
+			let Ok(slots) = <[Slot; 2]>::try_from(slots) else {
+				unreachable!("two slots were opened")
+			};
+			Inner::new(slots, active, state, saved)
+		} else {
+			// Fresh, or the slots of an interrupted first open or migration
+			// (never written to before a header was valid).
+			let state = match fs::read(&legacy) {
+				Ok(bytes) => {
+					let state = replay(&bytes);
+					if state.len < bytes.len() {
+						tracing::warn!(
+							dropped = bytes.len() - state.len,
+							"raft log has a torn tail; dropping it"
+						);
+					}
+					state
+				},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => Replayed::default(),
+				Err(error) => return Err(error),
+			};
+			let slots = [Slot::create(&paths[0], SLOT_GROWTH)?, Slot::create(&paths[1], SLOT_GROWTH)?];
+			sync_dir(dir)?;
+			// Slot 1 stands in as the active slot of epoch 0: the rewrite seals
+			// slot 0 with epoch 1.
+			let mut inner = Inner::new(slots, 1, state, saved);
+			inner.rewrite()?;
+			inner
+		};
+		match fs::remove_file(&legacy) {
+			Ok(()) => sync_dir(dir)?,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(error),
+		}
+		inner.write_committed(inner.committed)?;
+		match fs::remove_file(dir.join(LEGACY_COMMITTED_FILE)) {
+			Ok(()) => {},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+			Err(error) => return Err(error),
+		}
 		Ok(Self { inner: Arc::new(Mutex::new(inner)) })
 	}
 
@@ -123,23 +227,56 @@ impl LogStore {
 	}
 }
 
+/// What [`Inner`] keeps beside the log.
+struct Saved {
+	dir:            PathBuf,
+	vote:           Option<Vote<NodeId>>,
+	committed:      Option<LogId<NodeId>>,
+	committed_file: File,
+}
+
 impl Inner {
+	fn new(slots: [Slot; 2], active: usize, state: Replayed, saved: Saved) -> Self {
+		Self {
+			slots,
+			active,
+			records: state.records,
+			entries: state.entries,
+			last_purged: state.last_purged,
+			dir: saved.dir,
+			vote: saved.vote,
+			committed: saved.committed,
+			committed_file: saved.committed_file,
+		}
+	}
+
+	/// Appends `records` to the active slot and fdatasyncs them.
 	fn write_records(&mut self, records: &[Record]) -> io::Result<()> {
 		let mut buf = Vec::new();
 		for record in records {
 			encode_record(record, &mut buf);
 		}
-		self.file.write_all(&buf)?;
-		self.file.sync_data()?;
+		let slot = &mut self.slots[self.active];
+		let end = slot.end + buf.len() as u64;
+		slot.reserve(end)?;
+		slot.write_at(slot.end, &buf)?;
+		slot.file.sync_data()?;
+		slot.end = end;
 		self.records += records.len();
 		Ok(())
 	}
 
-	/// Rewrites `log.bin` with only live state once dead records dominate.
+	/// Rewrites the log with only live state once dead records dominate.
 	fn maybe_compact(&mut self) -> io::Result<()> {
 		if self.records <= 2 * self.entries.len() + 1024 {
 			return Ok(());
 		}
+		self.rewrite()
+	}
+
+	/// Writes the live state into the other slot, then seals it with the next
+	/// epoch, which makes it the slot replayed on open.
+	fn rewrite(&mut self) -> io::Result<()> {
 		let mut buf = Vec::new();
 		let mut records = 0;
 		if let Some(purged) = self.last_purged {
@@ -150,11 +287,34 @@ impl Inner {
 			encode_record(&Record::Entry(entry.clone()), &mut buf);
 			records += 1;
 		}
-		let path = self.dir.join(LOG_FILE);
-		replace_file(&path, &buf)?;
-		self.file = OpenOptions::new().read(true).append(true).open(&path)?;
+		let epoch = self.slots[self.active].epoch.unwrap_or(0) + 1;
+		let target = 1 - self.active;
+		let slot = &mut self.slots[target];
+		let end = BODY + buf.len() as u64;
+		slot.reserve(end)?;
+		slot.write_at(BODY, &buf)?;
+		if slot.end > end {
+			slot.zero(end, slot.end)?;
+		}
+		slot.file.sync_data()?;
+		slot.seal(epoch)?;
+		slot.end = end;
+		self.active = target;
 		self.records = records;
 		Ok(())
+	}
+
+	/// Overwrites `committed.bin` in place (no fsync).
+	fn write_committed(&mut self, committed: Option<LogId<NodeId>>) -> io::Result<()> {
+		let payload = serde_json::to_vec(&committed).map_err(io::Error::other)?;
+		let mut buf = Vec::with_capacity(COMMITTED_LEN);
+		frame(&payload, &mut buf);
+		if buf.len() > COMMITTED_LEN {
+			return Err(io::Error::other("raft committed id record too large"));
+		}
+		buf.resize(COMMITTED_LEN, 0);
+		self.committed_file.seek(SeekFrom::Start(0))?;
+		self.committed_file.write_all(&buf)
 	}
 
 	fn last_log_id(&self) -> Option<LogId<NodeId>> {
@@ -167,67 +327,209 @@ impl Inner {
 	}
 }
 
+impl Slot {
+	/// Creates (or truncates) `path` as an unsealed slot of `len` written
+	/// zero bytes.
+	fn create(path: &Path, len: u64) -> io::Result<Self> {
+		let file = OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(true)
+			.open(path)?;
+		let mut slot = Self { file, epoch: None, len: 0, end: BODY };
+		slot.grow(len)?;
+		Ok(slot)
+	}
+
+	/// Opens an existing slot of `len` bytes.
+	fn open(path: &Path, epoch: Option<u64>, len: u64) -> io::Result<Self> {
+		let file = OpenOptions::new().read(true).write(true).open(path)?;
+		Ok(Self { file, epoch, len, end: BODY })
+	}
+
+	fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+		self.file.seek(SeekFrom::Start(offset))?;
+		self.file.write_all(bytes)
+	}
+
+	/// Overwrites `[from, to)` with zeros.
+	fn zero(&mut self, from: u64, to: u64) -> io::Result<()> {
+		self.file.seek(SeekFrom::Start(from))?;
+		let mut left = to.saturating_sub(from);
+		while left > 0 {
+			let chunk = usize::try_from(left).map_or(ZEROS.len(), |left| left.min(ZEROS.len()));
+			self.file.write_all(&ZEROS[..chunk])?;
+			left -= chunk as u64;
+		}
+		Ok(())
+	}
+
+	/// Makes room for `size` bytes (plus a growth step) of written zeros.
+	fn reserve(&mut self, size: u64) -> io::Result<()> {
+		if size <= self.len {
+			return Ok(());
+		}
+		self.grow((size + SLOT_GROWTH).next_multiple_of(SLOT_GROWTH))
+	}
+
+	/// Extends the file to `len` with written zeros, durably: the one
+	/// operation that changes its block map, so later overwrites in place
+	/// sync without a journal commit (unwritten preallocation would not do).
+	fn grow(&mut self, len: u64) -> io::Result<()> {
+		self.zero(self.len, len)?;
+		self.file.sync_all()?;
+		self.len = len;
+		Ok(())
+	}
+
+	/// Writes and syncs the header with `epoch`.
+	fn seal(&mut self, epoch: u64) -> io::Result<()> {
+		self.write_at(0, &slot_header(epoch))?;
+		self.file.sync_data()?;
+		self.epoch = Some(epoch);
+		Ok(())
+	}
+}
+
+fn slot_header(epoch: u64) -> [u8; SLOT_HEADER] {
+	let mut header = [0; SLOT_HEADER];
+	header[..8].copy_from_slice(SLOT_MAGIC);
+	header[8..16].copy_from_slice(&epoch.to_le_bytes());
+	let hash = fnv1a64(&header[..16]);
+	header[16..].copy_from_slice(&hash.to_le_bytes());
+	header
+}
+
+/// The epoch of a slot whose contents start with `bytes`; `None` when the
+/// header is missing or torn.
+fn decode_slot_header(bytes: &[u8]) -> Option<u64> {
+	let header = bytes.get(..SLOT_HEADER)?;
+	if header[..8] != SLOT_MAGIC[..] || header[16..] != fnv1a64(&header[..16]).to_le_bytes() {
+		return None;
+	}
+	header[8..16].try_into().ok().map(u64::from_le_bytes)
+}
+
+/// Applies the records at the start of `bytes`, up to the first that does
+/// not decode.
+fn replay(bytes: &[u8]) -> Replayed {
+	let mut state = Replayed::default();
+	while let Some((record, len)) = decode_record(&bytes[state.len..]) {
+		state.len += len;
+		state.records += 1;
+		match record {
+			Record::Entry(entry) => {
+				state.entries.insert(entry.log_id.index, entry);
+			},
+			Record::Truncate(index) => {
+				state.entries.split_off(&index);
+			},
+			Record::Purge(log_id) => {
+				state.entries = state.entries.split_off(&(log_id.index + 1));
+				state.last_purged = Some(log_id);
+			},
+		}
+	}
+	state
+}
+
+/// Length of `bytes` without its trailing zeros.
+fn dirty_len(bytes: &[u8]) -> usize {
+	bytes
+		.iter()
+		.rposition(|byte| *byte != 0)
+		.map_or(0, |last| last + 1)
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
 	bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
 		(hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
 	})
 }
 
-fn encode_record(record: &Record, buf: &mut Vec<u8>) {
-	let payload = serde_json::to_vec(record).expect("raft log record serializes");
+/// Appends `payload` with its length and checksum to `buf`.
+fn frame(payload: &[u8], buf: &mut Vec<u8>) {
 	let len = u32::try_from(payload.len()).expect("raft log record below 4 GiB");
 	buf.extend_from_slice(&len.to_le_bytes());
-	buf.extend_from_slice(&fnv1a64(&payload).to_le_bytes());
-	buf.extend_from_slice(&payload);
+	buf.extend_from_slice(&fnv1a64(payload).to_le_bytes());
+	buf.extend_from_slice(payload);
+}
+
+/// The framed payload at the start of `bytes` and the framed length; `None`
+/// on end of data or a torn/corrupt frame (zeros never form a frame: the
+/// empty payload's checksum is not zero).
+fn unframe(bytes: &[u8]) -> Option<(&[u8], usize)> {
+	let header = bytes.get(..HEADER)?;
+	let len = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
+	let hash = u64::from_le_bytes(header[4..].try_into().ok()?);
+	let payload = bytes.get(HEADER..HEADER + len)?;
+	(fnv1a64(payload) == hash).then_some((payload, HEADER + len))
+}
+
+fn encode_record(record: &Record, buf: &mut Vec<u8>) {
+	frame(&serde_json::to_vec(record).expect("raft log record serializes"), buf);
 }
 
 /// Decodes the record at the start of `bytes`; `None` on end of data or a
 /// torn/corrupt record.
 fn decode_record(bytes: &[u8]) -> Option<(Record, usize)> {
-	let header = bytes.get(..HEADER)?;
-	let len = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
-	let hash = u64::from_le_bytes(header[4..].try_into().ok()?);
-	let payload = bytes.get(HEADER..HEADER + len)?;
-	if fnv1a64(payload) != hash {
-		return None;
-	}
-	Some((serde_json::from_slice(payload).ok()?, HEADER + len))
+	let (payload, len) = unframe(bytes)?;
+	Some((serde_json::from_slice(payload).ok()?, len))
+}
+
+/// The committed id (`committed.bin` exists); unknown, and re-learned, when
+/// unreadable. A never written `committed.bin` falls back to the
+/// `committed.json` of earlier versions.
+fn read_committed(dir: &Path) -> io::Result<Option<LogId<NodeId>>> {
+	let bytes = fs::read(dir.join(COMMITTED_FILE))?;
+	let committed = if bytes.is_empty() {
+		read_json(&dir.join(LEGACY_COMMITTED_FILE)).map(Option::flatten)
+	} else {
+		unframe(&bytes)
+			.and_then(|(payload, _)| serde_json::from_slice(payload).ok())
+			.ok_or_else(|| io::Error::other("torn record"))
+	};
+	Ok(committed.unwrap_or_else(|error| {
+		tracing::warn!(%error, "raft committed index unreadable; re-learning it");
+		None
+	}))
 }
 
 /// Atomically replaces `path` with `bytes` (temp file, fsync, rename, fsync
 /// dir).
 pub fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-	write_and_rename(path, bytes, true)
-}
-
-/// Replaces `path` with `bytes` via a temp file and rename, optionally
-/// fsyncing the file and its directory.
-fn write_and_rename(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
 	let tmp = path.with_extension("tmp");
 	{
 		let mut file = File::create(&tmp)?;
 		file.write_all(bytes)?;
-		if durable {
-			file.sync_all()?;
-		}
+		file.sync_all()?;
 	}
 	fs::rename(&tmp, path)?;
-	if durable && let Some(dir) = path.parent() {
-		File::open(dir)?.sync_all()?;
+	match path.parent() {
+		Some(dir) => sync_dir(dir),
+		None => Ok(()),
 	}
-	Ok(())
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+fn sync_dir(dir: &Path) -> io::Result<()> {
+	File::open(dir)?.sync_all()
+}
+
+/// The contents of `path`; `None` when it does not exist.
+fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
 	match fs::read(path) {
-		Ok(bytes) => serde_json::from_slice(&bytes)
-			.map(Some)
-			.map_err(io::Error::other),
+		Ok(bytes) => Ok(Some(bytes)),
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
 		Err(error) => Err(error),
 	}
 }
 
+fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+	read_optional(path)?
+		.map(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
+		.transpose()
+}
 fn io_err(
 	subject: ErrorSubject<NodeId>,
 	verb: ErrorVerb,
@@ -300,11 +602,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 		Ok(self.inner.lock().vote)
 	}
 
-	/// Persists the committed id without fsync: openraft only uses it to
-	/// re-apply logs at startup before a leader is known, and a stale or lost
-	/// value is safe (entries are re-committed and re-applied). It never runs
-	/// ahead of the durable log, which is fsync'd before commit. Saves two
-	/// fsyncs per KV write.
+	/// Persists the committed id in place without fsync: openraft only uses
+	/// it to re-apply logs at startup before a leader is known, and a stale or
+	/// lost value is safe (entries are re-committed and re-applied). It never
+	/// runs ahead of the durable log, which is fsync'd before commit. Saves two
+	/// fsyncs per KV write, and the overwrite in place creates, renames, and
+	/// allocates nothing.
 	async fn save_committed(
 		&mut self,
 		committed: Option<LogId<NodeId>>,
@@ -314,8 +617,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 				if inner.committed == committed {
 					return Ok(());
 				}
-				let bytes = serde_json::to_vec(&committed).map_err(io::Error::other)?;
-				write_and_rename(&inner.dir.join(COMMITTED_FILE), &bytes, false)?;
+				inner.write_committed(committed)?;
 				inner.committed = committed;
 				Ok(())
 			})
@@ -388,11 +690,23 @@ mod tests {
 	use openraft::{CommittedLeaderId, EntryPayload};
 
 	use super::*;
+	use crate::kv::machine::Command;
 
 	fn entry(term: u64, index: u64) -> LogEntry {
 		LogEntry {
 			log_id:  LogId::new(CommittedLeaderId::new(term, NodeId(1)), index),
 			payload: EntryPayload::Blank,
+		}
+	}
+
+	/// An entry whose record takes about `len` bytes.
+	fn big_entry(index: u64, len: usize) -> LogEntry {
+		LogEntry {
+			payload: EntryPayload::Normal(Command::SetClusterId {
+				now_ms:     0,
+				cluster_id: "x".repeat(len),
+			}),
+			..entry(1, index)
 		}
 	}
 
@@ -407,6 +721,19 @@ mod tests {
 		for e in entries {
 			inner.entries.insert(e.log_id.index, e);
 		}
+	}
+
+	/// Path, append offset, and length of the active slot.
+	fn active_slot(dir: &Path, store: &LogStore) -> (PathBuf, u64, u64) {
+		let inner = store.inner.lock();
+		let slot = &inner.slots[inner.active];
+		(dir.join(SLOT_FILES[inner.active]), slot.end, slot.len)
+	}
+
+	fn overwrite(path: &Path, offset: u64, bytes: &[u8]) {
+		let mut file = OpenOptions::new().write(true).open(path).unwrap();
+		file.seek(SeekFrom::Start(offset)).unwrap();
+		file.write_all(bytes).unwrap();
 	}
 
 	#[tokio::test]
@@ -434,7 +761,7 @@ mod tests {
 	}
 
 	/// The committed id is written without fsync, so a power loss can leave it
-	/// empty: the log must still open, with the committed id unknown.
+	/// torn: the log must still open, with the committed id unknown.
 	#[tokio::test]
 	async fn torn_committed_index_is_treated_as_unknown() {
 		let dir = tempfile::tempdir().unwrap();
@@ -446,29 +773,74 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		fs::write(dir.path().join(COMMITTED_FILE), b"").unwrap();
+		overwrite(&dir.path().join(COMMITTED_FILE), 20, b"torn");
 		let mut store = LogStore::open(dir.path()).unwrap();
 		assert_eq!(indexes(&store), vec![1, 2]);
 		assert_eq!(store.read_committed().await.unwrap(), None);
 	}
 
+	/// A torn append is dropped and zeroed, so shorter records written over
+	/// it later replay without its leftovers.
 	#[tokio::test]
-	async fn torn_tail_is_dropped_and_log_stays_appendable() {
+	async fn torn_tail_is_zeroed_and_log_stays_appendable() {
 		let dir = tempfile::tempdir().unwrap();
-		{
+		let (path, end) = {
 			let store = LogStore::open(dir.path()).unwrap();
-			append_sync(&store, vec![entry(1, 1), entry(1, 2)]);
-		}
-		let path = dir.path().join(LOG_FILE);
-		let full = fs::read(&path).unwrap();
-		fs::write(&path, &full[..full.len() - 5]).unwrap();
+			append_sync(&store, vec![entry(1, 1), big_entry(2, 10_000)]);
+			let (path, end, _) = active_slot(dir.path(), &store);
+			(path, end)
+		};
+		overwrite(&path, end - 5, &[0; 5]);
 		{
 			let store = LogStore::open(dir.path()).unwrap();
 			assert_eq!(indexes(&store), vec![1]);
 			append_sync(&store, vec![entry(1, 2), entry(1, 3)]);
+			let (_, end, len) = active_slot(dir.path(), &store);
+			let bytes = fs::read(&path).unwrap();
+			assert_eq!(bytes.len() as u64, len);
+			assert!(
+				bytes[usize::try_from(end).unwrap()..]
+					.iter()
+					.all(|b| *b == 0)
+			);
 		}
 		let store = LogStore::open(dir.path()).unwrap();
 		assert_eq!(indexes(&store), vec![1, 2, 3]);
+	}
+
+	/// Sizes and allocated blocks of the log files in `dir`.
+	#[cfg(unix)]
+	fn log_layout(dir: &Path) -> BTreeMap<String, (u64, u64)> {
+		use std::os::unix::fs::MetadataExt;
+		fs::read_dir(dir)
+			.unwrap()
+			.map(|entry| entry.unwrap())
+			.filter(|entry| entry.file_name().to_string_lossy().starts_with("log"))
+			.map(|entry| {
+				let meta = entry.metadata().unwrap();
+				(entry.file_name().into_string().unwrap(), (meta.len(), meta.blocks()))
+			})
+			.collect()
+	}
+
+	/// Appends change no log file's size or allocation: an `fdatasync` after
+	/// such a change needs a filesystem journal commit, which on ext4
+	/// (`data=ordered`) waits for every other file's newly allocated dirty
+	/// data and stalled KV writes for over a minute beside template builds.
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn appends_change_no_file_size_or_allocation() {
+		let dir = tempfile::tempdir().unwrap();
+		{
+			let store = LogStore::open(dir.path()).unwrap();
+			let before = log_layout(dir.path());
+			for i in 1..=200 {
+				append_sync(&store, vec![entry(1, i)]);
+			}
+			assert_eq!(log_layout(dir.path()), before);
+		}
+		let store = LogStore::open(dir.path()).unwrap();
+		assert_eq!(indexes(&store), (1..=200).collect::<Vec<_>>());
 	}
 
 	#[tokio::test]
@@ -499,5 +871,111 @@ mod tests {
 		let store = LogStore::open(dir.path()).unwrap();
 		assert_eq!(indexes(&store), (2991..=3000).collect::<Vec<_>>());
 		assert_eq!(store.inner.lock().last_purged, Some(entry(1, 2990).log_id));
+	}
+
+	/// Compactions alternate between the slots; the target's longer stale
+	/// contents are zeroed, and each reopen replays the newest slot.
+	#[tokio::test]
+	async fn compactions_alternate_slots_and_survive_reopen() {
+		let dir = tempfile::tempdir().unwrap();
+		let first = {
+			let mut store = LogStore::open(dir.path()).unwrap();
+			let first = store.inner.lock().active;
+			append_sync(&store, (1..=50).map(|i| big_entry(i, 100)).collect());
+			store.purge(entry(1, 40).log_id).await.unwrap();
+			store.inner.lock().rewrite().unwrap();
+			assert_ne!(store.inner.lock().active, first);
+			append_sync(&store, vec![entry(1, 51)]);
+			store.purge(entry(1, 45).log_id).await.unwrap();
+			store.inner.lock().rewrite().unwrap();
+			assert_eq!(store.inner.lock().active, first);
+			let (path, end, _) = active_slot(dir.path(), &store);
+			let bytes = fs::read(path).unwrap();
+			assert!(
+				bytes[usize::try_from(end).unwrap()..]
+					.iter()
+					.all(|b| *b == 0)
+			);
+			first
+		};
+		let mut store = LogStore::open(dir.path()).unwrap();
+		assert_eq!(store.inner.lock().active, first);
+		assert_eq!(indexes(&store), (46..=51).collect::<Vec<_>>());
+		append_sync(&store, vec![entry(1, 52)]);
+		drop(store);
+		store = LogStore::open(dir.path()).unwrap();
+		assert_eq!(indexes(&store), (46..=52).collect::<Vec<_>>());
+		let state = store.get_log_state().await.unwrap();
+		assert_eq!(state.last_purged_log_id, Some(entry(1, 45).log_id));
+	}
+
+	/// A crash after compaction wrote the other slot but before its header
+	/// was durable replays the previous slot, which still holds everything.
+	#[tokio::test]
+	async fn interrupted_compaction_keeps_the_previous_slot() {
+		let dir = tempfile::tempdir().unwrap();
+		let target = {
+			let mut store = LogStore::open(dir.path()).unwrap();
+			append_sync(&store, (1..=10).map(|i| entry(1, i)).collect());
+			store.purge(entry(1, 4).log_id).await.unwrap();
+			store.inner.lock().rewrite().unwrap();
+			let (path, ..) = active_slot(dir.path(), &store);
+			path
+		};
+		overwrite(&target, 0, &[0; SLOT_HEADER]);
+		{
+			let mut store = LogStore::open(dir.path()).unwrap();
+			assert_ne!(active_slot(dir.path(), &store).0, target);
+			assert_eq!(indexes(&store), (5..=10).collect::<Vec<_>>());
+			let state = store.get_log_state().await.unwrap();
+			assert_eq!(state.last_purged_log_id, Some(entry(1, 4).log_id));
+			append_sync(&store, vec![entry(1, 11)]);
+		}
+		let store = LogStore::open(dir.path()).unwrap();
+		assert_eq!(indexes(&store), (5..=11).collect::<Vec<_>>());
+	}
+
+	/// Records beyond a slot's size grow it (zero-filled) and replay.
+	#[tokio::test]
+	async fn appends_beyond_the_slot_grow_it() {
+		let dir = tempfile::tempdir().unwrap();
+		{
+			let store = LogStore::open(dir.path()).unwrap();
+			for i in 1..=4 {
+				append_sync(&store, vec![big_entry(i, 3 << 20)]);
+			}
+			let (path, end, len) = active_slot(dir.path(), &store);
+			assert!(end > SLOT_GROWTH && len >= end);
+			assert_eq!(fs::metadata(path).unwrap().len(), len);
+		}
+		let store = LogStore::open(dir.path()).unwrap();
+		assert_eq!(indexes(&store), vec![1, 2, 3, 4]);
+	}
+
+	/// The single `log.bin` and `committed.json` of earlier versions are
+	/// replayed (torn tail dropped), moved into the slots, and removed.
+	#[tokio::test]
+	async fn legacy_log_and_committed_id_are_migrated() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut legacy = Vec::new();
+		for i in 1..=5 {
+			encode_record(&Record::Entry(entry(1, i)), &mut legacy);
+		}
+		encode_record(&Record::Purge(entry(1, 1).log_id), &mut legacy);
+		encode_record(&Record::Truncate(5), &mut legacy);
+		legacy.extend_from_slice(b"torn");
+		fs::write(dir.path().join(LEGACY_LOG_FILE), &legacy).unwrap();
+		let committed = Some(entry(1, 4).log_id);
+		fs::write(dir.path().join(LEGACY_COMMITTED_FILE), serde_json::to_vec(&committed).unwrap())
+			.unwrap();
+		for _ in 0..2 {
+			let mut store = LogStore::open(dir.path()).unwrap();
+			assert_eq!(indexes(&store), vec![2, 3, 4]);
+			let state = store.get_log_state().await.unwrap();
+			assert_eq!(state.last_purged_log_id, Some(entry(1, 1).log_id));
+			assert_eq!(store.read_committed().await.unwrap(), committed);
+			assert!(!dir.path().join(LEGACY_LOG_FILE).exists());
+			assert!(!dir.path().join(LEGACY_COMMITTED_FILE).exists());
+		}
 	}
 }
