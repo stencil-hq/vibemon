@@ -834,6 +834,12 @@ pub struct ArtifactInfo { pub build_id: String, pub node_id: NodeId, pub arch: S
 6. Record `meta.json`; report `ArtifactInfo`; logs stream into `build.log`
    (served by `GET /builds/{id}`).
 
+A failed or cancelled build keeps only its logs (rootfs, snapshot, meta and
+manifest are removed). At startup the node does the same for build
+directories without `meta.json` (builds cut off by the restart) and removes
+hidden `.trash-*`/`.incoming-*` directories of interrupted deletions and
+peer fetches. A cancelled build VM launch kills the half-started VMM.
+
 Other nodes fetch artifacts lazily from `artifact_sources` when asked to
 create a sandbox. A snapshot is only reused when `arch`, `backend` and
 `cpu_baseline` match; otherwise the node reruns step 5 (without

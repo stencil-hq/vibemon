@@ -321,6 +321,50 @@ impl ArtifactStore {
 		Ok(true)
 	}
 
+	/// Removes the outputs of a build that did not complete: rootfs (with
+	/// its overlay base), snapshot, meta, and manifest. Logs stay.
+	pub fn discard_outputs(&self, build_id: &str) {
+		let Ok(dir) = self.build_dir(build_id) else {
+			return;
+		};
+		let _ = copy::remove_disk(&dir.join(ROOTFS));
+		for file in [META, MANIFEST] {
+			let _ = std::fs::remove_file(dir.join(file));
+		}
+		let _ = std::fs::remove_dir_all(dir.join(SNAPSHOT));
+	}
+
+	/// Reclaims what a previous process left unfinished. Call once at
+	/// startup, before builds, fetches, or deletions run: hidden `.trash-*`
+	/// and `.incoming-*` directories of interrupted deletions and peer
+	/// fetches, and the outputs of builds without `meta.json` (builds cut off
+	/// by the restart; their logs stay for `GET /builds/{id}`).
+	pub fn sweep_interrupted(&self) {
+		let entries = match std::fs::read_dir(&self.inner.builds) {
+			Ok(entries) => entries,
+			Err(error) => {
+				tracing::warn!(%error, "listing builds for cleanup");
+				return;
+			},
+		};
+		for entry in entries.filter_map(Result::ok) {
+			let Ok(name) = entry.file_name().into_string() else {
+				continue;
+			};
+			let path = entry.path();
+			if name.starts_with('.') {
+				if let Err(error) = std::fs::remove_dir_all(&path) {
+					tracing::warn!(%error, path = %path.display(), "removing an interrupted artifact operation");
+				}
+			} else if !path.join(META).exists()
+				&& (path.join(ROOTFS).exists() || path.join(SNAPSHOT).exists())
+			{
+				tracing::info!(build = name, "discarding outputs of an interrupted build");
+				self.discard_outputs(&name);
+			}
+		}
+	}
+
 	/// Installs a snapshot-as-template build captured from a running sandbox:
 	/// moves `snapshot_dir` and `rootfs` (same filesystem) into
 	/// `builds/<build_id>/` and commits `info` (node identity fields are set
@@ -797,6 +841,37 @@ mod tests {
 		assert!(store.delete("b1").await.unwrap());
 		assert!(!dir.exists());
 		assert!(!store.delete("b1").await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn startup_sweep_discards_interrupted_builds_and_operations() {
+		let (data, store) = committed_build("done", host(), None).await;
+		let builds = data.path().join("builds");
+		let names = |dir: &Path| {
+			let mut names: Vec<String> = std::fs::read_dir(dir)
+				.unwrap()
+				.map(|e| e.unwrap().file_name().into_string().unwrap())
+				.collect();
+			names.sort();
+			names
+		};
+		// A build cut off by a restart: partial disk pair, snapshot, log.
+		let cut = store.build_dir("cut").unwrap();
+		std::fs::create_dir_all(cut.join(SNAPSHOT)).unwrap();
+		std::fs::write(cut.join(ROOTFS), b"overlay").unwrap();
+		std::fs::write(copy::disk_base(&cut.join(ROOTFS)), b"base").unwrap();
+		std::fs::write(cut.join(SNAPSHOT).join("memory.1.bin"), b"ram").unwrap();
+		std::fs::write(cut.join(BUILD_LOG), b"{}").unwrap();
+		// Interrupted deletion and peer fetch.
+		for leftover in [".trash-old-0123abcd", ".incoming-new-89abcdef"] {
+			std::fs::create_dir_all(builds.join(leftover)).unwrap();
+			std::fs::write(builds.join(leftover).join(ROOTFS), b"x").unwrap();
+		}
+
+		store.sweep_interrupted();
+		assert_eq!(names(&builds), ["cut", "done"]);
+		assert_eq!(names(&cut), [BUILD_LOG], "only the log of the cut-off build stays");
+		assert!(store.local("done").is_some(), "complete builds are untouched");
 	}
 
 	/// Serves `store`'s artifacts like the node API; `tamper` corrupts

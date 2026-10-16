@@ -35,8 +35,7 @@ use super::{
 use crate::{
 	api::{ArtifactInfo, BuildBase, GuestInit, StartBuild, TemplateVersion},
 	artifacts::{
-		ArtifactMeta, ArtifactStore, MANIFEST, META, ROOTFS, SNAPSHOT, copy::materialize_disk,
-		kernel_cmdline, now_ms,
+		ArtifactMeta, ArtifactStore, ROOTFS, SNAPSHOT, copy::materialize_disk, kernel_cmdline, now_ms,
 	},
 	client::NodeClient,
 	envd::EnvdClient,
@@ -1250,17 +1249,6 @@ pub(super) async fn regenerate_snapshot(
 	meta.info.has_snapshot = true;
 	let build_id = meta.info.build_id.clone();
 	builder.inner.store.commit(&build_id, meta).await
-}
-
-/// Removes partial outputs of a failed or cancelled build (logs are kept).
-pub(super) fn discard_outputs(store: &ArtifactStore, build_id: &str) {
-	let Ok(dir) = store.build_dir(build_id) else {
-		return;
-	};
-	for file in [ROOTFS, META, MANIFEST] {
-		let _ = std::fs::remove_file(dir.join(file));
-	}
-	let _ = std::fs::remove_dir_all(dir.join(SNAPSHOT));
 }
 
 /// VM instance name for a build phase (`b-<16 hex>-<phase>`).

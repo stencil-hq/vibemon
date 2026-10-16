@@ -150,6 +150,7 @@ impl Builder {
 			ArtifactStore::new(&config.data_dir, host, config.secret.clone(), config.http.clone())
 				.context("opening artifact store")?
 				.with_object_store(config.object_store.clone());
+		store.sweep_interrupted();
 		let cache_dir = config.data_dir.join("cache");
 		let oci = OciClient::new(
 			config.http.clone(),
@@ -264,7 +265,7 @@ impl Builder {
 			},
 		}
 		if state.status != BuildState::Ready {
-			pipeline::discard_outputs(&inner.store, &req.build_id);
+			inner.store.discard_outputs(&req.build_id);
 		}
 	}
 
