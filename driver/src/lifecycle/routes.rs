@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use tokio::task::JoinHandle;
-use vmon_cluster::kv::{Compare, Kv, Op, Txn};
+use tokio::{task::JoinHandle, time::Instant};
+use vmon_cluster::kv::{Compare, Kv, KvError, Op, Txn};
 use vmon_node::api::SandboxRoute;
 
 use crate::{
@@ -16,8 +16,11 @@ use crate::{
 
 /// TTL of `lock/sbx/<id>` (§9.4); renewed while the holder works.
 pub const LOCK_TTL: Duration = Duration::from_mins(1);
-/// How often a held lock is renewed.
+/// How often a held lock is renewed, counted from when the previous
+/// successful write was proposed.
 const LOCK_RENEW: Duration = Duration::from_secs(20);
+/// Retry delay after a failed renewal.
+const LOCK_RENEW_RETRY: Duration = Duration::from_secs(1);
 /// Poll interval while waiting for a busy lock.
 const LOCK_POLL: Duration = Duration::from_millis(100);
 /// How long API operations wait for a concurrent transition to finish.
@@ -178,6 +181,52 @@ pub async fn remove_route(kv: &Kv, sandbox_id: &str, team_id: &str) -> ApiResult
 	Ok(())
 }
 
+/// Outcome of [`hold_lease`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lease {
+	/// The holder still had the lease; its TTL restarted.
+	Extended,
+	/// The lease was absent (never taken, released, or expired) and is now
+	/// the holder's.
+	Taken,
+	/// Another holder has the lease.
+	Lost,
+}
+
+/// Holds the TTL lease `key` for `holder`: extends it while `holder` owns it
+/// and takes it when nobody does.
+///
+/// A TTL counts from the leader's clock when the write is proposed, so under
+/// raft commit latency a renewal can apply after the lease has already
+/// expired. That is a lapse, not a takeover: the lease is re-taken unless
+/// another holder got it first.
+pub async fn hold_lease(
+	kv: &Kv,
+	key: &str,
+	holder: &[u8],
+	ttl: Duration,
+) -> Result<Lease, KvError> {
+	let put = Op::Put { key: key.to_owned(), value: holder.to_vec(), ttl_ms: Some(ttl_ms(ttl)) };
+	let extend = Txn {
+		compare: vec![Compare::Value { key: key.to_owned(), value: holder.to_vec() }],
+		success: vec![put.clone()],
+		failure: Vec::new(),
+	};
+	if kv.txn(extend).await?.succeeded {
+		return Ok(Lease::Extended);
+	}
+	let take = Txn {
+		compare: vec![Compare::Missing(key.to_owned())],
+		success: vec![put],
+		failure: Vec::new(),
+	};
+	Ok(if kv.txn(take).await?.succeeded {
+		Lease::Taken
+	} else {
+		Lease::Lost
+	})
+}
+
 /// Whether some operation currently holds `lock/sbx/<id>`.
 pub async fn is_locked(kv: &Kv, sandbox_id: &str) -> ApiResult<bool> {
 	Ok(kv.get(&lock_key(sandbox_id)).await?.is_some())
@@ -199,8 +248,10 @@ impl SandboxLock {
 		let key = lock_key(sandbox_id);
 		let holder =
 			format!("{}/{}", state.cluster.local_id(), uuid::Uuid::new_v4().simple()).into_bytes();
-		let deadline = tokio::time::Instant::now() + wait;
+		let deadline = Instant::now() + wait;
 		loop {
+			// The TTL runs from the proposal, not from when the reply arrives.
+			let proposed = Instant::now();
 			let txn = Txn {
 				compare: vec![Compare::Missing(key.clone())],
 				success: vec![Op::Put {
@@ -211,10 +262,10 @@ impl SandboxLock {
 				failure: Vec::new(),
 			};
 			if kv.txn(txn).await?.succeeded {
-				let renew = tokio::spawn(renew_loop(kv.clone(), key.clone(), holder.clone()));
+				let renew = tokio::spawn(renew_loop(kv.clone(), key.clone(), holder.clone(), proposed));
 				return Ok(Self { kv, key, holder, renew: Some(renew) });
 			}
-			if tokio::time::Instant::now() >= deadline {
+			if Instant::now() >= deadline {
 				return Err(ApiError::conflict(format!(
 					"Sandbox \"{sandbox_id}\" is changing state, please retry"
 				)));
@@ -258,25 +309,28 @@ async fn release(kv: &Kv, key: &str, holder: &[u8]) {
 	}
 }
 
-async fn renew_loop(kv: Kv, key: String, holder: Vec<u8>) {
+/// Renews a held lock every [`LOCK_RENEW`] after the last successful write
+/// was proposed (immediately when that write took longer to commit), so slow
+/// KV commits do not let it lapse; a lapsed lock nobody else took is re-taken.
+async fn renew_loop(kv: Kv, key: String, holder: Vec<u8>, proposed: Instant) {
+	let mut next = proposed + LOCK_RENEW;
 	loop {
-		tokio::time::sleep(LOCK_RENEW).await;
-		let txn = Txn {
-			compare: vec![Compare::Value { key: key.clone(), value: holder.clone() }],
-			success: vec![Op::Put {
-				key:    key.clone(),
-				value:  holder.clone(),
-				ttl_ms: Some(ttl_ms(LOCK_TTL)),
-			}],
-			failure: Vec::new(),
-		};
-		match kv.txn(txn).await {
-			Ok(result) if !result.succeeded => {
+		tokio::time::sleep_until(next).await;
+		let proposed = Instant::now();
+		match hold_lease(&kv, &key, &holder, LOCK_TTL).await {
+			Ok(Lease::Extended) => next = proposed + LOCK_RENEW,
+			Ok(Lease::Taken) => {
+				tracing::warn!(key, "sandbox lock lapsed before its renewal applied; re-took it");
+				next = proposed + LOCK_RENEW;
+			},
+			Ok(Lease::Lost) => {
 				tracing::warn!(key, "sandbox lock lost before the operation finished");
 				return;
 			},
-			Ok(_) => {},
-			Err(error) => tracing::warn!(%error, key, "renewing sandbox lock failed"),
+			Err(error) => {
+				tracing::warn!(%error, key, "renewing sandbox lock failed");
+				next = Instant::now() + LOCK_RENEW_RETRY;
+			},
 		}
 	}
 }

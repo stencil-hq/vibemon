@@ -313,7 +313,7 @@ in raft membership, which rebuilds the replication streams immediately.
 |---|---|---|---|
 | `sbx/<sandboxID>` | `SandboxRoute` | driver | Live catalog: node, team, state, endAt, ingress settings. Present for `running`, `pausing`, `resuming`, `snapshotting` (`killing` only in routes left by older drivers; the reconciler finishes those kills). Absent when paused/killed. |
 | `team/<teamID>/sbx/<sandboxID>` | `""` | driver | Admission index (`CountBelow`) for concurrent-sandbox limits. |
-| `lock/<name>` | holder (NodeId, `lock/sbx/*`: `<NodeId>/<uuid>` per operation) | driver | TTL leases (`Missing` + `Put{ttl}`, released with `Value` compare): per-sandbox ops (`lock/sbx/<id>`, 60 s, renewed every 20 s), build supervision (`lock/build/<id>`). |
+| `lock/<name>` | holder (NodeId, `lock/sbx/*`: `<NodeId>/<uuid>` per operation) | driver | TTL leases (`Missing` + `Put{ttl}`, released with `Value` compare): per-sandbox ops (`lock/sbx/<id>`, 60 s, renewed every 20 s), build supervision (`lock/build/<id>`). A TTL runs from the leader's clock at proposal, so renewals are scheduled from the previous write's proposal (not its reply), and a renewal that finds its lease expired re-takes it if no other holder has (a lapse under slow commits is not a takeover). |
 | `art/<buildID>/<nodeID>` | `ArtifactInfo` | driver (from node reports) | Which nodes hold a build's artifacts (rootfs, snapshot, cpu baseline). |
 | `paused/<sandboxID>/remote` | `paused_store::Remote{url, manifest, arch, backend, cpu_baseline, bytes}` | node (through the KV forwarder) | Complete portable paused generation in the object store (§8.2 "Portable pauses"); published by txn only when `paused/<id>/deleted` is missing, no record exists, and `paused/<id>/owner` names the publisher. `bytes` = transferred object bytes. |
 | `paused/<sandboxID>/owner` | `NodeId` | driver | Node allowed to publish the pause's generation (written on pause and on a relocating resume): a restarted former holder cannot publish stale state. Deleted on kill. |
@@ -1016,7 +1016,10 @@ child uses it (children map its memory snapshot privately).
 
 The **build supervisor** runs on every driver: each `building` build is
 supervised by whichever driver holds `lock/build/<id>` (TTL 20 s, renewed
-every 5 s), so a dead driver's builds are adopted once its lease lapses. The
+every 5 s by a task beside the polling, so slow polls cannot starve it), so
+a dead driver's builds are adopted once its lease lapses; supervision stops
+only when another driver holds the lease or the KV stays unreachable for a
+whole TTL. The
 holder polls the builder's `GET /node/v1/builds/{id}?logsOffset` every
 500 ms, appends new lines to `build_logs` (draining all lines before
 recording a terminal state), and on `ready` writes `art/<build>/<node>`,

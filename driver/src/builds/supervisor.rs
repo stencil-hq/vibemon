@@ -1,8 +1,9 @@
 //! Build supervisor (ARCHITECTURE.md §9.4).
 //!
 //! Every driver scans `MySQL` for builds in `building`; for each it can
-//! lease (`lock/build/<id>`, TTL,
-//! renewed) it polls the builder node's `GET /node/v1/builds/{id}`,
+//! lease (`lock/build/<id>`, TTL, renewed independently of how long polls
+//! take; a lapsed lease nobody else took is re-taken) it polls the builder
+//! node's `GET /node/v1/builds/{id}`,
 //! persists new log lines, and records the outcome: on `ready` the
 //! artifact (`MySQL` + KV `art/<build>/<node>`) and tags, on failure the
 //! reason. A build whose lease lapses (its driver died) is adopted by any
@@ -12,14 +13,11 @@
 //! abandoned mid-way, retires fork templates their fork never retired, and
 //! purges fork templates whose artifacts are collected.
 
-use std::{
-	collections::HashSet,
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use tokio::time::Instant;
 use vmon_cluster::{
 	NodeId,
 	gossip::MemberState,
@@ -31,6 +29,7 @@ use super::{
 	BUILD_TIMEOUT, BUILD_TIMEOUT_MESSAGE, artifacts, lock_key, record_artifact, snapshots,
 };
 use crate::{
+	lifecycle::routes::{Lease, hold_lease},
 	state::AppState,
 	store::builds::{BuildRow, BuildStatus, LogLevel, NewLog},
 };
@@ -44,7 +43,8 @@ pub(super) struct Timing {
 	pub poll:           Duration,
 	/// Lease TTL of `lock/build/<id>`.
 	pub lock_ttl:       Duration,
-	/// How often the lease is renewed.
+	/// How often the lease is renewed (counted from the previous successful
+	/// renewal's proposal, whatever the polls are doing).
 	pub renew:          Duration,
 	/// How often the leader runs artifact GC and stale-snapshot cleanup.
 	pub housekeeping:   Duration,
@@ -85,17 +85,18 @@ pub(super) async fn run(state: AppState, timing: Timing) {
 					if supervised.lock().contains(&id) {
 						continue;
 					}
-					match try_lock(&state, &id, timing.lock_ttl).await {
-						Ok(true) => {
+					let proposed = Instant::now();
+					match lease(&state, &id, timing.lock_ttl).await {
+						Ok(Lease::Extended | Lease::Taken) => {
 							supervised.lock().insert(id.clone());
 							let state = state.clone();
 							let supervised = Arc::clone(&supervised);
 							tokio::spawn(async move {
-								supervise(&state, &id, timing).await;
+								supervise(&state, &id, timing, proposed).await;
 								supervised.lock().remove(&id);
 							});
 						},
-						Ok(false) => {},
+						Ok(Lease::Lost) => {},
 						Err(error) => tracing::debug!(build = %id, %error, "build lease unavailable"),
 					}
 				}
@@ -131,42 +132,51 @@ pub async fn housekeeping(state: &AppState, stale_after: Duration) {
 	}
 }
 
-/// Takes (or re-takes, when this driver already holds it) a build lease.
-async fn try_lock(
+/// Takes, extends, or re-takes (after a lapse) this driver's build lease.
+async fn lease(
 	state: &AppState,
 	build_id: &str,
 	ttl: Duration,
-) -> Result<bool, vmon_cluster::kv::KvError> {
-	let key = lock_key(build_id);
+) -> Result<Lease, vmon_cluster::kv::KvError> {
 	let me = state.cluster.local_id().to_string().into_bytes();
-	let ttl_ms = Some(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
-	let put = Op::Put { key: key.clone(), value: me.clone(), ttl_ms };
-	let fresh = Txn {
-		compare: vec![Compare::Missing(key.clone())],
-		success: vec![put.clone()],
-		failure: vec![],
-	};
-	if state.cluster.kv.txn(fresh).await?.succeeded {
-		return Ok(true);
-	}
-	renew(state, build_id, ttl).await
+	hold_lease(&state.cluster.kv, &lock_key(build_id), &me, ttl).await
 }
 
-/// Extends a lease held by this driver; `false` when another holder has it.
-async fn renew(
-	state: &AppState,
-	build_id: &str,
-	ttl: Duration,
-) -> Result<bool, vmon_cluster::kv::KvError> {
-	let key = lock_key(build_id);
-	let me = state.cluster.local_id().to_string().into_bytes();
-	let ttl_ms = Some(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
-	let txn = Txn {
-		compare: vec![Compare::Value { key: key.clone(), value: me.clone() }],
-		success: vec![Op::Put { key, value: me, ttl_ms }],
-		failure: vec![],
-	};
-	Ok(state.cluster.kv.txn(txn).await?.succeeded)
+/// Keeps this driver's build lease alive for as long as supervision runs:
+/// renews every `timing.renew` after the last successful write was proposed
+/// (`held` initially), however long the polls take. Returns when the lease
+/// is gone: another driver took it, or the KV stayed unreachable until it
+/// may have lapsed.
+async fn keep_lease(state: &AppState, build_id: &str, timing: Timing, mut held: Instant) {
+	let mut next = held + timing.renew;
+	loop {
+		tokio::time::sleep_until(next).await;
+		let proposed = Instant::now();
+		match lease(state, build_id, timing.lock_ttl).await {
+			Ok(Lease::Extended) => held = proposed,
+			Ok(Lease::Taken) => {
+				tracing::info!(
+					build = build_id,
+					"build lease lapsed before its renewal applied; re-took it"
+				);
+				held = proposed;
+			},
+			Ok(Lease::Lost) => {
+				tracing::info!(build = build_id, "build lease taken over by another driver");
+				return;
+			},
+			Err(error) if held.elapsed() >= timing.lock_ttl => {
+				tracing::warn!(build = build_id, %error, "build lease lapsed; stopping supervision");
+				return;
+			},
+			Err(error) => {
+				tracing::debug!(build = build_id, %error, "build lease renewal failed; retrying");
+				next = Instant::now() + timing.poll;
+				continue;
+			},
+		}
+		next = held + timing.renew;
+	}
 }
 
 async fn release(state: &AppState, build_id: &str) {
@@ -191,44 +201,35 @@ enum Progress {
 	Done,
 }
 
-async fn supervise(state: &AppState, build_id: &str, timing: Timing) {
+/// Supervises a build whose lease this driver took with a write proposed at
+/// `held`. Polling and lease renewal run side by side, so a poll stalled on
+/// `MySQL` or the node cannot starve the renewal; losing the lease abandons
+/// the poll in flight (every step of it is idempotent for the new holder).
+async fn supervise(state: &AppState, build_id: &str, timing: Timing, held: Instant) {
 	tracing::debug!(build = build_id, "supervising build");
-	let mut logs_offset = match state.store.build_log_count(build_id).await {
-		Ok(count) => count,
-		Err(error) => {
-			tracing::warn!(build = build_id, %error, "reading build log count failed");
-			release(state, build_id).await;
-			return;
-		},
-	};
-	let mut last_renewed = Instant::now();
-	let mut poll = tokio::time::interval(timing.poll);
-	poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-	loop {
-		poll.tick().await;
-		if last_renewed.elapsed() >= timing.renew {
-			match renew(state, build_id, timing.lock_ttl).await {
-				Ok(true) => last_renewed = Instant::now(),
-				Ok(false) => {
-					tracing::info!(build = build_id, "build lease taken over by another driver");
-					return;
-				},
-				Err(error) if last_renewed.elapsed() + timing.renew >= timing.lock_ttl => {
-					tracing::warn!(build = build_id, %error, "build lease about to lapse; stopping supervision");
-					return;
-				},
-				Err(error) => {
-					tracing::debug!(build = build_id, %error, "build lease renewal failed; retrying");
-				},
+	let polling = async {
+		let mut logs_offset = match state.store.build_log_count(build_id).await {
+			Ok(count) => count,
+			Err(error) => {
+				tracing::warn!(build = build_id, %error, "reading build log count failed");
+				return;
+			},
+		};
+		let mut poll = tokio::time::interval(timing.poll);
+		poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		loop {
+			poll.tick().await;
+			match poll_once(state, build_id, &mut logs_offset).await {
+				Ok(Progress::Running) => {},
+				Ok(Progress::Done) => return,
+				Err(error) => tracing::warn!(build = build_id, %error, "build poll failed"),
 			}
 		}
-		match poll_once(state, build_id, &mut logs_offset).await {
-			Ok(Progress::Running) => {},
-			Ok(Progress::Done) => break,
-			Err(error) => tracing::warn!(build = build_id, %error, "build poll failed"),
-		}
+	};
+	tokio::select! {
+		() = polling => release(state, build_id).await,
+		() = keep_lease(state, build_id, timing, held) => {},
 	}
-	release(state, build_id).await;
 }
 
 /// One supervision step for a build.
