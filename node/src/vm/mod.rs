@@ -286,6 +286,18 @@ fn signal(pid: u32, sig: libc::c_int) {
 	}
 }
 
+/// SIGKILLs a spawned VMM on drop unless disarmed: a launch abandoned by its
+/// caller (a cancelled build drops the future) leaves no [`Vm`] to stop it.
+struct KillOnDrop(Option<u32>);
+
+impl Drop for KillOnDrop {
+	fn drop(&mut self) {
+		if let Some(pid) = self.0 {
+			signal(pid, libc::SIGKILL);
+		}
+	}
+}
+
 #[cfg(target_os = "linux")]
 fn chown_path(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
 	std::os::unix::fs::chown(path, Some(uid), Some(gid))
@@ -395,8 +407,10 @@ impl VmRuntime {
 				VmExit { code: status.ok().and_then(|s| s.code()), reason: read_status(&status_dir) };
 			let _ = exit_tx.send(Some(exit));
 		});
+		let mut abandoned = KillOnDrop(Some(pid));
 		let control = ControlClient::new(api_sock);
 		let ready = wait_ready(&control, &agent_sock, &exit_rx, spec.ready_timeout).await;
+		abandoned.0 = None;
 		match ready {
 			Ok(agent) => {
 				tracing::debug!(vm = %spec.name, pid, elapsed_ms = started.elapsed().as_millis() as u64, "vm ready");
@@ -682,5 +696,68 @@ mod tests {
 		assert_eq!(log_tail(&path, 2), "line 98\nline 99");
 		assert_eq!(log_tail(&dir.path().join("missing"), 2), "");
 		assert_eq!(vmm_log_path(&path), dir.path().join("console.vmm.log"));
+	}
+
+	#[tokio::test]
+	async fn abandoned_launch_kills_the_vmm() {
+		let dir = tempfile::tempdir().unwrap();
+		// A stand-in VMM that records its pid and never becomes ready.
+		let pid_file = dir.path().join("pid");
+		let fake = dir.path().join("vmon");
+		fs::write(&fake, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pid_file.display()))
+			.unwrap();
+		fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+		let runtime = VmRuntime::new(VmRuntimeConfig {
+			vmon_bin:         fake,
+			run_dir:          dir.path().join("run"),
+			boot_concurrency: 1,
+			isolation:        VmmIsolation::Default,
+			net:              NetManager::new(crate::net::NetMode::Auto, "172.20.0.0/16", None)
+				.unwrap(),
+		})
+		.unwrap();
+		let spec = VmSpec {
+			name:          "abandoned".into(),
+			boot:          Boot::Cold {
+				kernel:  dir.path().join("kernel"),
+				initrd:  None,
+				cmdline: String::new(),
+			},
+			vcpus:         1,
+			memory_mb:     128,
+			disk:          None,
+			shares:        Vec::new(),
+			net:           VmNet::None,
+			snapshot_root: None,
+			console_log:   dir.path().join("console.log"),
+			timeout:       None,
+			ready_timeout: Duration::from_mins(1),
+			extra_args:    Vec::new(),
+		};
+		// The caller gives up while the VMM boots (a cancelled build), which
+		// drops the launch future.
+		let pid = tokio::select! {
+			result = runtime.launch(spec) => panic!("launch returned: {:?}", result.err()),
+			pid = async {
+				loop {
+					if let Some(pid) = fs::read_to_string(&pid_file)
+						.ok()
+						.and_then(|text| text.trim().parse::<u32>().ok())
+					{
+						break pid;
+					}
+					tokio::time::sleep(Duration::from_millis(10)).await;
+				}
+			} => pid,
+		};
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while pid_alive(pid) && Instant::now() < deadline {
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		let alive = pid_alive(pid);
+		if alive {
+			signal(pid, libc::SIGKILL);
+		}
+		assert!(!alive, "the abandoned VMM is killed");
 	}
 }
