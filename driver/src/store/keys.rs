@@ -171,12 +171,77 @@ impl Store {
 		.await
 	}
 
-	/// Stamps `last_used_at = now`.
-	pub async fn touch_api_key(&self, id: &str) -> sqlx::Result<()> {
-		sqlx::query("UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP(3) WHERE id = ?")
+	/// Stamps `last_used_at = now` unless it was stamped less than
+	/// [`API_KEY_STAMP_INTERVAL`] ago; `false` when skipped.
+	pub async fn touch_api_key(&self, id: &str) -> sqlx::Result<bool> {
+		let result = retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE api_keys SET last_used_at = UTC_TIMESTAMP(3) WHERE id = ? AND (last_used_at \
+				 IS NULL OR last_used_at < UTC_TIMESTAMP(3) - INTERVAL ? SECOND)",
+			)
 			.bind(id)
+			.bind(API_KEY_STAMP_INTERVAL.as_secs())
 			.execute(self.pool())
 			.await
-			.map(drop)
+		})
+		.await?;
+		Ok(result.rows_affected() == 1)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	//! Gated on `VMON_MYSQL_TEST_URL` (see [`crate::store::testdb`]).
+
+	use super::*;
+	use crate::{state::TeamLimits, store::testdb::TestDb};
+
+	#[tokio::test]
+	async fn touch_skips_recently_stamped_keys() {
+		let Some(db) = TestDb::create().await else {
+			return;
+		};
+		let store = &db.store;
+		let team = store
+			.create_team("Acme", TeamLimits::default())
+			.await
+			.unwrap();
+		let key = store
+			.insert_api_key(&NewApiKey {
+				team_id:     &team.id,
+				name:        "k",
+				created_by:  None,
+				key_hash:    "hash",
+				key_enc:     b"enc",
+				mask_prefix: "e2b_",
+				mask_suffix: "abcd",
+			})
+			.await
+			.unwrap();
+		let last_used = async || {
+			store
+				.api_key(&team.id, &key.id)
+				.await
+				.unwrap()
+				.unwrap()
+				.last_used_at
+		};
+
+		assert!(store.touch_api_key(&key.id).await.unwrap());
+		let first = last_used().await.expect("the first use is stamped");
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		assert!(!store.touch_api_key(&key.id).await.unwrap());
+		assert_eq!(last_used().await, Some(first), "a recent stamp is not rewritten");
+
+		sqlx::query(
+			"UPDATE api_keys SET last_used_at = UTC_TIMESTAMP(3) - INTERVAL 1 HOUR WHERE id = ?",
+		)
+		.bind(&key.id)
+		.execute(store.pool())
+		.await
+		.unwrap();
+		assert!(store.touch_api_key(&key.id).await.unwrap());
+		assert!(last_used().await.unwrap() > first, "an old stamp is refreshed");
+		db.drop_db().await;
 	}
 }

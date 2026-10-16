@@ -131,7 +131,7 @@ TEAM=6f0c3c1e-…
 |---|---|---|
 | `POST` | `/admin/teams/{teamID}/api-keys` | Body `{"name": "…"}` (trimmed, 1–255 UTF-8 bytes). 201 with the key object including the plaintext `key`. |
 | `DELETE` | `/admin/teams/{teamID}/api-keys/{keyID}` | 204; 404 when the team has no such key. |
-| `GET` | `/api-keys` with `X-Team-ID` | The team's keys (ID, name, mask, `createdAt`, `createdBy`, `lastUsed`), no plaintext. |
+| `GET` | `/api-keys` with `X-Team-ID` | The team's keys (ID, name, mask, `createdAt`, `createdBy`, `lastUsed`), no plaintext. `lastUsed` is stamped at most once a minute. |
 | `PATCH` | `/api-keys/{keyID}` with `X-Team-ID` | Rename: body `{"name": "…"}`. |
 | `DELETE` | `/api-keys/{keyID}` with `X-Team-ID` | Same as the admin delete. |
 

@@ -918,7 +918,10 @@ served at `/dashboard/` on the public listeners):
 
 ### 9.2 Auth
 
-- `X-API-Key` → team (SHA-256 lookup, cached 30 s).
+- `X-API-Key` → team (SHA-256 lookup, cached 30 s). A cache fill stamps the
+  key's `last_used_at` in the background, at most once per minute per key
+  (one in flight per driver; the `UPDATE` skips rows stamped less than a
+  minute ago).
 - `Authorization: Bearer <JWT>` (+ `X-Team-ID`) → user (+ team membership).
 - `X-Admin-Token` == `--admin-token` → admin (`/nodes*`, `/admin/*`,
   including the dashboard API of §9.1).

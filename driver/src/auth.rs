@@ -17,7 +17,7 @@ use crate::{
 	error::ApiError,
 	lifecycle::limits::normalize_sandbox_id,
 	state::AppState,
-	store::{Team, User, sandboxes::SandboxState},
+	store::{Team, User, keys::API_KEY_STAMP_INTERVAL, sandboxes::SandboxState},
 };
 
 /// How long a resolved API key stays cached.
@@ -100,7 +100,10 @@ struct CachedKey {
 /// API-key-hash → team cache (≈30 s), held in [`crate::state::Inner`].
 #[derive(Default)]
 pub struct AuthCache {
-	keys: Mutex<HashMap<String, CachedKey>>,
+	keys:    Mutex<HashMap<String, CachedKey>>,
+	/// Key id → when this driver's last `last_used_at` stamp of it finished
+	/// (`None` while one is in flight).
+	stamped: Mutex<HashMap<String, Option<Instant>>>,
 }
 
 impl AuthCache {
@@ -124,6 +127,32 @@ impl AuthCache {
 	/// Drops a key (after delete) so this driver stops accepting it at once.
 	pub fn invalidate_key(&self, hash: &str) {
 		self.keys.lock().remove(hash);
+	}
+
+	/// Claims the `last_used_at` stamp of key `id`: `false` while a stamp is
+	/// in flight or finished less than [`API_KEY_STAMP_INTERVAL`] ago, so
+	/// concurrent cache fills and writes stalled on a busy disk do not queue
+	/// further updates of the same row. [`Self::stamp_done`] ends the claim.
+	fn claim_stamp(&self, id: &str) -> bool {
+		let mut stamped = self.stamped.lock();
+		let busy =
+			|entry: &Option<Instant>| entry.is_none_or(|done| done.elapsed() < API_KEY_STAMP_INTERVAL);
+		if stamped.get(id).is_some_and(busy) {
+			return false;
+		}
+		if stamped.len() >= KEY_CACHE_SWEEP_AT {
+			stamped.retain(|_, entry| busy(entry));
+		}
+		stamped.insert(id.to_owned(), None);
+		true
+	}
+
+	/// Ends the stamp claimed by [`Self::claim_stamp`].
+	fn stamp_done(&self, id: &str) {
+		self
+			.stamped
+			.lock()
+			.insert(id.to_owned(), Some(Instant::now()));
 	}
 
 	/// Drops every cached key of a team, so tests see a block at once. In
@@ -154,7 +183,8 @@ fn bearer(parts: &Parts) -> Option<&str> {
 }
 
 /// Resolves an API key to its team, through the cache. On a cache fill the
-/// key's `last_used_at` is stamped in the background.
+/// key's `last_used_at` is stamped in the background, at most once per
+/// [`API_KEY_STAMP_INTERVAL`].
 pub async fn team_for_api_key(state: &AppState, key: &str) -> Result<Team, ApiError> {
 	let hash = crypto::hash_api_key(key).map_err(|e| match e {
 		ApiKeyFormatError::MissingPrefix => ApiError::unauthorized(MSG_KEY_MALFORMED),
@@ -175,12 +205,15 @@ pub async fn team_for_api_key(state: &AppState, key: &str) -> Result<Team, ApiEr
 		)));
 	};
 	state.auth_cache.put(hash, team.clone());
-	let store = state.store.clone();
-	tokio::spawn(async move {
-		if let Err(error) = store.touch_api_key(&key_id).await {
-			tracing::debug!(%error, "updating api key last_used_at failed");
-		}
-	});
+	if state.auth_cache.claim_stamp(&key_id) {
+		let state = state.clone();
+		tokio::spawn(async move {
+			if let Err(error) = state.store.touch_api_key(&key_id).await {
+				tracing::debug!(%error, "updating api key last_used_at failed");
+			}
+			state.auth_cache.stamp_done(&key_id);
+		});
+	}
 	Ok(team)
 }
 
@@ -384,6 +417,19 @@ mod tests {
 				.status,
 			axum::http::StatusCode::UNAUTHORIZED
 		);
+	}
+
+	#[test]
+	fn key_stamps_are_claimed_once_per_interval_and_never_while_in_flight() {
+		let cache = AuthCache::default();
+		assert!(cache.claim_stamp("k"));
+		assert!(!cache.claim_stamp("k"), "a stamp is in flight");
+		assert!(cache.claim_stamp("other"));
+		cache.stamp_done("k");
+		assert!(!cache.claim_stamp("k"), "stamped recently");
+		let long_ago = Instant::now().checked_sub(API_KEY_STAMP_INTERVAL).unwrap();
+		cache.stamped.lock().insert("k".into(), Some(long_ago));
+		assert!(cache.claim_stamp("k"));
 	}
 
 	#[test]
