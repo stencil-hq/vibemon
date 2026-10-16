@@ -6,17 +6,28 @@
 //! layer is a rootfs image plus the build context after that layer, stored
 //! under `cache/steps/<key>/`. `force` (template-wide or per step) disables
 //! reuse of the forced layer and everything after it.
+//!
+//! The cache is bounded by entry count and by the disk its entries occupy
+//! (allocated blocks, not apparent image sizes); the least recently used
+//! entries go first. Hidden `.<key>.*` directories are in-flight stores and
+//! displaced entries.
 
-use std::path::{Path, PathBuf};
+use std::{
+	collections::HashMap,
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::SystemTime,
+};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::steps::BuildContext;
 use crate::artifacts::{
 	copy::{clone_file, try_reflink},
-	write_json_atomic,
+	disk_usage,
 };
 
 /// How a layer's rootfs is captured into the cache.
@@ -29,7 +40,7 @@ pub enum CopyPolicy {
 	ReflinkOnly,
 }
 
-/// Cached layers kept per node (oldest evicted first).
+/// Cached layers kept per node at most (least recently used evicted first).
 const MAX_ENTRIES: usize = 48;
 /// Install attempts when other writers race on the same key.
 const INSTALL_ATTEMPTS: usize = 32;
@@ -104,40 +115,83 @@ struct LayerRecord {
 /// On-disk layer cache under `<data>/cache/steps`.
 #[derive(Clone, Debug)]
 pub struct StepCache {
-	dir: PathBuf,
+	inner: Arc<Inner>,
+}
+
+#[derive(Debug)]
+struct Inner {
+	dir:       PathBuf,
+	/// Disk the entries may occupy (allocated bytes).
+	max_bytes: u64,
+	/// Reference counts of entries being restored. Eviction and replacing
+	/// stores leave them in place; held while entries are moved.
+	pinned:    Mutex<HashMap<String, usize>>,
+}
+
+/// One cache entry of the stored layers.
+#[derive(Debug)]
+struct Entry {
+	key:   String,
+	path:  PathBuf,
+	/// Last store or restore.
+	used:  SystemTime,
+	bytes: u64,
+}
+
+/// The deepest reusable layer of a build, pinned until dropped so that
+/// neither eviction nor a replacing store removes it while it is restored.
+#[derive(Debug)]
+pub struct CachedLayer {
+	cache: StepCache,
+	index: usize,
+	key:   String,
 }
 
 impl StepCache {
-	/// Opens (creating) the cache directory.
-	pub fn new(dir: PathBuf) -> std::io::Result<Self> {
+	/// Opens (creating) the cache directory, keeping at most `max_bytes` of
+	/// entries. Leftovers of stores interrupted by a node restart are
+	/// removed.
+	pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
 		std::fs::create_dir_all(&dir)?;
-		Ok(Self { dir })
+		for entry in std::fs::read_dir(&dir)? {
+			let path = entry?.path();
+			if path
+				.file_name()
+				.is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+				&& let Err(error) = std::fs::remove_dir_all(&path)
+			{
+				tracing::warn!(%error, path = %path.display(), "removing an interrupted cache store");
+			}
+		}
+		let cache =
+			Self { inner: Arc::new(Inner { dir, max_bytes, pinned: Mutex::new(HashMap::new()) }) };
+		cache.evict();
+		Ok(cache)
 	}
 
 	/// Whether a complete entry exists for `key`.
 	pub fn contains(&self, key: &str) -> bool {
-		let dir = self.dir.join(key);
+		let dir = self.inner.dir.join(key);
 		dir.join(LAYER).is_file() && dir.join(ROOTFS).is_file()
 	}
 
-	/// Clones the cached rootfs of `key` to `dest` and returns its context.
-	pub fn restore(&self, key: &str, dest: &Path) -> Result<BuildContext> {
-		let dir = self.dir.join(key);
-		let record: LayerRecord =
-			serde_json::from_slice(&std::fs::read(dir.join(LAYER))?).context("cached layer record")?;
-		if dest.exists() {
-			std::fs::remove_file(dest)?;
-		}
-		clone_file(&dir.join(ROOTFS), dest)
-			.with_context(|| format!("restoring cached layer {key}"))?;
-		// Touch for LRU eviction.
-		let _ = std::fs::File::open(dir.join(LAYER))
-			.and_then(|f| f.set_modified(std::time::SystemTime::now()));
-		Ok(record.context)
+	/// Pins the deepest reusable layer of `layers` (see [`resume_point`]);
+	/// `None` means build everything from scratch.
+	pub fn pin_resume_point(&self, layers: &[Layer]) -> Option<CachedLayer> {
+		let mut pinned = self.inner.pinned.lock();
+		let index = resume_point(layers, |key| self.contains(key))?;
+		let key = layers[index].key.clone();
+		*pinned.entry(key.clone()).or_default() += 1;
+		Some(CachedLayer { cache: self.clone(), index, key })
 	}
 
-	/// Stores a clone of `rootfs` (which must be quiescent) as `key`.
-	/// Returns `false` when `policy` skipped the copy.
+	/// Stores a clone of `rootfs` (which must be quiescent) as `key`, then
+	/// evicts down to the limits. Returns `false` when `policy` skipped the
+	/// copy.
+	///
+	/// The work runs on a blocking thread that finishes (and removes its
+	/// staging directory) even when the caller stops waiting, as a cancelled
+	/// build does.
 	pub async fn store(
 		&self,
 		key: &str,
@@ -145,87 +199,205 @@ impl StepCache {
 		context: &BuildContext,
 		policy: CopyPolicy,
 	) -> Result<bool> {
-		let staging = self
-			.dir
-			.join(format!(".{key}.{:08x}", rand::random::<u32>()));
-		let final_dir = self.dir.join(key);
-		let result = async {
-			tokio::fs::create_dir_all(&staging).await?;
-			let (src, dst) = (rootfs.to_owned(), staging.join(ROOTFS));
-			let copied = tokio::task::spawn_blocking(move || match policy {
-				CopyPolicy::Always => clone_file(&src, &dst).map(|()| true),
-				CopyPolicy::ReflinkOnly => try_reflink(&src, &dst),
-			})
-			.await??;
-			if !copied {
-				return Ok(false);
+		let cache = self.clone();
+		let (key, rootfs) = (key.to_owned(), rootfs.to_owned());
+		let record = LayerRecord { key: key.clone(), context: context.clone() };
+		tokio::task::spawn_blocking(move || {
+			let staging = cache
+				.inner
+				.dir
+				.join(format!(".{key}.{:08x}", rand::random::<u32>()));
+			let result = cache.install(&staging, &key, &rootfs, &record, policy);
+			let _ = std::fs::remove_dir_all(&staging);
+			let stored = result?;
+			if stored {
+				cache.evict();
 			}
-			write_json_atomic(&staging.join(LAYER), &LayerRecord {
-				key:     key.to_owned(),
-				context: context.clone(),
-			})
-			.await?;
-			// Directory renames never replace a non-empty directory, so an
-			// existing entry (forced rebuild, or a concurrent writer of the
-			// same key) is moved aside and the install retried; the last
-			// writer wins and no reader ever sees a half-written entry.
-			let mut last_error = None;
-			for _ in 0..INSTALL_ATTEMPTS {
-				match tokio::fs::rename(&staging, &final_dir).await {
-					Ok(()) => return Ok(true),
-					Err(error) => last_error = Some(error),
-				}
-				let trash = self
-					.dir
-					.join(format!(".{key}.{:08x}.old", rand::random::<u32>()));
-				if tokio::fs::rename(&final_dir, &trash).await.is_ok() {
-					let _ = tokio::fs::remove_dir_all(&trash).await;
-				}
-			}
-			if self.contains(key) {
-				return Ok(true);
-			}
-			Err(
-				anyhow::Error::from(
-					last_error.unwrap_or_else(|| std::io::Error::other("no attempt made")),
-				)
-				.context(format!("installing cached layer {key}")),
-			)
-		}
-		.await;
-		let _ = tokio::fs::remove_dir_all(&staging).await;
-		let stored = result?;
-		if stored {
-			self.evict();
-		}
-		Ok(stored)
+			Ok(stored)
+		})
+		.await?
 	}
 
-	/// Drops the least recently used entries beyond [`MAX_ENTRIES`].
+	/// Copies `rootfs` into `staging` and installs it as `key`.
+	fn install(
+		&self,
+		staging: &Path,
+		key: &str,
+		rootfs: &Path,
+		record: &LayerRecord,
+		policy: CopyPolicy,
+	) -> Result<bool> {
+		std::fs::create_dir_all(staging)?;
+		let image = staging.join(ROOTFS);
+		let copied = match policy {
+			CopyPolicy::Always => clone_file(rootfs, &image).map(|()| true),
+			CopyPolicy::ReflinkOnly => try_reflink(rootfs, &image),
+		}?;
+		if !copied {
+			return Ok(false);
+		}
+		std::fs::write(staging.join(LAYER), serde_json::to_vec_pretty(record)?)?;
+		// Directory renames never replace a non-empty directory, so an
+		// existing entry (forced rebuild, or a concurrent writer of the same
+		// key) is moved aside and the install retried; the last writer wins
+		// and no reader ever sees a half-written entry. An entry being
+		// restored is kept instead: it holds the same layer.
+		let final_dir = self.inner.dir.join(key);
+		let mut last_error = None;
+		for _ in 0..INSTALL_ATTEMPTS {
+			let pinned = self.inner.pinned.lock();
+			match std::fs::rename(staging, &final_dir) {
+				Ok(()) => return Ok(true),
+				Err(error) => last_error = Some(error),
+			}
+			if pinned.contains_key(key) && self.contains(key) {
+				return Ok(true);
+			}
+			let trash = self.trash_path(key);
+			let displaced = std::fs::rename(&final_dir, &trash).is_ok();
+			drop(pinned);
+			if displaced {
+				let _ = std::fs::remove_dir_all(&trash);
+			}
+		}
+		if self.contains(key) {
+			return Ok(true);
+		}
+		Err(
+			anyhow::Error::from(
+				last_error.unwrap_or_else(|| std::io::Error::other("no attempt made")),
+			)
+			.context(format!("installing cached layer {key}")),
+		)
+	}
+
+	/// Drops least recently used entries until at most [`MAX_ENTRIES`]
+	/// remain and they occupy at most the byte budget. Pinned entries stay.
 	fn evict(&self) {
-		let Ok(entries) = std::fs::read_dir(&self.dir) else {
-			return;
+		let doomed: Vec<(PathBuf, u64)> = {
+			let pinned = self.inner.pinned.lock();
+			let entries = match self.entries() {
+				Ok(entries) => entries,
+				Err(error) => {
+					tracing::warn!(%error, "listing the step cache");
+					return;
+				},
+			};
+			victims(entries, MAX_ENTRIES, self.inner.max_bytes, |key| pinned.contains_key(key))
+				.into_iter()
+				.filter_map(|entry| {
+					// Out of the way of new pins before the slow removal.
+					let trash = self.trash_path(&entry.key);
+					match std::fs::rename(&entry.path, &trash) {
+						Ok(()) => Some((trash, entry.bytes)),
+						Err(error) => {
+							tracing::warn!(%error, layer = entry.key, "evicting cached layer");
+							None
+						},
+					}
+				})
+				.collect()
 		};
-		let mut layers: Vec<(std::time::SystemTime, PathBuf)> = entries
-			.filter_map(Result::ok)
-			.filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-			.map(|e| {
-				let modified = std::fs::metadata(e.path().join(LAYER))
-					.and_then(|m| m.modified())
-					.unwrap_or(std::time::UNIX_EPOCH);
-				(modified, e.path())
-			})
-			.collect();
-		if layers.len() <= MAX_ENTRIES {
+		if doomed.is_empty() {
 			return;
 		}
-		layers.sort_unstable_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-		for (_, path) in layers.into_iter().skip(MAX_ENTRIES) {
-			if let Err(error) = std::fs::remove_dir_all(&path) {
+		let freed: u64 = doomed.iter().map(|(_, bytes)| bytes).sum();
+		for (path, _) in &doomed {
+			if let Err(error) = std::fs::remove_dir_all(path) {
 				tracing::warn!(%error, path = %path.display(), "evicting cached layer");
 			}
 		}
+		tracing::info!(layers = doomed.len(), bytes = freed, "evicted step cache layers");
 	}
+
+	/// Every installed entry, complete or not.
+	fn entries(&self) -> std::io::Result<Vec<Entry>> {
+		let mut entries = Vec::new();
+		for dirent in std::fs::read_dir(&self.inner.dir)? {
+			let dirent = dirent?;
+			let Ok(key) = dirent.file_name().into_string() else {
+				continue;
+			};
+			if key.starts_with('.') {
+				continue;
+			}
+			let path = dirent.path();
+			let used = std::fs::metadata(path.join(LAYER))
+				.and_then(|m| m.modified())
+				.unwrap_or(SystemTime::UNIX_EPOCH);
+			let bytes = disk_usage(&path).unwrap_or(0);
+			entries.push(Entry { key, path, used, bytes });
+		}
+		Ok(entries)
+	}
+
+	fn trash_path(&self, key: &str) -> PathBuf {
+		self
+			.inner
+			.dir
+			.join(format!(".{key}.{:08x}.old", rand::random::<u32>()))
+	}
+}
+
+impl CachedLayer {
+	/// Index of the layer in the planned chain.
+	pub const fn index(&self) -> usize {
+		self.index
+	}
+
+	/// Clones the cached rootfs to `dest` and returns the layer's context.
+	pub fn restore(&self, dest: &Path) -> Result<BuildContext> {
+		let dir = self.cache.inner.dir.join(&self.key);
+		let record: LayerRecord =
+			serde_json::from_slice(&std::fs::read(dir.join(LAYER))?).context("cached layer record")?;
+		if dest.exists() {
+			std::fs::remove_file(dest)?;
+		}
+		clone_file(&dir.join(ROOTFS), dest)
+			.with_context(|| format!("restoring cached layer {}", self.key))?;
+		// Touch for LRU eviction.
+		let _ = std::fs::File::open(dir.join(LAYER)).and_then(|f| f.set_modified(SystemTime::now()));
+		Ok(record.context)
+	}
+}
+
+impl Drop for CachedLayer {
+	fn drop(&mut self) {
+		let mut pinned = self.cache.inner.pinned.lock();
+		if let Some(count) = pinned.get_mut(&self.key) {
+			*count -= 1;
+			if *count == 0 {
+				pinned.remove(&self.key);
+			}
+		}
+	}
+}
+
+/// Entries to evict, least recently used first, until at most
+/// `max_entries` remain within `max_bytes`; pinned entries are skipped. A
+/// layer larger than the whole budget is not kept.
+fn victims(
+	mut entries: Vec<Entry>,
+	max_entries: usize,
+	max_bytes: u64,
+	pinned: impl Fn(&str) -> bool,
+) -> Vec<Entry> {
+	entries.sort_unstable_by_key(|entry| entry.used);
+	let mut count = entries.len();
+	let mut bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+	let mut doomed = Vec::new();
+	for entry in entries {
+		if count <= max_entries && bytes <= max_bytes {
+			break;
+		}
+		if pinned(&entry.key) {
+			continue;
+		}
+		count -= 1;
+		bytes -= entry.bytes;
+		doomed.push(entry);
+	}
+	doomed
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -250,6 +422,25 @@ mod tests {
 				force: *force,
 			})
 			.collect()
+	}
+
+	/// Pins `key` alone, as a build whose deepest cached layer it is.
+	fn pin(cache: &StepCache, key: &str) -> CachedLayer {
+		cache
+			.pin_resume_point(&[Layer { key: key.into(), forced: false }])
+			.expect("cached")
+	}
+
+	/// Stores `bytes` as layer `key`.
+	async fn store_bytes(cache: &StepCache, dir: &Path, key: &str, bytes: &[u8]) {
+		let rootfs = dir.join(format!("rootfs-{key}"));
+		std::fs::write(&rootfs, bytes).unwrap();
+		let stored = cache
+			.store(key, &rootfs, &BuildContext::default(), CopyPolicy::Always)
+			.await;
+		assert!(stored.unwrap());
+		// Distinct last-use times even on coarse filesystem clocks.
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 	}
 
 	fn steps() -> Vec<(String, Vec<String>, Option<String>, bool)> {
@@ -324,7 +515,7 @@ mod tests {
 	#[tokio::test]
 	async fn concurrent_and_repeated_stores_of_one_key_leave_a_valid_entry() {
 		let dir = tempfile::tempdir().unwrap();
-		let cache = StepCache::new(dir.path().join("steps")).unwrap();
+		let cache = StepCache::new(dir.path().join("steps"), u64::MAX).unwrap();
 		let ctx = BuildContext::default();
 		let mut sources = Vec::new();
 		for i in 0..8u8 {
@@ -339,7 +530,7 @@ mod tests {
 			assert!(result.unwrap(), "every concurrent writer succeeds");
 		}
 		let out = dir.path().join("out");
-		cache.restore("k", &out).unwrap();
+		pin(&cache, "k").restore(&out).unwrap();
 		let bytes = std::fs::read(&out).unwrap();
 		assert!(
 			bytes.len() == 64 && bytes.iter().all(|b| *b == bytes[0]),
@@ -353,15 +544,98 @@ mod tests {
 			.store("k", &newer, &ctx, CopyPolicy::Always)
 			.await
 			.unwrap();
-		cache.restore("k", &out).unwrap();
+		pin(&cache, "k").restore(&out).unwrap();
 		assert_eq!(std::fs::read(&out).unwrap(), b"newer");
 		let leftovers = std::fs::read_dir(dir.path().join("steps")).unwrap().count();
 		assert_eq!(leftovers, 1, "no staging or displaced directories remain");
 	}
+
+	#[test]
+	fn opening_reclaims_interrupted_stores() {
+		let dir = tempfile::tempdir().unwrap();
+		let steps = dir.path().join("steps");
+		for leftover in [".k.0123abcd", ".k.89abcdef.old"] {
+			std::fs::create_dir_all(steps.join(leftover)).unwrap();
+			std::fs::write(steps.join(leftover).join(ROOTFS), b"partial").unwrap();
+		}
+		StepCache::new(steps.clone(), u64::MAX).unwrap();
+		assert_eq!(std::fs::read_dir(&steps).unwrap().count(), 0, "staging dirs are reclaimed");
+	}
+
+	#[tokio::test]
+	async fn byte_budget_evicts_least_recently_used_layers() {
+		let dir = tempfile::tempdir().unwrap();
+		// Room for two 1 MiB layers, far below the entry limit.
+		let cache = StepCache::new(dir.path().join("steps"), 5 << 19).unwrap();
+		let layer = vec![1u8; 1 << 20];
+		store_bytes(&cache, dir.path(), "a", &layer).await;
+		store_bytes(&cache, dir.path(), "b", &layer).await;
+		// Restoring `a` makes `b` the least recently used.
+		pin(&cache, "a").restore(&dir.path().join("out")).unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		store_bytes(&cache, dir.path(), "c", &layer).await;
+		assert!(cache.contains("a") && cache.contains("c"));
+		assert!(!cache.contains("b"), "the least recently used layer is evicted");
+		let names = std::fs::read_dir(dir.path().join("steps")).unwrap().count();
+		assert_eq!(names, 2, "evicted layers leave nothing behind");
+
+		// A budget lowered across a restart applies on open.
+		let reopened = StepCache::new(dir.path().join("steps"), 3 << 19).unwrap();
+		assert!(reopened.contains("c") && !reopened.contains("a"));
+	}
+
+	#[tokio::test]
+	async fn pinned_layer_survives_eviction_and_replacement() {
+		let dir = tempfile::tempdir().unwrap();
+		// Room for one 1 MiB layer.
+		let cache = StepCache::new(dir.path().join("steps"), 3 << 19).unwrap();
+		let layer = |byte: u8| vec![byte; 1 << 20];
+		store_bytes(&cache, dir.path(), "a", &layer(1)).await;
+		let restoring = pin(&cache, "a");
+		store_bytes(&cache, dir.path(), "b", &layer(2)).await;
+		assert!(cache.contains("a"), "a pinned layer is not evicted");
+		assert!(!cache.contains("b"), "the budget still holds");
+		// A forced rebuild of the same key keeps the entry being restored.
+		store_bytes(&cache, dir.path(), "a", &layer(3)).await;
+		let out = dir.path().join("out");
+		restoring.restore(&out).unwrap();
+		assert_eq!(std::fs::read(&out).unwrap(), layer(1));
+		drop(restoring);
+		store_bytes(&cache, dir.path(), "c", &layer(4)).await;
+		assert!(!cache.contains("a") && cache.contains("c"), "unpinned, it is evicted again");
+	}
+
+	#[tokio::test]
+	async fn abandoned_store_finishes_and_cleans_up() {
+		let dir = tempfile::tempdir().unwrap();
+		let cache = StepCache::new(dir.path().join("steps"), u64::MAX).unwrap();
+		let rootfs = dir.path().join("rootfs");
+		std::fs::write(&rootfs, vec![7u8; 4 << 20]).unwrap();
+		// A cancelled build drops the store future after its first poll.
+		let dropped = tokio::time::timeout(
+			std::time::Duration::ZERO,
+			cache.store("k", &rootfs, &BuildContext::default(), CopyPolicy::Always),
+		)
+		.await;
+		assert!(dropped.is_err(), "the store was abandoned midway");
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		let names = || -> Vec<String> {
+			std::fs::read_dir(dir.path().join("steps"))
+				.unwrap()
+				.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+				.collect()
+		};
+		while names() != ["k"] && std::time::Instant::now() < deadline {
+			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		}
+		assert_eq!(names(), ["k"], "the copy completes and no staging directory remains");
+		assert!(cache.contains("k"));
+	}
+
 	#[tokio::test]
 	async fn store_and_restore_round_trip() {
 		let dir = tempfile::tempdir().unwrap();
-		let cache = StepCache::new(dir.path().join("steps")).unwrap();
+		let cache = StepCache::new(dir.path().join("steps"), u64::MAX).unwrap();
 		let rootfs = dir.path().join("rootfs");
 		std::fs::write(&rootfs, b"image").unwrap();
 		let ctx = BuildContext {
@@ -379,7 +653,7 @@ mod tests {
 		assert!(cache.contains("k"));
 		let out = dir.path().join("out");
 		std::fs::write(&out, b"stale").unwrap();
-		assert_eq!(cache.restore("k", &out).unwrap(), ctx);
+		assert_eq!(pin(&cache, "k").restore(&out).unwrap(), ctx);
 		assert_eq!(std::fs::read(&out).unwrap(), b"image");
 	}
 }

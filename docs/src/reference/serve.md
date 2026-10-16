@@ -115,6 +115,7 @@ Policy semantics per platform are covered in [Networking and egress](../operate/
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--max-builds <MAX_BUILDS>` | `VMON_MAX_BUILDS` | `0` | Concurrent template builds on this node. `0` means 2. Further builds wait for a slot. |
+| `--step-cache-mb <STEP_CACHE_MB>` | `VMON_STEP_CACHE_MB` | `0` | Disk the build step cache (`cache/steps/`) may occupy, in MiB, counting allocated blocks. Least recently used layers are evicted beyond it (and beyond 48 layers). `0` means 10% of the filesystem holding the data directory. |
 | `--registry-mirror <REGISTRY_MIRROR>` | `VMON_REGISTRY_MIRROR` | none | Docker Hub pull-through mirror, for example `https://mirror.gcr.io`. Tried first for anonymous `docker.io` template base images, then falls back to Docker Hub. |
 
 See [Templates](../concepts/templates.md).

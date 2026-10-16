@@ -141,6 +141,10 @@ pub struct ServeArgs {
 	/// Concurrent template builds on this node (0 = 2).
 	#[arg(long, env = "VMON_MAX_BUILDS", default_value_t = 0)]
 	max_builds:              usize,
+	/// Disk the build step cache may occupy in MiB; least recently used
+	/// layers are evicted beyond it (0 = 10% of the data dir's filesystem).
+	#[arg(long, env = "VMON_STEP_CACHE_MB", default_value_t = 0)]
+	step_cache_mb:           u64,
 	/// Linux root only: uid:gid that VMM processes drop to (unset = no privilege
 	/// drop).
 	#[arg(long, env = "VMON_VMM_USER", value_parser = parse_uid_gid)]
@@ -289,6 +293,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			vmon_bin:                std::env::current_exe().context("locating the vmon binary")?,
 			boot_concurrency:        args.boot_concurrency,
 			max_parallel_builds:     args.max_builds,
+			step_cache_mb:           args.step_cache_mb,
 			net_mode:                args.net.into(),
 			net_pool:                args.net_pool.clone(),
 			volumes_dir:             args.volumes_dir.clone(),

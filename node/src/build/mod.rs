@@ -62,6 +62,8 @@ pub struct BuildConfig {
 	pub agent_binary:    PathBuf,
 	/// Concurrent builds on this node.
 	pub max_parallel:    usize,
+	/// Disk the step cache may occupy, in MiB.
+	pub step_cache_mb:   u64,
 	/// Cluster secret (peer artifact and file-context fetches).
 	pub secret:          String,
 	pub http:            reqwest::Client,
@@ -154,7 +156,9 @@ impl Builder {
 			&cache_dir.join("oci"),
 			config.registry_mirror.as_deref(),
 		);
-		let cache = StepCache::new(cache_dir.join("steps")).context("opening step cache")?;
+		let cache =
+			StepCache::new(cache_dir.join("steps"), config.step_cache_mb.saturating_mul(1 << 20))
+				.context("opening step cache")?;
 		let permits = Semaphore::new(config.max_parallel.max(1));
 		Ok(Self {
 			inner: Arc::new(Inner {

@@ -158,6 +158,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 			kernel:          kernel.clone(),
 			agent_binary:    agent,
 			max_parallel:    1,
+			step_cache_mb:   u64::MAX,
 			secret:          SECRET.into(),
 			http:            reqwest::Client::new(),
 			registry_mirror: None,

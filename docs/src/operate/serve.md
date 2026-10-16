@@ -117,6 +117,7 @@ A node advertises its capacity in gossip, and drivers place sandboxes from it:
 | Free disk | A node with less than 512 MiB free on its data directory gets no new sandboxes. |
 | `--boot-concurrency` (default `0` = 4 × CPUs) | Concurrent VM boots. Also sets the size of the pre-created TAP pool on Linux (one per boot slot, at most 32). |
 | `--max-builds` (default `0` = 2) | Concurrent template builds. Further builds queue. |
+| `--step-cache-mb` (default `0` = 10% of the data directory's filesystem) | Disk kept for cached build layers; least recently used layers are evicted beyond it. |
 
 When no node has room, creates fail with 503 `sandbox_capacity_unavailable`. When no node matches the request's architecture, features, or pin, they fail with 503 `sandbox_no_compatible_node`. Per-team quotas are separate; see [Authentication and teams](../concepts/auth.md#limits). Lower `--max-vcpus` and `--max-memory-mb` to reserve host resources for other workloads.
 

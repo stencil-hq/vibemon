@@ -128,6 +128,11 @@ impl Node {
 				} else {
 					config.max_parallel_builds
 				},
+				step_cache_mb: if config.step_cache_mb == 0 {
+					host::disk_size_mb(&config.data_dir) / 10
+				} else {
+					config.step_cache_mb
+				},
 				secret: config.cluster_secret.clone(),
 				http,
 				registry_mirror: config.registry_mirror.clone(),

@@ -35,6 +35,9 @@ pub struct NodeConfig {
 	pub boot_concurrency:        usize,
 	/// Concurrent template builds; 0 = 2.
 	pub max_parallel_builds:     usize,
+	/// Disk the build step cache may occupy, in MiB; 0 = 10% of the
+	/// filesystem holding `data_dir`.
+	pub step_cache_mb:           u64,
 	pub net_mode:                NetMode,
 	/// TAP lease pool (`--net-pool`, default `172.20.0.0/16`).
 	pub net_pool:                String,

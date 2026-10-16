@@ -417,7 +417,7 @@ raft/                         (drivers)
 files/<templateID>/<hash>.tar (build file contexts; nodes, located through KV `file/<templateID>/<hash>`)
 cache/oci/blobs/sha256/<hex>  (pulled layers, shared)
 builds/<buildID>/             rootfs.ext4 (raw; a block overlay + rootfs.ext4.base for snapshot builds), snapshot/ (vmm snapshot dir), meta.json (ArtifactMeta), manifest.json, build.log, console-*.log
-cache/steps/<layerKey>/       step-cache layers (rootfs.ext4 + layer.json)
+cache/steps/<layerKey>/       step-cache layers (rootfs.ext4 + layer.json); .<layerKey>.* = in-flight stores and displaced entries
 cache/context/<templateID>/<hash>/  extracted COPY file contexts
 sandboxes/<sandboxID>/        rootfs.img (block overlay) + rootfs.img.base (hard link of its raw base), console.log (serial), console.vmm.log, metrics.jsonl,
                               meta.json (SandboxMeta, 0600), snap/ (live --snapshot-root; snap/base = hard-linked RAM base), net-policy.json (user-net)
@@ -627,6 +627,7 @@ under the 104-byte macOS `sun_path` limit.
   `vmon-agent-<arch>` beside `vmon_bin`, else `<exe>/../../target/test-assets/`;
   must be a static ELF for the guest arch), `vmon_bin` (`current_exe()`),
   `boot_concurrency` (0 = 4 × CPUs), `max_parallel_builds` (0 = 2),
+  `step_cache_mb` (0 = 10% of the data dir's filesystem),
   `net_mode` (`user|tap|auto`), `net_pool`, `volumes_dir: Option<PathBuf>`,
   `shared_volumes`, `capacity: CapacityOverrides{cpus, memory_mb}`,
   `cluster_secret`, `vmm_user: Option<(uid, gid)>` (Linux root: VMMs drop to
@@ -816,7 +817,13 @@ pub struct ArtifactInfo { pub build_id: String, pub node_id: NodeId, pub arch: S
    template's envd defaults). Step cache (`cache/steps/<key>/`): chained
    SHA-256 over (base digest, provisioning fingerprint, agent digest, each
    layer) → resume from the deepest cached layer below the first `force`d
-   one. Then GC4 `poweroff`.
+   one. Then GC4 `poweroff`. The cache keeps at most 48 layers within
+   `--step-cache-mb` of allocated disk (default 10% of the data
+   filesystem), evicting the least recently stored or restored first; a
+   layer being restored is pinned against eviction and replacement. A
+   store runs to completion on a blocking thread even when its build is
+   cancelled, so its staging directory never leaks; staging left by a
+   node restart is removed at startup.
 5. **Template snapshot** (fresh boot with the distro init, network, no
    virtio-fs shares, the build's vCPUs/memory, `--snapshot-root
    builds/<id>`): upstream `configure.sh` (`/.e2b`, user `user` with sudo,

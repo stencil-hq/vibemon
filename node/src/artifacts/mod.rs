@@ -581,7 +581,7 @@ fn hash_tree(dir: &Path) -> Result<Vec<ArtifactFile>> {
 }
 
 /// Allocated bytes of a directory tree (sparse files count what they use).
-fn disk_usage(dir: &Path) -> Result<u64> {
+pub(crate) fn disk_usage(dir: &Path) -> Result<u64> {
 	let mut total = 0u64;
 	let mut stack = vec![dir.to_path_buf()];
 	while let Some(current) = stack.pop() {

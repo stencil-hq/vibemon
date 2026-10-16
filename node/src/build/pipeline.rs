@@ -268,7 +268,7 @@ impl Job {
 			.iter()
 			.map(|l| cache::Layer { key: l.key.clone(), forced: l.forced })
 			.collect();
-		let resume = cache::resume_point(&chain, |key| inner.cache.contains(key));
+		let resume = inner.cache.pin_resume_point(&chain);
 		let last = layers.len() - 1;
 
 		// Materialize the starting rootfs.
@@ -276,13 +276,13 @@ impl Job {
 		let mut needs_provision = false;
 		let mut refresh_agent = false;
 		let (mut ctx, start) = match (resume, &base) {
-			(Some(index), _) => {
+			(Some(cached), _) => {
+				let index = cached.index();
 				for layer in &layers[..=index] {
 					log.info(Some(&layer.label), format!("CACHED {} [{}]", layer.text, layer.key));
 				}
-				let ctx = inner
-					.cache
-					.restore(&layers[index].key, &rootfs)
+				let ctx = cached
+					.restore(&rootfs)
 					.map_err(fail(&layers[index].label))?;
 				(ctx, index)
 			},

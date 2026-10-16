@@ -1,5 +1,5 @@
 //! Host facts for capacity reporting (ARCHITECTURE.md §5.1 `NodeCapacity`):
-//! backend, OS, CPU baseline, logical CPUs, RAM, and free disk.
+//! backend, OS, CPU baseline, logical CPUs, RAM, and disk.
 
 use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
 
@@ -72,18 +72,24 @@ pub fn memory_mb() -> u64 {
 /// Free space (for unprivileged users) of the filesystem holding `path`, in
 /// MiB.
 pub fn disk_free_mb(path: &Path) -> u64 {
-	let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-		return 0;
-	};
+	#[allow(clippy::useless_conversion, reason = "field widths differ between macOS and Linux")]
+	let bytes = statvfs(path).map_or(0, |stat| u64::from(stat.f_bavail) * u64::from(stat.f_frsize));
+	bytes >> 20
+}
+
+/// Size of the filesystem holding `path`, in MiB (0 when unknown).
+pub fn disk_size_mb(path: &Path) -> u64 {
+	#[allow(clippy::useless_conversion, reason = "field widths differ between macOS and Linux")]
+	let bytes = statvfs(path).map_or(0, |stat| u64::from(stat.f_blocks) * u64::from(stat.f_frsize));
+	bytes >> 20
+}
+
+fn statvfs(path: &Path) -> Option<libc::statvfs> {
+	let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
 	// SAFETY: statvfs is plain old data; zeroed is valid.
 	let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
 	// SAFETY: `cpath` is NUL-terminated and `stat` is writable.
-	if unsafe { libc::statvfs(cpath.as_ptr(), &raw mut stat) } != 0 {
-		return 0;
-	}
-	#[allow(clippy::useless_conversion, reason = "field widths differ between macOS and Linux")]
-	let bytes = u64::from(stat.f_bavail) * u64::from(stat.f_frsize);
-	bytes >> 20
+	(unsafe { libc::statvfs(cpath.as_ptr(), &raw mut stat) } == 0).then_some(stat)
 }
 
 /// Snapshot-compatibility key from `vmon vmm --print-cpu-baseline`.

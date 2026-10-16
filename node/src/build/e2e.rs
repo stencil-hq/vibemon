@@ -119,6 +119,7 @@ async fn setup_node(data: PathBuf, cpu_baseline: Option<&str>) -> Env {
 			kernel:          path_var("VMON_KERNEL"),
 			agent_binary:    path_var("VMON_AGENT"),
 			max_parallel:    2,
+			step_cache_mb:   u64::MAX,
 			secret:          "e2e-secret".into(),
 			http:            reqwest::Client::new(),
 			registry_mirror: std::env::var("VMON_REGISTRY_MIRROR").ok(),
