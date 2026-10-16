@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, types::Json};
 
-use super::{Cursor, Store, micros};
+use super::{Cursor, Store, micros, retry_deadlocks};
 
 /// Secret metadata (never the value).
 #[derive(Clone, Debug, FromRow)]
@@ -44,25 +44,31 @@ impl Store {
 		metadata: &BTreeMap<String, String>,
 	) -> sqlx::Result<SecretRow> {
 		let id = format!("{SECRET_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
-		let mut tx = self.pool().begin().await?;
-		sqlx::query(
-			"INSERT INTO secrets (id, team_id, name, current_version, metadata) VALUES (?, ?, ?, 1, \
-			 ?)",
-		)
-		.bind(&id)
-		.bind(team_id)
-		.bind(name)
-		.bind(Json(metadata))
-		.execute(&mut *tx)
-		.await?;
-		sqlx::query("INSERT INTO secret_versions (secret_id, version, value_enc) VALUES (?, 1, ?)")
-			.bind(&id)
+		let id = id.as_str();
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			sqlx::query(
+				"INSERT INTO secrets (id, team_id, name, current_version, metadata) VALUES (?, ?, ?, \
+				 1, ?)",
+			)
+			.bind(id)
+			.bind(team_id)
+			.bind(name)
+			.bind(Json(metadata))
+			.execute(&mut *tx)
+			.await?;
+			sqlx::query(
+				"INSERT INTO secret_versions (secret_id, version, value_enc) VALUES (?, 1, ?)",
+			)
+			.bind(id)
 			.bind(value_enc)
 			.execute(&mut *tx)
 			.await?;
-		tx.commit().await?;
+			tx.commit().await
+		})
+		.await?;
 		self
-			.secret(team_id, &id)
+			.secret(team_id, id)
 			.await?
 			.ok_or(sqlx::Error::RowNotFound)
 	}
@@ -141,58 +147,70 @@ impl Store {
 		value_enc: &[u8],
 		metadata: Option<&BTreeMap<String, String>>,
 	) -> sqlx::Result<Option<SecretRow>> {
-		let mut tx = self.pool().begin().await?;
-		let version: Option<i64> = sqlx::query_scalar(
-			"SELECT current_version FROM secrets WHERE team_id = ? AND id = ? FOR UPDATE",
-		)
-		.bind(team_id)
-		.bind(id)
-		.fetch_optional(&mut *tx)
-		.await?;
-		let Some(version) = version else {
-			return Ok(None);
-		};
-		let next = version + 1;
-		sqlx::query("INSERT INTO secret_versions (secret_id, version, value_enc) VALUES (?, ?, ?)")
+		let found = retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let version: Option<i64> = sqlx::query_scalar(
+				"SELECT current_version FROM secrets WHERE team_id = ? AND id = ? FOR UPDATE",
+			)
+			.bind(team_id)
+			.bind(id)
+			.fetch_optional(&mut *tx)
+			.await?;
+			let Some(version) = version else {
+				return Ok(false);
+			};
+			let next = version + 1;
+			sqlx::query(
+				"INSERT INTO secret_versions (secret_id, version, value_enc) VALUES (?, ?, ?)",
+			)
 			.bind(id)
 			.bind(next)
 			.bind(value_enc)
 			.execute(&mut *tx)
 			.await?;
-		match metadata {
-			Some(metadata) => {
-				sqlx::query(
-					"UPDATE secrets SET current_version = ?, metadata = ?, updated_at = \
-					 CURRENT_TIMESTAMP(3) WHERE id = ?",
-				)
-				.bind(next)
-				.bind(Json(metadata))
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
-			},
-			None => {
-				sqlx::query(
-					"UPDATE secrets SET current_version = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE \
-					 id = ?",
-				)
-				.bind(next)
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
-			},
+			match metadata {
+				Some(metadata) => {
+					sqlx::query(
+						"UPDATE secrets SET current_version = ?, metadata = ?, updated_at = \
+						 CURRENT_TIMESTAMP(3) WHERE id = ?",
+					)
+					.bind(next)
+					.bind(Json(metadata))
+					.bind(id)
+					.execute(&mut *tx)
+					.await?;
+				},
+				None => {
+					sqlx::query(
+						"UPDATE secrets SET current_version = ?, updated_at = CURRENT_TIMESTAMP(3) \
+						 WHERE id = ?",
+					)
+					.bind(next)
+					.bind(id)
+					.execute(&mut *tx)
+					.await?;
+				},
+			}
+			tx.commit().await?;
+			Ok(true)
+		})
+		.await?;
+		if !found {
+			return Ok(None);
 		}
-		tx.commit().await?;
 		self.secret(team_id, id).await
 	}
 
 	/// Deletes a secret with all versions; `false` when unknown.
 	pub async fn delete_secret(&self, team_id: &str, id: &str) -> sqlx::Result<bool> {
-		let done = sqlx::query("DELETE FROM secrets WHERE team_id = ? AND id = ?")
-			.bind(team_id)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		let done = retry_deadlocks(|| async move {
+			sqlx::query("DELETE FROM secrets WHERE team_id = ? AND id = ?")
+				.bind(team_id)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(done.rows_affected() > 0)
 	}
 

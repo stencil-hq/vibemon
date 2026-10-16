@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
-use super::Store;
+use super::{Store, retry_deadlocks};
 
 /// A team volume.
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
@@ -34,18 +34,22 @@ impl Store {
 		object_store: bool,
 	) -> sqlx::Result<VolumeRow> {
 		let id = uuid::Uuid::new_v4().to_string();
-		sqlx::query(
-			"INSERT INTO volumes (id, team_id, name, node_id, object_store) VALUES (?, ?, ?, ?, ?)",
-		)
-		.bind(&id)
-		.bind(team_id)
-		.bind(name)
-		.bind(node_id)
-		.bind(object_store)
-		.execute(self.pool())
+		let id = id.as_str();
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"INSERT INTO volumes (id, team_id, name, node_id, object_store) VALUES (?, ?, ?, ?, ?)",
+			)
+			.bind(id)
+			.bind(team_id)
+			.bind(name)
+			.bind(node_id)
+			.bind(object_store)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		self
-			.volume(team_id, &id)
+			.volume(team_id, id)
 			.await?
 			.ok_or(sqlx::Error::RowNotFound)
 	}
@@ -86,11 +90,14 @@ impl Store {
 
 	/// Deletes a volume row; `false` when unknown.
 	pub async fn delete_volume(&self, team_id: &str, id: &str) -> sqlx::Result<bool> {
-		let done = sqlx::query("DELETE FROM volumes WHERE team_id = ? AND id = ?")
-			.bind(team_id)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		let done = retry_deadlocks(|| async move {
+			sqlx::query("DELETE FROM volumes WHERE team_id = ? AND id = ?")
+				.bind(team_id)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(done.rows_affected() > 0)
 	}
 }

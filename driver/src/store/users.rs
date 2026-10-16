@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
-use super::Store;
+use super::{Store, retry_deadlocks};
 
 /// A human account that signs in through the CLI login page.
 #[derive(Clone, Debug, PartialEq, Eq, FromRow)]
@@ -22,13 +22,17 @@ impl Store {
 	/// surface as `sqlx::Error::Database`.
 	pub async fn create_user(&self, email: &str, password_hash: &str) -> sqlx::Result<User> {
 		let id = uuid::Uuid::new_v4().to_string();
-		sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
-			.bind(&id)
-			.bind(email.trim().to_lowercase())
-			.bind(password_hash)
-			.execute(self.pool())
-			.await?;
-		self.user_by_id(&id).await?.ok_or(sqlx::Error::RowNotFound)
+		let id = id.as_str();
+		retry_deadlocks(|| async move {
+			sqlx::query("INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)")
+				.bind(id)
+				.bind(email.trim().to_lowercase())
+				.bind(password_hash)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
+		self.user_by_id(id).await?.ok_or(sqlx::Error::RowNotFound)
 	}
 
 	/// User by id.
@@ -49,11 +53,14 @@ impl Store {
 
 	/// Replaces a user's password hash; `false` when the user is unknown.
 	pub async fn set_user_password(&self, id: &str, password_hash: &str) -> sqlx::Result<bool> {
-		let done = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-			.bind(password_hash)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		let done = retry_deadlocks(|| async move {
+			sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+				.bind(password_hash)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(done.rows_affected() > 0)
 	}
 }

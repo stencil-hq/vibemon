@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, MySql, QueryBuilder, types::Json};
 
-use super::{Cursor, Store, from_micros};
+use super::{Cursor, Store, from_micros, retry_deadlocks};
 
 /// A registered webhook.
 #[derive(Clone, Debug, FromRow)]
@@ -140,23 +140,27 @@ impl Store {
 		signature_secret_enc: &[u8],
 	) -> sqlx::Result<WebhookRow> {
 		let id = uuid::Uuid::new_v4().to_string();
+		let id = id.as_str();
 		let cursor = self.max_event_seq().await?;
-		sqlx::query(
-			"INSERT INTO webhooks (id, team_id, name, url, events, enabled, signature_secret_enc, \
-			 last_event_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		)
-		.bind(&id)
-		.bind(team_id)
-		.bind(name)
-		.bind(url)
-		.bind(Json(events))
-		.bind(enabled)
-		.bind(signature_secret_enc)
-		.bind(cursor)
-		.execute(self.pool())
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"INSERT INTO webhooks (id, team_id, name, url, events, enabled, signature_secret_enc, \
+				 last_event_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.bind(id)
+			.bind(team_id)
+			.bind(name)
+			.bind(url)
+			.bind(Json(events))
+			.bind(enabled)
+			.bind(signature_secret_enc)
+			.bind(cursor)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		self
-			.webhook(team_id, &id)
+			.webhook(team_id, id)
 			.await?
 			.ok_or(sqlx::Error::RowNotFound)
 	}
@@ -204,88 +208,106 @@ impl Store {
 		let Some(current) = self.webhook(team_id, id).await? else {
 			return Ok(None);
 		};
-		let mut builder =
-			QueryBuilder::<MySql>::new("UPDATE webhooks SET updated_at = CURRENT_TIMESTAMP(3)");
-		if let Some(name) = &patch.name {
-			builder.push(", name = ").push_bind(name.clone());
-		}
-		if let Some(url) = &patch.url {
-			builder.push(", url = ").push_bind(url.clone());
-		}
-		if let Some(events) = &patch.events {
-			builder.push(", events = ").push_bind(Json(events.clone()));
-		}
-		if let Some(enabled) = patch.enabled {
-			builder.push(", enabled = ").push_bind(enabled);
-			if enabled && !current.enabled {
-				let cursor = self.max_event_seq().await?;
+		let cursor = match patch.enabled {
+			Some(true) if !current.enabled => Some(self.max_event_seq().await?),
+			_ => None,
+		};
+		retry_deadlocks(|| async move {
+			let mut builder =
+				QueryBuilder::<MySql>::new("UPDATE webhooks SET updated_at = CURRENT_TIMESTAMP(3)");
+			if let Some(name) = &patch.name {
+				builder.push(", name = ").push_bind(name.clone());
+			}
+			if let Some(url) = &patch.url {
+				builder.push(", url = ").push_bind(url.clone());
+			}
+			if let Some(events) = &patch.events {
+				builder.push(", events = ").push_bind(Json(events.clone()));
+			}
+			if let Some(enabled) = patch.enabled {
+				builder.push(", enabled = ").push_bind(enabled);
+			}
+			if let Some(cursor) = cursor {
 				builder
 					.push(", last_event_seq = GREATEST(last_event_seq, ")
 					.push_bind(cursor)
 					.push(")");
 			}
-		}
-		if let Some(secret) = &patch.signature_secret_enc {
+			if let Some(secret) = &patch.signature_secret_enc {
+				builder
+					.push(", signature_secret_enc = ")
+					.push_bind(secret.clone());
+			}
 			builder
-				.push(", signature_secret_enc = ")
-				.push_bind(secret.clone());
-		}
-		builder
-			.push(" WHERE team_id = ")
-			.push_bind(team_id.to_owned())
-			.push(" AND id = ")
-			.push_bind(id.to_owned());
-		builder.build().execute(self.pool()).await?;
+				.push(" WHERE team_id = ")
+				.push_bind(team_id.to_owned())
+				.push(" AND id = ")
+				.push_bind(id.to_owned());
+			builder.build().execute(self.pool()).await
+		})
+		.await?;
 		self.webhook(team_id, id).await
 	}
 
 	/// Deletes a webhook and its deliveries; `false` when unknown.
 	pub async fn delete_webhook(&self, team_id: &str, id: &str) -> sqlx::Result<bool> {
-		let done = sqlx::query("DELETE FROM webhooks WHERE team_id = ? AND id = ?")
-			.bind(team_id)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		let done = retry_deadlocks(|| async move {
+			sqlx::query("DELETE FROM webhooks WHERE team_id = ? AND id = ?")
+				.bind(team_id)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(done.rows_affected() > 0)
 	}
 
 	/// Moves a webhook's delivery cursor forward (never backwards).
 	pub async fn advance_webhook_cursor(&self, id: &str, seq: u64) -> sqlx::Result<()> {
-		sqlx::query("UPDATE webhooks SET last_event_seq = GREATEST(last_event_seq, ?) WHERE id = ?")
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE webhooks SET last_event_seq = GREATEST(last_event_seq, ?) WHERE id = ?",
+			)
 			.bind(seq)
 			.bind(id)
 			.execute(self.pool())
 			.await
-			.map(drop)
+		})
+		.await
+		.map(drop)
 	}
 
 	/// Records one delivery attempt.
 	pub async fn insert_delivery(&self, d: &NewDelivery) -> sqlx::Result<String> {
 		let id = uuid::Uuid::new_v4().to_string();
-		sqlx::query(
-			"INSERT INTO webhook_deliveries (id, team_id, webhook_id, event_id, sandbox_id, \
-			 event_type, status, duration_ms, request_url, request_headers, request_body, \
-			 response_status, response_headers, response_body, error_class, error_message, ts) \
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		)
-		.bind(&id)
-		.bind(&d.team_id)
-		.bind(&d.webhook_id)
-		.bind(&d.event_id)
-		.bind(&d.sandbox_id)
-		.bind(&d.event_type)
-		.bind(d.status)
-		.bind(d.duration_ms)
-		.bind(&d.request_url)
-		.bind(&d.request_headers)
-		.bind(&d.request_body)
-		.bind(d.response_status)
-		.bind(&d.response_headers)
-		.bind(&d.response_body)
-		.bind(d.error_class)
-		.bind(&d.error_message)
-		.bind(d.ts)
-		.execute(self.pool())
+		let row_id = id.as_str();
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"INSERT INTO webhook_deliveries (id, team_id, webhook_id, event_id, sandbox_id, \
+				 event_type, status, duration_ms, request_url, request_headers, request_body, \
+				 response_status, response_headers, response_body, error_class, error_message, ts) \
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.bind(row_id)
+			.bind(&d.team_id)
+			.bind(&d.webhook_id)
+			.bind(&d.event_id)
+			.bind(&d.sandbox_id)
+			.bind(&d.event_type)
+			.bind(d.status)
+			.bind(d.duration_ms)
+			.bind(&d.request_url)
+			.bind(&d.request_headers)
+			.bind(&d.request_body)
+			.bind(d.response_status)
+			.bind(&d.response_headers)
+			.bind(&d.response_body)
+			.bind(d.error_class)
+			.bind(&d.error_message)
+			.bind(d.ts)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(id)
 	}

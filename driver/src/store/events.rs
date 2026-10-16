@@ -6,7 +6,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use sqlx::{FromRow, MySql, QueryBuilder, types::Json};
 
-use super::Store;
+use super::{Store, retry_deadlocks};
 
 /// Event type names (`SandboxEvent.type`, webhook subscriptions).
 pub mod event_types {
@@ -180,7 +180,7 @@ impl Store {
 	/// Appends an event and returns its id. Webhook delivery picks it up on
 	/// its next poll.
 	pub async fn record_event(&self, event: &NewSandboxEvent<'_>) -> sqlx::Result<String> {
-		insert_event(self.pool(), event).await
+		retry_deadlocks(|| insert_event(self.pool(), event)).await
 	}
 
 	/// Events API page (offset pagination, newest first unless `order_asc`).

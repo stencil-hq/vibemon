@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, MySql, QueryBuilder, Transaction, types::Json};
 use vmon_node::api::{ArtifactInfo, BuildReason};
 
-use super::{Cursor, Store, from_micros, templates::upsert_tags};
+use super::{Cursor, Store, from_micros, retry_deadlocks, templates::upsert_tags};
 
 /// Build lifecycle as stored (and as E2B reports it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,89 +314,116 @@ impl Store {
 	/// Moves a `waiting` build to `building` on a node; `false` when the
 	/// build was no longer waiting.
 	pub async fn mark_build_started(&self, id: &str, start: &BuildStart<'_>) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let result = sqlx::query(
-			"UPDATE builds SET status = 'building', node_id = ?, arch = ?, spec = ?, \
-			 template_version = ?, start_cmd = ?, ready_cmd = ?, started_at = UTC_TIMESTAMP(3), \
-			 updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status = 'waiting'",
-		)
-		.bind(start.node_id)
-		.bind(start.arch)
-		.bind(Json(start.spec))
-		.bind(start.template_version)
-		.bind(start.start_cmd)
-		.bind(start.ready_cmd)
-		.bind(id)
-		.execute(&mut *tx)
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let Some((template_id, _)) = lock_build_template(&mut tx, id).await? else {
+				return Ok(false);
+			};
+			let result = sqlx::query(
+				"UPDATE builds SET status = 'building', node_id = ?, arch = ?, spec = ?, \
+				 template_version = ?, start_cmd = ?, ready_cmd = ?, started_at = NULL, updated_at = \
+				 UTC_TIMESTAMP(3) WHERE id = ? AND status = 'waiting'",
+			)
+			.bind(start.node_id)
+			.bind(start.arch)
+			.bind(Json(start.spec))
+			.bind(start.template_version)
+			.bind(start.start_cmd)
+			.bind(start.ready_cmd)
+			.bind(id)
+			.execute(&mut *tx)
+			.await?;
+			if result.rows_affected() == 0 {
+				return Ok(false);
+			}
+			sqlx::query(
+				"UPDATE templates SET build_count = build_count + 1, updated_at = UTC_TIMESTAMP(3) \
+				 WHERE id = ?",
+			)
+			.bind(&template_id)
+			.execute(&mut *tx)
+			.await?;
+			tx.commit().await?;
+			Ok(true)
+		})
+		.await
+	}
+
+	/// Records that the builder node started running a dispatched build (it
+	/// left the node's queue); `false` when already recorded or no longer
+	/// building.
+	pub async fn mark_build_running(&self, id: &str) -> sqlx::Result<bool> {
+		let result = retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE builds SET started_at = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE \
+				 id = ? AND status = 'building' AND started_at IS NULL",
+			)
+			.bind(id)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
-		if result.rows_affected() == 0 {
-			return Ok(false);
-		}
-		sqlx::query(
-			"UPDATE templates t JOIN builds b ON b.template_id = t.id SET t.build_count = \
-			 t.build_count + 1, t.updated_at = UTC_TIMESTAMP(3) WHERE b.id = ?",
-		)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		tx.commit().await?;
-		Ok(true)
+		Ok(result.rows_affected() > 0)
 	}
 
 	/// Marks an unfinished build `ready` with its artifact, records the
 	/// build facts, and points its requested tags at it. `false` when the
 	/// build had already finished (e.g. cancelled meanwhile).
 	pub async fn finish_build_ready(&self, id: &str, artifact: &ArtifactInfo) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let result = sqlx::query(
-			"UPDATE builds SET status = 'ready', artifact = ?, envd_version = ?, arch = ?, node_id = \
-			 ?, vcpus = ?, memory_mb = ?, disk_mb = ?, reason = NULL, finished_at = \
-			 UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN ('waiting', \
-			 'building')",
-		)
-		.bind(Json(artifact))
-		.bind(&artifact.envd_version)
-		.bind(&artifact.arch)
-		.bind(artifact.node_id.to_string())
-		.bind(artifact.vcpus)
-		.bind(artifact.memory_mb)
-		.bind(artifact.disk_mb)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		if result.rows_affected() == 0 {
-			return Ok(false);
-		}
-		let (template_id, Json(tags)): (String, Json<Vec<String>>) =
-			sqlx::query_as("SELECT template_id, tags FROM builds WHERE id = ?")
-				.bind(id)
-				.fetch_one(&mut *tx)
-				.await?;
-		let live: Option<i64> =
-			sqlx::query_scalar("SELECT 1 FROM templates WHERE id = ? AND deleted_at IS NULL")
-				.bind(&template_id)
-				.fetch_optional(&mut *tx)
-				.await?;
-		if live.is_some() {
-			upsert_tags(&mut tx, &template_id, id, &tags).await?;
-			sqlx::query("UPDATE templates SET updated_at = UTC_TIMESTAMP(3) WHERE id = ?")
-				.bind(&template_id)
-				.execute(&mut *tx)
-				.await?;
-		}
-		tx.commit().await?;
-		Ok(true)
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let Some((template_id, live)) = lock_build_template(&mut tx, id).await? else {
+				return Ok(false);
+			};
+			let result = sqlx::query(
+				"UPDATE builds SET status = 'ready', artifact = ?, envd_version = ?, arch = ?, \
+				 node_id = ?, vcpus = ?, memory_mb = ?, disk_mb = ?, reason = NULL, finished_at = \
+				 UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN \
+				 ('waiting', 'building')",
+			)
+			.bind(Json(artifact))
+			.bind(&artifact.envd_version)
+			.bind(&artifact.arch)
+			.bind(artifact.node_id.to_string())
+			.bind(artifact.vcpus)
+			.bind(artifact.memory_mb)
+			.bind(artifact.disk_mb)
+			.bind(id)
+			.execute(&mut *tx)
+			.await?;
+			if result.rows_affected() == 0 {
+				return Ok(false);
+			}
+			if live {
+				let Json(tags): Json<Vec<String>> =
+					sqlx::query_scalar("SELECT tags FROM builds WHERE id = ?")
+						.bind(id)
+						.fetch_one(&mut *tx)
+						.await?;
+				upsert_tags(&mut tx, &template_id, id, &tags).await?;
+				sqlx::query("UPDATE templates SET updated_at = UTC_TIMESTAMP(3) WHERE id = ?")
+					.bind(&template_id)
+					.execute(&mut *tx)
+					.await?;
+			}
+			tx.commit().await?;
+			Ok(true)
+		})
+		.await
 	}
 
 	/// Marks an unfinished build `error`; `false` when it had already finished.
 	pub async fn fail_build(&self, id: &str, reason: &BuildReason) -> sqlx::Result<bool> {
-		let result = sqlx::query(
-			"UPDATE builds SET status = 'error', reason = ?, finished_at = UTC_TIMESTAMP(3), \
-			 updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN ('waiting', 'building')",
-		)
-		.bind(Json(reason))
-		.bind(id)
-		.execute(self.pool())
+		let result = retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE builds SET status = 'error', reason = ?, finished_at = UTC_TIMESTAMP(3), \
+				 updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN ('waiting', 'building')",
+			)
+			.bind(Json(reason))
+			.bind(id)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(result.rows_affected() == 1)
 	}
@@ -426,18 +453,22 @@ impl Store {
 			return Ok(());
 		}
 		for chunk in logs.chunks(CHUNK) {
-			let mut query = QueryBuilder::<MySql>::new(
-				"INSERT IGNORE INTO build_logs (build_id, seq, ts, level, step, message) ",
-			);
-			query.push_values(chunk.iter().enumerate(), |mut row, (offset, log)| {
-				row.push_bind(build_id)
-					.push_bind(base + offset as u64)
-					.push_bind(log.ts)
-					.push_bind(log.level.as_str())
-					.push_bind(log.step.clone())
-					.push_bind(log.message.clone());
-			});
-			query.build().execute(self.pool()).await?;
+			let first = base;
+			retry_deadlocks(|| async move {
+				let mut query = QueryBuilder::<MySql>::new(
+					"INSERT IGNORE INTO build_logs (build_id, seq, ts, level, step, message) ",
+				);
+				query.push_values(chunk.iter().enumerate(), |mut row, (offset, log)| {
+					row.push_bind(build_id)
+						.push_bind(first + offset as u64)
+						.push_bind(log.ts)
+						.push_bind(log.level.as_str())
+						.push_bind(log.step.clone())
+						.push_bind(log.message.clone());
+				});
+				query.build().execute(self.pool()).await
+			})
+			.await?;
 			base += chunk.len() as u64;
 		}
 		Ok(())
@@ -521,10 +552,13 @@ impl Store {
 
 	/// Records that a build's artifacts were deleted from every holder.
 	pub async fn mark_artifacts_collected(&self, id: &str) -> sqlx::Result<()> {
-		sqlx::query("UPDATE builds SET artifacts_gc_at = UTC_TIMESTAMP(3) WHERE id = ?")
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		retry_deadlocks(|| async move {
+			sqlx::query("UPDATE builds SET artifacts_gc_at = UTC_TIMESTAMP(3) WHERE id = ?")
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(())
 	}
 
@@ -534,4 +568,31 @@ impl Store {
 			.fetch_all(self.pool())
 			.await
 	}
+}
+
+/// Locks the template row of build `id` and returns its id and whether it is
+/// live (not deleted); `None` for an unknown build.
+///
+/// A transaction that changes a build and its template locks the template
+/// first, as template deletes and build registrations do. Locking the build
+/// first closed deadlock cycles with them under concurrent builds.
+async fn lock_build_template(
+	tx: &mut Transaction<'_, MySql>,
+	id: &str,
+) -> sqlx::Result<Option<(String, bool)>> {
+	// A build never changes templates, so this plain read needs no lock.
+	let Some(template_id) =
+		sqlx::query_scalar::<_, String>("SELECT template_id FROM builds WHERE id = ?")
+			.bind(id)
+			.fetch_optional(&mut **tx)
+			.await?
+	else {
+		return Ok(None);
+	};
+	let deleted_at: Option<Option<DateTime<Utc>>> =
+		sqlx::query_scalar("SELECT deleted_at FROM templates WHERE id = ? FOR UPDATE")
+			.bind(&template_id)
+			.fetch_optional(&mut **tx)
+			.await?;
+	Ok(deleted_at.map(|deleted_at| (template_id, deleted_at.is_none())))
 }

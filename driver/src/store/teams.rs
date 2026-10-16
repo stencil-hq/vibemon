@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
-use super::Store;
+use super::{Store, retry_deadlocks};
 use crate::state::TeamLimits;
 
 /// A tenant (E2B "team"/"project"); every API-key and sandbox belongs to one.
@@ -104,21 +104,25 @@ impl Store {
 			} else {
 				format!("{base}-{attempt}")
 			};
-			let inserted = sqlx::query(
-				"INSERT INTO teams (id, name, slug, max_concurrent_sandboxes, max_concurrent_builds, \
-				 max_vcpus, max_memory_mb, max_disk_mb, max_length_hours) VALUES (?, ?, ?, ?, ?, ?, \
-				 ?, ?, ?)",
-			)
-			.bind(&id)
-			.bind(name)
-			.bind(&slug)
-			.bind(limits.max_concurrent_sandboxes)
-			.bind(limits.max_concurrent_builds)
-			.bind(limits.max_vcpus)
-			.bind(limits.max_memory_mb)
-			.bind(limits.max_disk_mb)
-			.bind(limits.max_length_hours)
-			.execute(self.pool())
+			let (id, slug) = (id.as_str(), slug.as_str());
+			let inserted = retry_deadlocks(|| async move {
+				sqlx::query(
+					"INSERT INTO teams (id, name, slug, max_concurrent_sandboxes, \
+					 max_concurrent_builds, max_vcpus, max_memory_mb, max_disk_mb, max_length_hours) \
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.bind(id)
+				.bind(name)
+				.bind(slug)
+				.bind(limits.max_concurrent_sandboxes)
+				.bind(limits.max_concurrent_builds)
+				.bind(limits.max_vcpus)
+				.bind(limits.max_memory_mb)
+				.bind(limits.max_disk_mb)
+				.bind(limits.max_length_hours)
+				.execute(self.pool())
+				.await
+			})
 			.await;
 			match inserted {
 				Ok(_) => break,
@@ -165,29 +169,35 @@ impl Store {
 	pub async fn set_team_limits(&self, id: &str, limits: TeamLimits) -> sqlx::Result<bool> {
 		// MySQL reports 0 affected rows when nothing changed, so existence is
 		// checked separately.
-		sqlx::query(
-			"UPDATE teams SET max_concurrent_sandboxes = ?, max_concurrent_builds = ?, max_vcpus = \
-			 ?, max_memory_mb = ?, max_disk_mb = ?, max_length_hours = ? WHERE id = ?",
-		)
-		.bind(limits.max_concurrent_sandboxes)
-		.bind(limits.max_concurrent_builds)
-		.bind(limits.max_vcpus)
-		.bind(limits.max_memory_mb)
-		.bind(limits.max_disk_mb)
-		.bind(limits.max_length_hours)
-		.bind(id)
-		.execute(self.pool())
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE teams SET max_concurrent_sandboxes = ?, max_concurrent_builds = ?, max_vcpus \
+				 = ?, max_memory_mb = ?, max_disk_mb = ?, max_length_hours = ? WHERE id = ?",
+			)
+			.bind(limits.max_concurrent_sandboxes)
+			.bind(limits.max_concurrent_builds)
+			.bind(limits.max_vcpus)
+			.bind(limits.max_memory_mb)
+			.bind(limits.max_disk_mb)
+			.bind(limits.max_length_hours)
+			.bind(id)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(self.team_by_id(id).await?.is_some())
 	}
 
 	/// Blocks or unblocks a team; `false` when the team does not exist.
 	pub async fn set_team_blocked(&self, id: &str, blocked: bool) -> sqlx::Result<bool> {
-		sqlx::query("UPDATE teams SET blocked = ? WHERE id = ?")
-			.bind(blocked)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		retry_deadlocks(|| async move {
+			sqlx::query("UPDATE teams SET blocked = ? WHERE id = ?")
+				.bind(blocked)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(self.team_by_id(id).await?.is_some())
 	}
 
@@ -195,24 +205,27 @@ impl Store {
 	/// not exist. Marking claims the free bare aliases of its public
 	/// templates; unmarking releases the bare aliases of its templates.
 	pub async fn set_team_system(&self, id: &str, system: bool) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		sqlx::query("UPDATE teams SET is_system = ? WHERE id = ?")
-			.bind(system)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-		if system {
-			super::templates::claim_bare_aliases(&mut tx, "t.team_id = ?", id).await?;
-		} else {
-			sqlx::query(
-				"DELETE a FROM template_aliases a JOIN templates t ON t.id = a.template_id WHERE \
-				 a.namespace = '' AND t.team_id = ?",
-			)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-		}
-		tx.commit().await?;
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			sqlx::query("UPDATE teams SET is_system = ? WHERE id = ?")
+				.bind(system)
+				.bind(id)
+				.execute(&mut *tx)
+				.await?;
+			if system {
+				super::templates::claim_bare_aliases(&mut tx, "t.team_id = ?", id).await?;
+			} else {
+				sqlx::query(
+					"DELETE a FROM template_aliases a JOIN templates t ON t.id = a.template_id WHERE \
+					 a.namespace = '' AND t.team_id = ?",
+				)
+				.bind(id)
+				.execute(&mut *tx)
+				.await?;
+			}
+			tx.commit().await
+		})
+		.await?;
 		Ok(self.team_by_id(id).await?.is_some())
 	}
 
@@ -224,23 +237,26 @@ impl Store {
 		user_id: &str,
 		is_default: bool,
 	) -> sqlx::Result<()> {
-		let mut tx = self.pool().begin().await?;
-		if is_default {
-			sqlx::query("UPDATE team_members SET is_default = FALSE WHERE user_id = ?")
-				.bind(user_id)
-				.execute(&mut *tx)
-				.await?;
-		}
-		sqlx::query(
-			"INSERT INTO team_members (team_id, user_id, is_default) VALUES (?, ?, ?) ON DUPLICATE \
-			 KEY UPDATE is_default = VALUES(is_default)",
-		)
-		.bind(team_id)
-		.bind(user_id)
-		.bind(is_default)
-		.execute(&mut *tx)
-		.await?;
-		tx.commit().await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			if is_default {
+				sqlx::query("UPDATE team_members SET is_default = FALSE WHERE user_id = ?")
+					.bind(user_id)
+					.execute(&mut *tx)
+					.await?;
+			}
+			sqlx::query(
+				"INSERT INTO team_members (team_id, user_id, is_default) VALUES (?, ?, ?) ON \
+				 DUPLICATE KEY UPDATE is_default = VALUES(is_default)",
+			)
+			.bind(team_id)
+			.bind(user_id)
+			.bind(is_default)
+			.execute(&mut *tx)
+			.await?;
+			tx.commit().await
+		})
+		.await
 	}
 
 	/// Teams the user belongs to with their `is_default` flag. When no

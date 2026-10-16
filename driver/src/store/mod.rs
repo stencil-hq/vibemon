@@ -21,6 +21,7 @@ use std::{borrow::Cow, str::FromStr, time::Duration};
 
 use anyhow::Context;
 use base64::Engine;
+use rand::RngExt;
 use sqlx::{
 	MySqlPool, SqlSafeStr,
 	migrate::{Migration, MigrationType, Migrator},
@@ -40,6 +41,10 @@ pub use self::{
 
 /// Maximum pooled connections per driver process.
 const MAX_CONNECTIONS: u32 = 32;
+/// Runs of an operation that `InnoDB` keeps picking as a deadlock victim.
+const DEADLOCK_ATTEMPTS: u32 = 8;
+/// Pause before the first rerun; it doubles per attempt and is jittered.
+const DEADLOCK_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Durable driver state in `MySQL`. Cheap to clone (the pool is an `Arc`).
 #[derive(Clone, Debug)]
@@ -85,6 +90,41 @@ impl Store {
 	pub const fn pool(&self) -> &MySqlPool {
 		&self.pool
 	}
+}
+
+/// Runs `op` (one autocommit statement, or one transaction it begins and
+/// commits itself) and reruns it from the start, after a short jittered
+/// pause, while `InnoDB` picks it as a deadlock victim (error 1213, SQLSTATE
+/// 40001). Every store method that writes goes through here.
+///
+/// `InnoDB` rolls a deadlock victim back whole, so a rerun starts from a
+/// clean slate; `op` must therefore have no effects outside the database.
+/// Lock wait timeouts (1205) are not rerun: they roll back only the timed
+/// out statement, the caller already waited `innodb_lock_wait_timeout`
+/// (50 s by default) for a lock that is still held, and queueing again
+/// would hold a pooled connection for that long once more.
+pub(crate) async fn retry_deadlocks<T, F, Fut>(mut op: F) -> sqlx::Result<T>
+where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = sqlx::Result<T>>,
+{
+	let mut attempt = 1;
+	loop {
+		match op().await {
+			Err(error) if attempt < DEADLOCK_ATTEMPTS && is_deadlock(&error) => {
+				tracing::debug!(attempt, %error, "rerunning MySQL deadlock victim");
+				let jitter = rand::rng().random_range(0.5..1.5);
+				tokio::time::sleep((DEADLOCK_BACKOFF * (1 << (attempt - 1))).mul_f64(jitter)).await;
+				attempt += 1;
+			},
+			outcome => return outcome,
+		}
+	}
+}
+
+/// Whether `InnoDB` aborted the transaction as a deadlock victim.
+fn is_deadlock(error: &sqlx::Error) -> bool {
+	matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("40001"))
 }
 
 /// Migrations embedded at build time, in version order. (`sqlx::migrate!`

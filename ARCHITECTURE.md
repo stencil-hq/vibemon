@@ -388,7 +388,13 @@ Migrations are embedded by hand in `driver::store` (`MIGRATIONS`): sqlx is
 built without its `macros` feature, so `sqlx::migrate!` is unavailable.
 
 Store API is `driver::store::Store` (one struct over a `MySqlPool`, methods
-grouped by table, no ORM).
+grouped by table, no ORM). Every write (one statement, or one whole
+transaction from `BEGIN`) runs through `store::retry_deadlocks`, which reruns
+it after a short jittered backoff when `InnoDB` picks it as a deadlock victim
+(1213; up to 8 runs). Lock wait timeouts (1205) are not rerun. Transactions
+that touch a template and its builds lock the template row first; the fork
+purge deletes candidates one by one by id, so it never locks other template
+rows.
 
 ## 8. Node
 

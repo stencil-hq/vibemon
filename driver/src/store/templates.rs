@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, MySql, QueryBuilder, Transaction, types::Json};
 
-use super::{Cursor, Store, from_micros};
+use super::{Cursor, Store, from_micros, retry_deadlocks};
 use crate::store::builds::{BuildRow, superseded_reason};
 
 /// What a template row represents.
@@ -252,63 +252,73 @@ impl Store {
 	/// follow: publishing a system team's template claims the free bare
 	/// aliases of its names, unpublishing releases the template's bare aliases.
 	pub async fn set_template_public(&self, id: &str, public: bool) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let result = sqlx::query(
-			"UPDATE templates SET public = ?, updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND \
-			 deleted_at IS NULL",
-		)
-		.bind(public)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		if public {
-			claim_bare_aliases(&mut tx, "t.id = ?", id).await?;
-		} else {
-			sqlx::query("DELETE FROM template_aliases WHERE template_id = ? AND namespace = ''")
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
-		}
-		tx.commit().await?;
-		Ok(result.rows_affected() == 1)
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let result = sqlx::query(
+				"UPDATE templates SET public = ?, updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND \
+				 deleted_at IS NULL",
+			)
+			.bind(public)
+			.bind(id)
+			.execute(&mut *tx)
+			.await?;
+			if public {
+				claim_bare_aliases(&mut tx, "t.id = ?", id).await?;
+			} else {
+				sqlx::query("DELETE FROM template_aliases WHERE template_id = ? AND namespace = ''")
+					.bind(id)
+					.execute(&mut *tx)
+					.await?;
+			}
+			tx.commit().await?;
+			Ok(result.rows_affected() == 1)
+		})
+		.await
 	}
 
 	/// Soft-deletes a template: sets `deleted_at`, frees its aliases and tags,
 	/// and fails its unfinished builds. Returns the builds that were
 	/// `building` (the caller cancels them on their node); `None` when the
 	/// template did not exist.
+	///
+	/// Locks the template row, then its builds: every transaction that
+	/// changes a template and its builds locks them in this order.
 	pub async fn soft_delete_template(&self, id: &str) -> sqlx::Result<Option<Vec<BuildRow>>> {
-		let mut tx = self.pool().begin().await?;
-		let deleted = sqlx::query(
-			"UPDATE templates SET deleted_at = UTC_TIMESTAMP(3) WHERE id = ? AND deleted_at IS NULL",
-		)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		if deleted.rows_affected() == 0 {
-			return Ok(None);
-		}
-		let building =
-			BuildRow::select_where(&mut tx, "template_id = ? AND status = 'building'", id).await?;
-		sqlx::query("DELETE FROM template_aliases WHERE template_id = ?")
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let deleted = sqlx::query(
+				"UPDATE templates SET deleted_at = UTC_TIMESTAMP(3) WHERE id = ? AND deleted_at IS \
+				 NULL",
+			)
 			.bind(id)
 			.execute(&mut *tx)
 			.await?;
-		sqlx::query("DELETE FROM template_tags WHERE template_id = ?")
+			if deleted.rows_affected() == 0 {
+				return Ok(None);
+			}
+			let building =
+				BuildRow::select_where(&mut tx, "template_id = ? AND status = 'building'", id).await?;
+			sqlx::query("DELETE FROM template_aliases WHERE template_id = ?")
+				.bind(id)
+				.execute(&mut *tx)
+				.await?;
+			sqlx::query("DELETE FROM template_tags WHERE template_id = ?")
+				.bind(id)
+				.execute(&mut *tx)
+				.await?;
+			sqlx::query(
+				"UPDATE builds SET status = 'error', reason = ?, finished_at = UTC_TIMESTAMP(3), \
+				 updated_at = UTC_TIMESTAMP(3) WHERE template_id = ? AND status IN ('waiting', \
+				 'building')",
+			)
+			.bind(Json(serde_json::json!({"message": "The template was deleted."})))
 			.bind(id)
 			.execute(&mut *tx)
 			.await?;
-		sqlx::query(
-			"UPDATE builds SET status = 'error', reason = ?, finished_at = UTC_TIMESTAMP(3), \
-			 updated_at = UTC_TIMESTAMP(3) WHERE template_id = ? AND status IN ('waiting', \
-			 'building')",
-		)
-		.bind(Json(serde_json::json!({"message": "The template was deleted."})))
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		tx.commit().await?;
-		Ok(Some(building))
+			tx.commit().await?;
+			Ok(Some(building))
+		})
+		.await
 	}
 
 	/// Hidden fork templates created before `before` that were never retired
@@ -329,15 +339,35 @@ impl Store {
 	/// collected (cascades to their builds, tags, and build logs): nothing
 	/// refers to a hidden fork's rows once its artifacts are gone. Returns
 	/// how many were deleted.
+	///
+	/// Candidates come from a non-locking read and are deleted by id, so only
+	/// their rows get locked. (No `templates` index starts with `kind`: a
+	/// single `DELETE … WHERE kind = 'fork'` scanned and locked every template
+	/// row until it committed, stalling all template writes behind it.)
 	pub async fn purge_collected_forks(&self) -> sqlx::Result<u64> {
-		let done = sqlx::query(
-			"DELETE FROM templates WHERE kind = 'fork' AND deleted_at IS NOT NULL AND NOT EXISTS \
-			 (SELECT 1 FROM builds b WHERE b.template_id = templates.id AND b.artifacts_gc_at IS \
-			 NULL)",
+		let candidates: Vec<String> = sqlx::query_scalar(
+			"SELECT t.id FROM templates t WHERE t.kind = 'fork' AND t.deleted_at IS NOT NULL AND NOT \
+			 EXISTS (SELECT 1 FROM builds b WHERE b.template_id = t.id AND b.artifacts_gc_at IS NULL)",
 		)
-		.execute(self.pool())
+		.fetch_all(self.pool())
 		.await?;
-		Ok(done.rows_affected())
+		let mut purged = 0;
+		for id in &candidates {
+			let id = id.as_str();
+			let done = retry_deadlocks(|| async move {
+				sqlx::query(
+					"DELETE FROM templates WHERE id = ? AND kind = 'fork' AND deleted_at IS NOT NULL \
+					 AND NOT EXISTS (SELECT 1 FROM builds b WHERE b.template_id = templates.id AND \
+					 b.artifacts_gc_at IS NULL)",
+				)
+				.bind(id)
+				.execute(self.pool())
+				.await
+			})
+			.await?;
+			purged += done.rows_affected();
+		}
+		Ok(purged)
 	}
 
 	/// Records one sandbox start from the template.
@@ -395,9 +425,12 @@ impl Store {
 		build_id: &str,
 		tags: &[String],
 	) -> sqlx::Result<()> {
-		let mut tx = self.pool().begin().await?;
-		upsert_tags(&mut tx, template_id, build_id, tags).await?;
-		tx.commit().await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			upsert_tags(&mut tx, template_id, build_id, tags).await?;
+			tx.commit().await
+		})
+		.await
 	}
 
 	/// Removes tags; returns how many existed.
@@ -405,27 +438,27 @@ impl Store {
 		if tags.is_empty() {
 			return Ok(0);
 		}
-		let mut query = QueryBuilder::<MySql>::new("DELETE FROM template_tags WHERE template_id = ");
-		query.push_bind(template_id).push(" AND tag IN (");
-		let mut list = query.separated(", ");
-		for tag in tags {
-			list.push_bind(tag);
-		}
-		query.push(")");
-		Ok(query.build().execute(self.pool()).await?.rows_affected())
+		retry_deadlocks(|| async move {
+			let mut query =
+				QueryBuilder::<MySql>::new("DELETE FROM template_tags WHERE template_id = ");
+			query.push_bind(template_id).push(" AND tag IN (");
+			let mut list = query.separated(", ");
+			for tag in tags {
+				list.push_bind(tag);
+			}
+			query.push(")");
+			Ok(query.build().execute(self.pool()).await?.rows_affected())
+		})
+		.await
 	}
 
 	/// `POST /v3/templates`: reuses the team's template for the alias (or
 	/// creates it with its alias), supersedes earlier `waiting` builds sharing
 	/// a tag, enforces the team build limit, and inserts a `waiting` build.
 	pub async fn register_build(&self, req: &RegisterBuild<'_>) -> sqlx::Result<RegisterOutcome> {
-		let mut attempt = 1;
-		loop {
-			match self.register_build_once(req).await {
-				Err(error) if is_deadlock(&error) && attempt < DEADLOCK_ATTEMPTS => attempt += 1,
-				outcome => return outcome,
-			}
-		}
+		// Registrations probe alias rows `FOR UPDATE` and insert missing ones,
+		// so concurrent registrations of new names deadlock on the shared gap.
+		retry_deadlocks(|| self.register_build_once(req)).await
 	}
 
 	async fn register_build_once(&self, req: &RegisterBuild<'_>) -> sqlx::Result<RegisterOutcome> {
@@ -503,13 +536,7 @@ impl Store {
 		&self,
 		req: &RegisterSnapshot<'_>,
 	) -> sqlx::Result<SnapshotOutcome> {
-		let mut attempt = 1;
-		loop {
-			match self.register_snapshot_once(req).await {
-				Err(error) if is_deadlock(&error) && attempt < DEADLOCK_ATTEMPTS => attempt += 1,
-				outcome => return outcome,
-			}
-		}
+		retry_deadlocks(|| self.register_snapshot_once(req)).await
 	}
 
 	async fn register_snapshot_once(
@@ -585,17 +612,6 @@ pub struct TemplateFilter<'a> {
 	pub alias:             Option<&'a str>,
 	/// Only templates with at least one `ready` build.
 	pub ready_only:        bool,
-}
-
-/// Attempts of a transaction that MySQL keeps aborting as a deadlock victim.
-const DEADLOCK_ATTEMPTS: u32 = 8;
-
-/// Whether MySQL aborted the transaction as a deadlock victim (SQLSTATE
-/// 40001). Registrations probe alias rows `FOR UPDATE` and insert missing
-/// ones, so concurrent registrations of new names deadlock on the shared gap
-/// lock; `InnoDB` rolls the victim back whole, so rerunning it is safe.
-fn is_deadlock(error: &sqlx::Error) -> bool {
-	matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("40001"))
 }
 
 /// Gives the live public templates of system teams matching `filter` (one

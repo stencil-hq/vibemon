@@ -1,10 +1,19 @@
 //! `api_keys`: team API keys (SHA-256 for lookup, AES-GCM ciphertext so
 //! `GET /teams` can return the key).
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
-use super::{Store, Team};
+use super::{Store, Team, retry_deadlocks};
+
+/// How stale `last_used_at` must be before a use stamps it again.
+///
+/// `lastUsed` keeps minute precision without rewriting a key's row on every
+/// use: one key shared by many clients makes that row the hottest in the
+/// database.
+pub const API_KEY_STAMP_INTERVAL: Duration = Duration::from_mins(1);
 
 /// One stored API key (never carries the plaintext).
 #[derive(Clone, Debug, FromRow)]
@@ -44,22 +53,26 @@ impl Store {
 	/// Stores a new key and returns its row.
 	pub async fn insert_api_key(&self, key: &NewApiKey<'_>) -> sqlx::Result<ApiKeyRow> {
 		let id = uuid::Uuid::new_v4().to_string();
-		sqlx::query(
-			"INSERT INTO api_keys (id, team_id, key_hash, key_enc, mask_prefix, mask_suffix, name, \
-			 created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		)
-		.bind(&id)
-		.bind(key.team_id)
-		.bind(key.key_hash)
-		.bind(key.key_enc)
-		.bind(key.mask_prefix)
-		.bind(key.mask_suffix)
-		.bind(key.name)
-		.bind(key.created_by)
-		.execute(self.pool())
+		let id = id.as_str();
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"INSERT INTO api_keys (id, team_id, key_hash, key_enc, mask_prefix, mask_suffix, \
+				 name, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.bind(id)
+			.bind(key.team_id)
+			.bind(key.key_hash)
+			.bind(key.key_enc)
+			.bind(key.mask_prefix)
+			.bind(key.mask_suffix)
+			.bind(key.name)
+			.bind(key.created_by)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		self
-			.api_key(key.team_id, &id)
+			.api_key(key.team_id, id)
 			.await?
 			.ok_or(sqlx::Error::RowNotFound)
 	}
@@ -122,34 +135,40 @@ impl Store {
 
 	/// Renames a key; `false` when it does not belong to the team.
 	pub async fn rename_api_key(&self, team_id: &str, id: &str, name: &str) -> sqlx::Result<bool> {
-		sqlx::query("UPDATE api_keys SET name = ? WHERE team_id = ? AND id = ?")
-			.bind(name)
-			.bind(team_id)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		retry_deadlocks(|| async move {
+			sqlx::query("UPDATE api_keys SET name = ? WHERE team_id = ? AND id = ?")
+				.bind(name)
+				.bind(team_id)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(self.api_key(team_id, id).await?.is_some())
 	}
 
 	/// Deletes a key and returns its hash (for cache invalidation).
 	pub async fn delete_api_key(&self, team_id: &str, id: &str) -> sqlx::Result<Option<String>> {
-		let mut tx = self.pool().begin().await?;
-		let hash: Option<String> = sqlx::query_scalar(
-			"SELECT key_hash FROM api_keys WHERE team_id = ? AND id = ? FOR UPDATE",
-		)
-		.bind(team_id)
-		.bind(id)
-		.fetch_optional(&mut *tx)
-		.await?;
-		if hash.is_some() {
-			sqlx::query("DELETE FROM api_keys WHERE team_id = ? AND id = ?")
-				.bind(team_id)
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
-		}
-		tx.commit().await?;
-		Ok(hash)
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let hash: Option<String> = sqlx::query_scalar(
+				"SELECT key_hash FROM api_keys WHERE team_id = ? AND id = ? FOR UPDATE",
+			)
+			.bind(team_id)
+			.bind(id)
+			.fetch_optional(&mut *tx)
+			.await?;
+			if hash.is_some() {
+				sqlx::query("DELETE FROM api_keys WHERE team_id = ? AND id = ?")
+					.bind(team_id)
+					.bind(id)
+					.execute(&mut *tx)
+					.await?;
+			}
+			tx.commit().await?;
+			Ok(hash)
+		})
+		.await
 	}
 
 	/// Stamps `last_used_at = now`.

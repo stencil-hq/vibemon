@@ -471,3 +471,212 @@ async fn concurrent_registrations_of_new_aliases_all_succeed() {
 	}
 	db.drop_db().await;
 }
+
+/// Waits until a statement on the test database blocks on a row lock.
+async fn wait_for_lock_wait(store: &Store) {
+	for _ in 0..500 {
+		let waiting: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN \
+			 performance_schema.data_locks l ON l.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID WHERE \
+			 l.OBJECT_SCHEMA = DATABASE()",
+		)
+		.fetch_one(store.pool())
+		.await
+		.unwrap();
+		if waiting > 0 {
+			return;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+	}
+	panic!("no statement started waiting for a lock");
+}
+
+/// Asserts that no other transaction holds a lock on build `id`.
+async fn assert_build_unlocked(store: &Store, id: &str) {
+	let mut probe = store.pool().begin().await.unwrap();
+	sqlx::query("SELECT id FROM builds WHERE id = ? FOR UPDATE NOWAIT")
+		.bind(id)
+		.fetch_one(&mut *probe)
+		.await
+		.expect("the build row is not locked while the template lock is awaited");
+	probe.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn deadlocked_template_delete_is_rerun() {
+	let Some(db) = TestDb::create().await else {
+		return;
+	};
+	let store = &db.store;
+	let team = store
+		.create_team("Acme", TeamLimits::default())
+		.await
+		.unwrap();
+	let (outcome, build_id) = register(store, &team.id, &team.slug, "tpl", &tags(&["v1"]), 10).await;
+	let tid = template_id(&outcome);
+
+	// Another transaction locks the build, then the template: the reverse of
+	// the delete's order. Its inserted log lines make it the heavier one, so
+	// InnoDB picks the delete as the deadlock victim.
+	let mut other = store.pool().begin().await.unwrap();
+	sqlx::query(
+		"INSERT INTO build_logs (build_id, seq, ts, level, message) WITH RECURSIVE n (i) AS (SELECT \
+		 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199) SELECT ?, i, UTC_TIMESTAMP(3), 'info', \
+		 'weight' FROM n",
+	)
+	.bind(&build_id)
+	.execute(&mut *other)
+	.await
+	.unwrap();
+	sqlx::query("UPDATE builds SET updated_at = UTC_TIMESTAMP(3) WHERE id = ?")
+		.bind(&build_id)
+		.execute(&mut *other)
+		.await
+		.unwrap();
+	let delete = tokio::spawn({
+		let store = store.clone();
+		let tid = tid.clone();
+		async move { store.soft_delete_template(&tid).await }
+	});
+	// The delete holds the template and waits for the build.
+	wait_for_lock_wait(store).await;
+	sqlx::query("UPDATE templates SET updated_at = UTC_TIMESTAMP(3) WHERE id = ?")
+		.bind(&tid)
+		.execute(&mut *other)
+		.await
+		.expect("the delete, not this transaction, is the deadlock victim");
+	other.commit().await.unwrap();
+
+	let deleted = delete
+		.await
+		.unwrap()
+		.expect("the deadlocked delete is rerun");
+	assert!(deleted.is_some());
+	assert!(store.template(&tid).await.unwrap().is_none());
+	assert_eq!(store.build(&build_id).await.unwrap().unwrap().status(), BuildStatus::Error);
+	db.drop_db().await;
+}
+
+#[tokio::test]
+async fn build_transitions_lock_the_template_before_the_build() {
+	let Some(db) = TestDb::create().await else {
+		return;
+	};
+	let store = &db.store;
+	let team = store
+		.create_team("Acme", TeamLimits::default())
+		.await
+		.unwrap();
+	let (outcome, build_id) = register(store, &team.id, &team.slug, "tpl", &tags(&["v1"]), 10).await;
+	let tid = template_id(&outcome);
+	let lock_template = async || {
+		let mut holder = store.pool().begin().await.unwrap();
+		sqlx::query("SELECT id FROM templates WHERE id = ? FOR UPDATE")
+			.bind(&tid)
+			.fetch_one(&mut *holder)
+			.await
+			.unwrap();
+		holder
+	};
+
+	// Template deletes and registrations lock the template, then its builds;
+	// a transition locking the build first closes a deadlock cycle with them.
+	let holder = lock_template().await;
+	let started = tokio::spawn({
+		let store = store.clone();
+		let build_id = build_id.clone();
+		async move {
+			let spec = serde_json::json!({"fromImage": "e2bdev/base"});
+			let start = BuildStart {
+				node_id:          "0000000000000007",
+				arch:             "x86_64",
+				spec:             &spec,
+				template_version: "2.1.0",
+				start_cmd:        None,
+				ready_cmd:        None,
+			};
+			store.mark_build_started(&build_id, &start).await
+		}
+	});
+	wait_for_lock_wait(store).await;
+	assert_build_unlocked(store, &build_id).await;
+	holder.commit().await.unwrap();
+	assert!(started.await.unwrap().unwrap());
+
+	let holder = lock_template().await;
+	let finished = tokio::spawn({
+		let store = store.clone();
+		let build_id = build_id.clone();
+		async move {
+			store
+				.finish_build_ready(&build_id, &artifact(&build_id))
+				.await
+		}
+	});
+	wait_for_lock_wait(store).await;
+	assert_build_unlocked(store, &build_id).await;
+	holder.commit().await.unwrap();
+	assert!(finished.await.unwrap().unwrap());
+	assert_eq!(store.tag_build(&tid, "v1").await.unwrap().as_deref(), Some(build_id.as_str()));
+	db.drop_db().await;
+}
+
+#[tokio::test]
+async fn fork_purge_leaves_other_templates_unlocked() {
+	let Some(db) = TestDb::create().await else {
+		return;
+	};
+	let store = &db.store;
+	let team = store
+		.create_team("Acme", TeamLimits::default())
+		.await
+		.unwrap();
+	let (outcome, _) = register(store, &team.id, &team.slug, "tpl", &tags(&["v1"]), 10).await;
+	let live = template_id(&outcome);
+	let fork_id = crate::builds::names::new_template_id();
+	let fork_build = uuid::Uuid::new_v4().to_string();
+	store
+		.register_snapshot(&RegisterSnapshot {
+			team_id:           &team.id,
+			kind:              TemplateKind::Fork,
+			source_sandbox_id: "isbx",
+			node_id:           "00000000000000d1",
+			name:              None,
+			tag:               "default",
+			new_template_id:   &fork_id,
+			build_id:          &fork_build,
+			vcpus:             2,
+			memory_mb:         512,
+			disk_mb:           1024,
+			envd_version:      "0.6.4",
+		})
+		.await
+		.unwrap();
+	assert!(
+		store
+			.soft_delete_template(&fork_id)
+			.await
+			.unwrap()
+			.is_some()
+	);
+	assert_eq!(store.purge_collected_forks().await.unwrap(), 0, "artifacts not collected yet");
+	store.mark_artifacts_collected(&fork_build).await.unwrap();
+
+	// A transaction holding an unrelated template (a spawn count bump, a
+	// build registration) must not stall the purge, nor the purge it.
+	let mut holder = store.pool().begin().await.unwrap();
+	sqlx::query("SELECT id FROM templates WHERE id = ? FOR UPDATE")
+		.bind(&live)
+		.fetch_one(&mut *holder)
+		.await
+		.unwrap();
+	let purged =
+		tokio::time::timeout(std::time::Duration::from_secs(5), store.purge_collected_forks())
+			.await
+			.expect("the purge does not wait for unrelated templates")
+			.unwrap();
+	holder.rollback().await.unwrap();
+	assert_eq!(purged, 1);
+	assert!(store.build(&fork_build).await.unwrap().is_none(), "builds cascade");
+	db.drop_db().await;
+}

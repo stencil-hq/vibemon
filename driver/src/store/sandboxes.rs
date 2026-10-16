@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{MySql, QueryBuilder, types::Json};
 use vmon_node::api::VolumeMount;
 
-use super::{NewSandboxEvent, Store, events::insert_event};
+use super::{NewSandboxEvent, Store, events::insert_event, retry_deadlocks};
 use crate::lifecycle::network::NetworkConfig;
 
 /// Durable sandbox state (`sandboxes.state`).
@@ -214,44 +214,47 @@ impl Store {
 		row: &NewSandboxRow<'_>,
 		event: &NewSandboxEvent<'_>,
 	) -> sqlx::Result<()> {
-		let mut tx = self.pool().begin().await?;
-		sqlx::query(
-			"INSERT INTO sandboxes (id, team_id, template_id, build_id, alias, node_id, state, \
-			 execution_id, vcpus, memory_mb, disk_mb, metadata, env_enc, auto_pause, \
-			 auto_pause_memory, auto_resume, allow_internet_access, network, egress_enc, \
-			 volume_mounts, lifecycle, envd_version, started_at, end_at, s3_mounts, s3_mounts_enc) \
-			 VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-			 ?, ?)",
-		)
-		.bind(row.id)
-		.bind(row.team_id)
-		.bind(row.template_id)
-		.bind(row.build_id)
-		.bind(row.alias)
-		.bind(row.node_id)
-		.bind(row.execution_id)
-		.bind(row.vcpus)
-		.bind(row.memory_mb)
-		.bind(row.disk_mb)
-		.bind(Json(row.metadata))
-		.bind(row.env_enc.as_deref())
-		.bind(row.auto_pause)
-		.bind(row.auto_pause_memory)
-		.bind(row.auto_resume)
-		.bind(row.allow_internet_access)
-		.bind(Json(row.network))
-		.bind(row.egress_enc.as_slice())
-		.bind(Json(row.volume_mounts))
-		.bind(Json(row.lifecycle))
-		.bind(row.envd_version)
-		.bind(row.started_at)
-		.bind(row.end_at)
-		.bind((!row.s3_mounts.is_empty()).then_some(Json(row.s3_mounts)))
-		.bind(row.s3_mounts_enc.as_deref())
-		.execute(&mut *tx)
-		.await?;
-		insert_event(&mut *tx, event).await?;
-		tx.commit().await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			sqlx::query(
+				"INSERT INTO sandboxes (id, team_id, template_id, build_id, alias, node_id, state, \
+				 execution_id, vcpus, memory_mb, disk_mb, metadata, env_enc, auto_pause, \
+				 auto_pause_memory, auto_resume, allow_internet_access, network, egress_enc, \
+				 volume_mounts, lifecycle, envd_version, started_at, end_at, s3_mounts, \
+				 s3_mounts_enc) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+				 ?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.bind(row.id)
+			.bind(row.team_id)
+			.bind(row.template_id)
+			.bind(row.build_id)
+			.bind(row.alias)
+			.bind(row.node_id)
+			.bind(row.execution_id)
+			.bind(row.vcpus)
+			.bind(row.memory_mb)
+			.bind(row.disk_mb)
+			.bind(Json(row.metadata))
+			.bind(row.env_enc.as_deref())
+			.bind(row.auto_pause)
+			.bind(row.auto_pause_memory)
+			.bind(row.auto_resume)
+			.bind(row.allow_internet_access)
+			.bind(Json(row.network))
+			.bind(row.egress_enc.as_slice())
+			.bind(Json(row.volume_mounts))
+			.bind(Json(row.lifecycle))
+			.bind(row.envd_version)
+			.bind(row.started_at)
+			.bind(row.end_at)
+			.bind((!row.s3_mounts.is_empty()).then_some(Json(row.s3_mounts)))
+			.bind(row.s3_mounts_enc.as_deref())
+			.execute(&mut *tx)
+			.await?;
+			insert_event(&mut *tx, event).await?;
+			tx.commit().await
+		})
+		.await
 	}
 
 	/// Row by sandbox ID regardless of team or state.
@@ -272,19 +275,22 @@ impl Store {
 		resumed: &ResumedExecution<'_>,
 		event: &NewSandboxEvent<'_>,
 	) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let done = sqlx::query(
-			"UPDATE sandboxes SET state = 'running', node_id = ?, execution_id = ?, started_at = ?, \
-			 end_at = ?, paused_at = NULL WHERE id = ? AND state = 'paused'",
-		)
-		.bind(resumed.node_id)
-		.bind(resumed.execution_id)
-		.bind(resumed.started_at)
-		.bind(resumed.end_at)
-		.bind(resumed.id)
-		.execute(&mut *tx)
-		.await?;
-		commit_with_event(tx, done.rows_affected() == 1, event).await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let done = sqlx::query(
+				"UPDATE sandboxes SET state = 'running', node_id = ?, execution_id = ?, started_at = \
+				 ?, end_at = ?, paused_at = NULL WHERE id = ? AND state = 'paused'",
+			)
+			.bind(resumed.node_id)
+			.bind(resumed.execution_id)
+			.bind(resumed.started_at)
+			.bind(resumed.end_at)
+			.bind(resumed.id)
+			.execute(&mut *tx)
+			.await?;
+			commit_with_event(tx, done.rows_affected() == 1, event).await
+		})
+		.await
 	}
 
 	/// Running → paused plus `event`, atomically; `false` (nothing written)
@@ -295,15 +301,19 @@ impl Store {
 		paused_at: DateTime<Utc>,
 		event: &NewSandboxEvent<'_>,
 	) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let done = sqlx::query(
-			"UPDATE sandboxes SET state = 'paused', paused_at = ? WHERE id = ? AND state = 'running'",
-		)
-		.bind(paused_at)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		commit_with_event(tx, done.rows_affected() == 1, event).await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let done = sqlx::query(
+				"UPDATE sandboxes SET state = 'paused', paused_at = ? WHERE id = ? AND state = \
+				 'running'",
+			)
+			.bind(paused_at)
+			.bind(id)
+			.execute(&mut *tx)
+			.await?;
+			commit_with_event(tx, done.rows_affected() == 1, event).await
+		})
+		.await
 	}
 
 	/// Running/paused → killed plus `event`, atomically; `false` (nothing
@@ -314,24 +324,31 @@ impl Store {
 		ended_at: DateTime<Utc>,
 		event: &NewSandboxEvent<'_>,
 	) -> sqlx::Result<bool> {
-		let mut tx = self.pool().begin().await?;
-		let done = sqlx::query(
-			"UPDATE sandboxes SET state = 'killed', ended_at = ? WHERE id = ? AND state <> 'killed'",
-		)
-		.bind(ended_at)
-		.bind(id)
-		.execute(&mut *tx)
-		.await?;
-		commit_with_event(tx, done.rows_affected() == 1, event).await
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let done = sqlx::query(
+				"UPDATE sandboxes SET state = 'killed', ended_at = ? WHERE id = ? AND state <> \
+				 'killed'",
+			)
+			.bind(ended_at)
+			.bind(id)
+			.execute(&mut *tx)
+			.await?;
+			commit_with_event(tx, done.rows_affected() == 1, event).await
+		})
+		.await
 	}
 
 	/// New expiry of a running sandbox.
 	pub async fn set_sandbox_end_at(&self, id: &str, end_at: DateTime<Utc>) -> sqlx::Result<()> {
-		sqlx::query("UPDATE sandboxes SET end_at = ? WHERE id = ?")
-			.bind(end_at)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		retry_deadlocks(|| async move {
+			sqlx::query("UPDATE sandboxes SET end_at = ? WHERE id = ?")
+				.bind(end_at)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(())
 	}
 
@@ -343,25 +360,32 @@ impl Store {
 		egress_enc: &[u8],
 		allow_internet_access: Option<bool>,
 	) -> sqlx::Result<()> {
-		sqlx::query(
-			"UPDATE sandboxes SET network = ?, egress_enc = ?, allow_internet_access = ? WHERE id = ?",
-		)
-		.bind(Json(network))
-		.bind(egress_enc)
-		.bind(allow_internet_access)
-		.bind(id)
-		.execute(self.pool())
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE sandboxes SET network = ?, egress_enc = ?, allow_internet_access = ? WHERE id \
+				 = ?",
+			)
+			.bind(Json(network))
+			.bind(egress_enc)
+			.bind(allow_internet_access)
+			.bind(id)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(())
 	}
 
 	/// Remembers the latest snapshot build captured from a sandbox.
 	pub async fn set_sandbox_snapshot_build(&self, id: &str, build_id: &str) -> sqlx::Result<()> {
-		sqlx::query("UPDATE sandboxes SET snapshot_build_id = ? WHERE id = ?")
-			.bind(build_id)
-			.bind(id)
-			.execute(self.pool())
-			.await?;
+		retry_deadlocks(|| async move {
+			sqlx::query("UPDATE sandboxes SET snapshot_build_id = ? WHERE id = ?")
+				.bind(build_id)
+				.bind(id)
+				.execute(self.pool())
+				.await
+		})
+		.await?;
 		Ok(())
 	}
 

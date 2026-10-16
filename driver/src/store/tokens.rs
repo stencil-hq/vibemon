@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 
-use super::Store;
+use super::{Store, retry_deadlocks};
 
 /// A stored refresh token.
 #[derive(Clone, Debug, FromRow)]
@@ -40,14 +40,18 @@ impl Store {
 		expires_at: DateTime<Utc>,
 	) -> sqlx::Result<String> {
 		let id = uuid::Uuid::new_v4().to_string();
-		sqlx::query(
-			"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
-		)
-		.bind(&id)
-		.bind(user_id)
-		.bind(token_hash)
-		.bind(expires_at)
-		.execute(self.pool())
+		let row_id = id.as_str();
+		retry_deadlocks(|| async move {
+			sqlx::query(
+				"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+			)
+			.bind(row_id)
+			.bind(user_id)
+			.bind(token_hash)
+			.bind(expires_at)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(id)
 	}
@@ -59,56 +63,62 @@ impl Store {
 		new_hash: &str,
 		new_expires_at: DateTime<Utc>,
 	) -> sqlx::Result<Rotation> {
-		let mut tx = self.pool().begin().await?;
-		let row: Option<RefreshTokenRow> = sqlx::query_as(
-			"SELECT id, user_id, token_hash, created_at, expires_at, revoked_at FROM refresh_tokens \
-			 WHERE token_hash = ? FOR UPDATE",
-		)
-		.bind(old_hash)
-		.fetch_optional(&mut *tx)
-		.await?;
-		let Some(row) = row else {
-			return Ok(Rotation::Invalid);
-		};
-		if row.revoked_at.is_some() {
-			sqlx::query(
-				"UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE user_id = ? AND \
-				 revoked_at IS NULL",
+		retry_deadlocks(|| async move {
+			let mut tx = self.pool().begin().await?;
+			let row: Option<RefreshTokenRow> = sqlx::query_as(
+				"SELECT id, user_id, token_hash, created_at, expires_at, revoked_at FROM \
+				 refresh_tokens WHERE token_hash = ? FOR UPDATE",
 			)
+			.bind(old_hash)
+			.fetch_optional(&mut *tx)
+			.await?;
+			let Some(row) = row else {
+				return Ok(Rotation::Invalid);
+			};
+			if row.revoked_at.is_some() {
+				sqlx::query(
+					"UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE user_id = ? AND \
+					 revoked_at IS NULL",
+				)
+				.bind(&row.user_id)
+				.execute(&mut *tx)
+				.await?;
+				tx.commit().await?;
+				return Ok(Rotation::Reused);
+			}
+			if row.expires_at <= Utc::now() {
+				return Ok(Rotation::Invalid);
+			}
+			sqlx::query("UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE id = ?")
+				.bind(&row.id)
+				.execute(&mut *tx)
+				.await?;
+			sqlx::query(
+				"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+			)
+			.bind(uuid::Uuid::new_v4().to_string())
 			.bind(&row.user_id)
+			.bind(new_hash)
+			.bind(new_expires_at)
 			.execute(&mut *tx)
 			.await?;
 			tx.commit().await?;
-			return Ok(Rotation::Reused);
-		}
-		if row.expires_at <= Utc::now() {
-			return Ok(Rotation::Invalid);
-		}
-		sqlx::query("UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE id = ?")
-			.bind(&row.id)
-			.execute(&mut *tx)
-			.await?;
-		sqlx::query(
-			"INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
-		)
-		.bind(uuid::Uuid::new_v4().to_string())
-		.bind(&row.user_id)
-		.bind(new_hash)
-		.bind(new_expires_at)
-		.execute(&mut *tx)
-		.await?;
-		tx.commit().await?;
-		Ok(Rotation::Rotated { user_id: row.user_id })
+			Ok(Rotation::Rotated { user_id: row.user_id })
+		})
+		.await
 	}
 
 	/// Revokes a refresh token; `false` when unknown or already revoked.
 	pub async fn revoke_refresh_token(&self, token_hash: &str) -> sqlx::Result<bool> {
-		let done = sqlx::query(
-			"UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE token_hash = ? AND \
-			 revoked_at IS NULL",
-		)
-		.bind(token_hash)
-		.execute(self.pool())
+		let done = retry_deadlocks(|| async move {
+			sqlx::query(
+				"UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP(3) WHERE token_hash = ? AND \
+				 revoked_at IS NULL",
+			)
+			.bind(token_hash)
+			.execute(self.pool())
+			.await
+		})
 		.await?;
 		Ok(done.rows_affected() > 0)
 	}
