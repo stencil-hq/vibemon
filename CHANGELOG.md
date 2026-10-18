@@ -67,6 +67,8 @@ All notable changes to this project are recorded here.
 
 ### Changed
 
+- Migrated events, deliveries, and build logs to journal streams for persistent, append-only history and improved pagination stability
+- Updated delivery API cursors to support sequence-based journal pagination
 - Increased lifecycle event and webhook delivery retention from 7 days to 30 days
 - Disk overlays (`--disk-overlay-of`) on Linux and macOS are now block-level copy-on-write overlays over a hard-linked raw base (`<rootfs>.base`), so sandbox create, kill, pause, resume, and fork no longer copy the template rootfs on filesystems without reflinks (ext4); overlay clones reflink when possible and otherwise copy only written extents, and guest flushes on these VM-private overlays no longer fsync the host
 - Template builds resolve image tags with `HEAD` (not counted against Docker Hub pull limits) and serve manifests and image configs from a content-addressed cache, so rebuilding from a cached image no longer re-downloads manifests; registry rate limits (HTTP 429) now fail with the registry's message and `Retry-After`

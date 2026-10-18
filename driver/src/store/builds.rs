@@ -19,24 +19,26 @@
 //! - `db/build.gc/<updated_at>/<id>`: finished builds of deleted templates
 //!   whose artifacts are not collected yet; written by template deletes,
 //!   removed by [`Store::mark_artifacts_collected`].
-//! - `db/blog/<build_id>/<seq>` → [`LogRow`] and
-//!   `db/blog.ts/<build_id>/<ts>/<seq>` → `{seq, level}`: log lines in sequence
-//!   and in time order, written with [`HISTORY_TTL`] and deleted with their
-//!   build.
+//! - `db/build.logs/<build_id>` → `u64`: number of stored log lines (= next
+//!   line `seq`). [`Store::append_build_logs`] reads it (guarded) in the same
+//!   transaction as its appends, so re-delivered or concurrent batches never
+//!   duplicate a line. Deleted with its build.
+//!
+//! Journal stream `blog/<build_id>` → one [`LogRow`] per record, appended in
+//! line `seq` order; records expire after [`super::HISTORY_RETENTION`] and
+//! become unreachable when their build is deleted.
 //!
 //! [`put_build`] moves the status indexes with the record. Each transition
 //! reads the build (and the template it changes) in its transaction, so a
 //! concurrent transition fails the commit and the rerun sees its status.
 
-use std::collections::HashSet;
-
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
-use vmon_cluster::kv::{Compare, Range};
+use vmon_cluster::kv::{Range, Scan};
 use vmon_node::api::{ArtifactInfo, BuildReason};
 
 use super::{
-	Cursor, HISTORY_TTL, Read, Result, Store, Tx, from_micros, key, now, prefix, seq,
+	Cursor, Read, Result, Store, Tx, from_micros, key, now, prefix,
 	templates::{TemplateRow, template_key, upsert_tags},
 	time_segment,
 };
@@ -47,8 +49,9 @@ const READY: &str = "db/build.ready";
 const UNFINISHED: &str = "db/build.unfinished";
 const BUILDING: &str = "db/build.building";
 const GC: &str = "db/build.gc";
-const LOG: &str = "db/blog";
-const LOG_BY_TIME: &str = "db/blog.ts";
+const LOG_COUNT: &str = "db/build.logs";
+/// Journal table of build log streams (`blog/<build_id>`).
+const LOG_STREAM: &str = "blog";
 
 /// `kind` of builds made from steps (`POST /v3/templates`).
 pub(super) const KIND_BUILD: &str = "build";
@@ -174,7 +177,7 @@ impl BuildRow {
 	}
 }
 
-/// A stored build log line (`db/blog/<build_id>/<seq>`).
+/// A stored build log line (journal stream `blog/<build_id>`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRow {
 	pub seq:     u64,
@@ -183,14 +186,6 @@ pub struct LogRow {
 	pub level:   String,
 	pub step:    Option<String>,
 	pub message: String,
-}
-
-/// Value of a `db/blog.ts` entry: what level filtering needs before the line
-/// is loaded.
-#[derive(Serialize, Deserialize)]
-struct LogRef {
-	seq:   u64,
-	level: String,
 }
 
 /// A log line to persist (from a node's `BuildStatus`).
@@ -269,8 +264,14 @@ fn gc_key(build: &BuildRow) -> String {
 	key(GC, &[&time_segment(build.updated_at), &build.id])
 }
 
-fn log_key(build_id: &str, n: u64) -> String {
-	key(LOG, &[build_id, &seq(n)])
+/// Key of the stored line count of build `build_id`.
+fn log_count_key(build_id: &str) -> String {
+	key(LOG_COUNT, &[build_id])
+}
+
+/// Journal scan of every log line of build `build_id`, oldest first.
+fn log_scan(build_id: &str) -> Scan {
+	Scan { stream: key(LOG_STREAM, &[build_id]), ..Scan::default() }
 }
 
 /// Stages `new` (replacing `old`, the record read in this transaction; `None`
@@ -317,8 +318,7 @@ pub(super) fn delete_build(tx: &mut Tx<'_>, build: &BuildRow) {
 	}
 	tx.delete(template_index_key(build));
 	tx.delete(gc_key(build));
-	tx.delete_prefix(prefix(LOG, &[&build.id]));
-	tx.delete_prefix(prefix(LOG_BY_TIME, &[&build.id]));
+	tx.delete(log_count_key(&build.id));
 	tx.delete(build_key(&build.id));
 }
 
@@ -637,14 +637,12 @@ impl Store {
 	///
 	/// Store failures.
 	pub async fn build_log_count(&self, build_id: &str) -> Result<u64> {
-		let range = Range {
-			prefix: prefix(LOG, &[build_id]),
-			limit: Some(1),
-			reverse: true,
-			..Range::default()
-		};
-		let last = self.read().await?.scan::<LogRow>(&range).await?;
-		Ok(last.first().map_or(0, |(_, line)| line.seq + 1))
+		Ok(self
+			.read()
+			.await?
+			.get::<u64>(&log_count_key(build_id))
+			.await?
+			.unwrap_or(0))
 	}
 
 	/// Appends log lines with consecutive `seq` from `first_seq` in one
@@ -674,30 +672,19 @@ impl Store {
 				message: log.message.clone(),
 			})
 			.collect();
-		let stored = Range {
-			prefix:  prefix(LOG, &[build_id]),
-			after:   first_seq.checked_sub(1).map(|n| log_key(build_id, n)),
-			limit:   Some(lines.len()),
-			reverse: false,
-		};
+		let end = first_seq + lines.len() as u64;
+		let count_key = log_count_key(build_id);
+		let stream = vec![key(LOG_STREAM, &[build_id])];
 		let mut tx = self.tx().await?;
 		loop {
-			let existing: HashSet<u64> = tx
-				.scan::<LogRow>(&stored)
-				.await?
-				.into_iter()
-				.map(|(_, line)| line.seq)
-				.collect();
-			for line in lines.iter().filter(|line| !existing.contains(&line.seq)) {
-				let line_key = log_key(build_id, line.seq);
-				tx.require(Compare::Missing(line_key.clone()));
-				tx.put_ttl(line_key, line, HISTORY_TTL);
-				tx.put_ttl(
-					key(LOG_BY_TIME, &[build_id, &time_segment(line.ts), &seq(line.seq)]),
-					&LogRef { seq: line.seq, level: line.level.clone() },
-					HISTORY_TTL,
-				);
+			let stored = tx.get::<u64>(&count_key).await?.unwrap_or(0);
+			if end <= stored {
+				return Ok(());
 			}
+			for line in lines.iter().filter(|line| line.seq >= stored) {
+				tx.append(stream.clone(), line);
+			}
+			tx.put(count_key.clone(), &end);
 			if tx.commit().await? {
 				return Ok(());
 			}
@@ -723,11 +710,11 @@ impl Store {
 			return Ok(page);
 		}
 		let mut skip = offset;
-		let range = Range { prefix: prefix(LOG, &[build_id]), ..Range::default() };
 		self
 			.read()
 			.await?
-			.scan_all::<LogRow>(&range, |_, line| {
+			.journal_each::<LogRow>(&log_scan(build_id), |logged| {
+				let line = logged.value;
 				if LogLevel::normalize(&line.level) >= min_level {
 					if skip > 0 {
 						skip -= 1;
@@ -759,39 +746,31 @@ impl Store {
 		if want == 0 {
 			return Ok(Vec::new());
 		}
-		let from = key(LOG_BY_TIME, &[build_id, &time_segment(cursor)]);
-		let range = match direction {
-			// Every key of an instant at or after `cursor` sorts after its bare
-			// time segment.
-			LogDirection::Forward => Range {
-				prefix: prefix(LOG_BY_TIME, &[build_id]),
-				after: Some(from),
-				..Range::default()
+		// Node timestamps need not follow `seq`, so the (bounded) stream is
+		// filtered and sorted in full.
+		let mut page = Vec::new();
+		self
+			.read()
+			.await?
+			.journal_each::<LogRow>(&log_scan(build_id), |logged| {
+				let line = logged.value;
+				let in_range = match direction {
+					LogDirection::Forward => line.ts >= cursor,
+					LogDirection::Backward => line.ts <= cursor,
+				};
+				if in_range && LogLevel::normalize(&line.level) >= min_level {
+					page.push(line);
+				}
+				true
+			})
+			.await?;
+		match direction {
+			LogDirection::Forward => page.sort_unstable_by_key(|line| (line.ts, line.seq)),
+			LogDirection::Backward => {
+				page.sort_unstable_by_key(|line| std::cmp::Reverse((line.ts, line.seq)));
 			},
-			// `~` sorts after every `seq` segment of the cursor's instant.
-			LogDirection::Backward => Range {
-				prefix: prefix(LOG_BY_TIME, &[build_id]),
-				after: Some(format!("{from}/~")),
-				reverse: true,
-				..Range::default()
-			},
-		};
-		let r = self.read().await?;
-		let mut seqs = Vec::new();
-		r.scan_all::<LogRef>(&range, |_, line| {
-			if LogLevel::normalize(&line.level) >= min_level {
-				seqs.push(line.seq);
-			}
-			seqs.len() < want
-		})
-		.await?;
-		let mut page = Vec::with_capacity(seqs.len());
-		for n in seqs {
-			// Expired lines are skipped.
-			if let Some(line) = r.get::<LogRow>(&log_key(build_id, n)).await? {
-				page.push(line);
-			}
 		}
+		page.truncate(want);
 		Ok(page)
 	}
 

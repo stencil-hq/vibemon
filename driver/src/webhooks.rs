@@ -6,7 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use futures::future::join_all;
 use http::{HeaderMap, HeaderValue};
 
@@ -78,7 +77,8 @@ async fn deliver_hook(state: &AppState, hook: &WebhookRow) -> store::Result<()> 
 			if attempt > 1 {
 				tokio::time::sleep(RETRY_BASE * 2u32.pow(attempt - 2)).await;
 			}
-			let delivery = deliver_once(&state.http, hook, secret.as_deref(), event).await;
+			let mut delivery = deliver_once(&state.http, hook, secret.as_deref(), event).await;
+			delivery.first = attempt == 1;
 			let ok = delivery.status == "success";
 			state.store.insert_delivery(&delivery).await?;
 			if ok || delivery.error_class == Some("signature_error") {
@@ -120,9 +120,12 @@ fn classify(error: &reqwest::Error) -> &'static str {
 	}
 }
 
-/// Performs one signed POST of `event` to `hook.url` and describes the
-/// attempt. `secret` is `None` when the stored secret cannot be decrypted
-/// (recorded as `signature_error`, nothing is sent).
+/// Performs one signed POST of `event` to `hook.url` and describes the attempt.
+///
+/// The attempt is marked as the event's first (the delivery loop clears
+/// [`NewDelivery::first`] on retries). `secret` is `None` when the stored
+/// secret cannot be decrypted (recorded as `signature_error`, nothing is
+/// sent).
 pub async fn deliver_once(
 	http: &reqwest::Client,
 	hook: &WebhookRow,
@@ -131,7 +134,6 @@ pub async fn deliver_once(
 ) -> NewDelivery {
 	let body = event.to_webhook_json().to_string();
 	let delivery_id = uuid::Uuid::new_v4().to_string();
-	let started = Utc::now();
 	let mut record = NewDelivery {
 		team_id:          hook.team_id.clone(),
 		webhook_id:       hook.id.clone(),
@@ -148,7 +150,7 @@ pub async fn deliver_once(
 		response_body:    None,
 		error_class:      None,
 		error_message:    None,
-		ts:               started,
+		first:            true,
 	};
 	let Some(secret) = secret else {
 		record.error_class = Some("signature_error");
@@ -211,6 +213,7 @@ mod tests {
 
 	use axum::{Router, body::Bytes, http::StatusCode, routing::post};
 	use base64::Engine;
+	use chrono::Utc;
 	use parking_lot::Mutex;
 	use sha2::{Digest, Sha256};
 

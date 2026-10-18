@@ -2,29 +2,27 @@
 //! by the sandbox lifecycle through [`Store::record_event`] or, together with
 //! a state change, by the transitions in [`super::sandboxes`].
 //!
-//! Keys (every one written with [`HISTORY_TTL`] in the event's commit):
-//! - `db/event/<stamp>` → [`SandboxEventRow`] (JSON; `seq` is not stored): the
-//!   log in global commit order. `<stamp>` is the commit revision
-//!   ([`vmon_cluster::kv::stamp`]) and is the event's `seq`.
-//! - `db/event.team/<team>/<stamp>` → `{type, ts}`: the team's events in commit
-//!   order (events API, webhook cursor, metrics timeline).
-//! - `db/event.sandbox/<team>/<sandbox>/<stamp>` → `{type, ts}`: one sandbox's
-//!   events (events API with a sandbox filter).
+//! Events live in the raft-replicated journal, not the KV. Each event is one
+//! record (value: [`SandboxEventRow`] JSON without `seq`/`ts`) indexed in
+//! three streams:
+//! - `ev`: every event, in commit order (fleet sampler, newest `seq`).
+//! - `ev/<team>`: the team's events (events API, webhook cursor, metrics
+//!   timeline).
+//! - `ev/<team>/<sandbox>`: one sandbox's events (events API with a sandbox
+//!   filter).
 //!
-//! The index values carry the event type and time so type filters and the
-//! metrics timeline never load records they discard; only returned events
-//! read their `db/event/<stamp>` record. A commit stages at most one event
-//! (all stamped keys of a commit share its stamp). No guards: events are
-//! append-only.
+//! An event's `seq` is its record's journal position and its `ts` the
+//! record's commit time. Records expire [`HISTORY_RETENTION`] after commit.
+//! No guards: events are append-only, and a commit may stage several.
 
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use vmon_cluster::kv::{Range, stamp};
+use vmon_cluster::kv::Scan;
 
-use super::{Error, HISTORY_TTL, Read, Result, Store, Tx, last_segment, prefix};
+use super::{HISTORY_RETENTION, Logged, Result, Store, Tx, key};
 
 /// Event type names (`SandboxEvent.type`, webhook subscriptions).
 pub mod event_types {
@@ -47,22 +45,18 @@ pub mod event_types {
 /// Version stamped into every serialized event.
 pub const EVENT_VERSION: &str = "v2";
 /// Retention advertised in webhook payloads: events expire after
-/// [`HISTORY_TTL`].
+/// [`HISTORY_RETENTION`].
 #[expect(clippy::cast_possible_truncation, reason = "asserted at compile time to fit in u32")]
 pub const EVENTS_TTL_DAYS: u32 = {
-	let days = HISTORY_TTL.as_secs() / DAY.as_secs();
-	assert!(days * DAY.as_secs() == HISTORY_TTL.as_secs(), "HISTORY_TTL is whole days");
-	assert!(days < 1 << 32, "HISTORY_TTL in days fits in u32");
+	let days = HISTORY_RETENTION.as_secs() / DAY.as_secs();
+	assert!(days * DAY.as_secs() == HISTORY_RETENTION.as_secs(), "HISTORY_RETENTION is whole days");
+	assert!(days < 1 << 32, "HISTORY_RETENTION in days fits in u32");
 	days as u32
 };
 const DAY: Duration = Duration::from_hours(24);
 
-/// Primary records, in commit order.
-const EVENTS: &str = "db/event";
-/// Per-team index.
-const BY_TEAM: &str = "db/event.team";
-/// Per-(team, sandbox) index.
-const BY_SANDBOX: &str = "db/event.sandbox";
+/// Journal stream table: `ev`, `ev/<team>`, `ev/<team>/<sandbox>`.
+const EVENTS: &str = "ev";
 
 /// Insert payload for [`Store::record_event`].
 #[derive(Clone, Debug)]
@@ -81,11 +75,11 @@ pub struct NewSandboxEvent<'a> {
 	pub data:         Value,
 }
 
-/// A stored event (`db/event/<stamp>`).
+/// A journal event record (streams `ev`, `ev/<team>`, `ev/<team>/<sandbox>`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxEventRow {
-	/// Commit revision stamped into the event's key: monotonic in commit
-	/// order (webhook cursor). Not stored in the record.
+	/// Journal position of the record: dense, monotonic in commit order
+	/// (webhook cursor). Not stored in the value.
 	#[serde(skip)]
 	pub seq:          u64,
 	pub id:           String,
@@ -96,18 +90,19 @@ pub struct SandboxEventRow {
 	pub build_id:     String,
 	#[serde(rename = "type")]
 	pub event_type:   String,
+	/// Commit time of the record. Not stored in the value.
+	#[serde(skip)]
 	pub ts:           DateTime<Utc>,
 	#[serde(default)]
 	pub data:         Option<Value>,
 }
 
-/// Value of the index keys; also decodes the type and time of a full
-/// [`SandboxEventRow`] record (same field names).
-#[derive(Debug, Serialize, Deserialize)]
+/// Decodes only the type of a [`SandboxEventRow`] record, so filters and
+/// counters skip the rest of the value.
+#[derive(Debug, Deserialize)]
 struct EventRef {
 	#[serde(rename = "type")]
 	event_type: String,
-	ts:         DateTime<Utc>,
 }
 
 /// Filters of the events API.
@@ -179,53 +174,37 @@ impl SandboxEventRow {
 	}
 }
 
-/// Stages `event` (record and both index keys) into `tx` and returns its id.
-/// The event commits iff the transaction does; a transaction stages at most
-/// one event.
+/// Stages `event` (one journal record in `ev`, `ev/<team>` and
+/// `ev/<team>/<sandbox>`) into `tx` and returns its id. The event commits iff
+/// the transaction does.
 pub(super) fn stage_event(tx: &mut Tx<'_>, event: &NewSandboxEvent<'_>) -> String {
 	let id = uuid::Uuid::new_v4().to_string();
-	let ts = super::now();
 	let row = SandboxEventRow {
-		seq: 0,
-		id: id.clone(),
-		team_id: event.team_id.to_owned(),
-		sandbox_id: event.sandbox_id.to_owned(),
+		seq:          0,
+		id:           id.clone(),
+		team_id:      event.team_id.to_owned(),
+		sandbox_id:   event.sandbox_id.to_owned(),
 		execution_id: event.execution_id.to_owned(),
-		template_id: event.template_id.to_owned(),
-		build_id: event.build_id.to_owned(),
-		event_type: event.event_type.to_owned(),
-		ts,
-		data: Some(event.data.clone()),
+		template_id:  event.template_id.to_owned(),
+		build_id:     event.build_id.to_owned(),
+		event_type:   event.event_type.to_owned(),
+		ts:           DateTime::default(),
+		data:         Some(event.data.clone()),
 	};
-	let index = EventRef { event_type: event.event_type.to_owned(), ts };
-	let ttl = Some(HISTORY_TTL);
-	tx.put_stamped(prefix(EVENTS, &[]), "", &row, ttl);
-	tx.put_stamped(prefix(BY_TEAM, &[event.team_id]), "", &index, ttl);
-	tx.put_stamped(prefix(BY_SANDBOX, &[event.team_id, event.sandbox_id]), "", &index, ttl);
+	tx.append(
+		vec![
+			key(EVENTS, &[]),
+			key(EVENTS, &[event.team_id]),
+			key(EVENTS, &[event.team_id, event.sandbox_id]),
+		],
+		&row,
+	);
 	id
 }
 
-/// `seq` of the event at a stamped key (its last segment).
-fn seq_of(key: &str) -> Result<u64> {
-	last_segment(key)
-		.parse()
-		.map_err(|error: std::num::ParseIntError| Error::Corrupt {
-			key:   key.to_owned(),
-			error: error.to_string(),
-		})
-}
-
-/// Loads the records of `seqs` in order, skipping expired ones.
-async fn load(r: &Read<'_>, seqs: Vec<u64>) -> Result<Vec<SandboxEventRow>> {
-	let mut rows = Vec::with_capacity(seqs.len());
-	for seq in seqs {
-		let key = format!("{}{}", prefix(EVENTS, &[]), stamp(seq));
-		if let Some(mut row) = r.get::<SandboxEventRow>(&key).await? {
-			row.seq = seq;
-			rows.push(row);
-		}
-	}
-	Ok(rows)
+/// Event of a journal record, with its `seq` and `ts`.
+fn row(logged: Logged<SandboxEventRow>) -> SandboxEventRow {
+	SandboxEventRow { seq: logged.seq, ts: logged.at, ..logged.value }
 }
 
 /// Whether `event_type` passes a type filter (empty = all).
@@ -256,43 +235,35 @@ impl Store {
 		if query.limit == 0 {
 			return Ok(Vec::new());
 		}
-		let index = match &query.sandbox_id {
-			Some(sandbox_id) => prefix(BY_SANDBOX, &[team_id, sandbox_id]),
-			None => prefix(BY_TEAM, &[team_id]),
+		let stream = match &query.sandbox_id {
+			Some(sandbox_id) => key(EVENTS, &[team_id, sandbox_id]),
+			None => key(EVENTS, &[team_id]),
 		};
-		let range = Range { prefix: index, reverse: !query.order_asc, ..Range::default() };
+		let scan = Scan { stream, reverse: !query.order_asc, ..Scan::default() };
 		let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
 		let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
-		let r = self.read().await?;
 		let mut skipped = 0;
-		let mut seqs = Vec::new();
-		let mut corrupt = None;
-		r.scan_all::<EventRef>(&range, |key, event| {
-			if !wanted(&query.types, &event.event_type) {
-				return true;
-			}
-			if skipped < offset {
-				skipped += 1;
-				return true;
-			}
-			match seq_of(&key) {
-				Ok(seq) => seqs.push(seq),
-				Err(error) => {
-					corrupt = Some(error);
-					return false;
-				},
-			}
-			seqs.len() < limit
-		})
-		.await?;
-		if let Some(error) = corrupt {
-			return Err(error);
-		}
-		load(&r, seqs).await
+		let mut rows = Vec::new();
+		self
+			.read()
+			.await?
+			.journal_each::<SandboxEventRow>(&scan, |logged| {
+				if !wanted(&query.types, &logged.value.event_type) {
+					return true;
+				}
+				if skipped < offset {
+					skipped += 1;
+					return true;
+				}
+				rows.push(row(logged));
+				rows.len() < limit
+			})
+			.await?;
+		Ok(rows)
 	}
 
-	/// Events of a team with `seq > after_seq` (oldest first) restricted to
-	/// `types`; used by webhook delivery.
+	/// Events of a team with `seq > after_seq` (oldest first; 0 = from the
+	/// start) restricted to `types`; used by webhook delivery.
 	pub async fn events_after(
 		&self,
 		team_id: &str,
@@ -304,103 +275,86 @@ impl Store {
 			return Ok(Vec::new());
 		}
 		let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-		let index = prefix(BY_TEAM, &[team_id]);
-		let range = Range {
-			after: Some(format!("{index}{}", stamp(after_seq))),
-			prefix: index,
-			..Range::default()
-		};
-		let r = self.read().await?;
-		let mut seqs = Vec::new();
-		let mut corrupt = None;
-		r.scan_all::<EventRef>(&range, |key, event| {
-			if !wanted(types, &event.event_type) {
-				return true;
-			}
-			match seq_of(&key) {
-				Ok(seq) => seqs.push(seq),
-				Err(error) => {
-					corrupt = Some(error);
-					return false;
-				},
-			}
-			seqs.len() < limit
-		})
-		.await?;
-		if let Some(error) = corrupt {
-			return Err(error);
-		}
-		load(&r, seqs).await
+		let scan =
+			Scan { stream: key(EVENTS, &[team_id]), after: Some(after_seq), ..Scan::default() };
+		let mut rows = Vec::new();
+		self
+			.read()
+			.await?
+			.journal_each::<SandboxEventRow>(&scan, |logged| {
+				if wanted(types, &logged.value.event_type) {
+					rows.push(row(logged));
+				}
+				rows.len() < limit
+			})
+			.await?;
+		Ok(rows)
 	}
 
 	/// Highest retained event sequence number (0 when none).
 	pub async fn max_event_seq(&self) -> Result<u64> {
-		let range =
-			Range { prefix: prefix(EVENTS, &[]), limit: Some(1), reverse: true, ..Range::default() };
-		let last = self.read().await?.scan::<EventRef>(&range).await?;
-		last.first().map_or(Ok(0), |(key, _)| seq_of(key))
+		let scan =
+			Scan { stream: key(EVENTS, &[]), limit: Some(1), reverse: true, ..Scan::default() };
+		let last = self.read().await?.journal::<EventRef>(&scan).await?;
+		Ok(last.first().map_or(0, |logged| logged.seq))
 	}
 
 	/// Cluster-wide start events (created + resumed) with `seq > after_seq`,
 	/// and the highest `seq` of any type (`after_seq` when none); one ordered
-	/// scan of the log, used as the fleet sampler's cursor.
+	/// walk of the log, used as the fleet sampler's cursor.
 	pub async fn start_events_after(&self, after_seq: u64) -> Result<(u64, u64)> {
-		let events = prefix(EVENTS, &[]);
-		let range = Range {
-			after: Some(format!("{events}{}", stamp(after_seq))),
-			prefix: events,
-			..Range::default()
-		};
+		let scan = Scan { stream: key(EVENTS, &[]), after: Some(after_seq), ..Scan::default() };
 		let mut starts = 0;
-		let mut last = None;
+		let mut max = after_seq;
 		self
 			.read()
 			.await?
-			.scan_all::<EventRef>(&range, |key, event| {
-				starts += u64::from(is_start(&event.event_type));
-				last = Some(key);
+			.journal_each::<EventRef>(&scan, |logged| {
+				starts += u64::from(is_start(&logged.value.event_type));
+				max = logged.seq;
 				true
 			})
 			.await?;
-		let max = last.as_deref().map_or(Ok(after_seq), seq_of)?;
 		Ok((starts, max))
 	}
 
-	/// `(ts, type)` of a team's start/stop events in `[start, end]`, oldest
-	/// first, plus the net running count before `start` over the retained
-	/// events, clamped at 0 (team metrics).
+	/// `(ts, type)` of a team's start/stop events in `[start, end]`, ordered
+	/// by (time, seq), plus the net running count before `start` over the
+	/// retained events, clamped at 0 (team metrics).
 	pub async fn lifecycle_timeline(
 		&self,
 		team_id: &str,
 		start: DateTime<Utc>,
 		end: DateTime<Utc>,
 	) -> Result<(i64, Vec<(DateTime<Utc>, String)>)> {
-		let range = Range { prefix: prefix(BY_TEAM, &[team_id]), ..Range::default() };
+		let scan = Scan { stream: key(EVENTS, &[team_id]), ..Scan::default() };
 		let mut baseline = 0i64;
 		let mut events = Vec::new();
 		self
 			.read()
 			.await?
-			.scan_all::<EventRef>(&range, |key, event| {
-				let delta = if is_start(&event.event_type) {
+			.journal_each::<EventRef>(&scan, |logged| {
+				// Commit time never decreases with seq: nothing later is in
+				// the window.
+				if logged.at > end {
+					return false;
+				}
+				let delta = if is_start(&logged.value.event_type) {
 					1
-				} else if is_stop(&event.event_type) {
+				} else if is_stop(&logged.value.event_type) {
 					-1
 				} else {
 					return true;
 				};
-				if event.ts < start {
+				if logged.at < start {
 					baseline += delta;
-				} else if event.ts <= end {
-					events.push((event.ts, key, event.event_type));
+				} else {
+					events.push((logged.at, logged.value.event_type));
 				}
 				true
 			})
 			.await?;
-		// Index keys are in commit order; timestamps are minted just before
-		// the commit, so order by time with the commit as tie-breaker.
-		events.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-		Ok((baseline.max(0), events.into_iter().map(|(ts, _, ty)| (ts, ty)).collect()))
+		Ok((baseline.max(0), events))
 	}
 }
 
@@ -538,6 +492,29 @@ mod tests {
 			.unwrap();
 		assert_eq!(baseline, 1);
 		assert_eq!(events.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>(), [event_types::KILLED]);
+		db.finish().await;
+	}
+
+	#[tokio::test]
+	async fn one_commit_holds_several_events_sharing_its_time() {
+		let db = TestStore::start().await;
+		let store = &db.store;
+		let before = store.max_event_seq().await.unwrap();
+		let mut tx = store.tx().await.unwrap();
+		loop {
+			stage_event(&mut tx, &new_event("ia", event_types::CREATED));
+			stage_event(&mut tx, &new_event("ib", event_types::CREATED));
+			if tx.commit().await.unwrap() {
+				break;
+			}
+		}
+		let rows = store.events_after(TEAM, before, &[], 10).await.unwrap();
+		assert_eq!(rows.iter().map(|e| e.seq).collect::<Vec<_>>(), [before + 1, before + 2]);
+		assert_eq!(rows[0].ts, rows[1].ts, "ts is the shared commit time");
+		assert_eq!(store.max_event_seq().await.unwrap(), before + 2);
+		let only_ib =
+			EventQuery { sandbox_id: Some("ib".into()), limit: 10, ..EventQuery::default() };
+		assert_eq!(store.list_events(TEAM, &only_ib).await.unwrap().len(), 1);
 		db.finish().await;
 	}
 }

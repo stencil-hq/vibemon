@@ -5,36 +5,70 @@
 //!   forward (guarded read-modify-write).
 //! - `db/webhook.team/<team>/<id>` → empty: the team's webhooks.
 //!
-//! Deliveries (all written with [`HISTORY_TTL`], removed with their webhook;
-//! an attempt recorded for a deleted webhook is dropped):
-//! - `db/delivery/<webhook>/<event>/<time(ts)>/<id>` → [`DeliveryRow`]: the
-//!   attempts of one event in time order.
-//! - `db/delivery.event/<webhook>/<event>` → time of the event's first attempt
-//!   (guarded: the first attempt creates the group exactly once).
-//! - `db/delivery.group/<webhook>/<time(first attempt)>/<event>` → event type:
-//!   groups in order of their first attempt, paged by range scans.
-//! - `db/delivery.ts/<webhook>/<time(ts)>/<id>` → time, status, event type and
-//!   duration of every attempt in time order, scanned by the stats.
+//! Delivery attempts live in the journal, not the KV: each attempt is one
+//! record whose value is its [`DeliveryRow`] (`ts` comes from the record's
+//! commit time), appended in the same transaction as a guarded read of the
+//! webhook record (an attempt recorded for a deleted webhook is dropped).
+//! Streams:
+//! - `wh/<webhook>`: every attempt, in commit (= time) order; walked by the
+//!   stats.
+//! - `wh/<webhook>/event/<event>`: the attempts of one event.
+//! - `wh/<webhook>/groups`: the first attempt of each event (one per event
+//!   group, in order of first attempts), paged by the deliveries list. A first
+//!   attempt repeated after a leader change appends a second group record;
+//!   readers keep only the group record that is also the earliest record of the
+//!   event's stream.
+//!
+//! Records expire after [`super::HISTORY_RETENTION`]; deleting a webhook
+//! leaves them unreachable (webhook ids are never reused).
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, SubsecRound, Utc};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use vmon_cluster::kv::Range;
+use vmon_cluster::kv::Scan;
 
-use super::{
-	Cursor, Error, HISTORY_TTL, Result, Store, from_micros, key, last_segment, micros, now, prefix,
-	segments, seq, time_segment,
-};
+use super::{Logged, Result, Store, key, last_segment, now, prefix};
 
 const WEBHOOKS: &str = "db/webhook";
 const WEBHOOK_TEAMS: &str = "db/webhook.team";
-const DELIVERIES: &str = "db/delivery";
-const DELIVERY_EVENTS: &str = "db/delivery.event";
-const DELIVERY_GROUPS: &str = "db/delivery.group";
-const DELIVERY_TIMES: &str = "db/delivery.ts";
-/// Groups fetched per range page of [`Store::delivery_groups`].
+/// Journal table of delivery attempts (`wh/<webhook>/…` streams).
+const DELIVERIES: &str = "wh";
+/// Segment of the `wh/<webhook>/groups` stream.
+const GROUPS: &str = "groups";
+/// Segment of the `wh/<webhook>/event/<event>` streams.
+const EVENT: &str = "event";
+/// Group records fetched per journal page of [`Store::delivery_groups`].
 const GROUP_PAGE: usize = 128;
+
+/// Page position of [`Store::delivery_groups`] (the deliveries API's
+/// `nextCursor`): the journal seq of the last listed group's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryCursor(u64);
+
+impl DeliveryCursor {
+	/// Opaque token sent as `nextCursor`.
+	pub fn encode(self) -> String {
+		URL_SAFE_NO_PAD.encode(self.0.to_string())
+	}
+
+	/// Parses a client-supplied cursor; `None` when malformed.
+	pub fn decode(token: &str) -> Option<Self> {
+		let raw = URL_SAFE_NO_PAD.decode(token.trim_end_matches('=')).ok()?;
+		String::from_utf8(raw).ok()?.parse().ok().map(Self)
+	}
+}
+
+/// One event's delivery attempts ([`Store::delivery_groups`]).
+#[derive(Clone, Debug)]
+pub struct DeliveryGroup {
+	/// Resumes the listing after this group.
+	pub cursor:   DeliveryCursor,
+	pub event_id: String,
+	/// Attempts matching the filter, oldest first (never empty).
+	pub attempts: Vec<DeliveryRow>,
+}
 
 /// A registered webhook.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -84,10 +118,14 @@ pub struct NewDelivery {
 	/// `http_error|dns_error|timeout|transport_error|request_error|signature_error|canceled`.
 	pub error_class:      Option<&'static str>,
 	pub error_message:    Option<String>,
-	pub ts:               DateTime<Utc>,
+	/// The event's first attempt: opens its group in
+	/// [`Store::delivery_groups`]. Repeating it (a new leader redelivering the
+	/// event) is harmless: readers deduplicate groups by event.
+	pub first:            bool,
 }
 
-/// A stored delivery attempt (`WebhookDelivery`).
+/// A stored delivery attempt (`WebhookDelivery`); the journal record value
+/// of the `wh/<webhook>…` streams.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeliveryRow {
 	pub id:               String,
@@ -106,16 +144,25 @@ pub struct DeliveryRow {
 	pub response_body:    Option<String>,
 	pub error_class:      Option<String>,
 	pub error_message:    Option<String>,
+	/// Commit time of the journal record (not stored in the value).
+	#[serde(skip)]
 	pub ts:               DateTime<Utc>,
 }
 
-/// What the stats need of one attempt (`db/delivery.ts/…` value).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// What the stats decode of a stored [`DeliveryRow`].
+#[derive(Debug, Deserialize)]
 struct DeliveryStat {
-	ts:          DateTime<Utc>,
 	status:      String,
 	event_type:  String,
 	duration_ms: i32,
+}
+
+/// What [`Store::delivery_groups`] decodes of a group record (a stored
+/// [`DeliveryRow`]).
+#[derive(Debug, Deserialize)]
+struct DeliveryHead {
+	event_id:   String,
+	event_type: String,
 }
 
 /// Filters of the deliveries list and stats.
@@ -185,34 +232,9 @@ fn team_key(team_id: &str, id: &str) -> String {
 	key(WEBHOOK_TEAMS, &[team_id, id])
 }
 
-/// Where a [`Store::delivery_groups`] scan starts: strictly past the cursor
-/// and inside the window bound on the scan's side.
-fn groups_after(
-	webhook_id: &str,
-	filter: &DeliveryFilter,
-	after: Option<&Cursor>,
-	order_asc: bool,
-) -> Option<String> {
-	let base = prefix(DELIVERY_GROUPS, &[webhook_id]);
-	let cursor = after.map(|c| {
-		key(DELIVERY_GROUPS, &[webhook_id, &time_segment(from_micros(c.created_at_us)), &c.id])
-	});
-	if order_asc {
-		// Every key of a group first attempted at or after `start` sorts
-		// after `{base}{time(start)}`.
-		let bound = filter
-			.start
-			.map(|start| format!("{base}{}", time_segment(start)));
-		cursor.into_iter().chain(bound).max()
-	} else {
-		// … and every key of one first attempted at or before `end` sorts
-		// before `{base}{time(end) + 1}`.
-		let bound = filter.end.map(|end| {
-			let us = u64::try_from(end.timestamp_micros()).unwrap_or(0);
-			format!("{base}{}", seq(us.saturating_add(1)))
-		});
-		cursor.into_iter().chain(bound).min()
-	}
+/// An attempt with its time taken from its record.
+fn attempt_row(logged: Logged<DeliveryRow>) -> DeliveryRow {
+	DeliveryRow { ts: logged.at, ..logged.value }
 }
 
 impl Store {
@@ -347,7 +369,8 @@ impl Store {
 		}
 	}
 
-	/// Deletes a webhook and its deliveries; `false` when unknown.
+	/// Deletes a webhook; `false` when unknown. Its deliveries stay in the
+	/// journal, unreachable through the API, until they expire.
 	///
 	/// # Errors
 	///
@@ -362,9 +385,6 @@ impl Store {
 			}
 			tx.delete(row_key.clone());
 			tx.delete(team_key(team_id, id));
-			for table in [DELIVERIES, DELIVERY_EVENTS, DELIVERY_GROUPS, DELIVERY_TIMES] {
-				tx.delete_prefix(prefix(table, &[id]));
-			}
 			if tx.commit().await? {
 				return Ok(true);
 			}
@@ -394,54 +414,46 @@ impl Store {
 		}
 	}
 
-	/// Records one delivery attempt and returns its id. The attempt is
-	/// dropped when the webhook no longer exists (its deliveries are gone).
+	/// Records one delivery attempt (timed by its commit) and returns its
+	/// id. The attempt is dropped when the webhook no longer exists.
 	///
 	/// # Errors
 	///
 	/// Store failures.
 	pub async fn insert_delivery(&self, d: &NewDelivery) -> Result<String> {
-		let ts = d.ts.trunc_subsecs(3);
-		let time = time_segment(ts);
 		let row = DeliveryRow {
-			id: uuid::Uuid::new_v4().to_string(),
-			team_id: d.team_id.clone(),
-			webhook_id: d.webhook_id.clone(),
-			event_id: d.event_id.clone(),
-			sandbox_id: d.sandbox_id.clone(),
-			event_type: d.event_type.clone(),
-			status: d.status.to_owned(),
-			duration_ms: d.duration_ms,
-			request_url: d.request_url.clone(),
-			request_headers: d.request_headers.clone(),
-			request_body: d.request_body.clone(),
-			response_status: d.response_status,
+			id:               uuid::Uuid::new_v4().to_string(),
+			team_id:          d.team_id.clone(),
+			webhook_id:       d.webhook_id.clone(),
+			event_id:         d.event_id.clone(),
+			sandbox_id:       d.sandbox_id.clone(),
+			event_type:       d.event_type.clone(),
+			status:           d.status.to_owned(),
+			duration_ms:      d.duration_ms,
+			request_url:      d.request_url.clone(),
+			request_headers:  d.request_headers.clone(),
+			request_body:     d.request_body.clone(),
+			response_status:  d.response_status,
 			response_headers: d.response_headers.clone(),
-			response_body: d.response_body.clone(),
-			error_class: d.error_class.map(str::to_owned),
-			error_message: d.error_message.clone(),
-			ts,
-		};
-		let stat = DeliveryStat {
-			ts,
-			status: row.status.clone(),
-			event_type: row.event_type.clone(),
-			duration_ms: row.duration_ms,
+			response_body:    d.response_body.clone(),
+			error_class:      d.error_class.map(str::to_owned),
+			error_message:    d.error_message.clone(),
+			// Not stored: read back from the record's commit time.
+			ts:               DateTime::default(),
 		};
 		let hook = d.webhook_id.as_str();
-		let event = d.event_id.as_str();
-		let event_key = key(DELIVERY_EVENTS, &[hook, event]);
+		let mut streams =
+			vec![key(DELIVERIES, &[hook]), key(DELIVERIES, &[hook, EVENT, &d.event_id])];
+		if d.first {
+			streams.push(key(DELIVERIES, &[hook, GROUPS]));
+		}
+		let hook_key = webhook_key(hook);
 		let mut tx = self.tx().await?;
 		loop {
-			if tx.get::<WebhookRow>(&webhook_key(hook)).await?.is_none() {
+			if tx.get::<WebhookRow>(&hook_key).await?.is_none() {
 				return Ok(row.id);
 			}
-			if tx.get::<DateTime<Utc>>(&event_key).await?.is_none() {
-				tx.put_ttl(event_key.clone(), &ts, HISTORY_TTL);
-				tx.put_ttl(key(DELIVERY_GROUPS, &[hook, &time, event]), &row.event_type, HISTORY_TTL);
-			}
-			tx.put_ttl(key(DELIVERIES, &[hook, event, &time, &row.id]), &row, HISTORY_TTL);
-			tx.put_ttl(key(DELIVERY_TIMES, &[hook, &time, &row.id]), &stat, HISTORY_TTL);
+			tx.append(streams.clone(), &row);
 			if tx.commit().await? {
 				return Ok(row.id);
 			}
@@ -449,11 +461,14 @@ impl Store {
 	}
 
 	/// One page of delivery attempts grouped by event. Groups are ordered by
-	/// their first attempt (`(first ts, event id)`, the cursor), and a group
-	/// is in `filter`'s window when its first attempt is; each group lists
-	/// its attempts matching `filter` (oldest first) and groups without any
-	/// are skipped. `after` is the cursor of the last group of the previous
-	/// page. Returns up to `limit` groups.
+	/// their first attempt (the journal order of the `wh/<webhook>/groups`
+	/// stream), and a group is in `filter`'s window when its first attempt
+	/// is; each group lists its attempts matching `filter` (oldest first) and
+	/// groups without any are skipped. `after` is the cursor of the last group
+	/// of the previous page. Returns up to `limit` groups.
+	///
+	/// The journal cannot seek by time: groups outside the window on the
+	/// scan's starting side are read and skipped.
 	///
 	/// # Errors
 	///
@@ -462,50 +477,65 @@ impl Store {
 		&self,
 		webhook_id: &str,
 		filter: &DeliveryFilter,
-		after: Option<&Cursor>,
+		after: Option<DeliveryCursor>,
 		limit: u32,
 		order_asc: bool,
-	) -> Result<Vec<(Cursor, Vec<DeliveryRow>)>> {
+	) -> Result<Vec<DeliveryGroup>> {
 		let limit = limit as usize;
 		let mut out = Vec::new();
 		if limit == 0 {
 			return Ok(out);
 		}
 		let r = self.read().await?;
-		let mut range = Range {
-			prefix:  prefix(DELIVERY_GROUPS, &[webhook_id]),
-			after:   groups_after(webhook_id, filter, after, order_asc),
+		let mut scan = Scan {
+			stream:  key(DELIVERIES, &[webhook_id, GROUPS]),
+			after:   after.map(|cursor| cursor.0),
 			limit:   Some(GROUP_PAGE),
 			reverse: !order_asc,
 		};
+		let early = |at: DateTime<Utc>| filter.start.is_some_and(|start| at < start);
+		let late = |at: DateTime<Utc>| filter.end.is_some_and(|end| at > end);
 		loop {
-			let page = r.scan::<String>(&range).await?;
+			let page = r.journal::<DeliveryHead>(&scan).await?;
 			let more = page.len() == GROUP_PAGE;
-			range.after = page.last().map(|(key, _)| key.clone());
-			for (group, event_type) in page {
-				let [_, time, event] =
-					<[String; 3]>::try_from(segments(&group, DELIVERY_GROUPS)).map_err(|_| {
-						Error::Corrupt { key: group.clone(), error: "not a delivery group key".into() }
-					})?;
-				let first = from_micros(time.parse().unwrap_or_default());
-				let past = if order_asc {
-					filter.end.is_some_and(|end| first > end)
+			scan.after = page.last().map(|group| group.seq);
+			for group in page {
+				let (past, before) = if order_asc {
+					(late(group.at), early(group.at))
 				} else {
-					filter.start.is_some_and(|start| first < start)
+					(early(group.at), late(group.at))
 				};
 				if past {
 					return Ok(out);
 				}
-				if !filter.wants_type(&event_type) {
+				if before || !filter.wants_type(&group.value.event_type) {
 					continue;
 				}
-				let mut attempts: Vec<DeliveryRow> =
-					r.list(&prefix(DELIVERIES, &[webhook_id, &event])).await?;
-				attempts.retain(|a| filter.matches(a.ts, &a.status, &a.event_type));
+				let event = group.value.event_id;
+				let attempts = r
+					.journal::<DeliveryRow>(&Scan {
+						stream: key(DELIVERIES, &[webhook_id, EVENT, &event]),
+						..Scan::default()
+					})
+					.await?;
+				// A repeated first attempt is not the event's group: only the
+				// event's earliest record is.
+				if attempts.first().is_none_or(|first| first.seq != group.seq) {
+					continue;
+				}
+				let attempts: Vec<DeliveryRow> = attempts
+					.into_iter()
+					.map(attempt_row)
+					.filter(|a| filter.matches(a.ts, &a.status, &a.event_type))
+					.collect();
 				if attempts.is_empty() {
 					continue;
 				}
-				out.push((Cursor { created_at_us: micros(first), id: event }, attempts));
+				out.push(DeliveryGroup {
+					cursor: DeliveryCursor(group.seq),
+					event_id: event,
+					attempts,
+				});
 				if out.len() >= limit {
 					return Ok(out);
 				}
@@ -517,7 +547,8 @@ impl Store {
 	}
 
 	/// Aggregates attempts in `filter`'s window into buckets of
-	/// `bucket_secs`, oldest first.
+	/// `bucket_secs`, oldest first. Walks the webhook's attempts newest
+	/// first down to the window's start.
 	///
 	/// # Errors
 	///
@@ -529,26 +560,17 @@ impl Store {
 		bucket_secs: i64,
 	) -> Result<Vec<StatsBucket>> {
 		let bucket_secs = bucket_secs.max(1);
-		let base = prefix(DELIVERY_TIMES, &[webhook_id]);
-		let range = Range {
-			// Every attempt at or after `start` sorts after `{base}{time(start)}`.
-			after:   filter
-				.start
-				.map(|start| format!("{base}{}", time_segment(start))),
-			prefix:  base,
-			limit:   None,
-			reverse: false,
-		};
+		let scan = Scan { stream: key(DELIVERIES, &[webhook_id]), reverse: true, ..Scan::default() };
 		let mut buckets = BTreeMap::<i64, BucketSum>::new();
 		self
 			.read()
 			.await?
-			.scan_all::<DeliveryStat>(&range, |_, stat| {
-				if filter.end.is_some_and(|end| stat.ts > end) {
+			.journal_each::<DeliveryStat>(&scan, |Logged { at, value: stat, .. }| {
+				if filter.start.is_some_and(|start| at < start) {
 					return false;
 				}
-				if filter.matches(stat.ts, &stat.status, &stat.event_type) {
-					let bucket = stat.ts.timestamp_millis().div_euclid(bucket_secs * 1000);
+				if filter.matches(at, &stat.status, &stat.event_type) {
+					let bucket = at.timestamp_millis().div_euclid(bucket_secs * 1000);
 					let sum = buckets.entry(bucket).or_insert(BucketSum {
 						total:  0,
 						failed: 0,
@@ -576,16 +598,14 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-	use chrono::{DateTime, Utc};
+	use std::time::Duration;
+
+	use chrono::DateTime;
 
 	use super::{DeliveryFilter, NewDelivery, WebhookWrite};
 	use crate::store::{Store, testing::TestStore};
 
-	fn at(secs: i64) -> DateTime<Utc> {
-		DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
-	}
-
-	fn attempt(hook: &str, event: &str, status: &'static str, secs: i64, ms: i32) -> NewDelivery {
+	fn attempt(hook: &str, event: &str, status: &'static str, ms: i32, first: bool) -> NewDelivery {
 		NewDelivery {
 			team_id: "team".into(),
 			webhook_id: hook.into(),
@@ -607,7 +627,7 @@ mod tests {
 			response_body: None,
 			error_class: (status == "failed").then_some("http_error"),
 			error_message: None,
-			ts: at(secs),
+			first,
 		}
 	}
 
@@ -622,23 +642,23 @@ mod tests {
 		let mut cursor = None;
 		loop {
 			let page = store
-				.delivery_groups(hook, filter, cursor.as_ref(), limit, asc)
+				.delivery_groups(hook, filter, cursor, limit, asc)
 				.await
 				.unwrap();
-			let Some((last, _)) = page.last() else {
+			let Some(last) = page.last() else {
 				return out;
 			};
-			cursor = Some(last.clone());
+			cursor = Some(last.cursor);
 			out.extend(
 				page
 					.into_iter()
-					.map(|(c, attempts)| format!("{}:{}", c.id, attempts.len())),
+					.map(|group| format!("{}:{}", group.event_id, group.attempts.len())),
 			);
 		}
 	}
 
 	#[tokio::test]
-	async fn webhook_cursor_only_moves_forward_and_delete_drops_deliveries() {
+	async fn webhook_cursor_only_moves_forward_and_deleted_hooks_drop_attempts() {
 		let db = TestStore::start().await;
 		let store = &db.store;
 		let hook = store
@@ -695,24 +715,22 @@ mod tests {
 		);
 
 		store
-			.insert_delivery(&attempt(&hook.id, "k1", "success", 0, 5))
+			.insert_delivery(&attempt(&hook.id, "k1", "success", 5, true))
 			.await
 			.unwrap();
 		let all = DeliveryFilter::default();
-		assert_eq!(groups(store, &hook.id, &all, true, 10).await.len(), 1);
+		assert_eq!(groups(store, &hook.id, &all, true, 10).await, ["k1:1"]);
 		assert!(!store.delete_webhook("other", &hook.id).await.unwrap());
 		assert!(store.delete_webhook("team", &hook.id).await.unwrap());
 		assert!(!store.delete_webhook("team", &hook.id).await.unwrap());
 		assert_eq!(store.list_webhooks("team").await.unwrap().len(), 0);
-		assert_eq!(groups(store, &hook.id, &all, true, 10).await.len(), 0);
-		assert_eq!(
-			store
-				.delivery_stats(&hook.id, &all, 60)
-				.await
-				.unwrap()
-				.len(),
-			0
-		);
+		assert!(store.webhook("team", &hook.id).await.unwrap().is_none());
+		// Attempts recorded after the delete are dropped.
+		store
+			.insert_delivery(&attempt(&hook.id, "k2", "success", 5, true))
+			.await
+			.unwrap();
+		assert_eq!(groups(store, &hook.id, &all, true, 10).await, ["k1:1"]);
 		db.finish().await;
 	}
 
@@ -725,21 +743,30 @@ mod tests {
 			.await
 			.unwrap()
 			.id;
-		// k1: failed then retried successfully; c2 and k3 later; k4 has the
-		// same first attempt time as k3.
-		for (event, status, secs, ms) in [
-			("k1", "failed", 0, 100),
-			("k1", "success", 1, 20),
-			("c2", "success", 70, 30),
-			("k3", "failed", 130, 40),
-			("k4", "success", 130, 50),
+		// k1: failed then retried successfully; c2, k3 and k4 later. Attempts
+		// are timed by their commits: keep them apart on the ms grid.
+		for (event, status, ms, first) in [
+			("k1", "failed", 100, true),
+			("k1", "success", 20, false),
+			("c2", "success", 30, true),
+			("k3", "failed", 40, true),
+			("k4", "success", 50, true),
 		] {
 			store
-				.insert_delivery(&attempt(&hook, event, status, secs, ms))
+				.insert_delivery(&attempt(&hook, event, status, ms, first))
 				.await
 				.unwrap();
+			tokio::time::sleep(Duration::from_millis(3)).await;
 		}
 		let all = DeliveryFilter::default();
+		let listed = store
+			.delivery_groups(&hook, &all, None, 10, true)
+			.await
+			.unwrap();
+		let first_at = |event: &str| {
+			let group = listed.iter().find(|group| group.event_id == event).unwrap();
+			group.attempts[0].ts
+		};
 		let asc = groups(store, &hook, &all, true, 2).await;
 		assert_eq!(asc, ["k1:2", "c2:1", "k3:1", "k4:1"]);
 		let mut desc = groups(store, &hook, &all, false, 1).await;
@@ -749,26 +776,47 @@ mod tests {
 		let failed = DeliveryFilter { statuses: vec!["failed".into()], ..DeliveryFilter::default() };
 		assert_eq!(groups(store, &hook, &failed, true, 10).await, ["k1:1", "k3:1"]);
 		let window = DeliveryFilter {
-			start: Some(at(60)),
-			end: Some(at(130)),
+			start: Some(first_at("c2")),
+			end: Some(first_at("k4")),
 			event_types: vec!["killed".into()],
 			..DeliveryFilter::default()
 		};
 		assert_eq!(groups(store, &hook, &window, false, 10).await, ["k4:1", "k3:1"]);
+		let to_k3 = DeliveryFilter { end: Some(first_at("k3")), ..window.clone() };
+		assert_eq!(groups(store, &hook, &to_k3, true, 10).await, ["k3:1"]);
 
-		let stats = store.delivery_stats(&hook, &all, 60).await.unwrap();
+		// One bucket spanning every attempt (it starts at the epoch).
+		let stats = store
+			.delivery_stats(&hook, &all, 1_000_000_000_000)
+			.await
+			.unwrap();
 		let summary: Vec<_> = stats
 			.iter()
 			.map(|b| (b.start, b.total, b.failed, b.min_ms, b.avg_ms, b.max_ms))
 			.collect();
-		// `at(0)` is a multiple of 60 s, so it starts a bucket.
-		assert_eq!(summary, [
-			(at(0), 2, 1, 20.0, 60.0, 100.0),
-			(at(60), 1, 0, 30.0, 30.0, 30.0),
-			(at(120), 2, 1, 40.0, 45.0, 50.0),
-		]);
+		let epoch = DateTime::from_timestamp(0, 0).unwrap();
+		assert_eq!(summary, [(epoch, 5, 2, 20.0, 48.0, 100.0)]);
+		let minutes = store.delivery_stats(&hook, &all, 60).await.unwrap();
+		assert_eq!(minutes.iter().map(|b| b.total).sum::<i64>(), 5);
+		assert!(minutes.iter().all(|b| b.start.timestamp() % 60 == 0));
+		assert!(minutes.windows(2).all(|w| w[0].start < w[1].start));
 		let windowed = store.delivery_stats(&hook, &window, 60).await.unwrap();
-		assert_eq!(windowed.iter().map(|b| b.total).sum::<i64>(), 2);
+		let totals = windowed
+			.iter()
+			.fold((0, 0), |(total, failed), b| (total + b.total, failed + b.failed));
+		assert_eq!(totals, (2, 1));
+
+		// A new leader repeating k1's first attempt adds an attempt, not a
+		// group.
+		store
+			.insert_delivery(&attempt(&hook, "k1", "success", 10, true))
+			.await
+			.unwrap();
+		let asc = groups(store, &hook, &all, true, 1).await;
+		assert_eq!(asc, ["k1:3", "c2:1", "k3:1", "k4:1"]);
+		let mut desc = groups(store, &hook, &all, false, 1).await;
+		desc.reverse();
+		assert_eq!(desc, asc);
 		db.finish().await;
 	}
 }

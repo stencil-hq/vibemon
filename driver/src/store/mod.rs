@@ -42,7 +42,7 @@ use base64::Engine;
 use chrono::{DateTime, SubsecRound, Utc};
 use vmon_cluster::kv::{Kv, KvError};
 
-pub(crate) use self::tx::{Read, Tx};
+pub(crate) use self::tx::{Logged, Read, Tx};
 pub use self::{
 	events::{EventQuery, NewSandboxEvent, SandboxEventRow, event_types},
 	keys::{ApiKeyRow, NewApiKey},
@@ -51,15 +51,19 @@ pub use self::{
 	tokens::{RefreshTokenRow, Rotation},
 	users::User,
 	volumes::VolumeRow,
-	webhooks::{DeliveryFilter, DeliveryRow, NewDelivery, StatsBucket, WebhookRow, WebhookWrite},
+	webhooks::{
+		DeliveryCursor, DeliveryFilter, DeliveryGroup, DeliveryRow, NewDelivery, StatsBucket,
+		WebhookRow, WebhookWrite,
+	},
 };
 
-/// Retention of history records.
-///
-/// Sandbox events, webhook deliveries, build logs, and the records of killed
-/// sandboxes expire this long after they are written. Bounded because the KV
-/// holds all state in memory on every driver.
-pub const HISTORY_TTL: Duration = Duration::from_hours(7 * 24);
+/// Retention of history: sandbox events, webhook deliveries, and build logs
+/// live in the cluster journal (on disk) and expire this long after they were
+/// written.
+pub const HISTORY_RETENTION: Duration = vmon_cluster::kv::JOURNAL_RETENTION;
+
+/// How long the record of a killed sandbox stays in the (in-memory) KV.
+pub const KILLED_SANDBOX_TTL: Duration = Duration::from_hours(7 * 24);
 
 /// Durable driver state in the cluster KV. Cheap to clone.
 #[derive(Clone)]
@@ -153,15 +157,6 @@ pub(crate) fn prefix(table: &str, segments: &[&str]) -> String {
 	let mut out = key(table, segments);
 	out.push('/');
 	out
-}
-
-/// Unescaped segments of `key` after `table/` (empty when `key` is not under
-/// `table`).
-pub(crate) fn segments(key: &str, table: &str) -> Vec<String> {
-	key.strip_prefix(table)
-		.and_then(|rest| rest.strip_prefix('/'))
-		.map(|rest| rest.split('/').map(unescape).collect())
-		.unwrap_or_default()
 }
 
 /// Last unescaped segment of `key` (the id at the end of an index key).
@@ -281,7 +276,7 @@ pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {
-	use super::{Cursor, key, last_segment, prefix, segments};
+	use super::{Cursor, key, last_segment, prefix};
 
 	#[test]
 	fn cursor_round_trips_and_rejects_garbage() {
@@ -307,11 +302,10 @@ mod tests {
 
 	#[test]
 	fn key_segments_escape_separators_and_round_trip() {
-		let k = key("db/x", &["a/b", "50%", "c"]);
-		assert_eq!(k, "db/x/a%2Fb/50%25/c");
-		assert_eq!(segments(&k, "db/x"), ["a/b", "50%", "c"]);
+		let k = key("db/x", &["a/b", "50%", "c/%"]);
+		assert_eq!(k, "db/x/a%2Fb/50%25/c%2F%25");
+		assert_eq!(last_segment(&k), "c/%");
 		assert_eq!(last_segment(&key("db/x", &["t", "%2F"])), "%2F");
-		assert_eq!(segments("db/xy/a", "db/x"), Vec::<String>::new());
 		// A team's prefix never covers a team whose id extends it.
 		assert!(!key("db/x", &["team10", "k"]).starts_with(&prefix("db/x", &["team1"])));
 	}

@@ -4,7 +4,7 @@
 //! Keys:
 //! - `db/sandbox/<id>` → [`SandboxRow`] (JSON; ciphertexts base64). Records of
 //!   killed sandboxes keep no secrets (`env_enc`, `egress_enc`, `s3_mounts_enc`
-//!   emptied) and expire [`HISTORY_TTL`] after the kill.
+//!   emptied) and expire [`KILLED_SANDBOX_TTL`] after the kill.
 //! - `db/sandbox.live/<team>/<id>` → empty: index of the team's running and
 //!   paused sandboxes (team listings, counts, the reconciler, artifact GC).
 //!   Written with the record by [`Store::insert_sandbox`], removed by
@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use vmon_node::api::VolumeMount;
 
 use super::{
-	HISTORY_TTL, NewSandboxEvent, Read, Result, Store, Tx, events::stage_event, key, last_segment,
-	prefix,
+	KILLED_SANDBOX_TTL, NewSandboxEvent, Read, Result, Store, Tx, events::stage_event, key,
+	last_segment, prefix,
 };
 use crate::lifecycle::network::NetworkConfig;
 
@@ -283,14 +283,14 @@ fn live_key(team_id: &str, id: &str) -> String {
 }
 
 /// Stages `row` at its key. Killed records lose their secrets and expire
-/// [`HISTORY_TTL`] after this write.
+/// [`KILLED_SANDBOX_TTL`] after this write.
 fn stage_row(tx: &mut Tx<'_>, row: &mut SandboxRow) {
 	let key = sandbox_key(&row.id);
 	if row.state() == SandboxState::Killed {
 		row.env_enc = None;
 		row.egress_enc = Vec::new();
 		row.s3_mounts_enc = None;
-		tx.put_ttl(key, row, HISTORY_TTL);
+		tx.put_ttl(key, row, KILLED_SANDBOX_TTL);
 	} else {
 		tx.put(key, row);
 	}
@@ -396,7 +396,7 @@ impl Store {
 	/// Running/paused → killed plus `event`, atomically; `false` (nothing
 	/// written) when the row was already killed or missing. The record drops
 	/// out of the live index, loses its secrets, and expires after
-	/// [`HISTORY_TTL`].
+	/// [`KILLED_SANDBOX_TTL`].
 	pub async fn mark_sandbox_killed(
 		&self,
 		id: &str,

@@ -1,10 +1,11 @@
-//! Read views and optimistic transactions over the cluster KV.
+//! Read views and optimistic transactions over the cluster KV and its journal.
 
 use std::{collections::HashSet, time::Duration};
 
+use chrono::{DateTime, Utc};
 use rand::RngExt;
 use serde::{Serialize, de::DeserializeOwned};
-use vmon_cluster::kv::{Compare, Entry, Kv, Op, Range, Txn};
+use vmon_cluster::kv::{Compare, Entry, Kv, Op, Range, Record, Scan, Txn};
 
 use super::{Error, Result};
 
@@ -15,8 +16,18 @@ const ATTEMPTS: u32 = 32;
 /// [`MAX_BACKOFF`].
 const BACKOFF: Duration = Duration::from_millis(2);
 const MAX_BACKOFF: Duration = Duration::from_millis(100);
-/// Page size of [`Read::scan_all`].
+/// Page size of [`Read::scan_all`] and [`Read::journal_each`].
 const PAGE: usize = 512;
+
+/// A decoded journal record ([`Read::journal`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Logged<T> {
+	/// Journal position: dense from 1 across all streams, in commit order.
+	pub seq:   u64,
+	/// Commit time (leader clock, ms); never decreases with `seq`.
+	pub at:    DateTime<Utc>,
+	pub value: T,
+}
 
 /// Linearizable read view ([`super::Store::read`]): its barrier ran when it
 /// was created, so every read sees at least the state acknowledged before.
@@ -55,6 +66,37 @@ impl<'s> Read<'s> {
 			.into_iter()
 			.map(|e| e.key)
 			.collect())
+	}
+
+	/// One page of a journal stream ([`vmon_cluster::kv::Kv::scan`]).
+	pub async fn journal<T: DeserializeOwned>(&self, scan: &Scan) -> Result<Vec<Logged<T>>> {
+		self.kv.scan(scan).await?.iter().map(logged).collect()
+	}
+
+	/// Walks a journal stream page by page, handing each record to `visit`
+	/// until it returns `false` or the stream ends. `scan.limit` is ignored.
+	pub async fn journal_each<T: DeserializeOwned>(
+		&self,
+		scan: &Scan,
+		mut visit: impl FnMut(Logged<T>) -> bool,
+	) -> Result<()> {
+		let mut page = Scan { limit: Some(PAGE), ..scan.clone() };
+		loop {
+			let records = self.kv.scan(&page).await?;
+			let done = records.len() < PAGE;
+			let Some(last) = records.last().map(|r| r.seq) else {
+				return Ok(());
+			};
+			for record in &records {
+				if !visit(logged(record)?) {
+					return Ok(());
+				}
+			}
+			if done {
+				return Ok(());
+			}
+			page.after = Some(last);
+		}
 	}
 
 	/// Walks `range` page by page, handing each `(key, record)` to `visit`
@@ -129,18 +171,6 @@ impl<'s> Tx<'s> {
 			.collect()
 	}
 
-	/// Guarded range page of `(key, record)` pairs.
-	pub async fn scan<T: DeserializeOwned>(&mut self, range: &Range) -> Result<Vec<(String, T)>> {
-		let entries = self.kv.range(range).await?;
-		entries
-			.into_iter()
-			.map(|e| {
-				self.guard(&e.key, e.mod_rev);
-				keyed(e)
-			})
-			.collect()
-	}
-
 	/// Guarded keys under `prefix` (index scans; values are ignored).
 	pub async fn keys(&mut self, prefix: &str) -> Result<Vec<String>> {
 		let entries = self.kv.list(prefix).await?;
@@ -187,22 +217,10 @@ impl<'s> Tx<'s> {
 			.push(Op::Put { key: key.into(), value: Vec::new(), ttl_ms: ttl.map(millis) });
 	}
 
-	/// Stages `value` at `{prefix}{stamp}{suffix}`, `stamp` being the commit
-	/// revision ([`vmon_cluster::kv::stamp`]): such keys sort in commit order,
-	/// and every stamped write of one commit shares the stamp.
-	pub fn put_stamped<T: Serialize + ?Sized>(
-		&mut self,
-		prefix: impl Into<String>,
-		suffix: impl Into<String>,
-		value: &T,
-		ttl: Option<Duration>,
-	) {
-		self.ops.push(Op::PutStamped {
-			prefix: prefix.into(),
-			suffix: suffix.into(),
-			value:  encode(value),
-			ttl_ms: ttl.map(millis),
-		});
+	/// Stages appending `value` (JSON) to the journal under every one of
+	/// `streams` ([`Read::journal`]); history, not guarded and never compared.
+	pub fn append<T: Serialize + ?Sized>(&mut self, streams: Vec<String>, value: &T) {
+		self.ops.push(Op::Append { streams, value: encode(value) });
 	}
 
 	/// Stages the removal of `key`.
@@ -270,6 +288,16 @@ fn encode<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
 fn decode<T: DeserializeOwned>(entry: &Entry) -> Result<T> {
 	serde_json::from_slice(&entry.value)
 		.map_err(|error| Error::Corrupt { key: entry.key.clone(), error: error.to_string() })
+}
+
+fn logged<T: DeserializeOwned>(record: &Record) -> Result<Logged<T>> {
+	let value = serde_json::from_slice(&record.value).map_err(|error| Error::Corrupt {
+		key:   format!("journal record {}", record.seq),
+		error: error.to_string(),
+	})?;
+	let ms = i64::try_from(record.ts_ms).unwrap_or(i64::MAX);
+	let at = DateTime::from_timestamp_millis(ms).unwrap_or_default();
+	Ok(Logged { seq: record.seq, at, value })
 }
 
 fn keyed<T: DeserializeOwned>(entry: Entry) -> Result<(String, T)> {

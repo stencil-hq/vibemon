@@ -16,7 +16,8 @@ use crate::{
 	error::{ApiError, ApiResult},
 	state::AppState,
 	store::{
-		Cursor, DeliveryFilter, DeliveryRow, StatsBucket, WebhookRow, WebhookWrite, event_types,
+		DeliveryCursor, DeliveryFilter, DeliveryRow, StatsBucket, WebhookRow, WebhookWrite,
+		event_types,
 	},
 };
 
@@ -294,7 +295,7 @@ struct DeliveriesPayload {
 /// Parsed deliveries/stats query.
 #[derive(Debug, Default)]
 pub struct DeliveryQuery {
-	pub cursor:    Option<Cursor>,
+	pub cursor:    Option<DeliveryCursor>,
 	pub limit:     u32,
 	pub order_asc: bool,
 	pub filter:    DeliveryFilter,
@@ -313,8 +314,10 @@ pub fn parse_delivery_query(raw: Option<&str>) -> Result<DeliveryQuery, ApiError
 	for (key, value) in url::form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
 		match key.as_ref() {
 			"cursor" if !value.is_empty() => {
-				query.cursor =
-					Some(Cursor::decode(&value).ok_or_else(|| ApiError::bad_request("Invalid cursor"))?);
+				query.cursor = Some(
+					DeliveryCursor::decode(&value)
+						.ok_or_else(|| ApiError::bad_request("Invalid cursor"))?,
+				);
 			},
 			"limit" => {
 				let limit: u32 = value
@@ -376,28 +379,22 @@ async fn list_deliveries(
 		.ok_or_else(|| not_found(&webhook_id))?;
 	let mut groups = state
 		.store
-		.delivery_groups(
-			&webhook_id,
-			&query.filter,
-			query.cursor.as_ref(),
-			query.limit + 1,
-			query.order_asc,
-		)
+		.delivery_groups(&webhook_id, &query.filter, query.cursor, query.limit + 1, query.order_asc)
 		.await?;
 	let more = groups.len() > query.limit as usize;
 	groups.truncate(query.limit as usize);
 	let next_cursor = more
-		.then(|| groups.last().map(|(cursor, _)| cursor.encode()))
+		.then(|| groups.last().map(|group| group.cursor.encode()))
 		.flatten();
 	let data = groups
 		.into_iter()
-		.filter_map(|(cursor, attempts)| {
-			let first = attempts.first()?;
+		.filter_map(|group| {
+			let first = group.attempts.first()?;
 			Some(DeliveryGroupDto {
-				event_id:   cursor.id,
 				event_type: first.event_type.clone(),
 				sandbox_id: first.sandbox_id.clone(),
-				attempts:   attempts.into_iter().map(DeliveryDto::from).collect(),
+				event_id:   group.event_id,
+				attempts:   group.attempts.into_iter().map(DeliveryDto::from).collect(),
 			})
 		})
 		.collect();
