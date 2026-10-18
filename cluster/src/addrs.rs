@@ -133,6 +133,10 @@ unsafe fn sockaddr_ip(addr: *const libc::sockaddr, like: Option<IpAddr>) -> Opti
 /// # Safety
 ///
 /// Same as [`sockaddr_ip`]; `T` is a plain-old-data sockaddr struct.
+#[cfg_attr(
+	not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")),
+	expect(clippy::missing_const_for_fn, reason = "the BSD body bounds the copy with `Ord::min`")
+)]
 unsafe fn read_sockaddr<T>(addr: *const libc::sockaddr) -> T {
 	let mut out = MaybeUninit::<T>::zeroed();
 	#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
