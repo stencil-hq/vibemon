@@ -916,8 +916,17 @@ and reply documented per variant). The guest dispatcher matches it
 exhaustively, and host callers send `AgentClient::request(Op::…, args)`, so op
 names never appear as string literals. Ops added for vibemon: `tcp_connect`
 (above), `oci_unpack` (OCI layer tars incl. whiteouts/ownership/xattrs),
-`provision` (§8.6), `set_time`, `reseed`, `poweroff`; build steps use `exec`
-and `fs_write`.
+`provision` (§8.6), `set_time`, `reseed`, `gpu_release`, `poweroff`; build
+steps use `exec` and `fs_write`. `gpu_release` SIGKILLs every guest process
+holding `/dev/nvidia*` and unloads the NVIDIA driver, replying `{ok:true}`
+only once it is unloaded (or was never loaded):
+a GPU whose VM exits with the driver loaded keeps its GSP firmware running,
+VFIO's function-level reset does not stop it, and the next VM cannot boot the
+GPU. GPU guest bring-up (agent `gpu.rs`): when an NVIDIA display-class PCI
+function is present, the agent mounts the driver bundle (virtio-fs tag
+`vmon_gpu`, built by `kernel/nvidia.sh`) read-only at `/run/vmon/gpu`, loads
+`nvidia.ko` + `nvidia-uvm.ko`, creates `/dev/nvidia*`, and registers the
+libraries with `ldconfig` before envd serves.
 
 ### 8.4 Networking
 

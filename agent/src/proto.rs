@@ -184,7 +184,14 @@ ops! {
 	/// (`RNDADDENTROPY`) and reseeds the kernel CRNG (`RNDRESEEDCRNG`). Sent
 	/// after every memory restore.
 	Reseed = "reseed",
-	/// `{}` → `{ok}`, then sync, unmount, and power off.
+	/// `{}` → `{ok}` once the NVIDIA GPU driver is unloaded (or was never
+	/// loaded), else `{ok:false, error}`. SIGKILLs every guest process that
+	/// has a `/dev/nvidia*` file open or mapped first; send it before stopping
+	/// or pausing a GPU VM: a GPU whose VM exits with the driver loaded cannot
+	/// be booted by the next VM.
+	GpuRelease = "gpu_release",
+	/// `{}` → `{ok}`, then unload the GPU driver (as `gpu_release`), sync,
+	/// unmount, and power off.
 	Poweroff = "poweroff",
 }
 

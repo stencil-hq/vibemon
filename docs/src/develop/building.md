@@ -66,6 +66,7 @@ Host recipes pick the platform implementation automatically: KVM on Linux, HVF o
 | `templates *args` | Build the default templates as public templates of the system team against a running server (`templates/build.py`), e.g. `just templates -j 2 base desktop`. See [Templates](../concepts/templates.md). |
 | `ui` | Rebuild the admin dashboard (`ui/`, React + Vite, `bun`) into `driver/web/`, which the driver embeds; commit the output with the sources. `cd ui && bun run dev` serves it with hot reload on `:5173`, proxying the API to `just serve`. See [Admin dashboard](../operate/admin.md#admin-dashboard). |
 | `kernel *args` | Build the guest kernels into `target/kernel/` (`kernel/build.sh`; in Docker on macOS). See [Guest kernel](../operate/kernel.md). |
+| `gpu-driver *args` | Build the guest kernels plus the NVIDIA GPU driver bundle `target/kernel/vmon-nvidia-<arch>/` (`kernel/build.sh --nvidia`). See [Guest kernel](../operate/kernel.md#nvidia-gpu-driver-bundle). |
 | `clean` | `cargo clean`. |
 | `license-check` | `cargo deny check licenses`. |
 | `local-release target` | Package release binaries and guest assets for `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` without uploading (`scripts/package-local-release.sh`). |

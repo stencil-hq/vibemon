@@ -61,7 +61,7 @@ mod linux_agent {
 	use serde::Deserialize;
 	use serde_json::{Value, json};
 	use vmon_agent::{
-		entropy, envd,
+		entropy, envd, gpu,
 		logging::{self, Level},
 		proto::{self, Frame, Op},
 		provision, reaper,
@@ -162,6 +162,8 @@ mod linux_agent {
 			set_child_subreaper()?;
 			init_pid1(&cmdline);
 		}
+		// Before envd serves, so the first command already sees the GPU.
+		gpu::init();
 		match cmdline.get("vmon.agent").map(String::as_str) {
 			Some("run") => run_one_shot(&cmdline),
 			_ => serve(pid1),
@@ -355,6 +357,7 @@ mod linux_agent {
 				Op::Provision => self.provision(id, request),
 				Op::SetTime => self.set_time(id, &request),
 				Op::Reseed => self.reseed(id, &request),
+				Op::GpuRelease => self.gpu_release(id),
 				Op::Poweroff => self.poweroff(id),
 			}
 		}
@@ -465,6 +468,17 @@ mod linux_agent {
 				let err = io::Error::last_os_error();
 				self.send_io_error(id, format!("clock_settime: {err}"), &err);
 			}
+		}
+
+		fn gpu_release(&self, id: u32) {
+			let writer = self.writer.clone();
+			thread::spawn(move || {
+				let response = match gpu::release() {
+					Ok(()) => json!({"ok": true}),
+					Err(err) => json!({"ok": false, "error": err}),
+				};
+				send_json(&writer, proto::FRAME_RESP, id, &response);
+			});
 		}
 
 		fn poweroff(&self, id: u32) {
@@ -1876,6 +1890,9 @@ mod linux_agent {
 	/// Sync, unmount real filesystems, and power the VM off. Never returns
 	/// unless `reboot` fails.
 	fn power_off() {
+		if let Err(err) = gpu::release() {
+			logging::emit(Level::Error, "NVIDIA driver unload failed", json!({"error": err}));
+		}
 		// SAFETY: `sync` takes no arguments.
 		unsafe { libc::sync() };
 		let mounts = fs::read_to_string("/proc/mounts").unwrap_or_default();

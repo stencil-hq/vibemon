@@ -256,6 +256,13 @@ kernel *args:
         --volume "{{justfile_directory()}}:/src" --volume vmon-kernel-cache:/root/.cache/vmon-kernel \
         --workdir /src vmon-kernel-build nice -n 10 ./kernel/build.sh --jobs 4 "$@"
 
+# Build the guest kernels plus the NVIDIA GPU driver bundle for each
+# (target/kernel/vmon-nvidia-<arch>/, kernel/README.md); args go to
+# kernel/build.sh, e.g. `just gpu-driver --arch x86_64`.
+[positional-arguments]
+gpu-driver *args:
+    @{{just_executable()}} kernel --nvidia "$@"
+
 # Remove build artifacts.
 clean:
     cargo clean

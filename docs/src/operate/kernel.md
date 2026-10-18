@@ -10,7 +10,7 @@ Release assets ship it: `vmon-assets-<arch>.tar.gz` contains `vmon-kernel-<arch>
 
 ## What it adds
 
-Everything is built in (`CONFIG_MODULES=n`, as upstream): guests never need `/lib/modules` or `modprobe`.
+Everything is built in: guests never need `/lib/modules` or `modprobe`. Module support is enabled (unsigned, no usermode `modprobe`) only so GPU sandboxes can load the NVIDIA modules of the [GPU driver bundle](#nvidia-gpu-driver-bundle); the build turns every option that would become a module into a built-in one.
 
 | Area | Features |
 |---|---|
@@ -21,6 +21,7 @@ Everything is built in (`CONFIG_MODULES=n`, as upstream): guests never need `/li
 | Security | Landlock and BPF LSMs (`lsm=landlock,bpf`) |
 | Filesystems | NFS v3/v4.x client (+ `rpc_pipefs`, RPCSEC_GSS), CIFS, FUSE/virtiofs, squashfs (all compressors), EROFS, XFS, Btrfs, ISO 9660, quota, fanotify permission events, loop, NBD, device-mapper (thin, snapshot, crypt) |
 | Introspection | `/proc/config.gz` |
+| GPU passthrough | What NVIDIA's open kernel modules need: PCI MSI/MSI-X, firmware loading, MMU notifiers, dma-buf; DMI and PAT on x86_64 |
 
 Removed from `ch_defconfig`: the ktimer PPS test client and `PPS_DEBUG` (a wakeup and two dmesg lines every second in every sandbox), and the RAID6 boot benchmark pulled in by Btrfs (~1.1 s of a ~2 s boot under HVF).
 
@@ -43,6 +44,7 @@ kernel/build.sh --config-only    # resolve and verify the .config only
 | `--cache DIR` | Source tarball and build trees (default `$XDG_CACHE_HOME/vmon-kernel`, else `~/.cache/vmon-kernel`) |
 | `--jobs N` | Parallel jobs |
 | `--config-only` | Resolve and verify the `.config`, write `config-<arch>`, skip compiling |
+| `--nvidia` | Also build the [NVIDIA GPU driver bundle](#nvidia-gpu-driver-bundle) for each kernel |
 
 **Linux** (aarch64 or x86_64): `build.sh` runs natively. The host arch builds natively; the other arch is cross-compiled with `gcc-<arch>-linux-gnu`. On Debian/Ubuntu install the toolchain plus the cross compiler for the other arch (`gcc-aarch64-linux-gnu` on x86_64 hosts, `gcc-x86-64-linux-gnu` on aarch64 hosts):
 
@@ -64,6 +66,37 @@ Every line in the config fragments is verified after `olddefconfig`: an option t
 | `vmlinux-x86_64` | x86_64 ELF (DWARF stripped, BTF kept) |
 | `config-<arch>` | Resolved `.config` (also `/proc/config.gz` in the guest) |
 | `SHA256SUMS` | Checksums |
+| `vmon-nvidia-<arch>/` | GPU driver bundle (`--nvidia`) |
+
+## NVIDIA GPU driver bundle
+
+Sandboxes that get a whole NVIDIA GPU (VFIO passthrough) load the NVIDIA driver from a bundle built for the exact guest kernel they boot. Build it together with the kernel:
+
+```sh
+just gpu-driver --arch x86_64    # = kernel/build.sh --nvidia --arch x86_64
+```
+
+`--nvidia` (also accepted by `just kernel`) downloads the pinned NVIDIA driver installer (615.71.09, sha256-verified, cached under `--cache`), builds the NVIDIA open kernel modules (`nvidia.ko`, `nvidia-uvm.ko`; Turing and newer GPUs, including GeForce RTX 50xx) against the kernel's build tree, and writes `target/kernel/vmon-nvidia-<arch>/`:
+
+| Path | Content |
+|---|---|
+| `manifest.json` | `{"driver": "615.71.09", "kernel": "<guest kernel release>"}` |
+| `modules/` | `nvidia.ko`, `nvidia-uvm.ko` |
+| `firmware/nvidia/615.71.09/` | GSP firmware |
+| `lib/` | CUDA driver libraries (`libcuda`, `libnvidia-ml`, `libnvidia-ptxjitcompiler`, `libnvidia-nvvm`, …) with soname symlinks |
+| `bin/` | `nvidia-smi`, `nvidia-debugdump`, `nvidia-cuda-mps-control`, `nvidia-cuda-mps-server` |
+
+On Linux the build needs `zstd` in addition to the kernel toolchain; on macOS it runs in the kernel build container. The x86_64 bundle is about 610 MiB.
+
+The bundle matches one kernel build: modules built for another kernel release are refused in the guest. Rebuild the bundle whenever you rebuild the kernel, and install both together: put `vmon-nvidia-<arch>/` next to the `vmon` binary, beside `vmon-kernel-<arch>`.
+
+In a GPU sandbox the node shares the bundle read-only as virtio-fs tag `vmon_gpu`. Before envd starts, the guest agent mounts it at `/run/vmon/gpu`, loads the modules, creates `/dev/nvidiactl`, `/dev/nvidia<N>`, `/dev/nvidia-uvm` and `/dev/nvidia-uvm-tools`, registers `lib/` with the dynamic linker (`/etc/ld.so.conf.d/vmon-nvidia.conf` + `ldconfig`), and links the tools into `/usr/bin`, so `nvidia-smi` and CUDA programs work like in a container started by the NVIDIA Container Toolkit. GPU templates therefore need a glibc image with the CUDA runtime they use (for example `nvidia/cuda:13.0.3-runtime-ubuntu24.04`) and no driver libraries of their own. Failures are logged to the sandbox console (`NVIDIA GPU driver setup failed`) and do not stop the sandbox; sandboxes without a GPU skip all of this.
+
+> [!WARNING]
+> A GPU whose VM exits with the driver still loaded cannot be initialized by the next VM: VFIO's function-level reset does not stop the GPU's GSP firmware (`NVRM: ... unexpected WPR2 already up`). The node therefore asks the guest agent to unload the driver (GC4 `gpu_release`) before tearing a GPU VM down. Do not reset the GPU from the host with secondary bus resets (`reset_subordinate`, bridge control); on GeForce RTX 50xx this can drop the GPU off the bus until the host is power-cycled.
+
+> [!IMPORTANT]
+> Load `vfio-pci` with `disable_idle_d3=1` (`options vfio-pci disable_idle_d3=1` in `/etc/modprobe.d/`, or `vfio_pci.disable_idle_d3=1` on the host kernel command line) on hosts that pass whole GPUs through. Otherwise vfio-pci puts the idle GPU into D3hot between VMs; on a GeForce RTX 5070 the wake-up and resets when the next VM opened it ended in a fatal PCIe error that the platform firmware answered with a host reset. With the GPU kept in D0, back-to-back VMs that release the driver work, and the driver's GPU initialization in the guest takes about 2 s instead of about 7.5 s.
 
 ## How a node picks its kernel
 
@@ -84,3 +117,5 @@ no vmon guest kernel (vmon-kernel-<arch> next to vmon, or target/kernel/ from `j
 > Template snapshots capture the running kernel, so templates built under one kernel keep booting it. Rebuild templates after switching kernels.
 
 See [Running `vmon serve`](serve.md#guest-kernel-and-agent) for how the node finds the guest agent binary.
+
+The GPU driver bundle is not part of this lookup; see [NVIDIA GPU driver bundle](#nvidia-gpu-driver-bundle).

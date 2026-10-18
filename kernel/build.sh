@@ -3,8 +3,9 @@
 # tree as the kernel `vmon serve` downloads by default) plus the fragments in
 # kernel/config/. See kernel/README.md.
 #
-# Usage: kernel/build.sh [--arch aarch64|x86_64]... [--out DIR] [--cache DIR] [--jobs N] [--config-only]
+# Usage: kernel/build.sh [--arch aarch64|x86_64]... [--out DIR] [--cache DIR] [--jobs N] [--config-only] [--nvidia]
 #   --config-only  resolve and verify the .config, write config-<arch>, skip compiling
+#   --nvidia       also build the NVIDIA GPU driver bundle for each kernel (kernel/nvidia.sh)
 #
 # Runs on Linux (aarch64 or x86_64); the other arch is cross-compiled with the
 # Debian/Ubuntu `gcc-<arch>-linux-gnu` toolchain. Outputs, in --out
@@ -14,6 +15,7 @@
 #   vmlinux-x86_64          x86_64 ELF (debug info stripped, BTF kept)
 #   config-<arch>           the resolved .config
 #   SHA256SUMS              checksums of everything above
+#   vmon-nvidia-<arch>/     GPU driver bundle (--nvidia)
 set -euo pipefail
 
 # Kernel source: cloud-hypervisor/linux at the tag the node's default kernel
@@ -31,9 +33,10 @@ cache="${XDG_CACHE_HOME:-$HOME/.cache}/vmon-kernel"
 jobs="$(nproc)"
 arches=()
 config_only=0
+nvidia=0
 
 usage() {
-	sed -n '5,7p' "${BASH_SOURCE[0]}" | sed 's/^# //'
+	sed -n '5,8p' "${BASH_SOURCE[0]}" | sed 's/^# //'
 	exit "$1"
 }
 
@@ -44,6 +47,7 @@ while (($#)); do
 	--cache) cache="$2"; shift 2 ;;
 	--jobs) jobs="$2"; shift 2 ;;
 	--config-only) config_only=1; shift ;;
+	--nvidia) nvidia=1; shift ;;
 	-h | --help) usage 0 ;;
 	*) echo "build.sh: unknown argument: $1" >&2; usage 2 ;;
 	esac
@@ -60,6 +64,7 @@ host_arch="$(uname -m)"
 
 # python3: the BTF tooling (resolve_btfids → libbpf) generates its headers.
 need=(make gcc flex bison bc perl python3 pahole cpio xz sha256sum curl)
+((nvidia == 0)) || need+=(zstd readelf strings)
 for arch in "${arches[@]}"; do
 	case "$arch" in
 	aarch64 | x86_64) ;;
@@ -73,7 +78,7 @@ for tool in "${need[@]}"; do
 done
 if ((${#missing[@]})); then
 	die "missing tools: ${missing[*]}
-  Debian/Ubuntu: sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev dwarves python3 cpio xz-utils curl gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu"
+  Debian/Ubuntu: sudo apt-get install build-essential flex bison bc libelf-dev libssl-dev dwarves python3 cpio xz-utils curl gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu (+ zstd for --nvidia)"
 fi
 
 # --- source -----------------------------------------------------------------
@@ -146,6 +151,14 @@ build_arch() {
 	make "${make_args[@]}" -s ch_defconfig
 	"$src/scripts/kconfig/merge_config.sh" -m -O "$build" "$build/.config" "${fragments[@]}" >/dev/null
 	make "${make_args[@]}" -s olddefconfig
+	# Module support exists only for the GPU driver bundle's out-of-tree
+	# modules: build in every option olddefconfig resolved to `m` (defaults
+	# that were `y` while MODULES=n), so the kernel itself ships no modules.
+	sed -i 's/=m$/=y/' "$build/.config"
+	make "${make_args[@]}" -s olddefconfig
+	if grep -q '=m$' "$build/.config"; then
+		die "[$arch] options left as modules: $(grep '=m$' "$build/.config" | tr '\n' ' ')"
+	fi
 	verify_config "$build/.config" "${fragments[@]}"
 	if ((config_only)); then
 		install -m 0644 "$build/.config" "$out/config-$arch"
@@ -170,6 +183,13 @@ build_arch() {
 	esac
 	install -m 0644 "$build/.config" "$out/config-$arch"
 	echo "==> [$arch] $(cat "$build/include/config/kernel.release")"
+
+	if ((nvidia)); then
+		# The kernel builds no modules; this only runs modpost over vmlinux to
+		# write the Module.symvers that out-of-tree modules link against.
+		make "${make_args[@]}" -s modules
+		"$here/nvidia.sh" "$arch" "$src" "$build" "$out" "$cache" "$jobs" "$cross"
+	fi
 }
 
 for arch in "${arches[@]}"; do
