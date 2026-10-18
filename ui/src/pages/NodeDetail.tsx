@@ -172,6 +172,48 @@ export function NodeDetailPage({ id }: { id: string }) {
           </Card>
         )}
 
+        {n && n.gpus.length > 0 && (
+          <Card
+            title="GPUs"
+            subtitle={`${n.gpus.filter(gpuAvailable).length} of ${n.gpus.length} free`}
+            flush
+          >
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>PCI address</th>
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {n.gpus.map((g) => (
+                    <tr key={g.address}>
+                      <td>{g.model || "—"}</td>
+                      <td className="mono muted">{g.address}</td>
+                      <td>
+                        {g.problem ? (
+                          <Status tone="warn">{g.problem}</Status>
+                        ) : g.sandbox ? (
+                          <Status tone="live">
+                            in use by{" "}
+                            <Link to={`/sandboxes/${g.sandbox}`} className="row-link mono">
+                              {g.sandbox}
+                            </Link>
+                          </Status>
+                        ) : (
+                          <Status tone="ok">free</Status>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+
         <Card title="Sandboxes on this node" subtitle="Reported by the node itself" flush>
           {sandboxes.length === 0 ? (
             <Empty title={detail.loading ? "Loading…" : "No sandboxes"} />

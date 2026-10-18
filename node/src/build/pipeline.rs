@@ -615,6 +615,7 @@ async fn unpack(
 		timeout:       Some(VM_DEADLINE),
 		ready_timeout: UNPACK_READY,
 		extra_args:    Vec::new(),
+		gpu:           None,
 	};
 	let vm = inner.vms.launch(spec).await?;
 	let guard = VmGuard { vm: Some(vm), net: None };
@@ -706,6 +707,7 @@ async fn boot_helper(
 		timeout: Some(VM_DEADLINE),
 		ready_timeout: STEPS_READY,
 		extra_args: Vec::new(),
+		gpu: None,
 	};
 	let vm = inner.vms.launch(spec).await?;
 	let guard = VmGuard { vm: Some(vm), net: Some(net) };
@@ -1062,6 +1064,7 @@ pub(super) async fn snapshot_phase(
 		timeout: Some(VM_DEADLINE),
 		ready_timeout: TEMPLATE_READY,
 		extra_args: Vec::new(),
+		gpu: None,
 	};
 	let boot_started = Instant::now();
 	let vm = inner
@@ -1113,37 +1116,112 @@ pub(super) async fn snapshot_phase(
 		.await
 		.context("envd did not accept /init")?;
 
+	let start_task =
+		start_service(&agent, p.ctx, p.start_cmd, p.ready_cmd, &ServiceLog::Build(log.clone()))
+			.await?;
+	if let Some(task) = &start_task {
+		task.abort();
+	}
+	log.info(Some(FINALIZE), "Template is ready");
+	agent.fs_sync().await?;
+	vm.pause().await?;
+	vm.snapshot(SNAPSHOT)
+		.await
+		.context("capturing the template snapshot")?;
+	guard.kill().await;
+	if !tokio::fs::try_exists(snapshot_dir.join("current-generation"))
+		.await
+		.unwrap_or(false)
+	{
+		bail!("the VMM reported a snapshot but {} is incomplete", snapshot_dir.display());
+	}
+	Ok(())
+}
+
+/// Where [`start_service`] reports progress and start command output.
+#[derive(Clone)]
+pub enum ServiceLog {
+	/// The finalize step of a build log.
+	Build(BuildLog),
+	/// Node tracing of this sandbox (start command output at `debug`).
+	Sandbox(String),
+}
+
+impl ServiceLog {
+	fn info(&self, message: String) {
+		match self {
+			Self::Build(log) => log.info(Some(FINALIZE), message),
+			Self::Sandbox(id) => tracing::info!(sandbox = %id, "{message}"),
+		}
+	}
+
+	fn output(&self, line: String) {
+		match self {
+			Self::Build(log) => log.info(Some(FINALIZE), line),
+			Self::Sandbox(id) => tracing::debug!(sandbox = %id, "start command: {line}"),
+		}
+	}
+
+	fn error(&self, message: String) {
+		match self {
+			Self::Build(log) => log.error(Some(FINALIZE), message),
+			Self::Sandbox(id) => tracing::warn!(sandbox = %id, "{message}"),
+		}
+	}
+}
+
+/// Starts a template's service the way its snapshot captured it.
+///
+/// Runs `start_cmd` in the background (template user, workdir and
+/// environment of `ctx`), then polls `ready_cmd` every [`READY_INTERVAL`]
+/// until it exits 0, failing when the start command exits non-zero or after
+/// [`READY_TIMEOUT`]. A start command without a ready command gets
+/// `sleep 20`. Used by template snapshots and by every sandbox cold boot
+/// (whose fresh kernel runs none of it).
+///
+/// Returns the task that streams the start command's output to `log`; the
+/// guest process keeps running when the task is dropped or aborted.
+pub async fn start_service(
+	agent: &AgentClient,
+	ctx: &BuildContext,
+	start_cmd: Option<&str>,
+	ready_cmd: Option<&str>,
+	log: &ServiceLog,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+	let start_cmd = start_cmd.filter(|c| !c.trim().is_empty());
+	let ready_cmd = ready_cmd.filter(|c| !c.trim().is_empty());
+	if start_cmd.is_none() && ready_cmd.is_none() {
+		return Ok(None);
+	}
 	let run_as = |cmd: &str| ExecRequest {
-		cmd:  p.ctx.shell_argv(cmd),
+		cmd:  ctx.shell_argv(cmd),
 		cwd:  None,
-		env:  p.ctx.command_env(),
+		env:  ctx.command_env(),
 		tty:  false,
-		user: Some(p.ctx.user.clone()),
+		user: Some(ctx.user.clone()),
 	};
 	let (exit_tx, mut exit_rx) = tokio::sync::watch::channel(None::<i32>);
-	let start_task = match p.start_cmd.filter(|c| !c.trim().is_empty()) {
+	let start_task = match start_cmd {
 		Some(cmd) => {
-			log.info(Some(FINALIZE), format!("Running start command: {cmd}"));
+			log.info(format!("Running start command: {cmd}"));
 			let mut session = agent.exec(&run_as(cmd)).await?;
 			let log = log.clone();
 			Some(tokio::spawn(async move {
 				let (mut out, mut err) = (LineSplitter::default(), LineSplitter::default());
 				while let Some(event) = session.next().await {
 					match event {
-						ExecEvent::Stdout(chunk) => out
-							.feed(&chunk)
-							.into_iter()
-							.for_each(|l| log.info(Some(FINALIZE), l)),
-						ExecEvent::Stderr(chunk) => err
-							.feed(&chunk)
-							.into_iter()
-							.for_each(|l| log.info(Some(FINALIZE), l)),
+						ExecEvent::Stdout(chunk) => {
+							out.feed(&chunk).into_iter().for_each(|l| log.output(l));
+						},
+						ExecEvent::Stderr(chunk) => {
+							err.feed(&chunk).into_iter().for_each(|l| log.output(l));
+						},
 						ExecEvent::Exit { code, signal } => {
 							let _ = exit_tx.send(Some(signal.map_or(code, |s| 128 + s)));
 							return;
 						},
 						ExecEvent::Failed(error) => {
-							log.error(Some(FINALIZE), format!("start command: {error}"));
+							log.error(format!("start command: {error}"));
 							let _ = exit_tx.send(Some(-1));
 							return;
 						},
@@ -1153,12 +1231,9 @@ pub(super) async fn snapshot_phase(
 		},
 		None => None,
 	};
-	let ready = match (p.ready_cmd.filter(|c| !c.trim().is_empty()), start_task.is_some()) {
-		(Some(cmd), _) => cmd,
-		(None, true) => "sleep 20",
-		(None, false) => "sleep 0",
-	};
-	log.info(Some(FINALIZE), format!("Waiting for template to be ready: {ready}"));
+	// Without a ready command there is a start command (see above).
+	let ready = ready_cmd.unwrap_or("sleep 20");
+	log.info(format!("Waiting for template to be ready: {ready}"));
 	let ready_started = Instant::now();
 	let result = async {
 		loop {
@@ -1189,24 +1264,15 @@ pub(super) async fn snapshot_phase(
 		}
 	}
 	.await;
-	if let Some(task) = &start_task {
-		task.abort();
+	match result {
+		Ok(()) => Ok(start_task),
+		Err(error) => {
+			if let Some(task) = &start_task {
+				task.abort();
+			}
+			Err(error)
+		},
 	}
-	result?;
-	log.info(Some(FINALIZE), "Template is ready");
-	agent.fs_sync().await?;
-	vm.pause().await?;
-	vm.snapshot(SNAPSHOT)
-		.await
-		.context("capturing the template snapshot")?;
-	guard.kill().await;
-	if !tokio::fs::try_exists(snapshot_dir.join("current-generation"))
-		.await
-		.unwrap_or(false)
-	{
-		bail!("the VMM reported a snapshot but {} is incomplete", snapshot_dir.display());
-	}
-	Ok(())
 }
 
 /// Recreates the template snapshot of a local artifact on this host
@@ -1224,13 +1290,7 @@ pub(super) async fn regenerate_snapshot(
 			meta.info.build_id, host.arch, host.backend
 		),
 	);
-	let ctx = BuildContext {
-		user:      meta.info.default_user.clone(),
-		workdir:   meta.info.default_workdir.clone(),
-		env:       meta.info.env.clone(),
-		boot_init: meta.boot_init.clone(),
-		has_bash:  true,
-	};
+	let ctx = BuildContext::for_artifact(&meta);
 	let started = Instant::now();
 	let params = SnapshotParams {
 		build_id:        &meta.info.build_id,

@@ -660,6 +660,7 @@ paused/<sandboxID>.upload/    staging of a running object-store upload (meta.jso
                               (a lazily resumed sandbox's dir holds instead: rootfs.img (remote sector overlay), rootfs.cache,
                               rootfs.blk.json, rootfs.remote.json, pages/ (Linux page caches))
 volumes/<volumeID>/           volume contents (or --volumes-dir on shared storage)
+gpu-quarantine.json           GPUs that need a host reboot ({bootId, gpus: {address: sandbox}}; ignored after a host reboot)
 ```
 
 Unix sockets (`api.sock`, `agent.sock`) live under `--run-dir` (default
@@ -823,6 +824,49 @@ under the 104-byte macOS `sun_path` limit.
   every snapshotted virtio-fs tag needs a binding), so creates with
   `volumeMounts` cold-boot the template rootfs (`init=` from the build's
   `boot_init`), and template snapshots are captured without virtio-fs shares.
+- Every cold boot (volumes, GPUs, no usable snapshot, filesystem-only
+  resumes) then starts the template's service the way its snapshot captured
+  it (`build::start_service`, shared with §8.6 step 4): after envd `/init`,
+  the build's `startCmd` runs in the background (template user, workdir and
+  env; `bash -l -c` when the guest has `/bin/bash`) and `readyCmd` is polled
+  every 2 s (≤ 10 min, `sleep 20` without one); a failing start or ready
+  command fails the boot. Without local build metadata (a fetched pause
+  whose build is not on this node) no start command runs.
+- GPUs (`node::gpu`, Linux): every capacity tick discovers the assignable
+  units under `/sys/bus/pci/devices` — NVIDIA (`0x10de`) display-class
+  (`0x03xxxx`) functions: a whole GPU (a PF without `virtfn*` VFs) or an
+  SR-IOV VF with a vGPU profile (`physfn`, `nvidia/current_vgpu_type` ≠ 0) —
+  and publishes them as `NodeCapacity.gpus` (`GpuInfo{address, model (from
+  pci.ids, else "NVIDIA 10de:<device>"), sandbox (holder), problem}`). The
+  first problem wins: quarantined (below); a PF not on `vfio-pci`, without
+  an IOMMU group, or whose group has a member other than an unbound,
+  `vfio-pci` or `pcieport`-bridge function (VFs skip these three, like the
+  VMM); no single `vfio-dev/vfio<N>` with its `/dev/vfio/devices/vfio<N>`;
+  no `/dev/iommu`; a device node the node user cannot open read/write; no
+  guest driver bundle (`--gpu-driver`/`VMON_GPU_DRIVER`, else
+  `vmon-nvidia-<arch>/` beside `vmon_bin`, else `target/kernel/` of a dev
+  tree); a bundle whose `manifest.json` `kernel` differs from the release of
+  the node's guest kernel (bzImage header / `Linux version` banner); a
+  non-x86_64 host. `CreateSandbox.gpus`/`ResumeSandbox.gpus` (≤ 8) reserve
+  that many units all-or-nothing before anything else (`busy` otherwise);
+  `SandboxMeta.gpus` records them while the VMM runs and restart recovery
+  re-reserves them for an adopted VMM. A GPU sandbox always cold-boots (no
+  fork, no lazy resume) with `--vfio-gpu /sys/bus/pci/devices/<BDF>` per
+  unit, `--vm-uuid` (version-8 UUID from SHA-256 of the sandbox ID, stable
+  across resumes), `--boot-mode direct`, and the bundle as read-only
+  `--volume vmon_gpu:<bundle>:ro` (so at most 7 volumes); the VMM opens the
+  devices and lifts `RLIMIT_MEMLOCK` before dropping to `--vmm-user`.
+  Memory pause/snapshot answer 400 `gpu_memory_snapshot`. Before a GPU VMM
+  stops (kill, filesystem-only pause, failed boot) the node sends GC4
+  `gpu_release` (30 s); the GPUs are freed once the VMM is reaped, so a
+  pause returns only after that. A GPU whose VM exited without a successful
+  release (release failure, crash, guest poweroff, hard deadline, failed
+  launch, an adopted VMM found dead) is quarantined with problem `needs host
+  reboot: VM exited without releasing the GPU` in `gpu-quarantine.json`
+  keyed by `/proc/sys/kernel/random/boot_id`: it survives node restarts and
+  clears with the host reboot that actually resets the GPU (Blackwell GSP
+  state survives FLR; the node never issues bus resets). `Node::shutdown`
+  leaves GPU VMMs running like any other.
 - The VMM hard deadline (`extend`) is kept at `endAt + 60 s` as a safety net;
   the driver is the authority for timeouts.
 - Boot concurrency is bounded (`--boot-concurrency`, default 4 × CPUs).
@@ -858,7 +902,9 @@ under the 104-byte macOS `sun_path` limit.
   downloaded and sha256-verified into `<data>/assets/` with a WARN, which
   lacks netfilter/IPv6/bridge/NFS — see `kernel/README.md`), `agent: Option<PathBuf>` (None =
   `vmon-agent-<arch>` beside `vmon_bin`, else `<exe>/../../target/test-assets/`;
-  must be a static ELF for the guest arch), `vmon_bin` (`current_exe()`),
+  must be a static ELF for the guest arch), `gpu_driver: Option<PathBuf>`
+  (guest NVIDIA driver bundle; None = `vmon-nvidia-<arch>/` beside
+  `vmon_bin`, else `target/kernel/` in a dev tree), `vmon_bin` (`current_exe()`),
   `boot_concurrency` (0 = 4 × CPUs), `max_parallel_builds` (0 = 2),
   `step_cache_mb` (0 = 10% of the data dir's filesystem),
   `net_mode` (`user|tap|auto`), `net_pool`, `volumes_dir: Option<PathBuf>`,
@@ -1005,7 +1051,8 @@ pub struct CreateSandbox { pub sandbox_id: String, pub team_id: String, pub temp
     pub env_vars: BTreeMap<String, String>, pub envd_access_token: String,
     pub default_user: Option<String>, pub default_workdir: Option<String>,
     pub network: NetworkPolicy, pub volume_mounts: Vec<VolumeMount>, pub metadata: BTreeMap<String,String>,
-    pub cold_boot: bool }   // true = boot rootfs fresh (resume memory:false / no snapshot)
+    pub cold_boot: bool,    // true = boot rootfs fresh (resume memory:false / no snapshot)
+    pub gpus: u32 }         // GPUs to reserve (≤ 8; implies cold boot; too few free → busy)
 pub struct ResumeSandbox { pub end_at_ms: u64, pub init: GuestInit, pub network: NetworkPolicy,
     pub volume_mounts: Vec<VolumeMount>, pub cold_boot: bool,
     pub remote: Option<paused_store::Remote>,   // published generation (object store)
@@ -1204,8 +1251,9 @@ served at `/dashboard/` on the public listeners):
 - `GET /admin/sandboxes`: every team's running/paused sandboxes, newest
   first (`state` CSV, `team`, `limit` 1..=1000 default 500, `nextToken` /
   `X-Next-Token` as `/v2/sandboxes`); `ListedSandbox` fields plus `teamID`,
-  `teamName`, and `nodeID` (route node, else the row's). Live state overlays
-  the KV routes as in `/v2/sandboxes`, read once per request. `id=<sandboxID>`
+  `teamName`, `nodeID` (route node, else the row's), and `gpus` (count).
+  Live state overlays the KV routes as in `/v2/sandboxes`, read once per
+  request. `id=<sandboxID>`
   returns just that sandbox (`[row]`, or `[]` when killed, unknown, hidden,
   or filtered out by `state`/`team`; malformed → 400), reads its single route,
   and ignores `limit`/`nextToken`.
@@ -1240,6 +1288,21 @@ matching the build artifact when a snapshot must be reused. Score: free
 vCPU/memory headroom, +bonus when the node already has the build's artifacts
 (`art/<build>/*` in KV), −inflight creates. Power-of-two-choices among the
 top candidates; on `busy`/failure retry the next (max 3).
+
+GPUs (`PlacementRequest.gpus`, the sandbox's effective count): a node is
+compatible only with at least that many assignable GPUs in
+`NodeCapacity.gpus` (empty `problem`; else `NoCompatibleNode` →
+`sandbox_no_compatible_node`) and has room only while its free ones
+(`GpuInfo::available`: no holder, no problem) minus this driver's in-flight
+GPU creates on it (`NodeCounters.inflight_gpus`, held by the
+`InflightGuard`) cover the request (else `NoCapacity` →
+`sandbox_capacity_unavailable`). GPU requests get no snapshot bonus (they
+cold-boot). The node reserves GPUs atomically at create/resume and answers
+`busy` when another driver won the race, so the next candidate is tried.
+The effective count is `metadata["vmon.gpus"]`, else the build artifact's
+env `VMON_GPUS`, else 0 (decimal `0..=8`, else 400;
+`limits::requested_gpus`), stored as `SandboxRow.gpus` and sent as
+`CreateSandbox.gpus` / `ResumeSandbox.gpus`.
 
 ### 9.4 Sandbox lifecycle (driver-side state machine)
 

@@ -558,6 +558,17 @@ impl AgentClient {
 			.map(drop)
 	}
 
+	/// Unloads the guest NVIDIA driver so its GPUs survive the VM's
+	/// teardown; `Ok` only once it is unloaded (or was never loaded). Kills
+	/// the guest processes using the GPU first: send it right before the VM
+	/// stops or pauses.
+	pub async fn gpu_release(&self) -> anyhow::Result<()> {
+		self
+			.request_timeout(Op::GpuRelease, Value::Null, Duration::from_secs(30))
+			.await
+			.map(drop)
+	}
+
 	/// Mounts a virtio-fs tag or block device in the guest.
 	pub async fn mount(&self, req: &MountRequest) -> anyhow::Result<()> {
 		self

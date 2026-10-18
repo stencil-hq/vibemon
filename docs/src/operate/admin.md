@@ -168,7 +168,7 @@ The dashboard reads three vmon-specific routes, usable from scripts as well:
 |---|---|---|
 | `GET` | `/admin/cluster` | Cluster ID, the serving driver's ID, every gossip member (host name, advertised IPs, the cluster URL this driver reaches it at, state, roles, version, raft view, node capacity, CPU model and status, create counters, GPUs with their holder or problem), and `history`: up to one hour of 5 s fleet samples (nodes, sandboxes, builds, vCPU, memory, starts) |
 | `GET` | `/admin/teams` | Every team with limits, flags, and running/paused sandbox counts |
-| `GET` | `/admin/sandboxes` | Running and paused sandboxes of every team, newest first, with `teamID`, `teamName`, and `nodeID`. Query: `state` (`running`, `paused`, or both), `team`, `id` (one sandbox), `limit` (1–1000, default 500), `nextToken` (from `X-Next-Token`) |
+| `GET` | `/admin/sandboxes` | Running and paused sandboxes of every team, newest first, with `teamID`, `teamName`, `nodeID`, and `gpus` (count). Query: `state` (`running`, `paused`, or both), `team`, `id` (one sandbox), `limit` (1–1000, default 500), `nextToken` (from `X-Next-Token`) |
 
 ```sh
 curl -s -H "$AUTH" "$API/admin/sandboxes?state=running&limit=50"

@@ -24,6 +24,11 @@ pub struct ErrorBody {
 	pub message: String,
 }
 
+/// [`ErrorBody::code`] of a memory pause or snapshot of a sandbox that holds
+/// GPUs (400): GPU state cannot be captured, so such sandboxes only pause
+/// their filesystem.
+pub const GPU_MEMORY_SNAPSHOT: &str = "gpu_memory_snapshot";
+
 /// `POST /sandboxes`: start a sandbox from a build's template snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +55,10 @@ pub struct CreateSandbox {
 	pub s3_mounts:        Vec<S3Mount>,
 	/// Boot the rootfs fresh instead of forking the template snapshot.
 	pub cold_boot:        bool,
+	/// Whole GPUs (or vGPU VFs) to pass through, ≤ 8. The node reserves them
+	/// all or answers `busy`; a GPU sandbox always cold-boots.
+	#[serde(default)]
+	pub gpus:             u32,
 }
 
 /// Everything the node passes to envd `POST /init` after a boot or resume.

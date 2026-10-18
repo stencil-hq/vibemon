@@ -29,6 +29,10 @@ pub struct NodeConfig {
 	/// Static guest agent; `None` = `vmon-agent-<arch>` beside `vmon_bin`
 	/// or `target/test-assets/` in a dev tree.
 	pub agent:                   Option<PathBuf>,
+	/// Guest NVIDIA driver bundle for GPU sandboxes; `None` =
+	/// `vmon-nvidia-<arch>/` beside `vmon_bin`, then `target/kernel/` in a dev
+	/// tree ([`crate::assets::resolve_gpu_driver`]).
+	pub gpu_driver:              Option<PathBuf>,
 	/// This binary (`std::env::current_exe()`), re-executed as `vmon vmm`.
 	pub vmon_bin:                PathBuf,
 	/// Concurrent VM boots; 0 = 4 × logical CPUs.

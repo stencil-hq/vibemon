@@ -9,7 +9,8 @@ The E2B SDKs default to the unqualified aliases `base`, `code-interpreter-v1`,
 bare alias, which every team resolves after its own namespace
 (ARCHITECTURE.md §7), so these builds make the defaults work for all teams.
 `ubuntu-systemd` (stock Ubuntu 24.04 with systemd as PID 1) is vibemon's own
-reference template for `fromImage` builds on a plain distro image.
+reference template for `fromImage` builds on a plain distro image; `cuda`
+(NVIDIA CUDA runtime, one GPU by default) is its template for GPU sandboxes.
 
     uv run templates/build.py [NAME ...] [--jobs N] [--skip-cache]
 
@@ -44,6 +45,7 @@ TEMPLATES = {
     "desktop": "desktop",
     "mcp-gateway": "mcp-gateway",
     "ubuntu-systemd": "ubuntu-systemd",
+    "cuda": "cuda",
 }
 DEFAULT_API_URL = "http://127.0.0.1:3000"
 

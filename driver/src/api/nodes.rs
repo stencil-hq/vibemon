@@ -165,6 +165,8 @@ struct MemberNodeDto {
 	create_successes: u64,
 	create_fails:     u64,
 	inflight:         u32,
+	/// Host GPUs: `{address, model, sandbox, problem}`.
+	gpus:             Vec<GpuInfo>,
 }
 
 /// Public status: gossip liveness first, then the admin override / node drain
@@ -277,6 +279,7 @@ fn member_dto(
 			create_successes: counters.successes,
 			create_fails:     counters.fails,
 			inflight:         counters.inflight,
+			gpus:             cap.gpus.clone(),
 		});
 	let cluster_url = meta.cluster_url(member);
 	MemberDto {
@@ -459,6 +462,42 @@ mod tests {
 		assert!(parse_status(Some("standby")).is_err());
 		assert!(parse_status(Some("bogus")).is_err());
 		assert!(parse_status(None).is_err());
+	}
+
+	#[test]
+	fn cluster_member_lists_node_gpus() {
+		let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 7946));
+		let member = Member {
+			id: NodeId(7),
+			addr,
+			addrs: vec![addr],
+			state: MemberState::Alive,
+			incarnation: 0,
+			meta_version: 0,
+			meta: Vec::new(),
+		};
+		let gpu = GpuInfo {
+			address: "0000:52:00.0".into(),
+			model:   "GB205 [GeForce RTX 5070]".into(),
+			sandbox: Some("isbx".into()),
+			problem: String::new(),
+		};
+		let meta = MemberMeta {
+			roles: Roles { node: true, driver: false },
+			node: Some(NodeCapacity { gpus: vec![gpu], ..NodeCapacity::default() }),
+			..MemberMeta::default()
+		};
+		let dto = member_dto(&member, meta, None, NodeCounters::default());
+		let json = serde_json::to_value(&dto).unwrap();
+		assert_eq!(
+			json["node"]["gpus"],
+			serde_json::json!([{
+				"address": "0000:52:00.0",
+				"model": "GB205 [GeForce RTX 5070]",
+				"sandbox": "isbx",
+				"problem": "",
+			}])
+		);
 	}
 
 	#[test]

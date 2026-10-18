@@ -177,5 +177,8 @@ The node (`node/src/assets.rs`) picks the guest kernel in this order:
    with a WARN that netfilter (nftables/iptables, Docker), IPv6, bridge and
    NFS are missing.
 
+The GPU driver bundle is shared into GPU sandboxes by the node; the VMM flag
+is `--volume vmon_gpu:<dir>/vmon-nvidia-<arch>:ro`.
+
 Template snapshots capture the running kernel, so templates built under
 another kernel keep booting it: rebuild templates after switching kernels.

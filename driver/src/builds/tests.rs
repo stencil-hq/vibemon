@@ -141,6 +141,7 @@ fn capacity() -> NodeCapacity {
 		draining:       false,
 		features:       vec![],
 		cached_builds:  vec![],
+		gpus:           vec![],
 	}
 }
 

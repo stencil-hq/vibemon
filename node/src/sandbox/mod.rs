@@ -37,17 +37,18 @@ use crate::{
 		self,
 		copy::{clone_disk, link_disk_base, move_disk, remove_disk},
 	},
-	build::Builder,
+	build::{Builder, ServiceLog, start_service, steps::BuildContext},
 	egress::{Egress, EgressNet},
 	envd::EnvdClient,
-	gc4::MountRequest,
+	gc4::{AgentClient, ExecRequest, MountRequest},
+	gpu::{self, GpuPool},
 	lazy_resume::{self, PageServer},
 	logs, metrics,
 	net::NetLease,
 	paused_store::{self, Cancellation, Remote, Store, UploadInput},
 	s3fs::{self, S3Fs, S3FsConfig},
 	server::ApiError,
-	vm::{Boot, Disk, FsShare, RemoteDisk, Vm, VmRuntime, VmSpec, private_dir},
+	vm::{Boot, Disk, FsShare, RemoteDisk, Vm, VmGpu, VmRuntime, VmSpec, private_dir},
 	volumes::VolumeStore,
 };
 
@@ -59,6 +60,11 @@ const READY_TIMEOUT: Duration = Duration::from_mins(1);
 const PAUSE_SNAPSHOT: &str = "pause";
 /// Manifest that marks a published VMM snapshot directory.
 const CURRENT_GENERATION: &str = "current-generation";
+/// How long a GPU VM's filesystem-only pause waits for the VMM to quit
+/// before SIGKILL.
+const GPU_QUIT_GRACE: Duration = Duration::from_secs(30);
+/// `--volume` shares one VMM accepts.
+const MAX_VOLUMES: usize = 8;
 
 /// Current wall clock in unix ms.
 pub fn now_ms() -> u64 {
@@ -108,6 +114,8 @@ pub struct ManagerConfig {
 	pub lazy_resume:             bool,
 	/// Let bring-your-own-bucket mounts use private/loopback endpoints.
 	pub s3_mounts_allow_private: bool,
+	/// Host GPUs sandboxes reserve.
+	pub gpus:                    Arc<GpuPool>,
 }
 
 /// A running VM and what hangs off it.
@@ -120,6 +128,12 @@ struct Live {
 	/// Page source of a lazily restored RAM ([`lazy_resume`]): held (never
 	/// read) so it serves as long as the VMM and stops when `Live` drops.
 	_pages:     Option<PageServer>,
+	/// GPUs the VM holds; freed once the VMM is reaped
+	/// ([`SandboxManager::retire`]).
+	gpus:       Vec<String>,
+	/// The guest unloaded its GPU driver (`gpu_release`): the GPUs are
+	/// reusable. Otherwise they are quarantined when the VMM stops.
+	gpus_clean: bool,
 }
 
 impl Live {
@@ -187,6 +201,10 @@ struct BootPlan<'a> {
 	ram_base:  Option<PathBuf>,
 	/// Page source of a [`Boot::RemotePages`] restore.
 	pages:     Option<PageServer>,
+	/// Build whose start/ready commands a cold boot runs.
+	build_id:  &'a str,
+	/// Reserved GPUs to pass through (cold boots only).
+	gpus:      &'a [String],
 }
 
 /// Result of a successful boot.
@@ -195,6 +213,52 @@ struct Booted {
 	net:          NetLease,
 	envd_version: Option<String>,
 	pages:        Option<PageServer>,
+	gpus:         Vec<String>,
+}
+
+/// GPUs reserved for a boot: released on drop unless [`Self::keep`] hands
+/// them to the running VM.
+struct GpuLease<'a> {
+	pool: &'a GpuPool,
+	id:   &'a str,
+	gpus: Vec<String>,
+}
+
+impl<'a> GpuLease<'a> {
+	/// Reserves `count` GPUs for sandbox `id` (`busy` when too few are free).
+	fn reserve(pool: &'a GpuPool, id: &'a str, count: u32) -> Result<Self, ApiError> {
+		Ok(Self { pool, id, gpus: pool.reserve(id, count)? })
+	}
+
+	/// The boot succeeded: the VM holds the GPUs now.
+	fn keep(mut self) {
+		self.gpus.clear();
+	}
+}
+
+impl Drop for GpuLease<'_> {
+	fn drop(&mut self) {
+		self.pool.release(self.id, &self.gpus);
+	}
+}
+
+/// Asks the guest to unload its GPU driver right before its VMM stops (the
+/// guest's processes die with it); `true` once it did.
+async fn release_guest_gpus(id: &str, vm: &Vm) -> bool {
+	if vm.exited().is_some() {
+		return false;
+	}
+	match vm.agent().gpu_release().await {
+		Ok(()) => true,
+		Err(error) => {
+			tracing::warn!(
+				sandbox = id,
+				error = format!("{error:#}"),
+				"guest did not release its GPUs"
+			);
+			false
+		},
+	}
 }
 
 /// Owns every sandbox on this node.
@@ -536,6 +600,11 @@ impl SandboxManager {
 			.ok_or_else(|| ApiError::not_found(format!("sandbox {id} not found")))
 	}
 
+	/// Host GPUs and their reservations.
+	pub const fn gpus(&self) -> &Arc<GpuPool> {
+		&self.config.gpus
+	}
+
 	/// Totals over running sandboxes.
 	pub fn usage(&self) -> Usage {
 		let sandboxes = self.sandboxes.lock();
@@ -630,6 +699,36 @@ impl SandboxManager {
 			}
 			shares.push(FsShare::Volume { tag: format!("vol{index}"), dir, read_only: false });
 		}
+		let gpu = if plan.gpus.is_empty() {
+			None
+		} else {
+			// The guest agent loads the NVIDIA driver from this share.
+			let bundle = self
+				.config
+				.gpus
+				.bundle_dir()
+				.ok_or_else(|| ApiError::busy("this node has no guest GPU driver bundle"))?;
+			shares.push(FsShare::Volume {
+				tag:       gpu::BUNDLE_TAG.to_owned(),
+				dir:       bundle.to_owned(),
+				read_only: true,
+			});
+			// Caught here: a VMM that fails to start quarantines its GPUs.
+			if shares.len() > MAX_VOLUMES {
+				return Err(ApiError::invalid(format!(
+					"a GPU sandbox mounts at most {} volumes",
+					MAX_VOLUMES - 1
+				)));
+			}
+			Some(VmGpu {
+				functions: plan
+					.gpus
+					.iter()
+					.map(|address| self.config.gpus.sysfs_path(address))
+					.collect(),
+				vm_uuid:   gpu::vm_uuid(id),
+			})
+		};
 		let s3 = self
 			.s3fs
 			.attach(id, &paths.dir, plan.s3_mounts, plan.mounts)
@@ -672,19 +771,27 @@ impl SandboxManager {
 			timeout: Some(Duration::from_secs(deadline_secs(plan.end_at_ms, now_ms()))),
 			ready_timeout: READY_TIMEOUT,
 			extra_args,
+			gpu,
 		};
 		let vm = match self.vms.launch(spec).await {
 			Ok(vm) => vm,
 			Err(error) => {
+				// The guest may have loaded its GPU driver before it failed.
+				self.config.gpus.quarantine(id, plan.gpus);
 				net.release().await;
 				self.s3fs.detach_now(id);
 				return Err(ApiError::internal(format!("{error:#}")));
 			},
 		};
 		match self.prepare_guest(id, &vm, &net, &plan, s3.as_ref()).await {
-			Ok(envd_version) => Ok(Booted { vm, net, envd_version, pages: plan.pages.take() }),
+			Ok(envd_version) => {
+				Ok(Booted { vm, net, envd_version, pages: plan.pages.take(), gpus: plan.gpus.to_vec() })
+			},
 			Err(error) => {
 				self.egress.detach(id).await;
+				if !plan.gpus.is_empty() && !release_guest_gpus(id, &vm).await {
+					self.config.gpus.quarantine(id, plan.gpus);
+				}
 				vm.kill().await;
 				net.release().await;
 				self.s3fs.detach_now(id);
@@ -759,9 +866,61 @@ impl SandboxManager {
 		if init.ca_bundle.is_none() {
 			init.ca_bundle = self.egress.ca_bundle();
 		}
-		EnvdClient::with_token(vm.clone(), &init.envd_access_token)
+		let envd_version = EnvdClient::with_token(vm.clone(), &init.envd_access_token)
 			.init(&init)
+			.await?;
+		if plan.cold {
+			self
+				.start_template_service(id, &agent, plan.build_id)
+				.await?;
+		}
+		Ok(envd_version)
+	}
+
+	/// Runs the build's start command and waits for its ready command after
+	/// a cold boot, as the template snapshot did before capture: a fresh
+	/// kernel runs neither (a fork inherits the running service). Applies to
+	/// every cold boot (GPU sandboxes, templates without a usable snapshot,
+	/// filesystem-only resumes). The service keeps running in the background.
+	async fn start_template_service(
+		&self,
+		id: &str,
+		agent: &AgentClient,
+		build_id: &str,
+	) -> anyhow::Result<()> {
+		let Some(meta) = self.builder.artifacts().local_meta(build_id) else {
+			tracing::info!(
+				sandbox = id,
+				build = build_id,
+				"build metadata is not local; no start command after this cold boot"
+			);
+			return Ok(());
+		};
+		let has = |cmd: Option<&str>| cmd.is_some_and(|cmd| !cmd.trim().is_empty());
+		if !has(meta.start_cmd.as_deref()) && !has(meta.ready_cmd.as_deref()) {
+			return Ok(());
+		}
+		let mut ctx = BuildContext::for_artifact(&meta);
+		let probe = ExecRequest {
+			cmd: ["/bin/sh", "-c", "test -x /bin/bash"]
+				.map(str::to_owned)
+				.to_vec(),
+			..ExecRequest::default()
+		};
+		ctx.has_bash = matches!(agent.exec(&probe).await?.output().await, Ok((_, _, 0)));
+		// Dropping the output task leaves the start command running.
+		drop(
+			start_service(
+				agent,
+				&ctx,
+				meta.start_cmd.as_deref(),
+				meta.ready_cmd.as_deref(),
+				&ServiceLog::Sandbox(id.to_owned()),
+			)
 			.await
+			.context("starting the template's start command")?,
+		);
+		Ok(())
 	}
 
 	/// Spawns the metric scraper and exit watcher of a freshly booted VM.
@@ -840,13 +999,16 @@ impl SandboxManager {
 	/// Takes a VM out of service without waiting for host teardown: aborts its
 	/// tasks, SIGKILLs the VMM, and forgets its egress attachment (a resume can
 	/// attach again right away). The returned, already running task releases
-	/// the egress rules, reaps the VMM, and then frees the TAP lease; it never
-	/// touches the sandbox's paths or entry.
+	/// the egress rules, reaps the VMM, and then frees the TAP lease and the
+	/// GPUs (quarantined unless the guest released them, see
+	/// [`release_guest_gpus`]); it never touches the sandbox's paths or entry.
 	async fn retire(&self, id: &str, mut live: Live) -> JoinHandle<()> {
 		live.stop_tasks();
 		live.vm.terminate();
 		let attachment = self.egress.take(id).await;
 		let egress = self.egress.clone();
+		let gpus = Arc::clone(&self.config.gpus);
+		let id = id.to_owned();
 		tokio::spawn(async move {
 			let rules = async {
 				if let Some(net) = &attachment {
@@ -854,6 +1016,11 @@ impl SandboxManager {
 				}
 			};
 			tokio::join!(rules, live.vm.wait());
+			if live.gpus_clean {
+				gpus.release(&id, &live.gpus);
+			} else {
+				gpus.quarantine(&id, &live.gpus);
+			}
 			if let Some(net) = live.net.take() {
 				net.release().await;
 			}
@@ -875,6 +1042,7 @@ impl SandboxManager {
 			state.meta.ended_at_ms = Some(now_ms());
 			state.meta.pid = None;
 			state.meta.tap = None;
+			state.meta.gpus.clear();
 			if let Err(error) = meta::save(&entry.paths, &state.meta) {
 				tracing::warn!(sandbox = id, %error, "saving ended sandbox meta failed");
 			}
@@ -899,12 +1067,15 @@ impl SandboxManager {
 		let mut state = entry.state.lock();
 		state.meta.pid = Some(booted.vm.pid());
 		state.meta.tap = booted.net.tap().cloned();
+		state.meta.gpus.clone_from(&booted.gpus);
 		state.live = Some(Live {
 			vm: booted.vm,
 			net: Some(booted.net),
 			tasks,
 			generation,
 			_pages: booted.pages,
+			gpus: booted.gpus,
+			gpus_clean: false,
 		});
 	}
 
@@ -921,6 +1092,8 @@ impl SandboxManager {
 			return Err(ApiError::conflict(format!("sandbox {id} already exists")));
 		}
 		let _pending = Pending { manager: self, id: id.clone() };
+		// Before the artifact: a node without free GPUs answers `busy` at once.
+		let gpus = GpuLease::reserve(&self.config.gpus, &id, req.gpus)?;
 		let artifact = self
 			.builder
 			.ensure(&req.build_id, sources)
@@ -940,7 +1113,8 @@ impl SandboxManager {
 		// A fork inherits the snapshot's device set: it has no node-local
 		// volumes, and its S3 device tags (recorded beside snapshots captured
 		// with mounts, e.g. fork templates) must be exactly the requested ones.
-		let snapshot = (!req.cold_boot && artifact.has_snapshot)
+		// GPU state cannot be restored: GPU sandboxes always boot fresh.
+		let snapshot = (!req.cold_boot && req.gpus == 0 && artifact.has_snapshot)
 			.then(|| store.snapshot_dir(&req.build_id))
 			.transpose()
 			.map_err(ApiError::internal)?;
@@ -970,6 +1144,8 @@ impl SandboxManager {
 			init: &req.init,
 			ram_base,
 			pages: None,
+			build_id: &req.build_id,
+			gpus: &gpus.gpus,
 		};
 		let booted = match self.boot(&id, &paths, plan).await {
 			Ok(booted) => booted,
@@ -1004,6 +1180,7 @@ impl SandboxManager {
 			pid:               None,
 			tap:               None,
 			ended_at_ms:       None,
+			gpus:              Vec::new(),
 		};
 		let entry = Arc::new(Entry {
 			paths,
@@ -1012,6 +1189,7 @@ impl SandboxManager {
 			upload: Mutex::default(),
 		});
 		self.install_live(&id, &entry, booted);
+		gpus.keep();
 		let info = {
 			let state = entry.state.lock();
 			if let Err(error) = meta::save_unsynced(&entry.paths, &state.meta) {
@@ -1047,6 +1225,10 @@ impl SandboxManager {
 	/// the background ([`paused_store`]).
 	pub async fn pause(self: &Arc<Self>, id: &str, memory: bool) -> Result<SandboxInfo, ApiError> {
 		let entry = self.entry(id)?;
+		let holds_gpus = !entry.state.lock().meta.gpus.is_empty();
+		if memory && holds_gpus {
+			return Err(ApiError::gpu_memory_snapshot(id));
+		}
 		// Held until the paused state is durable (see `commit_paused`), so a
 		// resume or kill waits for it instead of racing it.
 		let ops = Arc::clone(&entry.ops).lock_owned().await;
@@ -1078,6 +1260,14 @@ impl SandboxManager {
 					vm.snapshot(PAUSE_SNAPSHOT).await
 				}
 			} else {
+				// The guest unloads its GPU driver first (its GPU users die), so
+				// the GPUs are reusable once the VMM is gone.
+				if holds_gpus
+					&& release_guest_gpus(id, &vm).await
+					&& let Some(live) = entry.state.lock().live.as_mut()
+				{
+					live.gpus_clean = true;
+				}
 				// Flush guest page cache, then stop all writes.
 				if let Err(error) = vm.agent().fs_sync().await {
 					tracing::warn!(
@@ -1086,7 +1276,15 @@ impl SandboxManager {
 						"fs_sync before filesystem pause failed"
 					);
 				}
-				vm.pause().await?;
+				// The VMM refuses to pause with a VFIO GPU attached, so a GPU VM
+				// (driver unloaded, filesystem synced) quits instead: the VMM
+				// closes its disk overlay, persisting the allocation bitmap that
+				// a SIGKILL would leave stale (losing the latest writes).
+				if holds_gpus {
+					vm.shutdown(GPU_QUIT_GRACE).await;
+				} else {
+					vm.pause().await?;
+				}
 				self.s3fs.sync(id).await
 			}
 		}
@@ -1129,8 +1327,12 @@ impl SandboxManager {
 		if let Some(live) = live {
 			// The VM is paused with every device quiesced and its state
 			// captured; nothing is left to flush, so skip the `quit` round trip
-			// and leave reaping and network teardown to the background.
-			drop(self.retire(id, live).await);
+			// and leave reaping and network teardown to the background. GPUs
+			// are free only once the VMM is reaped: wait for that.
+			let teardown = self.retire(id, live).await;
+			if holds_gpus {
+				let _ = teardown.await;
+			}
 		}
 		// Uploads finished above; the resume attaches a fresh proxy.
 		self.s3fs.detach_now(id);
@@ -1164,6 +1366,7 @@ impl SandboxManager {
 		state.meta.state = SandboxState::Paused;
 		state.meta.pid = None;
 		state.meta.tap = None;
+		state.meta.gpus.clear();
 		meta::save(paths, &state.meta).map_err(ApiError::internal)?;
 		let info = state.meta.info();
 		drop(state);
@@ -1202,6 +1405,7 @@ impl SandboxManager {
 		meta.pid = None;
 		meta.tap = None;
 		meta.ended_at_ms = None;
+		meta.gpus.clear();
 		meta
 			.envd_access_token
 			.clone_from(&req.init.envd_access_token);
@@ -1388,6 +1592,8 @@ impl SandboxManager {
 		sources: &[String],
 	) -> Result<SandboxInfo, ApiError> {
 		validate_id(id)?;
+		// GPU state cannot be restored: the paused filesystem boots fresh.
+		req.cold_boot |= req.gpus > 0;
 		if let Some(remote) = &req.remote {
 			let generation = paused_store::generation_prefix(remote)
 				.map_err(|error| ApiError::invalid(format!("{error:#}")))?;
@@ -1437,6 +1643,8 @@ impl SandboxManager {
 			}
 			(state.meta.build_id.clone(), state.meta.vcpus, state.meta.memory_mb)
 		};
+		// Before fetching anything: a node without free GPUs answers `busy`.
+		let gpus = GpuLease::reserve(&self.config.gpus, id, req.gpus)?;
 		let paths = entry.paths.clone();
 		let lazy = if paths.paused_resumable() {
 			None
@@ -1453,7 +1661,7 @@ impl SandboxManager {
 		};
 		let lazily = lazy.is_some();
 		let booted = match self
-			.boot_paused(id, &paths, req, &build_id, vcpus, memory_mb, lazy)
+			.boot_paused(id, &paths, req, &build_id, vcpus, memory_mb, lazy, &gpus.gpus)
 			.await
 		{
 			Err(error) if lazily => {
@@ -1495,6 +1703,7 @@ impl SandboxManager {
 			}
 		}
 		self.install_live(id, entry, booted);
+		gpus.keep();
 		let info = {
 			let state = entry.state.lock();
 			meta::save(&paths, &state.meta).map_err(ApiError::internal)?;
@@ -1518,6 +1727,7 @@ impl SandboxManager {
 		vcpus: u32,
 		memory_mb: u64,
 		lazy: Option<LazyResume>,
+		gpus: &[String],
 	) -> Result<Booted, ApiError> {
 		let fork = !req.cold_boot && paths.paused_snapshot().join(CURRENT_GENERATION).is_file();
 		// A fetched pause carries its build's boot init: a cold boot then needs
@@ -1566,6 +1776,8 @@ impl SandboxManager {
 			init: &req.init,
 			ram_base,
 			pages,
+			build_id,
+			gpus,
 		};
 		self.boot(id, paths, plan).await
 	}
@@ -1591,12 +1803,19 @@ impl SandboxManager {
 		};
 		let live = entry.state.lock().live.take();
 		self.forget(id, &entry);
-		let teardown = match live {
-			Some(live) => Some(self.retire(id, live).await),
-			None => None,
+		// A GPU VM first unloads its guest driver (bounded), off the request
+		// path; any other VM stops at once.
+		let (gpu_live, teardown) = match live {
+			Some(live) if !live.gpus.is_empty() => (Some(live), None),
+			Some(live) => (None, Some(self.retire(id, live).await)),
+			None => (None, None),
 		};
 		let (manager, id) = (Arc::clone(self), id.to_owned());
 		tokio::spawn(async move {
+			if let Some(mut live) = gpu_live {
+				live.gpus_clean |= release_guest_gpus(&id, &live.vm).await;
+				let _ = manager.retire(&id, live).await.await;
+			}
 			if let Some(teardown) = teardown {
 				let _ = teardown.await;
 			}
@@ -1653,6 +1872,9 @@ impl SandboxManager {
 	/// a frozen rootfs copy, resume, and install both as build `req.build_id`.
 	pub async fn snapshot(&self, id: &str, req: SnapshotSandbox) -> Result<ArtifactInfo, ApiError> {
 		let entry = self.entry(id)?;
+		if req.memory && !entry.state.lock().meta.gpus.is_empty() {
+			return Err(ApiError::gpu_memory_snapshot(id));
+		}
 		let _ops = entry.ops.lock().await;
 		let (vm, meta) = {
 			let state = entry.state.lock();
@@ -1845,6 +2067,10 @@ impl SandboxManager {
 				},
 				SandboxState::Running => match self.adopt(&id, &meta).await {
 					Ok((vm, net)) => {
+						// The live VMM still holds its GPUs.
+						if let Err(error) = self.config.gpus.claim(&id, &meta.gpus) {
+							tracing::error!(sandbox = %id, %error, "re-reserving the GPUs of an adopted sandbox failed");
+						}
 						if let Err(error) = self.reattach_egress(&id, &vm, &net, &meta.network).await {
 							tracing::warn!(sandbox = %id, error = format!("{error:#}"), "re-attaching egress failed");
 						}
@@ -1860,6 +2086,7 @@ impl SandboxManager {
 							net,
 							envd_version: None,
 							pages: None,
+							gpus: meta.gpus.clone(),
 						});
 						tracing::info!(sandbox = %id, "adopted running sandbox");
 						self.sandboxes.lock().insert(id, entry);
@@ -1873,6 +2100,8 @@ impl SandboxManager {
 							// harmless.
 							unsafe { libc::kill(pid, libc::SIGKILL) };
 						}
+						// Its guest never released them.
+						self.config.gpus.quarantine(&id, &meta.gpus);
 						if let Ok(net) = self.vms.net().adopt(meta.tap.clone()) {
 							net.release().await;
 						}
@@ -2053,6 +2282,7 @@ mod tests {
 			pid:               None,
 			tap:               None,
 			ended_at_ms:       None,
+			gpus:              Vec::new(),
 		};
 		meta::save_unsynced(&paths, &meta).unwrap();
 		fs::File::open(&paths.dir)

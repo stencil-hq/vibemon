@@ -224,6 +224,8 @@ pub struct AdminListedSandboxDto {
 	pub team_name: String,
 	#[serde(rename = "nodeID")]
 	pub node_id:   String,
+	/// GPUs passed through.
+	pub gpus:      u32,
 }
 
 /// `SandboxMetric`.

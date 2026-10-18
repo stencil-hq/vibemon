@@ -63,6 +63,7 @@ At startup the node resolves the guest kernel and the guest agent:
 
 - **Kernel:** `--kernel`, else `vmon-kernel-<arch>` next to the `vmon` binary (release assets), else `target/kernel/` of a dev tree (`just kernel`). As a last resort the node downloads a pinned cloud-hypervisor kernel into `<data-dir>/assets/`. That kernel lacks netfilter, IPv6, bridge, and NFS, which breaks Docker-in-sandbox and templates that rely on those features, so vmon logs a warning when it falls back to it.
 - **Agent:** `--agent`, else `vmon-agent-<arch>` next to the binary, else `target/test-assets/` of a dev tree (`just agent-musl`). It must be a static ELF for the guest architecture. If no agent is found, the node does not start.
+- **GPU driver bundle:** `--gpu-driver`, else `vmon-nvidia-<arch>/` next to the binary, else `target/kernel/` of a dev tree (`just gpu-driver`). Optional: without it, GPUs are listed but not assignable. See [GPUs](gpus.md).
 
 Keep the release assets next to `vmon`, or pass both flags explicitly. See [Guest kernel](kernel.md).
 

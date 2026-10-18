@@ -1,7 +1,10 @@
-//! Pure lifecycle rules: sandbox IDs, timeouts, and lifecycle flags.
+//! Pure lifecycle rules: sandbox IDs, timeouts, lifecycle flags, and GPU
+//! requests.
 //!
 //! Timeout validation and clamping follow upstream's API (the `timeout`
 //! fields of `spec/e2b/infra/spec/openapi.yml`) and ARCHITECTURE.md §9.4.
+
+use std::collections::BTreeMap;
 
 use rand::RngExt;
 
@@ -22,6 +25,12 @@ pub const REFRESH_MIN_S: u64 = 15;
 pub const REFRESH_MAX_S: u64 = 3600;
 /// Fork `count` bounds.
 pub const FORK_MAX: u32 = 100;
+/// Sandbox metadata key requesting GPUs (vibemon extension).
+pub const GPUS_METADATA_KEY: &str = "vmon.gpus";
+/// Template environment variable with the default GPU count.
+pub const GPUS_TEMPLATE_ENV: &str = "VMON_GPUS";
+/// Most GPUs one sandbox may request (the node API limit).
+pub const MAX_GPUS: u32 = 8;
 
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz1234567890";
 const ID_LEN: usize = 20;
@@ -161,6 +170,43 @@ pub fn lifecycle_flags(
 	Ok(flags)
 }
 
+/// GPUs a new sandbox gets: `metadata["vmon.gpus"]`, else the template's
+/// `VMON_GPUS` environment default, else 0. Each must be a decimal in
+/// `0..=8` (400 naming the offending key otherwise).
+pub fn requested_gpus(
+	metadata: &BTreeMap<String, String>,
+	template_env: &BTreeMap<String, String>,
+) -> ApiResult<u32> {
+	let parse = |raw: &str, what: &str| {
+		Some(raw)
+			.filter(|raw| !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+			.and_then(|raw| raw.parse::<u32>().ok())
+			.filter(|gpus| *gpus <= MAX_GPUS)
+			.ok_or_else(|| {
+				ApiError::bad_request(format!(
+					"{what} must be a whole number of GPUs between 0 and {MAX_GPUS}, got {raw:?}"
+				))
+			})
+	};
+	if let Some(raw) = metadata.get(GPUS_METADATA_KEY) {
+		return parse(raw.as_str(), &format!("metadata[\"{GPUS_METADATA_KEY}\"]"));
+	}
+	template_env.get(GPUS_TEMPLATE_ENV).map_or(Ok(0), |raw| {
+		parse(raw.as_str(), &format!("the template's environment variable {GPUS_TEMPLATE_ENV}"))
+	})
+}
+
+/// Whether a pause or snapshot captures guest memory.
+///
+/// GPUs passed through cannot be snapshotted, so a sandbox holding any is
+/// paused (manually or by `autoPause`) and snapshotted filesystem-only;
+/// resuming it cold-boots. This degrades at pause time and leaves the stored
+/// flags as requested, so the `autoPauseMemory`/`autoResume` rules of
+/// [`lifecycle_flags`] still apply to what the client asked for.
+pub const fn captures_memory(requested: bool, gpus: u32) -> bool {
+	requested && gpus == 0
+}
+
 /// Validates a fork `count` against the spec bounds and the team concurrency.
 pub fn validate_fork_count(count: Option<i64>, max_concurrent: u32) -> ApiResult<u32> {
 	let count = count.unwrap_or(1);
@@ -268,6 +314,47 @@ mod tests {
 		// autoResume without autoPause is allowed (manual pause can still
 		// auto-resume).
 		assert!(lifecycle_flags(None, None, Some(true)).unwrap().auto_resume);
+	}
+
+	#[test]
+	fn gpu_count_metadata_overrides_template_env() {
+		let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+			pairs
+				.iter()
+				.map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+				.collect()
+		};
+		let none = map(&[]);
+		let template = map(&[(GPUS_TEMPLATE_ENV, "1")]);
+		assert_eq!(requested_gpus(&none, &none).unwrap(), 0);
+		assert_eq!(requested_gpus(&none, &template).unwrap(), 1);
+		assert_eq!(requested_gpus(&map(&[(GPUS_METADATA_KEY, "2")]), &template).unwrap(), 2);
+		assert_eq!(
+			requested_gpus(&map(&[(GPUS_METADATA_KEY, "0")]), &template).unwrap(),
+			0,
+			"metadata opts a GPU template out"
+		);
+		assert_eq!(requested_gpus(&map(&[(GPUS_METADATA_KEY, "8")]), &none).unwrap(), 8);
+		for bad in ["", "9", "-1", "+1", " 1", "1.0", "one", "99999999999"] {
+			let error = requested_gpus(&map(&[(GPUS_METADATA_KEY, bad)]), &none).unwrap_err();
+			assert_eq!(error.status, 400, "{bad:?}");
+			assert!(error.message.contains("vmon.gpus"), "{}", error.message);
+		}
+		let error = requested_gpus(&none, &map(&[(GPUS_TEMPLATE_ENV, "lots")])).unwrap_err();
+		assert!(error.message.contains(GPUS_TEMPLATE_ENV), "{}", error.message);
+		// A valid override wins over a broken template default.
+		assert_eq!(
+			requested_gpus(&map(&[(GPUS_METADATA_KEY, "1")]), &map(&[(GPUS_TEMPLATE_ENV, "x")]))
+				.unwrap(),
+			1
+		);
+	}
+
+	#[test]
+	fn gpu_sandboxes_never_capture_memory() {
+		assert!(captures_memory(true, 0));
+		assert!(!captures_memory(false, 0));
+		assert!(!captures_memory(true, 1));
 	}
 
 	#[test]

@@ -43,6 +43,7 @@ interface Loaded {
   teamID: string;
   teamName: string;
   nodeID: string;
+  gpus: number;
 }
 
 /** Admin row (team, node), then the team-scoped detail carrying the envd token. */
@@ -50,7 +51,13 @@ async function loadSandbox(id: string, signal: AbortSignal): Promise<Loaded> {
   const [row] = (await api.sandboxes({ id }, signal)).rows;
   if (!row) throw new Error("It was killed or never existed.");
   const detail = await api.sandbox(row.teamID, id, signal);
-  return { detail, teamID: row.teamID, teamName: row.teamName, nodeID: row.nodeID };
+  return {
+    detail,
+    teamID: row.teamID,
+    teamName: row.teamName,
+    nodeID: row.nodeID,
+    gpus: row.gpus,
+  };
 }
 
 export function SandboxDetailPage({ id }: { id: string }) {
@@ -105,6 +112,7 @@ export function SandboxDetailPage({ id }: { id: string }) {
             <span className="faint"> · </span>
             {detail.cpuCount} vCPU · {fmt.mib(detail.memoryMB)} RAM · {fmt.mib(detail.diskSizeMB)}{" "}
             disk
+            {data.gpus > 0 && ` · ${data.gpus} GPU${data.gpus === 1 ? "" : "s"}`}
           </p>
         </div>
         <div className="page__actions">
@@ -197,6 +205,12 @@ export function SandboxDetailPage({ id }: { id: string }) {
               <span title={fmt.dateTime(detail.endAt)}>{fmt.ago(detail.endAt, now)}</span>
             )}
           </Detail>
+          {data.gpus > 0 && (
+            <Detail label="GPUs">
+              {data.gpus}
+              <span className="faint"> · pauses keep the filesystem only</span>
+            </Detail>
+          )}
           <Detail label="On timeout">
             {detail.lifecycle.onTimeout === "pause" ? "Pause" : "Kill"}
           </Detail>

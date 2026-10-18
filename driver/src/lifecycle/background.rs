@@ -318,6 +318,8 @@ async fn reconcile_listed(
 		// A resume the driver gave up on (timeout) that the node completed:
 		// pause it again rather than kill it with its paused state.
 		tracing::warn!(sandbox = id, node = %node, "re-pausing a sandbox resumed without a route");
+		let gpus = state.store.sandbox(id).await?.map_or(0, |row| row.gpus);
+		let memory = super::limits::captures_memory(true, gpus);
 		if let Err(error) = client
 			.pause_sandbox(id, &PauseSandbox { memory: true })
 			.await

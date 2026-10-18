@@ -245,6 +245,7 @@ async fn fork(env: &Env, build_id: &str, info: &ArtifactInfo) -> (Vm, crate::vm:
 			timeout: Some(Duration::from_mins(10)),
 			ready_timeout: Duration::from_secs(30),
 			extra_args: Vec::new(),
+			gpu: None,
 		})
 		.await
 		.unwrap();

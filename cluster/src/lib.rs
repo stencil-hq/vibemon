@@ -24,7 +24,7 @@ use axum::{
 	response::{IntoResponse, Response},
 	routing::Route,
 };
-pub use meta::{MemberMeta, NodeCapacity, NodeId, RaftStatus, Roles};
+pub use meta::{GpuInfo, MemberMeta, NodeCapacity, NodeId, RaftStatus, Roles};
 use openraft::async_runtime::WatchReceiver;
 use parking_lot::Mutex;
 use tokio::{

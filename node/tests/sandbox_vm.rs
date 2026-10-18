@@ -216,6 +216,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 				timeout:       Some(Duration::from_mins(10)),
 				ready_timeout: Duration::from_mins(1),
 				extra_args:    Vec::new(),
+				gpu:           None,
 			})
 			.await
 			.expect("template boot");
@@ -284,6 +285,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 			object_store: None,
 			lazy_resume: false,
 			s3_mounts_allow_private: false,
+			gpus: Arc::new(vmon_node::gpu::GpuPool::empty()),
 		},
 		vms,
 		builder,
@@ -344,6 +346,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 			volume_mounts:    Vec::new(),
 			s3_mounts:        Vec::new(),
 			cold_boot:        false,
+			gpus:             0,
 		})
 		.await
 		.expect("create sandbox");
@@ -416,6 +419,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 			remote: None,
 			meta: None,
 			artifact_sources: Vec::new(),
+			gpus: 0,
 		})
 		.await
 		.expect("resume");
@@ -448,6 +452,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 			remote:           None,
 			meta:             None,
 			artifact_sources: Vec::new(),
+			gpus:             0,
 		})
 		.await
 		.expect("second resume");
@@ -550,6 +555,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 			volume_mounts:    Vec::new(),
 			s3_mounts:        Vec::new(),
 			cold_boot:        false,
+			gpus:             0,
 		})
 		.await
 		.expect("create from snapshot build");
@@ -586,6 +592,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 			}],
 			s3_mounts:        Vec::new(),
 			cold_boot:        false,
+			gpus:             0,
 		})
 		.await
 		.expect("create with volume");
@@ -680,6 +687,7 @@ async fn concurrent_forks_all_become_ready() {
 					volume_mounts: Vec::new(),
 					s3_mounts: Vec::new(),
 					cold_boot: false,
+					gpus: 0,
 				};
 				let begun = Instant::now();
 				let result = client.create_sandbox(&request).await;

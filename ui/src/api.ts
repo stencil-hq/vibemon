@@ -204,6 +204,7 @@ export interface SandboxRow {
   teamID: string;
   teamName: string;
   nodeID: string;
+  gpus: number;
 }
 
 export interface SandboxDetail {

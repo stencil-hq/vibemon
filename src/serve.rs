@@ -129,6 +129,10 @@ pub struct ServeArgs {
 	/// Static guest agent binary (default: `vmon-agent-<arch>` next to vmon).
 	#[arg(long, env = "VMON_AGENT")]
 	agent:                   Option<PathBuf>,
+	/// Guest NVIDIA driver bundle for GPU sandboxes (default:
+	/// `vmon-nvidia-<arch>/` next to vmon, else `target/kernel/` of a dev tree)
+	#[arg(long, env = "VMON_GPU_DRIVER")]
+	gpu_driver:              Option<PathBuf>,
 	/// Guest networking.
 	#[arg(long, env = "VMON_NET", value_enum, default_value_t = NetArg::Auto)]
 	net:                     NetArg,
@@ -289,6 +293,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			run_dir:                 args.run_dir.clone().unwrap_or_else(default_run_dir),
 			kernel:                  args.kernel.clone(),
 			agent:                   args.agent.clone(),
+			gpu_driver:              args.gpu_driver.clone(),
 			vmon_bin:                std::env::current_exe().context("locating the vmon binary")?,
 			boot_concurrency:        args.boot_concurrency,
 			max_parallel_builds:     args.max_builds,

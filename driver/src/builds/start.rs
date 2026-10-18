@@ -551,6 +551,7 @@ mod tests {
 			draining,
 			features: vec![],
 			cached_builds: vec![],
+			gpus: vec![],
 		};
 		let meta = MemberMeta {
 			roles:         Roles { node: true, driver: false },

@@ -55,6 +55,16 @@ impl ApiError {
 		Self::new(StatusCode::BAD_REQUEST, "invalid", message)
 	}
 
+	/// 400 [`crate::api::GPU_MEMORY_SNAPSHOT`]: memory capture of a sandbox
+	/// holding GPUs.
+	pub fn gpu_memory_snapshot(id: &str) -> Self {
+		Self::new(
+			StatusCode::BAD_REQUEST,
+			crate::api::GPU_MEMORY_SNAPSHOT,
+			format!("sandbox {id} holds GPUs; its memory cannot be paused or snapshotted"),
+		)
+	}
+
 	/// 503 `busy` (no capacity; the driver retries another node).
 	pub fn busy(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message)

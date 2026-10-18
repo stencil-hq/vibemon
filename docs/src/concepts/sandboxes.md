@@ -33,6 +33,7 @@ const sbx = await Sandbox.create('base', { timeoutMs: 600_000, metadata: { job: 
 
 - A create normally is a copy-on-write fork of the template's memory snapshot, captured with any configured start command already running. The rootfs is a block overlay of the template's disk. See [Templates](templates.md).
 - vCPUs, memory, and disk come from the template build, not the request. The create fails with 400 if the build exceeds the team's `max_vcpus`, `max_memory_mb`, or `max_disk_mb`.
+- GPUs come from `metadata["vmon.gpus"]`, else the template's `VMON_GPUS` environment variable, else none. GPU sandboxes always cold-boot, and their pauses and snapshots keep only the filesystem. See [GPUs](../operate/gpus.md).
 - Admission checks the team's concurrent-sandbox limit atomically in the KV and answers 429 at the limit. Paused sandboxes do not count. See [Authentication and teams](auth.md#limits).
 - Creates with node-local `volumeMounts` cold-boot the template rootfs instead of forking the snapshot. Object-store volumes and `vmonS3Mounts` can reuse memory only when their device tags match the snapshot; otherwise they also cold-boot. See [Storage, object store, and volumes](../operate/storage.md#volumes).
 - On memory restores, the node requests 64 bytes of fresh host entropy and a kernel CRNG reseed before envd is reinitialized. It also reseeds the source after a snapshot. Reseed failures are logged as warnings rather than failing the operation.

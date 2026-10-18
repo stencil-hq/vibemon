@@ -75,6 +75,22 @@ export function nodeActions(member: ClusterMember, onChanged: () => void): MenuI
   ];
 }
 
+/** `free / total` GPUs of a node, noting the unassignable ones. */
+function GpuCell({ gpus }: { gpus: GpuInfo[] }) {
+  if (gpus.length === 0) return <td className="right num muted">—</td>;
+  const broken = gpus.filter((g) => g.problem !== "").length;
+  return (
+    <td className="right num">
+      {gpus.filter(gpuAvailable).length} / {gpus.length}
+      {broken > 0 && (
+        <div className="cell-sub" style={{ color: "var(--warn)" }}>
+          {broken} unavailable
+        </div>
+      )}
+    </td>
+  );
+}
+
 export function NodesPage() {
   const cluster = useCluster();
   const nodes = (cluster.data?.members ?? [])
@@ -108,6 +124,7 @@ export function NodesPage() {
                   <th style={{ width: 170 }}>vCPU</th>
                   <th style={{ width: 170 }}>Memory</th>
                   <th className="right">Disk free</th>
+                  {showGpus && <th className="right">GPUs free</th>}
                   <th className="right">Creates</th>
                   <th className="shrink">
                     <span className="visually-hidden">Actions</span>
@@ -149,6 +166,7 @@ export function NodesPage() {
                         <Meter label="Memory allocation" used={n.memoryUsedMB} total={n.memoryMB} />
                       </td>
                       <td className="right num muted">{fmt.mib(n.diskFreeMB)}</td>
+                      {showGpus && <GpuCell gpus={n.gpus} />}
                       <td className="right num muted">
                         {fmt.int(n.createSuccesses)}
                         {n.createFails > 0 && (

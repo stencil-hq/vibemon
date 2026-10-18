@@ -123,6 +123,10 @@ pub struct SandboxRow {
 	/// Encrypted inline credentials of `s3_mounts`, by index.
 	#[serde(with = "crate::store::b64_opt")]
 	pub s3_mounts_enc:         Option<Vec<u8>>,
+	/// GPUs passed through (`metadata["vmon.gpus"]` or the template's
+	/// `VMON_GPUS`); such sandboxes only pause their filesystem.
+	#[serde(default)]
+	pub gpus:                  u32,
 }
 
 impl SandboxRow {
@@ -189,6 +193,7 @@ pub struct NewSandboxRow<'a> {
 	pub end_at:                DateTime<Utc>,
 	pub s3_mounts:             &'a [S3MountRecord],
 	pub s3_mounts_enc:         Option<Vec<u8>>,
+	pub gpus:                  u32,
 }
 
 impl NewSandboxRow<'_> {
@@ -224,6 +229,7 @@ impl NewSandboxRow<'_> {
 			snapshot_build_id:     None,
 			s3_mounts:             (!self.s3_mounts.is_empty()).then(|| self.s3_mounts.to_vec()),
 			s3_mounts_enc:         self.s3_mounts_enc.clone(),
+			gpus:                  self.gpus,
 		}
 	}
 }
@@ -666,6 +672,7 @@ mod tests {
 			end_at: started_at + Duration::minutes(5),
 			s3_mounts: &[],
 			s3_mounts_enc: None,
+			gpus: 0,
 		}
 	}
 

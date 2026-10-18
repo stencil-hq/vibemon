@@ -963,6 +963,7 @@ fn admin_listed(
 		team_id: row.team_id.clone(),
 		team_name,
 		node_id,
+		gpus: row.gpus,
 	})
 }
 

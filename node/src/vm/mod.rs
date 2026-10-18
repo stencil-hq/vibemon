@@ -113,6 +113,15 @@ pub enum FsShare {
 	Volume { tag: String, dir: PathBuf, read_only: bool },
 }
 
+/// NVIDIA GPU functions passed through to a direct-boot VM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmGpu {
+	/// `/sys/bus/pci/devices/<BDF>` per function (`--vfio-gpu`).
+	pub functions: Vec<PathBuf>,
+	/// Stable SMBIOS system UUID (`--vm-uuid`, see [`crate::gpu::vm_uuid`]).
+	pub vm_uuid:   String,
+}
+
 /// Guest NIC.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VmNet {
@@ -161,6 +170,8 @@ pub struct VmSpec {
 	pub ready_timeout: Duration,
 	/// Raw extra `vmon vmm` flags (egress user-net policy).
 	pub extra_args:    Vec<String>,
+	/// GPU passthrough (cold boots only).
+	pub gpu:           Option<VmGpu>,
 }
 
 /// How a VMM process ended.
@@ -733,6 +744,7 @@ mod tests {
 			timeout:       None,
 			ready_timeout: Duration::from_mins(1),
 			extra_args:    Vec::new(),
+			gpu:           None,
 		};
 		// The caller gives up while the VMM boots (a cancelled build), which
 		// drops the launch future.

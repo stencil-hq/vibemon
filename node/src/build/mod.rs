@@ -33,8 +33,11 @@ use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 use vmon_cluster::NodeId;
 
-pub use self::routes::routes;
 use self::{cache::StepCache, log::BuildLog};
+pub use self::{
+	pipeline::{ServiceLog, start_service},
+	routes::routes,
+};
 use crate::{
 	api::{ArtifactInfo, BuildReason, BuildState, BuildStatus, StartBuild},
 	artifacts::{ArtifactStore, BUILD_LOG, HostIdentity},

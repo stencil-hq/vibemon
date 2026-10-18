@@ -56,6 +56,8 @@ struct FakeNode {
 	deadlines:         Vec<(String, u64)>,
 	/// Build IDs captured by `POST /sandboxes/{id}/snapshot`.
 	snapshots:         Vec<String>,
+	/// `memory` of each snapshot call.
+	snapshot_memory:   Vec<bool>,
 	/// Build IDs whose artifacts were deleted (`DELETE /artifacts/{id}`).
 	deleted_artifacts: Vec<String>,
 	/// The next this many creates fail like a node out of disk.
@@ -123,6 +125,7 @@ async fn fake_snapshot(
 		return disk_full(&format!("capturing sandbox {id}"));
 	}
 	node.snapshots.push(req.build_id.clone());
+	node.snapshot_memory.push(req.memory);
 	Json(artifact(&req.build_id)).into_response()
 }
 

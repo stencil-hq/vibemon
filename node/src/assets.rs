@@ -3,7 +3,8 @@
 //! The guest kernel (the vmon kernel shipped next to the
 //! binary or built into `target/kernel/`, else a pinned cloud-hypervisor
 //! kernel downloaded and sha256-verified on first use) and the static
-//! `vmon-agent` binary for the guest arch. Resolved once by `Node::start`.
+//! `vmon-agent` binary for the guest arch, and the guest NVIDIA driver bundle
+//! of GPU sandboxes. Resolved once by `Node::start`.
 
 use std::{
 	fs,
@@ -143,6 +144,59 @@ pub async fn resolve_kernel(
 	Ok(dest)
 }
 
+/// The guest NVIDIA driver bundle directory without downloading anything,
+/// in the order of [`local_kernel`]: `explicit` (`--gpu-driver`, must be a
+/// directory), `vmon-nvidia-<arch>/` next to the `vmon` binary (release
+/// assets), `target/kernel/vmon-nvidia-<arch>/` in the nearest ancestor of
+/// the binary's directory (dev tree after `just gpu-driver`).
+fn local_gpu_driver(
+	explicit: Option<&Path>,
+	vmon_bin: &Path,
+	arch: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+	if let Some(path) = explicit {
+		ensure!(path.is_dir(), "GPU driver bundle {} is not a directory", path.display());
+		return Ok(Some(path.to_owned()));
+	}
+	let name = format!("vmon-nvidia-{arch}");
+	let exe_dir = vmon_bin.parent().unwrap_or_else(|| Path::new("."));
+	let bundled = exe_dir.join(&name);
+	if bundled.is_dir() {
+		return Ok(Some(bundled));
+	}
+	Ok(exe_dir
+		.ancestors()
+		.map(|dir| dir.join("target/kernel").join(&name))
+		.find(|candidate| candidate.is_dir()))
+}
+
+/// Resolves the guest NVIDIA driver bundle ([`local_gpu_driver`]) together
+/// with the release of the guest `kernel` its modules must match. A missing
+/// bundle is not an error: GPUs then report it as their problem.
+pub fn resolve_gpu_driver(
+	explicit: Option<&Path>,
+	vmon_bin: &Path,
+	kernel: &Path,
+) -> anyhow::Result<crate::gpu::DriverBundle> {
+	let arch = host_arch();
+	let dir = local_gpu_driver(explicit, vmon_bin, arch)?;
+	let kernel = match &dir {
+		Some(dir) => {
+			let release = fs::read(kernel)
+				.ok()
+				.and_then(|image| crate::gpu::kernel_release(&image));
+			tracing::info!(
+				bundle = %dir.display(),
+				kernel = release.as_deref().unwrap_or("unknown"),
+				"guest GPU driver bundle"
+			);
+			release
+		},
+		None => None,
+	};
+	Ok(crate::gpu::DriverBundle { dir, kernel, searched: format!("vmon-nvidia-{arch}") })
+}
+
 /// Returns `explicit` if given, else `vmon-agent-<arch>` next to the `vmon`
 /// binary, else the dev build at `<exe_dir>/../../target/test-assets/`.
 /// The result must be a static ELF for the guest arch.
@@ -254,6 +308,30 @@ mod tests {
 		assert_eq!(local_kernel(Some(&explicit), &vmon, "aarch64").unwrap(), Some(explicit));
 		let missing = root.path().join("missing");
 		assert!(local_kernel(Some(&missing), &vmon, "aarch64").is_err());
+	}
+
+	#[test]
+	fn gpu_driver_lookup_prefers_explicit_then_bundled_then_dev_tree() {
+		let root = tempfile::tempdir().unwrap();
+		let bin_dir = root.path().join("target/ws/debug");
+		fs::create_dir_all(&bin_dir).unwrap();
+		let vmon = bin_dir.join("vmon");
+		assert_eq!(local_gpu_driver(None, &vmon, "x86_64").unwrap(), None);
+
+		let dev = root.path().join("target/kernel/vmon-nvidia-x86_64");
+		fs::create_dir_all(&dev).unwrap();
+		assert_eq!(local_gpu_driver(None, &vmon, "x86_64").unwrap(), Some(dev));
+		assert_eq!(local_gpu_driver(None, &vmon, "aarch64").unwrap(), None);
+
+		let bundled = bin_dir.join("vmon-nvidia-x86_64");
+		fs::create_dir_all(&bundled).unwrap();
+		assert_eq!(local_gpu_driver(None, &vmon, "x86_64").unwrap(), Some(bundled.clone()));
+
+		assert_eq!(
+			local_gpu_driver(Some(&bundled), &vmon, "aarch64").unwrap(),
+			Some(bundled.clone())
+		);
+		assert!(local_gpu_driver(Some(&bundled.join("missing")), &vmon, "x86_64").is_err());
 	}
 
 	#[test]

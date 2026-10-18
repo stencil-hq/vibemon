@@ -42,6 +42,10 @@ pub struct SandboxMeta {
 	pub tap:               Option<TapLease>,
 	/// Set once the sandbox is gone; the dir is kept for metrics/logs retention.
 	pub ended_at_ms:       Option<u64>,
+	/// PCI addresses of the GPUs the live VMM holds (running only);
+	/// re-reserved by restart recovery.
+	#[serde(default)]
+	pub gpus:              Vec<String>,
 }
 
 impl SandboxMeta {

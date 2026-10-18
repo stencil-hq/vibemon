@@ -86,6 +86,7 @@ These flags apply to the node role. Both assets are resolved once, at node start
 |---|---|---|---|
 | `--kernel <KERNEL>` | `VMON_KERNEL` | see below | Guest kernel image. When given, the file must exist. |
 | `--agent <AGENT>` | `VMON_AGENT` | see below | Static guest agent binary, installed in guests as `/usr/bin/envd`. Must be a static ELF (no dynamic loader) for the guest architecture. |
+| `--gpu-driver <DIR>` | `VMON_GPU_DRIVER` | see below | Guest NVIDIA driver bundle (`vmon-nvidia-<arch>/`) shared with GPU sandboxes. When given, it must be a directory. |
 
 Kernel lookup when `--kernel` is unset:
 
@@ -94,6 +95,8 @@ Kernel lookup when `--kernel` is unset:
 3. A pinned cloud-hypervisor kernel, downloaded into `<data-dir>/assets/` and verified by SHA-256. vmon logs a warning when it falls back to this kernel, because the kernel lacks netfilter (nftables/iptables, Docker), IPv6, bridge, and NFS.
 
 Agent lookup when `--agent` is unset: `vmon-agent-<arch>` next to the `vmon` binary, then `../../target/test-assets/vmon-agent-<arch>` relative to it (`just agent-musl`). If neither exists, the node fails to start. See [Guest kernel](../operate/kernel.md).
+
+GPU driver bundle lookup when `--gpu-driver` is unset: `vmon-nvidia-<arch>/` next to the `vmon` binary, then `target/kernel/vmon-nvidia-<arch>/` under the nearest ancestor of the binary's directory (`just gpu-driver`). Without a bundle the node still starts; its GPUs report `no guest driver bundle` and are not assignable. See [GPUs](../operate/gpus.md).
 
 ## Networking and egress
 

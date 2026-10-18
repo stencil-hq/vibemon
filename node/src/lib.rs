@@ -15,6 +15,7 @@ pub mod egress;
 pub mod envd;
 pub mod files;
 pub mod gc4;
+pub mod gpu;
 pub mod host;
 pub mod initramfs;
 pub mod lazy_resume;
@@ -80,6 +81,10 @@ impl Node {
 		)
 		.await?;
 		let agent = assets::resolve_agent(config.agent.as_deref(), &config.vmon_bin)?;
+		let gpus = Arc::new(gpu::GpuPool::host(
+			assets::resolve_gpu_driver(config.gpu_driver.as_deref(), &config.vmon_bin, &kernel)?,
+			&config.data_dir,
+		));
 		let cpu_baseline = host::cpu_baseline(&config.vmon_bin).await?;
 		let cpu_model = host::cpu_model();
 		let arch = assets::host_arch().to_owned();
@@ -152,6 +157,7 @@ impl Node {
 				object_store: config.object_store.clone(),
 				lazy_resume: config.lazy_resume,
 				s3_mounts_allow_private: config.s3_mounts_allow_private,
+				gpus,
 			},
 			vms,
 			builder.clone(),
@@ -183,12 +189,20 @@ impl Node {
 			let sandboxes = Arc::clone(&sandboxes);
 			let builder = builder.clone();
 			let data_dir = config.data_dir.clone();
+			let gpus = Arc::clone(sandboxes.gpus());
 			let overrides = config.capacity;
 			tokio::spawn(async move {
 				let mut ticker = tokio::time::interval(CAPACITY_INTERVAL);
 				loop {
 					ticker.tick().await;
 					let usage = sandboxes.usage();
+					// Sysfs reads (GPU discovery) stay off the async workers.
+					let host_gpus = {
+						let gpus = Arc::clone(&gpus);
+						tokio::task::spawn_blocking(move || gpus.list())
+							.await
+							.unwrap_or_default()
+					};
 					let capacity = NodeCapacity {
 						arch:           arch.clone(),
 						backend:        host::backend().to_owned(),
@@ -205,6 +219,7 @@ impl Node {
 						draining:       false,
 						features:       features.clone(),
 						cached_builds:  builder.artifacts().cached_builds(),
+						gpus:           host_gpus,
 					};
 					cluster.update_meta(|meta| {
 						let draining = meta.node.as_ref().is_some_and(|node| node.draining);

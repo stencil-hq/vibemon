@@ -143,6 +143,8 @@ struct Plan {
 	ingress:               Ingress,
 	volume_mounts:         Vec<VolumeMount>,
 	s3:                    s3mounts::ResolvedS3Mounts,
+	/// GPUs to pass through ([`limits::requested_gpus`]).
+	gpus:                  u32,
 }
 
 /// Current unix time in ms.
@@ -168,6 +170,7 @@ pub async fn create(state: &AppState, team: &Team, spec: CreateSpec) -> ApiResul
 	let resolved = builds::resolve_template(state, team, &spec.template_ref).await?;
 	let artifact = resolved.artifact;
 	check_resources(team, &artifact)?;
+	let gpus = limits::requested_gpus(&spec.metadata, &artifact.env)?;
 	let policy = egress_policy(&spec.network.egress(spec.allow_internet_access))?;
 	let ingress = spec.network.ingress()?;
 	let (volume_mounts, volume_node) = resolve_mounts(state, team, &spec.volume_mounts).await?;
@@ -194,6 +197,7 @@ pub async fn create(state: &AppState, team: &Team, spec: CreateSpec) -> ApiResul
 		ingress,
 		volume_mounts,
 		s3,
+		gpus,
 	};
 	launch(state, plan).await
 }
@@ -353,27 +357,15 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 		memory_mb:            plan.artifact.memory_mb,
 		envd_version:         plan.artifact.envd_version.clone(),
 	};
-	let mut features = required_features(&plan.policy);
-	if plan.volume_mounts.iter().any(|volume| volume.object_store) {
-		features.push(vmon_node::s3fs::FEATURE);
-	}
 	let mut placement = PlacementRequest {
 		vcpus: plan.artifact.vcpus,
 		memory_mb: plan.artifact.memory_mb,
 		arch: plan.artifact.arch.clone(),
-		features,
+		features: sandbox_features(&plan.policy, &plan.volume_mounts),
 		pinned: plan.pinned,
-		artifacts: plan
-			.sources
-			.iter()
-			.map(|s| ArtifactLocation {
-				node_id:      s.node_id,
-				backend:      s.info.backend.clone(),
-				cpu_baseline: s.info.cpu_baseline.clone(),
-				has_snapshot: s.info.has_snapshot,
-			})
-			.collect(),
-		excluded: Vec::new(),
+		artifacts: artifact_locations(&plan.sources),
+		gpus: plan.gpus,
+		..PlacementRequest::default()
 	};
 	let request = CreateSandbox {
 		sandbox_id:       id.clone(),
@@ -395,7 +387,9 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 		network:          plan.policy.clone(),
 		volume_mounts:    plan.volume_mounts.clone(),
 		s3_mounts:        plan.s3.mounts.clone(),
-		cold_boot:        false,
+		// Passed-through GPUs cannot fork a memory snapshot.
+		cold_boot:        plan.gpus > 0,
+		gpus:             plan.gpus,
 	};
 
 	let mut admitted = false;
@@ -428,7 +422,7 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 				return Err(error);
 			},
 		};
-		let guard = state.scheduler.begin(candidate.node_id);
+		let guard = state.scheduler.begin(candidate.node_id, plan.gpus);
 		match client.create_sandbox(&request).await {
 			Ok(info) => {
 				guard.finish(CreateOutcome::Success);
@@ -538,6 +532,7 @@ async fn record_launch(
 		end_at: datetime(end),
 		s3_mounts: &plan.s3.records,
 		s3_mounts_enc: plan.s3.enc.clone(),
+		gpus: plan.gpus,
 	};
 	let subject = EventSubject {
 		team_id:       &plan.team.id,
@@ -641,6 +636,117 @@ async fn artifact_info(state: &AppState, build_id: &str) -> Option<ArtifactInfo>
 	entries
 		.iter()
 		.find_map(|e| serde_json::from_slice(&e.value).ok())
+}
+
+/// Node features a sandbox needs: its egress policy's, plus S3 mounts for
+/// volumes in the object store.
+fn sandbox_features(policy: &NetworkPolicy, volumes: &[VolumeMount]) -> Vec<&'static str> {
+	let mut features = required_features(policy);
+	if volumes.iter().any(|volume| volume.object_store) {
+		features.push(vmon_node::s3fs::FEATURE);
+	}
+	features
+}
+
+/// Placement view of a build's holders (artifact score bonus).
+fn artifact_locations(sources: &[ArtifactSource]) -> Vec<ArtifactLocation> {
+	sources
+		.iter()
+		.map(|s| ArtifactLocation {
+			node_id:      s.node_id,
+			backend:      s.info.backend.clone(),
+			cpu_baseline: s.info.cpu_baseline.clone(),
+			has_snapshot: s.info.has_snapshot,
+		})
+		.collect()
+}
+
+/// The node every mounted volume on node-local storage lives on (a hard
+/// placement pin), unless volumes are shared.
+async fn volume_pin(
+	state: &AppState,
+	team_id: &str,
+	mounts: &[VolumeMount],
+) -> ApiResult<Option<NodeId>> {
+	let mut pin = None;
+	if state.config.shared_volumes {
+		return Ok(pin);
+	}
+	for mount in mounts {
+		let volume = state
+			.store
+			.volume(team_id, &mount.volume_id)
+			.await?
+			.ok_or_else(|| ApiError::bad_request(format!("volume '{}' not found", mount.name)))?;
+		if let Some(raw) = volume.node_id.as_deref() {
+			let node = parse_node(raw)?;
+			if pin.is_some_and(|pinned| pinned != node) {
+				return Err(ApiError::bad_request("all mounted volumes must live on the same node"));
+			}
+			pin = Some(node);
+		}
+	}
+	Ok(pin)
+}
+
+/// Request resuming `row`'s paused state on the node holding it, until
+/// `end_at_ms` (no portable generation, metadata, or artifact sources). A
+/// GPU sandbox always cold-boots and re-reserves its GPUs.
+async fn resume_request(
+	state: &AppState,
+	row: &SandboxRow,
+	policy: &NetworkPolicy,
+	end_at_ms: u64,
+	cold_boot: bool,
+) -> ApiResult<ResumeSandbox> {
+	Ok(ResumeSandbox {
+		end_at_ms,
+		init: guest_init(
+			state,
+			&row.id,
+			&row.template_id,
+			artifact_info(state, &row.build_id).await.as_ref(),
+			&decrypt_env(state, row)?,
+		),
+		network: policy.clone(),
+		volume_mounts: row.volume_mounts.clone(),
+		s3_mounts: s3mounts::restore(state, row).await?,
+		cold_boot: cold_boot || row.gpus > 0,
+		remote: None,
+		meta: None,
+		artifact_sources: Vec::new(),
+		gpus: row.gpus,
+	})
+}
+
+/// Authoritative node metadata of `row`'s paused state (until `end_at_ms`),
+/// for a node that does not hold it yet.
+fn paused_meta(
+	state: &AppState,
+	row: &SandboxRow,
+	network: NetworkPolicy,
+	end_at_ms: u64,
+) -> SandboxMeta {
+	SandboxMeta {
+		sandbox_id: row.id.clone(),
+		team_id: row.team_id.clone(),
+		template_id: row.template_id.clone(),
+		build_id: row.build_id.clone(),
+		state: NodeSandboxState::Paused,
+		vcpus: row.vcpus,
+		memory_mb: row.memory_mb,
+		disk_mb: row.disk_mb,
+		started_at_ms: unix_ms(row.started_at),
+		end_at_ms,
+		envd_version: row.envd_version.clone(),
+		envd_access_token: state.keys.envd_token(&row.id),
+		network,
+		volume_mounts: row.volume_mounts.clone(),
+		pid: None,
+		tap: None,
+		ended_at_ms: None,
+		gpus: Vec::new(),
+	}
 }
 
 fn parse_node(raw: &str) -> ApiResult<NodeId> {
@@ -857,8 +963,9 @@ async fn paused_remote(state: &AppState, id: &str) -> ApiResult<Option<Remote>> 
 		.map_err(|error| ApiError::internal(format!("paused sandbox record: {error}")))
 }
 
-/// Pauses a running sandbox (`memory=false` keeps only the filesystem).
-/// 409 when already paused or transitioning.
+/// Pauses a running sandbox (`memory=false` keeps only the filesystem; a
+/// sandbox holding GPUs always pauses filesystem-only,
+/// [`limits::captures_memory`]). 409 when already paused or transitioning.
 pub async fn pause(
 	state: &AppState,
 	team_id: Option<&str>,
@@ -896,6 +1003,7 @@ async fn pause_locked(state: &AppState, id: &str, current: Current, memory: bool
 		)));
 	}
 	let client = state.node(route.node_id)?;
+	let memory = limits::captures_memory(memory, current.row.as_ref().map_or(0, |row| row.gpus));
 	if has_object_store(state, route.node_id) {
 		// Only the current holder may publish this pause's generation; a
 		// restarted former holder is fenced off.
@@ -1138,35 +1246,18 @@ async fn resume_paused(
 	let owner = parse_node(&row.node_id)?;
 	let policy = decrypt_policy(state, row)?;
 	let remote = paused_remote(state, id).await?;
+	// GPU sandboxes pause filesystem-only: there is no memory to restore.
+	let cold_boot = cold_boot || row.gpus > 0;
 	let (node, client, cold_boot) = if let Some(remote) = &remote {
 		// Volumes on node-local storage keep pinning the sandbox to them.
-		let mut pin = None;
-		if !state.config.shared_volumes {
-			for mount in &row.volume_mounts {
-				let volume = state
-					.store
-					.volume(&team.id, &mount.volume_id)
-					.await?
-					.ok_or_else(|| {
-						ApiError::bad_request(format!("volume '{}' not found", mount.name))
-					})?;
-				if let Some(raw) = volume.node_id.as_deref() {
-					let node = parse_node(raw)?;
-					if pin.is_some_and(|pinned| pinned != node) {
-						return Err(ApiError::bad_request(
-							"all mounted volumes must live on the same node",
-						));
-					}
-					pin = Some(node);
-				}
-			}
-		}
+		let pin = volume_pin(state, &team.id, &row.volume_mounts).await?;
 		let placement = PlacementRequest {
 			vcpus: row.vcpus,
 			memory_mb: row.memory_mb,
 			arch: remote.arch.clone(),
 			features: required_features(&policy),
 			pinned: pin,
+			gpus: row.gpus,
 			..PlacementRequest::default()
 		};
 		let statuses = scheduler::load_statuses(kv).await?;
@@ -1220,40 +1311,13 @@ async fn resume_paused(
 		Vec::new()
 	};
 	let request = ResumeSandbox {
-		end_at_ms: end,
-		init: guest_init(
-			state,
-			id,
-			&row.template_id,
-			artifact_info(state, &row.build_id).await.as_ref(),
-			&decrypt_env(state, row)?,
-		),
-		network: policy.clone(),
-		volume_mounts: row.volume_mounts.clone(),
-		s3_mounts: s3mounts::restore(state, row).await?,
-		cold_boot,
 		// The holder may have lost its local copy too: always offer the record.
-		meta: remote.as_ref().map(|_| SandboxMeta {
-			sandbox_id:        id.to_owned(),
-			team_id:           row.team_id.clone(),
-			template_id:       row.template_id.clone(),
-			build_id:          row.build_id.clone(),
-			state:             NodeSandboxState::Paused,
-			vcpus:             row.vcpus,
-			memory_mb:         row.memory_mb,
-			disk_mb:           row.disk_mb,
-			started_at_ms:     unix_ms(row.started_at),
-			end_at_ms:         end,
-			envd_version:      row.envd_version.clone(),
-			envd_access_token: state.keys.envd_token(id),
-			network:           policy,
-			volume_mounts:     row.volume_mounts.clone(),
-			pid:               None,
-			tap:               None,
-			ended_at_ms:       None,
-		}),
+		meta: remote
+			.as_ref()
+			.map(|_| paused_meta(state, row, policy.clone(), end)),
 		remote,
 		artifact_sources,
+		..resume_request(state, row, &policy, end, cold_boot).await?
 	};
 	routes::admit(kv, id, &route, team.limits.max_concurrent_sandboxes).await?;
 	let info = match client.resume_sandbox(id, &request).await {
@@ -1445,7 +1509,8 @@ pub async fn update_network(
 }
 
 /// `POST /sandboxes/{id}/snapshots`: captures a running sandbox as a
-/// (named) snapshot template; the source keeps running.
+/// (named) snapshot template; the source keeps running. A sandbox holding
+/// GPUs is captured filesystem-only.
 pub async fn snapshot(
 	state: &AppState,
 	team: &Team,
@@ -1487,6 +1552,7 @@ async fn snapshot_locked(
 ) -> ApiResult<(SnapshotTarget, ArtifactInfo)> {
 	let id = row.id.as_str();
 	let client = state.node(route.node_id)?;
+	let memory = limits::captures_memory(memory, row.gpus);
 	let request = SnapshotRequest {
 		source_sandbox_id: id,
 		node_id: route.node_id,
@@ -1637,6 +1703,7 @@ async fn launch_forks(
 			ingress: ingress.clone(),
 			volume_mounts: row.volume_mounts.clone(),
 			s3: s3.clone(),
+			gpus: row.gpus,
 		};
 		// Type-erased: keeps the fork handler's future type shallow enough
 		// for axum's `Handler: Send` check.

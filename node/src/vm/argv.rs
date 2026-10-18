@@ -3,7 +3,7 @@
 
 use std::{ffi::OsString, path::Path};
 
-use super::{Boot, Disk, FsShare, VmNet, VmSpec, VmmIsolation};
+use super::{Boot, Disk, FsShare, VmGpu, VmNet, VmSpec, VmmIsolation};
 
 /// Socket paths of one VM instance.
 pub(super) struct VmSockets<'a> {
@@ -93,6 +93,15 @@ pub(super) fn vmm_argv(
 			flag("--mac", Some(mac.into()));
 		},
 	}
+	// The VMM preopens the functions and iommufd before it drops to the
+	// sandbox uid, and binds them into a `--jail`.
+	if let Some(VmGpu { functions, vm_uuid }) = &spec.gpu {
+		flag("--boot-mode", Some("direct".into()));
+		for function in functions {
+			flag("--vfio-gpu", Some(function.into()));
+		}
+		flag("--vm-uuid", Some(vm_uuid.into()));
+	}
 	if let Some(timeout) = spec.timeout {
 		flag("--timeout-secs", Some(timeout.as_secs().clamp(1, 86_400).to_string().into()));
 	}
@@ -137,6 +146,7 @@ mod tests {
 			timeout: Some(Duration::from_secs(90)),
 			ready_timeout: Duration::from_secs(10),
 			extra_args: vec!["--user-net-policy".into(), "/s/policy.json".into()],
+			gpu: None,
 		}
 	}
 
@@ -236,6 +246,32 @@ mod tests {
 		]);
 		let debug = format!("{lazy:?}");
 		assert!(!debug.contains("page-secret") && !debug.contains("X-Amz-Signature"));
+	}
+
+	#[test]
+	fn gpu_passthrough_renders_functions_uuid_and_direct_boot() {
+		let mut cold = spec(Boot::Cold {
+			kernel:  "/k/bzImage".into(),
+			initrd:  None,
+			cmdline: "console=ttyS0".into(),
+		});
+		let args = render(&cold, VmmIsolation::Disabled);
+		assert!(!args.iter().any(|a| a == "--vfio-gpu" || a == "--vm-uuid"));
+		cold.gpu = Some(VmGpu {
+			functions: vec![
+				"/sys/bus/pci/devices/0000:52:00.0".into(),
+				"/sys/bus/pci/devices/0000:53:00.0".into(),
+			],
+			vm_uuid:   "12345678-9abc-8ef0-9122-334455667788".into(),
+		});
+		let args = render(&cold, VmmIsolation::DropTo { uid: 1000, gid: 1000 });
+		assert_eq!(value_of(&args, "--vfio-gpu"), [
+			"/sys/bus/pci/devices/0000:52:00.0",
+			"/sys/bus/pci/devices/0000:53:00.0"
+		]);
+		assert_eq!(value_of(&args, "--vm-uuid"), ["12345678-9abc-8ef0-9122-334455667788"]);
+		assert_eq!(value_of(&args, "--boot-mode"), ["direct"]);
+		assert_eq!(value_of(&args, "--sandbox-uid"), ["1000"]);
 	}
 
 	#[test]

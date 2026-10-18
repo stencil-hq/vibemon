@@ -114,6 +114,31 @@ pub struct NodeCapacity {
 	pub features:       Vec<String>,
 	/// Build IDs with local artifacts, most recent first (truncated to fit).
 	pub cached_builds:  Vec<String>,
+	/// GPUs found on the host, assignable or not.
+	pub gpus:           Vec<GpuInfo>,
+}
+
+/// One host GPU as published in [`NodeCapacity::gpus`]; the scheduler counts
+/// the free, assignable ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuInfo {
+	/// PCI address (`0000:52:00.0`).
+	pub address: String,
+	/// Model name (`GB205 [GeForce RTX 5070]`).
+	pub model:   String,
+	/// Sandbox holding it; `None` when free.
+	pub sandbox: Option<String>,
+	/// Why sandboxes cannot use it (e.g. `bound to nvidia, not vfio-pci`);
+	/// empty when assignable.
+	pub problem: String,
+}
+
+impl GpuInfo {
+	/// Free and assignable.
+	pub const fn available(&self) -> bool {
+		self.sandbox.is_none() && self.problem.is_empty()
+	}
 }
 
 /// Raft view published by drivers; used for bootstrap and leader discovery.

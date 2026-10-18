@@ -36,6 +36,18 @@ pub struct BuildContext {
 }
 
 impl BuildContext {
+	/// Context of a finished build's start/ready commands: its default user,
+	/// workdir, environment and boot init.
+	pub fn for_artifact(meta: &crate::artifacts::ArtifactMeta) -> Self {
+		Self {
+			user:      meta.info.default_user.clone(),
+			workdir:   meta.info.default_workdir.clone(),
+			env:       meta.info.env.clone(),
+			boot_init: meta.boot_init.clone(),
+			has_bash:  true,
+		}
+	}
+
 	/// Environment for a guest command: the context env with upstream's PATH
 	/// rule.
 	pub fn command_env(&self) -> BTreeMap<String, String> {

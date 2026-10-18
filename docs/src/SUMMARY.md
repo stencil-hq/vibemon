@@ -23,6 +23,7 @@
 - [Networking and egress](operate/networking.md)
 - [Storage, object store, and volumes](operate/storage.md)
 - [Guest kernel](operate/kernel.md)
+- [GPUs](operate/gpus.md)
 - [Administration](operate/admin.md)
 
 # Reference

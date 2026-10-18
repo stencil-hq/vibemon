@@ -1,10 +1,14 @@
-//! Sandbox placement (ARCHITECTURE.md §9.3): filter alive node members by
-//! admin status, features, architecture, and capacity, score the survivors,
-//! and pick one with power-of-two-choices.
+//! Sandbox placement (ARCHITECTURE.md §9.3).
+//!
+//! Filter alive node members by admin status, features, architecture (plus
+//! backend and CPU baseline when memory must restore), assignable GPUs, and
+//! capacity (vCPUs, memory, disk, free GPUs), score the survivors, and pick
+//! one with power-of-two-choices.
 //!
 //! The filtering and scoring functions are pure so they can be unit-tested;
-//! [`Scheduler`] keeps the driver-local counters (in-flight creates and
-//! create outcomes per node) that feed the score and `GET /nodes`.
+//! [`Scheduler`] keeps the driver-local counters (in-flight creates, their
+//! GPUs, and create outcomes per node) that feed the score, the GPU filter,
+//! and `GET /nodes`.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -15,7 +19,7 @@ use parking_lot::Mutex;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use vmon_cluster::{
-	MemberMeta, NodeId,
+	GpuInfo, MemberMeta, NodeCapacity, NodeId,
 	kv::{Kv, KvError},
 };
 use vmon_node::paused_store::{self, Remote};
@@ -113,7 +117,10 @@ pub struct PlacementRequest {
 	/// Nodes holding the build's artifacts.
 	pub artifacts: Vec<ArtifactLocation>,
 	/// Nodes already tried for this create.
-	pub excluded:  Vec<NodeId>,
+	pub excluded:     Vec<NodeId>,
+	/// Whole GPUs (or vGPU VFs) passed through; such sandboxes always cold
+	/// boot.
+	pub gpus:         u32,
 }
 
 /// An eligible node with its score.
@@ -142,9 +149,12 @@ pub struct Scheduler {
 /// Create counters for one node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeCounters {
-	pub inflight:  u32,
-	pub successes: u64,
-	pub fails:     u64,
+	pub inflight:      u32,
+	/// GPUs requested by the in-flight creates (not yet visible as held in
+	/// the node's gossip capacity).
+	pub inflight_gpus: u32,
+	pub successes:     u64,
+	pub fails:         u64,
 }
 
 /// Marks one create as in flight on a node until [`InflightGuard::finish`] or
@@ -152,6 +162,7 @@ pub struct NodeCounters {
 pub struct InflightGuard<'a> {
 	scheduler: &'a Scheduler,
 	node:      NodeId,
+	gpus:      u32,
 	done:      bool,
 }
 
@@ -173,11 +184,14 @@ impl Scheduler {
 		self.counters.lock().get(&node).copied().unwrap_or_default()
 	}
 
-	/// Registers a create in flight on `node`; called by the lifecycle create
-	/// path.
-	pub fn begin(&self, node: NodeId) -> InflightGuard<'_> {
-		self.counters.lock().entry(node).or_default().inflight += 1;
-		InflightGuard { scheduler: self, node, done: false }
+	/// Registers a create of a sandbox with `gpus` GPUs in flight on `node`;
+	/// called by the lifecycle create path.
+	pub fn begin(&self, node: NodeId, gpus: u32) -> InflightGuard<'_> {
+		let mut counters = self.counters.lock();
+		let entry = counters.entry(node).or_default();
+		entry.inflight += 1;
+		entry.inflight_gpus += gpus;
+		InflightGuard { scheduler: self, node, gpus, done: false }
 	}
 
 	/// Prefers the paused owner, then a snapshot-compatible node. Only falls
@@ -195,7 +209,7 @@ impl Scheduler {
 	) -> Result<(Candidate, bool), Unplaceable> {
 		let counters = self.counters();
 		let mut candidates =
-			eligible(members, statuses, req, |id| counters.get(&id).map_or(0, |c| c.inflight))?;
+			eligible(members, statuses, req, |id| counters.get(&id).copied().unwrap_or_default())?;
 		candidates.retain(|candidate| {
 			candidate.node_id == owner
 				|| members.iter().any(|(id, meta)| {
@@ -245,7 +259,7 @@ impl Scheduler {
 		req: &PlacementRequest,
 	) -> Result<Candidate, Unplaceable> {
 		let counters = self.counters();
-		let inflight = |id: NodeId| counters.get(&id).map_or(0, |c| c.inflight);
+		let inflight = |id: NodeId| counters.get(&id).copied().unwrap_or_default();
 		let candidates = eligible(members, statuses, req, inflight)?;
 		Ok(power_of_two(candidates, &mut rand::rng()))
 	}
@@ -265,6 +279,7 @@ impl InflightGuard<'_> {
 		let mut counters = self.scheduler.counters.lock();
 		let entry = counters.entry(self.node).or_default();
 		entry.inflight = entry.inflight.saturating_sub(1);
+		entry.inflight_gpus = entry.inflight_gpus.saturating_sub(self.gpus);
 		match outcome {
 			Some(CreateOutcome::Success) => entry.successes += 1,
 			Some(CreateOutcome::Failure) | None => entry.fails += 1,
@@ -279,12 +294,17 @@ impl Drop for InflightGuard<'_> {
 }
 
 /// Hard filters + score for every node member. Returns candidates sorted by
-/// descending score, or why none qualified.
+/// descending score, or why none qualified. `inflight` yields this driver's
+/// creates in flight per node.
+///
+/// A GPU request needs a node with at least that many assignable GPUs
+/// (`NoCompatibleNode` otherwise) of which enough are free once this driver's
+/// in-flight GPU creates are subtracted (`NoCapacity` otherwise).
 pub fn eligible<S: BuildHasher>(
 	members: &[(NodeId, MemberMeta)],
 	statuses: &HashMap<NodeId, NodeStatus, S>,
 	req: &PlacementRequest,
-	inflight: impl Fn(NodeId) -> u32,
+	inflight: impl Fn(NodeId) -> NodeCounters,
 ) -> Result<Vec<Candidate>, Unplaceable> {
 	let artifact_nodes: HashSet<NodeId> = req.artifacts.iter().map(|a| a.node_id).collect();
 	let mut compatible = false;
@@ -309,7 +329,16 @@ pub fn eligible<S: BuildHasher>(
 		{
 			continue;
 		}
+		if req.gpus > 0 && count_gpus(cap, |gpu| gpu.problem.is_empty()) < req.gpus {
+			continue;
+		}
 		compatible = true;
+		let counters = inflight(*id);
+		if req.gpus > 0
+			&& count_gpus(cap, GpuInfo::available).saturating_sub(counters.inflight_gpus) < req.gpus
+		{
+			continue;
+		}
 		let vcpu_cap = u64::from(cap.cpus) * VCPU_OVERCOMMIT;
 		let mem_cap = cap.memory_mb * MEMORY_OVERCOMMIT;
 		let vcpu_after = u64::from(cap.vcpus_used) + u64::from(req.vcpus);
@@ -326,7 +355,8 @@ pub fn eligible<S: BuildHasher>(
 					&& a.backend == cap.backend
 					&& a.cpu_baseline == cap.cpu_baseline
 			});
-			if reusable {
+			// GPU sandboxes cold-boot: a template memory snapshot does not help.
+			if reusable && req.gpus == 0 {
 				score += SNAPSHOT_BONUS;
 			}
 		}
@@ -342,6 +372,11 @@ pub fn eligible<S: BuildHasher>(
 	}
 	out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node_id.cmp(&b.node_id)));
 	Ok(out)
+}
+
+/// GPUs of a node matching `filter`.
+fn count_gpus(cap: &NodeCapacity, filter: impl Fn(&GpuInfo) -> bool) -> u32 {
+	u32::try_from(cap.gpus.iter().filter(|gpu| filter(gpu)).count()).unwrap_or(u32::MAX)
 }
 
 /// Free fraction after placing, in `[0, 1]`.
@@ -371,7 +406,7 @@ pub fn power_of_two(mut candidates: Vec<Candidate>, rng: &mut impl rand::Rng) ->
 
 #[cfg(test)]
 mod tests {
-	use vmon_cluster::{NodeCapacity, Roles};
+	use vmon_cluster::Roles;
 
 	use super::*;
 
@@ -407,6 +442,87 @@ mod tests {
 		c.iter().map(|c| c.node_id.0).collect()
 	}
 
+	/// No creates in flight anywhere.
+	fn none(_: NodeId) -> NodeCounters {
+		NodeCounters::default()
+	}
+
+	fn gpu(address: &str, sandbox: Option<&str>, problem: &str) -> GpuInfo {
+		GpuInfo {
+			address: address.into(),
+			model:   "GB205 [GeForce RTX 5070]".into(),
+			sandbox: sandbox.map(str::to_owned),
+			problem: problem.into(),
+		}
+	}
+
+	#[test]
+	fn gpu_requests_need_enough_assignable_then_free_gpus() {
+		let members = vec![
+			node(1, |_| {}),
+			node(2, |c| c.gpus = vec![gpu("0000:52:00.0", None, "")]),
+			node(3, |c| {
+				c.gpus = vec![
+					gpu("0000:52:00.0", Some("busy1"), ""),
+					gpu("0000:53:00.0", None, "bound to nvidia, not vfio-pci"),
+				];
+			}),
+		];
+		let mut one = req();
+		one.gpus = 1;
+		assert_eq!(ids(&eligible(&members, &HashMap::new(), &one, none).unwrap()), vec![2]);
+		assert_eq!(
+			ids(&eligible(&members, &HashMap::new(), &req(), none).unwrap()).len(),
+			3,
+			"CPU-only sandboxes ignore GPUs"
+		);
+		// Node 3's only assignable GPU is held; node 2's is claimed by an
+		// in-flight create of this driver.
+		let claimed = |id: NodeId| NodeCounters {
+			inflight_gpus: u32::from(id == NodeId(2)),
+			..NodeCounters::default()
+		};
+		assert_eq!(
+			eligible(&members, &HashMap::new(), &one, claimed).unwrap_err(),
+			Unplaceable::NoCapacity
+		);
+		// Two assignable GPUs exist nowhere: a problem GPU does not count.
+		let mut two = req();
+		two.gpus = 2;
+		assert_eq!(
+			eligible(&members, &HashMap::new(), &two, none).unwrap_err(),
+			Unplaceable::NoCompatibleNode
+		);
+		let both = vec![node(4, |c| {
+			c.gpus = vec![gpu("0000:52:00.0", None, ""), gpu("0000:53:00.0", Some("s"), "")];
+		})];
+		assert_eq!(
+			eligible(&both, &HashMap::new(), &two, none).unwrap_err(),
+			Unplaceable::NoCapacity,
+			"enough GPUs exist but one is held"
+		);
+	}
+
+	#[test]
+	fn gpu_sandboxes_get_no_snapshot_bonus() {
+		let members = vec![
+			node(1, |c| c.gpus = vec![gpu("0000:52:00.0", None, "")]),
+			node(2, |c| c.gpus = vec![gpu("0000:52:00.0", None, "")]),
+		];
+		let mut r = req();
+		r.gpus = 1;
+		r.artifacts = [1, 2]
+			.map(|id| ArtifactLocation {
+				node_id:      NodeId(id),
+				backend:      "hvf".into(),
+				cpu_baseline: "m4".into(),
+				has_snapshot: id == 1,
+			})
+			.to_vec();
+		let ranked = eligible(&members, &HashMap::new(), &r, none).unwrap();
+		assert!((ranked[0].score - ranked[1].score).abs() < 1e-9);
+	}
+
 	#[test]
 	fn filters_status_draining_arch_and_features() {
 		let members = vec![
@@ -417,26 +533,45 @@ mod tests {
 			node(5, |_| {}),
 		];
 		let statuses = HashMap::from([(NodeId(5), NodeStatus::Unhealthy)]);
-		let got = eligible(&members, &statuses, &req(), |_| 0).unwrap();
+		let got = eligible(&members, &statuses, &req(), none).unwrap();
 		assert_eq!(ids(&got).len(), 2);
 		assert!(ids(&got).contains(&1) && ids(&got).contains(&4));
 
 		let mut needs_proxy = req();
 		needs_proxy.features = vec!["egress-proxy"];
-		assert_eq!(ids(&eligible(&members, &statuses, &needs_proxy, |_| 0).unwrap()), vec![4]);
+		assert_eq!(ids(&eligible(&members, &statuses, &needs_proxy, none).unwrap()), vec![4]);
+	}
+
+	#[test]
+	fn backend_and_cpu_baseline_filter_only_when_requested() {
+		let members = vec![
+			node(1, |_| {}),
+			node(2, |c| c.cpu_baseline = "m3".into()),
+			node(3, |c| c.backend = "kvm".into()),
+		];
+		assert_eq!(ids(&eligible(&members, &HashMap::new(), &req(), none).unwrap()).len(), 3);
+		let mut restore = req();
+		restore.backend = "hvf".into();
+		restore.cpu_baseline = "m4".into();
+		assert_eq!(ids(&eligible(&members, &HashMap::new(), &restore, none).unwrap()), vec![1]);
+		restore.cpu_baseline = "m5".into();
+		assert_eq!(
+			eligible(&members, &HashMap::new(), &restore, none).unwrap_err(),
+			Unplaceable::NoCompatibleNode
+		);
 	}
 
 	#[test]
 	fn distinguishes_incompatible_from_full() {
 		let members = vec![node(1, |c| c.vcpus_used = 31)];
 		assert_eq!(
-			eligible(&members, &HashMap::new(), &req(), |_| 0).unwrap_err(),
+			eligible(&members, &HashMap::new(), &req(), none).unwrap_err(),
 			Unplaceable::NoCapacity
 		);
 		let mut x86 = req();
 		x86.arch = "x86_64".into();
 		assert_eq!(
-			eligible(&members, &HashMap::new(), &x86, |_| 0).unwrap_err(),
+			eligible(&members, &HashMap::new(), &x86, none).unwrap_err(),
 			Unplaceable::NoCompatibleNode
 		);
 	}
@@ -446,14 +581,14 @@ mod tests {
 		// 8 cpus * 4 = 32 vCPU cap; 30 used + 2 requested = 32 fits, 31 + 2 does
 		// not.
 		let fits = vec![node(1, |c| c.vcpus_used = 30)];
-		assert!(eligible(&fits, &HashMap::new(), &req(), |_| 0).is_ok());
+		assert!(eligible(&fits, &HashMap::new(), &req(), none).is_ok());
 		let full = vec![node(1, |c| c.vcpus_used = 31)];
-		assert!(eligible(&full, &HashMap::new(), &req(), |_| 0).is_err());
+		assert!(eligible(&full, &HashMap::new(), &req(), none).is_err());
 		// 16 GiB * 2 = 32768 MiB memory cap.
 		let mem_full = vec![node(1, |c| c.memory_used_mb = 32_768 - 1023)];
-		assert!(eligible(&mem_full, &HashMap::new(), &req(), |_| 0).is_err());
+		assert!(eligible(&mem_full, &HashMap::new(), &req(), none).is_err());
 		let disk_low = vec![node(1, |c| c.disk_free_mb = MIN_FREE_DISK_MB - 1)];
-		assert!(eligible(&disk_low, &HashMap::new(), &req(), |_| 0).is_err());
+		assert!(eligible(&disk_low, &HashMap::new(), &req(), none).is_err());
 	}
 
 	#[test]
@@ -461,10 +596,10 @@ mod tests {
 		let members = vec![node(1, |_| {}), node(2, |_| {})];
 		let mut pinned = req();
 		pinned.pinned = Some(NodeId(2));
-		assert_eq!(ids(&eligible(&members, &HashMap::new(), &pinned, |_| 0).unwrap()), vec![2]);
+		assert_eq!(ids(&eligible(&members, &HashMap::new(), &pinned, none).unwrap()), vec![2]);
 		pinned.excluded = vec![NodeId(2)];
 		assert_eq!(
-			eligible(&members, &HashMap::new(), &pinned, |_| 0).unwrap_err(),
+			eligible(&members, &HashMap::new(), &pinned, none).unwrap_err(),
 			Unplaceable::NoCompatibleNode
 		);
 	}
@@ -479,13 +614,15 @@ mod tests {
 			cpu_baseline: "m4".into(),
 			has_snapshot: true,
 		}];
-		let ranked = eligible(&members, &HashMap::new(), &with_art, |_| 0).unwrap();
+		let ranked = eligible(&members, &HashMap::new(), &with_art, none).unwrap();
 		assert_eq!(ids(&ranked), vec![1, 2]);
 		assert!(ranked[0].score - ranked[1].score > ARTIFACT_BONUS);
 		// Seven in-flight creates (−1.75) outweigh the artifact + snapshot bonus.
-		let ranked =
-			eligible(&members, &HashMap::new(), &with_art, |id| if id == NodeId(1) { 7 } else { 0 })
-				.unwrap();
+		let ranked = eligible(&members, &HashMap::new(), &with_art, |id| NodeCounters {
+			inflight: if id == NodeId(1) { 7 } else { 0 },
+			..NodeCounters::default()
+		})
+		.unwrap();
 		assert_eq!(ids(&ranked), vec![2, 1]);
 	}
 
@@ -583,7 +720,7 @@ mod tests {
 		};
 		let mut r = req();
 		r.artifacts = vec![art(1), art(2)];
-		let ranked = eligible(&members, &HashMap::new(), &r, |_| 0).unwrap();
+		let ranked = eligible(&members, &HashMap::new(), &r, none).unwrap();
 		assert_eq!(ids(&ranked), vec![2, 1]);
 		assert!((ranked[0].score - ranked[1].score - SNAPSHOT_BONUS).abs() < 1e-9);
 	}
@@ -608,14 +745,16 @@ mod tests {
 	#[test]
 	fn inflight_guard_counts_outcomes_and_drop_as_failure() {
 		let s = Scheduler::default();
-		let g = s.begin(NodeId(1));
+		let g = s.begin(NodeId(1), 2);
 		assert_eq!(s.node_counters(NodeId(1)).inflight, 1);
+		assert_eq!(s.node_counters(NodeId(1)).inflight_gpus, 2);
 		g.finish(CreateOutcome::Success);
-		drop(s.begin(NodeId(1)));
+		drop(s.begin(NodeId(1), 0));
 		assert_eq!(s.node_counters(NodeId(1)), NodeCounters {
-			inflight:  0,
-			successes: 1,
-			fails:     1,
+			inflight:      0,
+			inflight_gpus: 0,
+			successes:     1,
+			fails:         1,
 		});
 	}
 }
