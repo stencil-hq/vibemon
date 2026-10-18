@@ -216,7 +216,8 @@ pub enum Compare { Exists(String), Missing(String), ModRev { key: String, rev: u
                    Value { key: String, value: Vec<u8> }, CountBelow { prefix: String, limit: u64 } }
 pub enum Op { Put { key: String, value: Vec<u8>, ttl_ms: Option<u64> }, Delete { key: String },
               DeletePrefix { prefix: String },
-              PutStamped { prefix: String, suffix: String, value: Vec<u8>, ttl_ms: Option<u64> } }
+              PutStamped { prefix: String, suffix: String, value: Vec<u8>, ttl_ms: Option<u64> },
+              Append { streams: Vec<String>, value: Vec<u8> } }
 pub struct Txn { pub compare: Vec<Compare>, pub success: Vec<Op>, pub failure: Vec<Op> }
 pub struct TxnResult { pub succeeded: bool, pub revision: u64 }
 pub struct Range { pub prefix: String, pub after: Option<String>, pub limit: Option<usize>, pub reverse: bool }
@@ -312,6 +313,42 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   unknown and is re-learned), so a KV write costs one `fdatasync`. The
   cluster UUID is written by a `SetClusterId` command (first wins).
 
+#### Journal (`cluster::kv::journal`)
+
+History that only grows (sandbox events, build logs, webhook deliveries)
+lives in a raft-replicated append-only journal on disk instead of the
+in-memory map.
+
+- `Op::Append { streams, value }` is part of a txn (atomic with its other
+  ops) and is applied by every driver's state machine into
+  `<data>/raft/journal/`. Each record gets a `seq`, dense from 1 across all
+  streams in commit order (from the replicated `KvState.journal` counter),
+  and the leader-stamped command time as its record time. One record belongs
+  to several streams (written once, indexed per stream). Txns cannot compare
+  journal contents.
+- Files: `<first seq>.seg` segments of framed records
+  (`len u32 | fnv1a64 u64 | payload`, payload `seq | ts_ms | stream count |
+  (len | stream)… | value`), sealed past 16 MiB; `<first seq>.idx`, sorted
+  `(stream hash, seq, offset)` entries written once a sealed segment is
+  fsynced; `holes.json` (skipped or expired seq ranges). Only unindexed
+  segments keep an in-memory index.
+- Durability: the apply path does not fsync. A maintenance task (every 10 s)
+  fsyncs and writes index files; before a raft snapshot is persisted the
+  journal is flushed, so records below the snapshot's journal position are
+  durable and later ones are rewritten by log replay (appends below the
+  journal's next seq are skipped). Open trusts indexed segments, validates
+  the rest, truncates at the first torn record and drops later unindexed
+  segments.
+- Holes: a driver installing a raft snapshot records the skipped seq range;
+  the maintenance task copies it from peers (`POST /cluster/v1/kv/journal`,
+  believed leader first). Only a peer with no holes of its own can declare a
+  range expired. Until the journal is complete, the driver forwards journal
+  scans to the leader.
+- Reads: `Kv::scan(&Scan { stream, after, limit, reverse })`, local after
+  the read barrier (`POST /cluster/v1/kv/scan` for remote handles).
+- Retention: `JOURNAL_RETENTION` (30 days); the maintenance task deletes
+  whole sealed segments past it (once a minute).
+
 ### 5.4 Raft bootstrap and membership (driven by gossip)
 
 - `--bootstrap-expect N` (default 1). A driver with an uninitialized raft waits
@@ -374,6 +411,7 @@ records it in raft membership, and resets the peer's replication backoff
 | `file/<templateID>/<hash>` | `{node: NodeId, size}` | driver | Where a build file-context archive is stored. |
 | `node/<nodeID>/status` | `"draining"|"unhealthy"` | driver (admin API) | Admin node status override; absent = ready (`POST /nodes/{id}` with `ready` deletes it). |
 | `db/…` | JSON records | driver (`driver::store`) | Durable system of record, §7. |
+| journal streams (`ev…`, `blog/…`, `wh/…`) | JSON records | driver (`driver::store`, `Op::Append`) | History on the on-disk journal (§5.3), not in the map; 30-day retention, §7. |
 | `idem/<teamID>/<key>` | `{hash, createdMs, response?}` | driver | `Idempotency-Key` of `POST /v2/sandboxes` (24 h TTL): same body replays the 201, other body → 409 `idempotency_request_mismatch`, pending → 409 `idempotency_in_progress` (422 `idempotency_outcome_unknown` after 10 min). |
 
 ```rust
@@ -396,8 +434,8 @@ under `db/<table>/…` keys; secondary indexes and unique constraints are extra
 keys under `db/<table>.<index>/…` (empty, an id, or the few fields their scans
 filter on), written by the same transaction. Key segments are escaped (`%` →
 `%25`, `/` → `%2F`); `<t>` below is a zero-padded µs timestamp, `<seq>` a
-zero-padded number, `<stamp>` a commit revision (`kv::stamp`). The KV holds
-everything in memory on every driver and snapshots it to `<data>/raft/`
+zero-padded number. The KV holds records in memory on every driver and
+snapshots them to `<data>/raft/`; history goes to the on-disk journal
 (§5.3). There are no schema migrations: a record field
 added later is `#[serde(default)]`. Timestamps are UTC with millisecond
 precision.
@@ -409,7 +447,8 @@ precision.
 - **Writes** (`Store::tx` → `Tx`) are optimistic transactions. Every key a
   `Tx` reads becomes a `ModRev` guard (absent keys stay absent); writes are
   staged (`put`, `put_ttl`, `mark` for index keys, `put_stamped`, `delete`,
-  `delete_prefix`) and `commit()` submits one KV txn. `false` means a guard
+  `delete_prefix`, `append` for journal records) and `commit()` submits one
+  KV txn. `false` means a guard
   was lost to a concurrent writer: the caller reruns its loop on fresh state
   (`store::Error::Contention` after too many losses). Reads in a `Tx` do not
   see its own staged writes.
@@ -419,16 +458,19 @@ precision.
   `store::Error::Duplicate` (HTTP 409) or the method's typed outcome.
 - **Admission and limits**: an index prefix per counted set, checked locally
   and guarded with `Compare::CountBelow { prefix, limit }`.
-- **Ordered history** (events, deliveries, build logs): keys sort by a
-  zero-padded segment; sandbox events use versionstamped keys
-  (`Op::PutStamped`), so an event's `seq` is the commit revision stamped into
-  its key, and the webhook cursor is that revision. Scans page with
-  `Range { after, limit, reverse }`.
-- **Retention** (`store::HISTORY_TTL`, 7 days): sandbox events, webhook
-  deliveries, build log lines, and records of killed sandboxes (stripped of
-  their encrypted env, egress policy, and S3 credentials) are written with
-  that TTL, including their index keys; readers tolerate expired references.
-  Webhook payloads advertise `events_ttl_days: 7`.
+- **History** (events, build logs, deliveries): journal records appended
+  with `Tx::append` in the same txn as the related KV writes (streams below);
+  read with `Read::journal` / `Read::journal_each` (`Scan { stream, after,
+  limit, reverse }`) as `Logged { seq, at, value }`. A sandbox event's `seq`
+  is its record seq and its timestamp the commit time; the webhook cursor is
+  that seq. History is never deleted explicitly: deleting a build or webhook
+  makes its streams unreachable (ids are never reused).
+- **Retention**: history expires `store::HISTORY_RETENTION` (=
+  `JOURNAL_RETENTION`, 30 days) after commit, whole segments at a time;
+  webhook payloads advertise `events_ttl_days: 30`. Records of killed
+  sandboxes (stripped of their encrypted env, egress policy, and S3
+  credentials) stay in the KV with `store::KILLED_SANDBOX_TTL` (7 days);
+  readers tolerate expired references.
 - **Errors**: `store::Error::Kv` (no leader / unreachable) maps to 503,
   `Duplicate` to 409, `Corrupt`/`Contention` to 500 `database error`.
 
@@ -458,24 +500,28 @@ Keys (each store module's `//!` docs also list the guards of its writes):
 | `db/build.unfinished/<team>/<kind>/<id>` | build id | `waiting`/`building` builds: concurrency limit (`CountBelow`). |
 | `db/build.building/<kind>/<t>/<id>` | build id | Supervisor work list, stale snapshot builds. |
 | `db/build.gc/<t>/<id>` | build id | Builds of deleted templates awaiting artifact GC. |
-| `db/blog/<build>/<seq>` | `LogRow` | Build log lines; `HISTORY_TTL`, deleted with the build. |
-| `db/blog.ts/<build>/<t>/<seq>` | `{seq, level}` | Time-cursor log pages; `HISTORY_TTL`. |
-| `db/sandbox/<id>` | `SandboxRow` | Sandboxes; killed ones stripped of secrets and kept `HISTORY_TTL`. |
+| `db/build.logs/<build>` | stored line count | Idempotent build log appends (lines already in `blog/<build>`). |
+| `db/sandbox/<id>` | `SandboxRow` | Sandboxes; killed ones stripped of secrets and kept `KILLED_SANDBOX_TTL`. |
 | `db/sandbox.live/<team>/<id>` | empty | Running and paused sandboxes (listings, counts, reconciler, artifact GC). |
-| `db/event/<stamp>` | `SandboxEventRow` | Lifecycle events in commit order (`seq` = stamp); `HISTORY_TTL`. |
-| `db/event.team/<team>/<stamp>` | `{type, ts}` | Team events, webhook cursor, team metrics; `HISTORY_TTL`. |
-| `db/event.sandbox/<team>/<sandbox>/<stamp>` | `{type, ts}` | One sandbox's events; `HISTORY_TTL`. |
 | `db/webhook/<id>` | `WebhookRow` | Webhooks (encrypted signature secret, forward-only `last_event_seq`). |
 | `db/webhook.team/<team>/<id>` | empty | A team's webhooks. |
-| `db/delivery/<webhook>/<event>/<t>/<id>` | `DeliveryRow` | Delivery attempts per event; `HISTORY_TTL`, deleted with the webhook. |
-| `db/delivery.event/<webhook>/<event>` | first attempt time | Creates an event's group once; `HISTORY_TTL`. |
-| `db/delivery.group/<webhook>/<t>/<event>` | event type | Delivery groups by first attempt; `HISTORY_TTL`. |
-| `db/delivery.ts/<webhook>/<t>/<id>` | time, status, type, duration | Delivery stats buckets; `HISTORY_TTL`. |
 | `db/secret/<team>/<id>` | `SecretRow` | Secrets (metadata, current version). |
 | `db/secret.name/<team>/<lower-cased name>` | secret id | Unique name per team. |
 | `db/secret.version/<team>/<id>/<seq>` | encrypted value | Secret versions. |
 | `db/volume/<team>/<id>` | `VolumeRow` | Volumes (node or object store). |
 | `db/volume.name/<team>/<lower-cased name>` | volume id | Unique name per team. |
+
+Journal streams (`HISTORY_RETENTION`; segments escaped like keys):
+
+| Stream | Value | Purpose |
+|---|---|---|
+| `ev` | sandbox event | All lifecycle events in commit order (event `seq` = record seq, timestamp = commit time). |
+| `ev/<team>` | (same record) | Team events, webhook cursor, team metrics. |
+| `ev/<team>/<sandbox>` | (same record) | One sandbox's events. |
+| `blog/<build>` | `LogRow` | Build log lines. |
+| `wh/<webhook>` | `DeliveryRow` (`ts` = commit time) | Every delivery attempt of a webhook (stats). |
+| `wh/<webhook>/event/<event>` | (same record) | One event's attempts. |
+| `wh/<webhook>/groups` | (same record, first attempts only) | Delivery groups in order of first attempt; the deliveries cursor is a group record's seq. A first attempt repeated after a leader change counts only if it is the event's earliest record. |
 
 `fork` templates are the hidden templates behind `POST /sandboxes/{id}/fork`:
 soft-deleted as soon as the fork's children are started or the fork failed,
@@ -532,7 +578,8 @@ running a temporary `dockerd` when PID 1 is the agent (build steps). Needs the
 
 ```
 node-id
-raft/                         (drivers)
+raft/                         (drivers) log.0, log.1, vote.json, committed.bin, snapshot.bin
+raft/journal/                 (drivers) history journal: <seq>.seg, <seq>.idx, holes.json
 files/<templateID>/<hash>.tar (build file contexts; nodes, located through KV `file/<templateID>/<hash>`)
 cache/oci/blobs/sha256/<hex>  (pulled layers, shared)
 builds/<buildID>/             rootfs.ext4 (raw; a block overlay + rootfs.ext4.base for snapshot builds), snapshot/ (vmm snapshot dir), meta.json (ArtifactMeta), manifest.json, build.log, console-*.log
@@ -1176,7 +1223,7 @@ a dead driver's builds are adopted once its lease lapses; supervision stops
 only when another driver holds the lease or the KV stays unreachable for a
 whole TTL. The
 holder polls the builder's `GET /node/v1/builds/{id}?logsOffset` every
-500 ms, appends new lines to the build log (`db/blog…`, draining all lines before
+500 ms, appends new lines to the build log (journal stream `blog/<build>`, draining all lines before
 recording a terminal state), and on `ready` writes `art/<build>/<node>`,
 the build's `artifact`, and its tags. A builder that is `Dead`/`Left` in
 gossip (or lost the build) fails it. `started_at` is set when the builder

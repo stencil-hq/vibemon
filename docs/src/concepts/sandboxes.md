@@ -202,7 +202,7 @@ e2b sandbox logs <sandbox-id> --level info -f
 
 ## Events
 
-Every lifecycle change is recorded in the driver store (kept for 7 days) as an event of type `sandbox.lifecycle.created`, `killed` (with `kill_reason`: `request`, `timeout`, `admin`, or `orphaned`), `updated` (timeout or network change), `paused`, `resumed`, or `checkpointed`.
+Every lifecycle change is recorded in the driver store (kept for 30 days) as an event of type `sandbox.lifecycle.created`, `killed` (with `kill_reason`: `request`, `timeout`, `admin`, or `orphaned`), `updated` (timeout or network change), `paused`, `resumed`, or `checkpointed`.
 
 ```sh
 curl -s "$E2B_API_URL/events/sandboxes/$SANDBOX_ID?limit=50&orderAsc=true" -H "X-API-Key: $E2B_API_KEY"

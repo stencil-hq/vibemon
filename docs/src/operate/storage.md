@@ -13,6 +13,7 @@ Flag reference: [`vmon serve` options](../reference/serve.md#object-store-and-vo
 ├── node-id
 ├── cluster-secret              generated when --cluster-secret is unset
 ├── raft/                       raft log and state (drivers)
+│   └── journal/                history journal: sandbox events, build logs, webhook deliveries (30 days)
 ├── files/<templateID>/<hash>.tar   build file-context uploads (stored on nodes)
 ├── cache/
 │   ├── oci/blobs/sha256/<hex>  pulled image layers, shared by builds

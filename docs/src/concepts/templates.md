@@ -129,7 +129,7 @@ The CLI converts the Dockerfile into v2 steps (`FROM`, `ENV`, `RUN`, `WORKDIR`, 
 | `GET /templates/{id}/builds/{buildID}/status` | `logsOffset`, `limit` (≤ 100), `level` | `status`, `logEntries`, and for errors `reason {message, step, logEntries}` |
 | `GET /templates/{id}/builds/{buildID}/logs` | `cursor` (ms), `limit` (≤ 100), `direction`, `level`, `source` | `logs[]` |
 
-The supervising driver copies the builder's log into the driver store (the raft KV) every 500 ms, so logs outlive the builder; they are kept for 7 days. `Template.get_build_status(...)` and `on_build_logs` read these endpoints.
+The supervising driver copies the builder's log into the driver store (the raft-replicated journal) every 500 ms, so logs outlive the builder; they are kept for 30 days. `Template.get_build_status(...)` and `on_build_logs` read these endpoints.
 
 ## Names, aliases, and tags
 

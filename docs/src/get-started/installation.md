@@ -72,7 +72,7 @@ Driver-only hosts need just `vmon`. `--kernel` (`VMON_KERNEL`) and `--agent` (`V
 
 ### Drivers
 
-Drivers need no external database: they keep all durable state (teams, keys, templates, builds, sandboxes, events, webhooks, secrets, volumes) in the raft KV they replicate among themselves, in memory and snapshotted under `<data-dir>/raft/`. Keep that directory on persistent storage. Every driver of a cluster uses the same cluster secret; see [Running vmon serve](../operate/serve.md#cluster-secret).
+Drivers need no external database: they keep all durable state (teams, keys, templates, builds, sandboxes, events, webhooks, secrets, volumes) in the raft KV they replicate among themselves, in memory and snapshotted under `<data-dir>/raft/` (history such as events, build logs, and webhook deliveries goes to an on-disk journal there instead of memory). Keep that directory on persistent storage. Every driver of a cluster uses the same cluster secret; see [Running vmon serve](../operate/serve.md#cluster-secret).
 
 ## Build from source
 

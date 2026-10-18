@@ -95,7 +95,7 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | GET/POST | `/secrets` | SDK | Encrypted versions in the store. |
 | GET/POST/DELETE | `/secrets/{id}` | SDK | Same. |
 | GET/PUT/DELETE | `/clusters/{clusterID}/rigs…` (5 ops) | Admin | **501** `Not implemented by this deployment` (the spec's documented answer for deployments without rigs/autoscaling). |
-| GET | `/events/sandboxes`, `/events/sandboxes/{id}` | dashboard | Stored lifecycle events (kept 7 days). |
+| GET | `/events/sandboxes`, `/events/sandboxes/{id}` | dashboard | Stored lifecycle events (kept 30 days). |
 | * | `/events/webhooks…` (7 ops) | dashboard | Webhooks with signed (`e2b-signature` = base64 SHA-256(secret + body)) lifecycle event delivery by the raft leader, ≤ 3 attempts, delivery log/stats. |
 | POST/DELETE | `/access-tokens…` | removed upstream | **410** with the upstream deprecation message. |
 | POST | `/templates`, `/templates/{id}`, `/templates/{id}/builds/{buildID}` (legacy v1) | removed upstream | Not served (404), matching current upstream; current CLIs use v2. |

@@ -110,7 +110,9 @@ run `codesign --sign - --entitlements hvf.entitlements --force <vmon>`.
 - **Driver store:** records are serde structs under `db/<table>/…` keys in the
   raft KV. Read through `Store::read()`; write in a `Store::tx()` loop (guarded
   reads, staged writes, rerun when `commit()` returns `false`). There are no
-  migrations: new record fields need `#[serde(default)]`.
+  migrations: new record fields need `#[serde(default)]`. History (events, build
+  logs, deliveries) goes to the on-disk raft journal via `Tx::append`, read with
+  `Read::journal`/`Read::journal_each`, never to KV keys.
 - **E2B fidelity:** match upstream wire behavior, using `spec/e2b/` and the
   upstream sources cited in `docs/src/reference/e2b-compat.md`. Protocol identifiers (`E2B_*`
   env vars, `/.e2b`, `/run/e2b`, aliases) stay as upstream. User-visible

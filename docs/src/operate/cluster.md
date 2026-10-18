@@ -40,7 +40,7 @@ Failure detection: each member probes one peer per second. An unanswered probe (
 
 ## Raft
 
-Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`: every driver holds the whole KV in memory and snapshots it there. Sandbox events, webhook deliveries, build logs, and records of killed sandboxes expire after 7 days, which bounds its size.
+Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`: every driver holds the KV in memory and snapshots it there. History (sandbox events, webhook deliveries, build logs) is not kept in memory: every driver appends it to an on-disk journal in `<data-dir>/raft/journal/`, replicated through raft and kept for 30 days. Records of killed sandboxes stay in the KV for 7 days.
 
 - **Bootstrap:** start the initial drivers with `--bootstrap-expect N`, where N is the number of initial drivers. A driver with uninitialized raft waits until gossip shows N alive drivers that have no cluster ID yet. The driver with the smallest node ID among them then initializes raft with exactly those N voters.
 - **Joining later:** a driver that sees any peer with a cluster ID never bootstraps. The leader reconciles membership every 2 s, adding new alive drivers as learners and promoting them to voters once they have caught up.
