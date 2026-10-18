@@ -1,5 +1,5 @@
 //! `vmonS3Mounts` through the API: validation, what the node receives, what
-//! `MySQL` keeps, credential re-resolution on resume, and object-store
+//! the store keeps, credential re-resolution on resume, and object-store
 //! volume placement.
 
 use vmon_node::api::{S3Mount, S3MountCredentials, S3MountMode};
@@ -16,10 +16,8 @@ fn keys(id: &str, secret: &str) -> S3MountCredentials {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_mounts_reach_the_node_and_never_leak_credentials() {
-	let Some(h) = harness().await else {
-		return;
-	};
-	let Harness { db, fake, state, api, team, .. } = &h;
+	let h = harness().await;
+	let Harness { store, fake, state, api, team, .. } = &h;
 	let secret_value = |key: &str, secret: &str| {
 		state.keys.encrypt(
 			json!({"accessKeyId": key, "secretAccessKey": secret})
@@ -27,8 +25,7 @@ async fn s3_mounts_reach_the_node_and_never_leak_credentials() {
 				.as_bytes(),
 		)
 	};
-	let secret = db
-		.store
+	let secret = store
 		.create_secret(
 			&team.id,
 			"bucket-keys",
@@ -90,18 +87,14 @@ async fn s3_mounts_reach_the_node_and_never_leak_credentials() {
 	];
 	assert_eq!(sent, expected);
 
-	// MySQL keeps no plaintext secret; the API never returns one.
-	let raw: (Option<String>, Option<Vec<u8>>) =
-		sqlx::query_as("SELECT CAST(s3_mounts AS CHAR), s3_mounts_enc FROM sandboxes WHERE id = ?")
-			.bind(&id)
-			.fetch_one(db.store.pool())
-			.await
-			.unwrap();
-	let records = raw.0.unwrap();
+	// The store keeps no plaintext secret; the API never returns one.
+	let row = store.sandbox(&id).await.unwrap().unwrap();
+	let records = serde_json::to_string(&row.s3_mounts).unwrap();
+	let stored = serde_json::to_string(&row).unwrap();
 	assert!(records.contains("bucket-keys") && records.contains("user-bucket"), "{records}");
 	for leak in ["TOPSECRET", "AKINLINE", "SECRETVALUE1"] {
-		assert!(!records.contains(leak), "{records}");
-		assert!(!String::from_utf8_lossy(raw.1.as_deref().unwrap()).contains(leak));
+		assert!(!stored.contains(leak), "{stored}");
+		assert!(!String::from_utf8_lossy(row.s3_mounts_enc.as_deref().unwrap()).contains(leak));
 	}
 	let (_, detail, _) = api.call("GET", &format!("/sandboxes/{id}"), None).await;
 	assert!(!detail.to_string().contains("TOPSECRET"), "{detail}");
@@ -112,7 +105,7 @@ async fn s3_mounts_reach_the_node_and_never_leak_credentials() {
 		.call("POST", &format!("/sandboxes/{id}/pause"), Some(json!({})))
 		.await;
 	assert_eq!(status, StatusCode::NO_CONTENT);
-	db.store
+	store
 		.update_secret(&team.id, &secret.id, &secret_value("AKSECRET2", "SECRETVALUE2"), None)
 		.await
 		.unwrap()
@@ -130,13 +123,10 @@ async fn s3_mounts_reach_the_node_and_never_leak_credentials() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn object_store_volumes_need_an_object_store_driver() {
-	let Some(h) = harness().await else {
-		return;
-	};
-	let Harness { db, fake, api, team, .. } = &h;
+	let h = harness().await;
+	let Harness { store, fake, api, team, .. } = &h;
 	// A volume created by an object-store driver: no owning node.
-	let volume = db
-		.store
+	let volume = store
 		.insert_volume(&team.id, "shared", None, true)
 		.await
 		.unwrap();

@@ -30,7 +30,7 @@ Some routes narrow this further. `/api-keys` refuses `X-API-Key`: listing, renam
 
 Generated keys are `e2b_` followed by 40 lowercase hex characters. Keys without the `e2b_` prefix are rejected before any lookup with the upstream "API key is malformed" message.
 
-The driver stores each key twice in MySQL (`api_keys`):
+The driver stores each key twice in its API key record (in the raft KV):
 
 - `key_hash`: SHA-256 of the hex-decoded key bytes, used for lookups.
 - `key_enc`: the key encrypted with AES-256-GCM under the data key derived from the cluster secret (see [Key material](#key-material)). This is what lets `GET /teams` hand the CLI a usable key.
@@ -62,7 +62,7 @@ Client configuration for the login is in [Connecting SDKs and the CLI](../get-st
 
 ## Admin token
 
-The admin token is the value of `--admin-token` (`VMON_ADMIN_TOKEN`) on a driver, compared in constant time against `X-Admin-Token`. It is not stored in MySQL, and each driver checks its own flag, so set the same value on every driver. Without `--admin-token` the admin routes reject every request with 401.
+The admin token is the value of `--admin-token` (`VMON_ADMIN_TOKEN`) on a driver, compared in constant time against `X-Admin-Token`. It is not stored in the cluster, and each driver checks its own flag, so set the same value on every driver. Without `--admin-token` the admin routes reject every request with 401.
 
 The admin routes are served on the public listener next to the E2B API. Operator workflows and `curl` examples are in [Administration](../operate/admin.md#admin-http-api).
 

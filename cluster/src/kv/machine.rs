@@ -4,11 +4,14 @@
 //! advances the applied clock (monotonically) and expires due keys, so every
 //! replica reaches the same state from the same log.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	ops::Bound,
+};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Compare, Entry, Op, Txn, TxnResult, WatchEvent};
+use super::{Compare, Entry, Op, Range, Txn, TxnResult, WatchEvent, stamp};
 
 /// Raft log payload (openraft `D`), proposed by the leader.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +63,11 @@ impl KvState {
 		serde_json::to_vec(self).expect("kv state serializes")
 	}
 
+	/// Revision of the last applied change.
+	pub const fn revision(&self) -> u64 {
+		self.revision
+	}
+
 	/// Cluster UUID recorded at bootstrap.
 	pub fn cluster_id(&self) -> Option<&str> {
 		self.cluster_id.as_deref()
@@ -83,6 +91,39 @@ impl KvState {
 			.filter(|e| self.live(e))
 			.cloned()
 			.collect()
+	}
+
+	/// Live entries matching `range`, in its order.
+	pub fn range(&self, range: &Range) -> Vec<Entry> {
+		let prefix = range.prefix.as_str();
+		let end = prefix_end(prefix);
+		let mut lower = Bound::Included(prefix);
+		let mut upper = end.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+		match range.after.as_deref() {
+			Some(after) if !range.reverse && after >= prefix => lower = Bound::Excluded(after),
+			Some(after) if range.reverse && end.as_deref().is_none_or(|end| after < end) => {
+				upper = Bound::Excluded(after);
+			},
+			_ => {},
+		}
+		let empty = match (lower, upper) {
+			(Bound::Included(lo) | Bound::Excluded(lo), Bound::Excluded(hi)) => lo >= hi,
+			_ => false,
+		};
+		if empty {
+			return Vec::new();
+		}
+		let matches = self
+			.entries
+			.range::<str, _>((lower, upper))
+			.map(|(_, entry)| entry);
+		let live = |entry: &&Entry| entry.key.starts_with(prefix) && self.live(entry);
+		let limit = range.limit.unwrap_or(usize::MAX);
+		if range.reverse {
+			matches.rev().filter(live).take(limit).cloned().collect()
+		} else {
+			matches.filter(live).take(limit).cloned().collect()
+		}
 	}
 
 	/// Applies one command; appends resulting changes to `events`.
@@ -182,28 +223,11 @@ impl KvState {
 	fn apply_op(&mut self, op: &Op, rev: u64, events: &mut Vec<WatchEvent>) -> bool {
 		match op {
 			Op::Put { key, value, ttl_ms } => {
-				let expires_at_ms = ttl_ms.map(|ttl| self.applied_ms.saturating_add(ttl));
-				let create_rev = match self.entries.get(key) {
-					Some(old) => {
-						if let Some(at) = old.expires_at_ms {
-							self.ttl.remove(&(at, key.clone()));
-						}
-						old.create_rev
-					},
-					None => rev,
-				};
-				if let Some(at) = expires_at_ms {
-					self.ttl.insert((at, key.clone()));
-				}
-				let entry = Entry {
-					key: key.clone(),
-					value: value.clone(),
-					create_rev,
-					mod_rev: rev,
-					expires_at_ms,
-				};
-				events.push(WatchEvent::Put(entry.clone()));
-				self.entries.insert(key.clone(), entry);
+				self.put(key.clone(), value, *ttl_ms, rev, events);
+				true
+			},
+			Op::PutStamped { prefix, suffix, value, ttl_ms } => {
+				self.put(format!("{prefix}{}{suffix}", stamp(rev)), value, *ttl_ms, rev, events);
 				true
 			},
 			Op::Delete { key } => self.remove(key, rev, events),
@@ -218,6 +242,33 @@ impl KvState {
 		}
 	}
 
+	fn put(
+		&mut self,
+		key: String,
+		value: &[u8],
+		ttl_ms: Option<u64>,
+		rev: u64,
+		events: &mut Vec<WatchEvent>,
+	) {
+		let expires_at_ms = ttl_ms.map(|ttl| self.applied_ms.saturating_add(ttl));
+		let create_rev = match self.entries.get(&key) {
+			Some(old) => {
+				if let Some(at) = old.expires_at_ms {
+					self.ttl.remove(&(at, key.clone()));
+				}
+				old.create_rev
+			},
+			None => rev,
+		};
+		if let Some(at) = expires_at_ms {
+			self.ttl.insert((at, key.clone()));
+		}
+		let entry =
+			Entry { key: key.clone(), value: value.to_vec(), create_rev, mod_rev: rev, expires_at_ms };
+		events.push(WatchEvent::Put(entry.clone()));
+		self.entries.insert(key, entry);
+	}
+
 	fn remove(&mut self, key: &str, rev: u64, events: &mut Vec<WatchEvent>) -> bool {
 		let Some(old) = self.entries.remove(key) else {
 			return false;
@@ -228,6 +279,20 @@ impl KvState {
 		events.push(WatchEvent::Delete { key: key.to_owned(), revision: rev });
 		true
 	}
+}
+
+/// Smallest string greater than every string starting with `prefix`; `None`
+/// when no such bound exists (empty prefix, or only `char::MAX`s).
+fn prefix_end(prefix: &str) -> Option<String> {
+	let mut end = prefix.to_owned();
+	while let Some(last) = end.pop() {
+		let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32);
+		if let Some(next) = next {
+			end.push(next);
+			return Some(end);
+		}
+	}
+	None
 }
 
 #[cfg(test)]
@@ -259,6 +324,54 @@ mod tests {
 		txn(&mut s, 4, vec![], vec![Op::Delete { key: "a".into() }]);
 		txn(&mut s, 5, vec![], vec![put("a", "3", None)]);
 		assert_eq!(s.get("a").unwrap().create_rev, 4);
+	}
+
+	#[test]
+	fn range_pages_within_the_prefix_in_both_directions() {
+		let mut s = KvState::default();
+		let keys = ["a/1", "a/2", "a/3", "a0", "a~", "b/1"];
+		txn(&mut s, 1, vec![], keys.iter().map(|k| put(k, "", None)).collect());
+		txn(&mut s, 2, vec![], vec![put("a/x", "", Some(1))]);
+		let scan = |s: &KvState, after: Option<&str>, limit: Option<usize>, reverse: bool| {
+			let range = Range { prefix: "a/".into(), after: after.map(Into::into), limit, reverse };
+			s.range(&range)
+				.into_iter()
+				.map(|e| e.key)
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(scan(&s, None, None, false), ["a/1", "a/2", "a/3", "a/x"]);
+		assert_eq!(scan(&s, Some("a/1"), Some(2), false), ["a/2", "a/3"]);
+		assert_eq!(scan(&s, None, Some(2), true), ["a/x", "a/3"]);
+		assert_eq!(scan(&s, Some("a/3"), None, true), ["a/2", "a/1"]);
+		// Cursors outside the prefix clamp to its bounds instead of leaking keys.
+		assert_eq!(scan(&s, Some("a"), Some(1), false), ["a/1"]);
+		assert_eq!(scan(&s, Some("zz"), Some(1), true), ["a/x"]);
+		assert_eq!(scan(&s, Some("zz"), None, false), Vec::<String>::new());
+		assert_eq!(scan(&s, Some("a"), None, true), Vec::<String>::new());
+		// Expired keys drop out of scans.
+		txn(&mut s, 10, vec![], vec![]);
+		assert_eq!(scan(&s, None, Some(1), true), ["a/3"]);
+	}
+
+	#[test]
+	fn stamped_keys_share_the_commit_revision_and_sort_in_commit_order() {
+		let mut s = KvState::default();
+		let stamped = |suffix: &str| Op::PutStamped {
+			prefix: "ev/".into(),
+			suffix: suffix.into(),
+			value:  b"v".to_vec(),
+			ttl_ms: None,
+		};
+		let first = txn(&mut s, 1, vec![], vec![stamped(""), stamped("/idx")]).revision;
+		txn(&mut s, 2, vec![], vec![put("other", "", None)]);
+		let second = txn(&mut s, 3, vec![], vec![stamped("")]).revision;
+		let keys: Vec<String> = s.list("ev/").into_iter().map(|e| e.key).collect();
+		assert_eq!(keys, [
+			format!("ev/{}", stamp(first)),
+			format!("ev/{}/idx", stamp(first)),
+			format!("ev/{}", stamp(second)),
+		]);
+		assert_eq!(s.get(&keys[0]).unwrap().create_rev, first);
 	}
 
 	#[test]

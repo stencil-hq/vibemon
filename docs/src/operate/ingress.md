@@ -38,8 +38,7 @@ vmon serve --role driver \
   --domain sbx.example.com \
   --tls-listen 0.0.0.0:443 \
   --tls-cert /etc/vmon/tls/fullchain.pem \
-  --tls-key /etc/vmon/tls/privkey.pem \
-  --mysql-url "$VMON_MYSQL_URL"
+  --tls-key /etc/vmon/tls/privkey.pem
 ```
 
 With TLS on port 443 and DNS in place, the SDKs need only `E2B_API_KEY` and `E2B_DOMAIN`. They then address `https://<port>-<id>.<domain>` directly.

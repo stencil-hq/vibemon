@@ -5,7 +5,7 @@
 //! existing sandbox runs under `lock/sbx/<id>`.
 //!
 //! Live sandboxes have a KV route (`sbx/<id>`); paused sandboxes have a
-//! `MySQL` row (`state='paused'`, `node_id` = holder of the paused state) and,
+//! store record (`state='paused'`, `node_id` = holder of the paused state) and,
 //! with an object store, a portable generation at `paused/<id>/remote` that
 //! lets another node resume them. The raft leader runs the reaper and
 //! reconciler ([`spawn_background`]).
@@ -288,19 +288,26 @@ fn validate_mount_path(path: &str) -> ApiResult<()> {
 /// started it is dropped (client disconnect, SDK timeout): cancelled midway,
 /// a transition would strand admission slots, routes in transitional states,
 /// VMs, or hidden fork templates.
-async fn detached<T: Send + 'static>(
+///
+/// Spawns when called (not on first poll), so the returned future only holds
+/// the task handle: checking that it is `Send` never walks the operation's
+/// (deep) future type again.
+fn detached<T: Send + 'static>(
 	operation: impl Future<Output = ApiResult<T>> + Send + 'static,
-) -> ApiResult<T> {
-	match tokio::spawn(operation).await {
-		Ok(result) => result,
-		Err(error) => match error.try_into_panic() {
-			Ok(panic) => std::panic::resume_unwind(panic),
-			Err(error) => Err(ApiError::internal(format!("lifecycle task failed: {error}"))),
-		},
+) -> impl Future<Output = ApiResult<T>> + Send {
+	let task = tokio::spawn(operation);
+	async move {
+		match task.await {
+			Ok(result) => result,
+			Err(error) => match error.try_into_panic() {
+				Ok(panic) => std::panic::resume_unwind(panic),
+				Err(error) => Err(ApiError::internal(format!("lifecycle task failed: {error}"))),
+			},
+		}
 	}
 }
 
-/// Admits, places, and starts one sandbox; records it in `MySQL`.
+/// Admits, places, and starts one sandbox; records it in the store.
 async fn launch(state: &AppState, plan: Plan) -> ApiResult<SandboxRef> {
 	if plan.sources.is_empty() && !builds::published(state, &plan.build_id).await {
 		return Err(
@@ -492,7 +499,7 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 	})
 }
 
-/// Inserts the `MySQL` row and `created` event of a started sandbox.
+/// Inserts the store record and `created` event of a started sandbox.
 async fn record_launch(
 	state: &AppState,
 	plan: &Plan,
@@ -1070,7 +1077,7 @@ async fn resume_locked(
 		| ResumeMode::Resume { timeout_ms, cold_boot } => (timeout_ms, cold_boot),
 		ResumeMode::Ingress if row.auto_resume => {
 			let secs = limits::auto_resume_timeout_s(
-				row.lifecycle.0.auto_resume_timeout_s,
+				row.lifecycle.auto_resume_timeout_s,
 				team.limits.max_length_hours,
 			);
 			(secs * 1000, false)
@@ -1103,7 +1110,7 @@ async fn extend(
 	Ok(route)
 }
 
-/// Persists a new `end_at_ms` (route, `MySQL`, node safety deadline).
+/// Persists a new `end_at_ms` (route, store, node safety deadline).
 async fn apply_end(state: &AppState, id: &str, route: &SandboxRoute) -> ApiResult<()> {
 	put_route(&state.cluster.kv, id, route).await?;
 	state
@@ -1139,7 +1146,7 @@ async fn resume_paused(
 		// Volumes on node-local storage keep pinning the sandbox to them.
 		let mut pin = None;
 		if !state.config.shared_volumes {
-			for mount in &row.volume_mounts.0 {
+			for mount in &row.volume_mounts {
 				let volume = state
 					.store
 					.volume(&team.id, &mount.volume_id)
@@ -1186,7 +1193,7 @@ async fn resume_paused(
 	if relocated {
 		tracing::info!(sandbox = id, from = %owner, to = %node, cold_boot, "resuming a paused sandbox on another node");
 	}
-	let ingress = row.network.0.ingress()?;
+	let ingress = row.network.ingress()?;
 	let now = now_ms();
 	let end = clamp_end(now, now + timeout_ms, max_length_ms(team.limits.max_length_hours));
 	let mut route = SandboxRoute {
@@ -1226,7 +1233,7 @@ async fn resume_paused(
 			&decrypt_env(state, row)?,
 		),
 		network: policy.clone(),
-		volume_mounts: row.volume_mounts.0.clone(),
+		volume_mounts: row.volume_mounts.clone(),
 		s3_mounts: s3mounts::restore(state, row).await?,
 		cold_boot,
 		// The holder may have lost its local copy too: always offer the record.
@@ -1244,7 +1251,7 @@ async fn resume_paused(
 			envd_version:      row.envd_version.clone(),
 			envd_access_token: state.keys.envd_token(id),
 			network:           policy,
-			volume_mounts:     row.volume_mounts.0.clone(),
+			volume_mounts:     row.volume_mounts.clone(),
 			pid:               None,
 			tap:               None,
 			ended_at_ms:       None,
@@ -1423,7 +1430,7 @@ pub async fn update_network(
 			.node(route.node_id)?
 			.update_network(id, &policy)
 			.await?;
-		let network = row.network.0.with_update(update).redacted();
+		let network = row.network.with_update(update).redacted();
 		state
 			.store
 			.set_sandbox_network(
@@ -1604,7 +1611,7 @@ async fn launch_forks(
 		.ok_or_else(|| ApiError::unavailable("the source sandbox's node left the cluster"))?;
 	let env_vars = decrypt_env(state, row)?;
 	let policy = decrypt_policy(state, row)?;
-	let ingress = row.network.0.ingress()?;
+	let ingress = row.network.ingress()?;
 	let flags = LifecycleFlags {
 		auto_pause:        row.auto_pause,
 		auto_pause_memory: row.auto_pause_memory,
@@ -1614,11 +1621,7 @@ async fn launch_forks(
 	// fork its memory snapshot).
 	let s3 = s3mounts::ResolvedS3Mounts {
 		mounts:  s3mounts::restore(state, row).await?,
-		records: row
-			.s3_mounts
-			.as_ref()
-			.map(|json| json.0.clone())
-			.unwrap_or_default(),
+		records: row.s3_mounts.clone().unwrap_or_default(),
 		enc:     row.s3_mounts_enc.clone(),
 	};
 	let children = (0..count).map(|_| {
@@ -1633,14 +1636,14 @@ async fn launch_forks(
 			pinned: Some(route.node_id),
 			timeout_ms,
 			env_vars: env_vars.clone(),
-			metadata: row.metadata.0.clone(),
+			metadata: row.metadata.clone(),
 			flags,
-			auto_resume_timeout_s: row.lifecycle.0.auto_resume_timeout_s,
+			auto_resume_timeout_s: row.lifecycle.auto_resume_timeout_s,
 			allow_internet_access: row.allow_internet_access,
-			network: row.network.0.clone(),
+			network: row.network.clone(),
 			policy: policy.clone(),
 			ingress: ingress.clone(),
-			volume_mounts: row.volume_mounts.0.clone(),
+			volume_mounts: row.volume_mounts.clone(),
 			s3: s3.clone(),
 		};
 		// Type-erased: keeps the fork handler's future type shallow enough
@@ -1737,7 +1740,7 @@ pub(crate) async fn expire(state: &AppState, id: &str) -> ApiResult<()> {
 	result
 }
 
-/// Subject of a `sandbox_events` row.
+/// Subject of a sandbox lifecycle event.
 struct EventSubject<'a> {
 	team_id:       &'a str,
 	sandbox_id:    &'a str,
@@ -1751,8 +1754,7 @@ struct EventSubject<'a> {
 }
 
 impl<'a> EventSubject<'a> {
-	/// The `sandbox_events` row for this subject (data per the E2B webhook
-	/// docs).
+	/// The lifecycle event for this subject (data per the E2B webhook docs).
 	fn event(&self, event_type: &'static str, kill: Option<KillReason>) -> NewSandboxEvent<'a> {
 		let mut data = json!({
 			"sandbox_metadata": self.metadata,
@@ -1784,7 +1786,7 @@ impl<'a> EventSubject<'a> {
 			execution_id:  &row.execution_id,
 			template_id:   &row.template_id,
 			build_id:      &row.build_id,
-			metadata:      &row.metadata.0,
+			metadata:      &row.metadata,
 			started_at_ms: unix_ms(row.started_at),
 			vcpus:         row.vcpus,
 			memory_mb:     row.memory_mb,

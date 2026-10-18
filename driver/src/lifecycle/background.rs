@@ -1,8 +1,8 @@
 //! Leader-only supervision (ARCHITECTURE.md §9.4).
 //!
 //! The reaper expires sandboxes past `endAt` every second; the reconciler
-//! compares node inventories with KV routes and `MySQL` every ten seconds.
-//! They run as separate tasks, so a reconciliation pass stalled on `MySQL`
+//! compares node inventories with KV routes and the store every ten seconds.
+//! They run as separate tasks, so a reconciliation pass stalled on the store
 //! does not hold up expiries, and one sandbox whose repair fails does not
 //! end the pass for the others.
 
@@ -34,7 +34,7 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long after a (re)start a sandbox is exempt from orphan repair: a
 /// running route whose VM the node does not list yet (the node create is
 /// still booting it) or a running row without a route (the create path
-/// between admission and the `MySQL` insert). Under storage stalls both
+/// between admission and the store insert). Under storage stalls both
 /// windows outlast the sandbox lock when its renewal applies late, so this
 /// is the safeguard that does not depend on the lock.
 const ORPHAN_GRACE_MS: u64 = 120_000;

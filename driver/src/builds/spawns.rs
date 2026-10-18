@@ -2,18 +2,20 @@
 //! sandbox create path.
 //!
 //! A create only counts its spawn in memory; one background task writes the
-//! accumulated counts, one `UPDATE` per template at a time. Creates therefore
-//! never wait for the template row, which concurrent creates of one template
-//! would otherwise queue on (each `UPDATE` holds the row lock until its commit
-//! is durable). Upstream batches the same way (`TemplateSpawnCounter`).
+//! accumulated counts, one store transaction per template at a time. Creates
+//! therefore never wait on the template record, which concurrent creates of
+//! one template would otherwise contend on (each write is a raft commit, and
+//! concurrent ones rerun on conflict). Upstream batches the same way
+//! (`TemplateSpawnCounter`).
 
 use std::{collections::HashMap, time::Duration};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use vmon_cluster::kv::KvError;
 
-use crate::state::AppState;
+use crate::{state::AppState, store};
 
 /// Delay before the writer retries counts whose write failed, doubling up to
 /// [`MAX_RETRY_DELAY`] while failures continue.
@@ -58,7 +60,7 @@ impl SpawnCounter {
 	}
 }
 
-/// Starts the task writing recorded spawns to `MySQL` (called by
+/// Starts the task writing recorded spawns to the store (called by
 /// [`crate::Driver::start`]). Counts whose write failed are retried with
 /// backoff, without waiting for the next create.
 pub fn spawn_spawn_writer(state: AppState) {
@@ -98,8 +100,8 @@ async fn write_pending(state: &AppState) -> bool {
 			state.spawns.add(&template_id, spawns);
 			written = false;
 		} else {
-			// The UPDATE may have committed before the connection failed;
-			// replaying it could count these spawns twice.
+			// The commit may have applied before the call failed; replaying
+			// it could count these spawns twice.
 			tracing::warn!(
 				template = %template_id,
 				count = spawns.count,
@@ -111,10 +113,19 @@ async fn write_pending(state: &AppState) -> bool {
 	written
 }
 
-/// Whether `error` proves the autocommit `UPDATE` did not apply: the server
-/// rejected it, or no connection was obtained to send it.
-const fn unapplied(error: &sqlx::Error) -> bool {
-	matches!(error, sqlx::Error::Database(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+/// Whether `error` proves [`store::Store::add_template_spawns`] wrote nothing:
+/// every commit attempt lost its guards (`Contention`), a read failed before
+/// any commit (`Corrupt`, `Duplicate`), or the KV refused the call before
+/// proposing it (`NoLeader`: no leader accepted the proposal; `Rejected`).
+/// Other KV failures may follow a proposal that still commits.
+const fn unapplied(error: &store::Error) -> bool {
+	matches!(
+		error,
+		store::Error::Contention(_)
+			| store::Error::Corrupt { .. }
+			| store::Error::Duplicate(_)
+			| store::Error::Kv(KvError::NoLeader | KvError::Rejected(_))
+	)
 }
 
 #[cfg(test)]

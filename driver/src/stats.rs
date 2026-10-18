@@ -1,6 +1,6 @@
 //! In-memory fleet history for the admin dashboard (`GET /admin/cluster`).
 //!
-//! Every driver samples gossip capacity and the `sandbox_events` start count
+//! Every driver samples gossip capacity and the sandbox event log's start count
 //! every [`SAMPLE_INTERVAL`] and keeps the newest [`HISTORY_LEN`] samples.
 
 use std::{collections::VecDeque, time::Duration};

@@ -2,7 +2,7 @@
 name = "vmon-driver"
 version = "0.3.2"
 edition = "2024"
-description = "Vibemon driver role: E2B-compatible API, MySQL store, scheduling, sandbox ingress"
+description = "Vibemon driver role: E2B-compatible API, KV-backed store, scheduling, sandbox ingress"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -35,7 +35,6 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

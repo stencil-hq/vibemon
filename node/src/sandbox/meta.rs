@@ -1,6 +1,6 @@
 //! On-disk sandbox record `sandboxes/<id>/meta.json` (ARCHITECTURE.md §8.1):
 //! what restart recovery needs to adopt a live VMM or keep a paused sandbox.
-//! Env vars and other MySQL-owned data are never written here; the envd
+//! Env vars and other driver-store data are never written here; the envd
 //! access token is kept (0600) because metric scrapes after a node restart
 //! need it.
 

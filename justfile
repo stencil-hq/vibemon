@@ -175,15 +175,10 @@ check:
 
 # --------------------------------------------------------------- serve / e2e
 
-# Start MySQL 8.4 for local development (docker container `vmon-mysql`, port 13306).
-mysql:
-    docker start vmon-mysql 2>/dev/null || docker run -d --name vmon-mysql -e MYSQL_ROOT_PASSWORD=vmon -e MYSQL_DATABASE=vmon -p 13306:3306 mysql:8.4
-
-# Monolithic dev server (node + driver) against `just mysql`; extra args are forwarded.
+# Monolithic dev server (node + driver); extra args are forwarded.
 [positional-arguments]
 serve *args: build agent-musl
     "$({{just_executable()}} _bin {{profile}})" serve \
-        --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
         --agent "{{justfile_directory()}}/target/test-assets/vmon-agent-$(uname -m | sed 's/arm64/aarch64/')" \
         --listen 127.0.0.1:3000 --public-url http://127.0.0.1:3000 --domain localhost "$@"
 
@@ -191,14 +186,14 @@ serve *args: build agent-musl
 # (python | js | all | serve | shell); see e2e/README.md. Extra args go to
 # e2e/run.py, e.g. `just e2e python -- tests/sync/sandbox_sync`.
 [positional-arguments]
-e2e suite="all" *args: build agent-musl fetch-assets mysql
+e2e suite="all" *args: build agent-musl fetch-assets
     VMON_BIN="$({{just_executable()}} _bin {{profile}})" \
     VMON_AGENT="{{justfile_directory()}}/target/test-assets/vmon-agent-$(uname -m | sed 's/arm64/aarch64/')" \
     python3 e2e/run.py "$@"
 
 # Gated distributed e2e (tests/cluster.rs): 3 drivers + 2 nodes on loopback,
 # leader/node failover, graceful node restart; see docs/src/develop/cluster-verification.md.
-cluster-e2e: agent-musl fetch-assets mysql
+cluster-e2e: agent-musl fetch-assets
     CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="{{justfile_directory()}}/demo/hvf-test-runner.sh" \
     VMON_ENTITLEMENTS="{{justfile_directory()}}/{{entitlements}}" \
     VMON_CLUSTER_E2E=1 cargo test --test cluster -- --nocapture
@@ -216,10 +211,6 @@ templates *args: build
 # `cd ui && bun run dev` serves it on :5173 against `just serve`.
 ui:
     cd ui && bun install --frozen-lockfile && bun run check && bun run build
-
-# Driver tests that need MySQL (`just mysql` first).
-test-db:
-    VMON_MYSQL_TEST_URL=mysql://root:vmon@127.0.0.1:13306/vmon cargo test -p vmon-driver
 
 # ----------------------------------------------------------------------- assets
 

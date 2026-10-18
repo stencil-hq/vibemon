@@ -1,11 +1,11 @@
 //! Build supervisor (ARCHITECTURE.md §9.4).
 //!
-//! Every driver scans `MySQL` for builds in `building`; for each it can
+//! Every driver scans the store for builds in `building`; for each it can
 //! lease (`lock/build/<id>`, TTL, renewed independently of how long polls
 //! take; a lapsed lease nobody else took is re-taken) it polls the builder
 //! node's `GET /node/v1/builds/{id}`,
 //! persists new log lines, and records the outcome: on `ready` the
-//! artifact (`MySQL` + KV `art/<build>/<node>`) and tags, on failure the
+//! artifact (store + KV `art/<build>/<node>`) and tags, on failure the
 //! reason. A build whose lease lapses (its driver died) is adopted by any
 //! driver, and losing the lease to another driver stops supervision; a
 //! builder that gossip declares dead fails the build; builds running longer
@@ -39,7 +39,7 @@ use crate::{
 /// Timing knobs of the supervisor (tests shorten them).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Timing {
-	/// How often `MySQL` is scanned for unsupervised builds.
+	/// How often the store is scanned for unsupervised builds.
 	pub scan:           Duration,
 	/// How often a supervised build's node is polled.
 	pub poll:           Duration,
@@ -205,7 +205,7 @@ enum Progress {
 
 /// Supervises a build whose lease this driver took with a write proposed at
 /// `held`. Polling and lease renewal run side by side, so a poll stalled on
-/// `MySQL` or the node cannot starve the renewal; losing the lease abandons
+/// the store or the node cannot starve the renewal; losing the lease abandons
 /// the poll in flight (every step of it is idempotent for the new holder).
 async fn supervise(state: &AppState, build_id: &str, timing: Timing, held: Instant) {
 	tracing::debug!(build = build_id, "supervising build");
@@ -358,7 +358,7 @@ async fn poll_once(
 }
 
 /// Whether a build has run longer than [`BUILD_TIMEOUT`] on its builder.
-/// Time spent waiting, in `MySQL` or in the builder's queue (`started_at`
+/// Time spent waiting, in the store or in the builder's queue (`started_at`
 /// still unset), does not count.
 fn timed_out(build: &BuildRow, now: DateTime<Utc>) -> bool {
 	build.started_at.is_some_and(|started| {
@@ -416,7 +416,7 @@ mod tests {
 			envd_version:     None,
 			arch:             None,
 			node_id:          None,
-			tags:             sqlx::types::Json(vec![]),
+			tags:             vec![],
 			spec:             None,
 			template_version: None,
 			start_cmd:        None,
@@ -427,6 +427,7 @@ mod tests {
 			updated_at:       created,
 			started_at:       started,
 			finished_at:      None,
+			artifacts_gc_at:  None,
 		}
 	}
 

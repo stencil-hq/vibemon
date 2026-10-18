@@ -1,6 +1,6 @@
 //! Build supervision end to end: a real single-driver [`Cluster`], a
 //! node-only gossip member whose cluster URL is an in-process fake node
-//! serving `/node/v1/builds/*`, and `MySQL` (gated on `VMON_MYSQL_TEST_URL`).
+//! serving `/node/v1/builds/*`, with the store on the driver's raft KV.
 
 use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc, time::Duration};
 
@@ -25,7 +25,7 @@ use super::{
 use crate::{
 	crypto::Keys,
 	state::{AppState, DriverConfig, TeamLimits},
-	store::{Team, builds::BuildStatus, testdb::TestDb},
+	store::{Store, Team, builds::BuildStatus},
 };
 
 const SECRET: &str = "test-secret";
@@ -185,7 +185,7 @@ where
 /// A driver (raft leader) and a node-only gossip member served by `fake`,
 /// with one team.
 struct Fixture {
-	db:     TestDb,
+	store:  Store,
 	_dir:   tempfile::TempDir,
 	driver: Cluster,
 	node:   Cluster,
@@ -194,9 +194,7 @@ struct Fixture {
 	team:   Team,
 }
 
-/// `None` (test skipped) without `VMON_MYSQL_TEST_URL`.
-async fn fixture() -> Option<Fixture> {
-	let db = TestDb::create().await?;
+async fn fixture() -> Fixture {
 	let dir = tempfile::tempdir().unwrap();
 
 	let driver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -208,6 +206,7 @@ async fn fixture() -> Option<Fixture> {
 		vec![],
 	)
 	.await;
+	let store = Store::new(driver.kv.clone());
 	let driver_router = driver.router();
 	tokio::spawn(async move { axum::serve(driver_listener, driver_router).await.unwrap() });
 
@@ -238,7 +237,7 @@ async fn fixture() -> Option<Fixture> {
 		object_store:   None,
 	};
 	let state =
-		AppState::new(config, db.store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
+		AppState::new(config, store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
 	eventually("raft leadership", || async { driver.is_leader() }).await;
 	eventually("the builder node in gossip", || async {
 		state
@@ -247,12 +246,11 @@ async fn fixture() -> Option<Fixture> {
 			.any(|(id, meta)| *id == NODE_ID && meta.node.is_some())
 	})
 	.await;
-	let team = db
-		.store
+	let team = store
 		.create_team("Acme", TeamLimits::default())
 		.await
 		.unwrap();
-	Some(Fixture { db, _dir: dir, driver, node, fake, state, team })
+	Fixture { store, _dir: dir, driver, node, fake, state, team }
 }
 
 impl Fixture {
@@ -278,14 +276,7 @@ impl Fixture {
 	}
 
 	async fn status(&self, build_id: &str) -> BuildStatus {
-		self
-			.db
-			.store
-			.build(build_id)
-			.await
-			.unwrap()
-			.unwrap()
-			.status()
+		self.store.build(build_id).await.unwrap().unwrap().status()
 	}
 
 	/// The holder of `lock/build/<id>`, if any.
@@ -312,15 +303,12 @@ impl Fixture {
 
 	async fn shutdown(self) {
 		self.driver.shutdown().await;
-		self.db.drop_db().await;
 	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies() {
-	let Some(Fixture { db, _dir, driver, node, fake, state, team }) = fixture().await else {
-		return;
-	};
+	let Fixture { store, _dir, driver, node, fake, state, team } = fixture().await;
 	tokio::spawn(supervisor::run(state.clone(), supervisor::Timing {
 		scan:           Duration::from_millis(100),
 		poll:           Duration::from_millis(50),
@@ -334,7 +322,7 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 	let request = BuildRequest { name: Some("my-tpl:v1".into()), ..BuildRequest::default() };
 	let registered = register_build(&state, &team, &request).await.unwrap();
 	let build_id = registered.build_id.clone();
-	let waiting = db.store.build(&build_id).await.unwrap().unwrap();
+	let waiting = store.build(&build_id).await.unwrap().unwrap();
 	assert_eq!(waiting.status(), BuildStatus::Waiting);
 	let start = StartRequest { from_image: Some("e2bdev/base".into()), ..StartRequest::default() };
 	start_build(
@@ -352,7 +340,7 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 		assert_eq!(fake.started.len(), 1);
 		assert_eq!(fake.started[0].template_version, vmon_node::api::TemplateVersion::V2_0);
 	}
-	let building = db.store.build(&build_id).await.unwrap().unwrap();
+	let building = store.build(&build_id).await.unwrap().unwrap();
 	assert_eq!(building.status(), BuildStatus::Building);
 	assert_eq!(building.node_id.as_deref(), Some(NODE_ID.to_string().as_str()));
 
@@ -362,10 +350,10 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 		line("1", "[builder 1/1] RUN true"),
 	];
 	eventually("three persisted log lines", || async {
-		db.store.build_log_count(&build_id).await.unwrap() == 3
+		store.build_log_count(&build_id).await.unwrap() == 3
 	})
 	.await;
-	assert_eq!(db.store.build(&build_id).await.unwrap().unwrap().status(), BuildStatus::Building);
+	assert_eq!(store.build(&build_id).await.unwrap().unwrap().status(), BuildStatus::Building);
 
 	// building → ready: two more lines plus the artifact in the same report.
 	{
@@ -381,14 +369,13 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 		script.artifact = Some(artifact(&build_id));
 	}
 	eventually("ready build", || async {
-		db.store.build(&build_id).await.unwrap().unwrap().status() == BuildStatus::Ready
+		store.build(&build_id).await.unwrap().unwrap().status() == BuildStatus::Ready
 	})
 	.await;
-	let ready = db.store.build(&build_id).await.unwrap().unwrap();
+	let ready = store.build(&build_id).await.unwrap().unwrap();
 	assert_eq!(ready.envd_version.as_deref(), Some("0.6.4"));
-	assert_eq!(ready.artifact.as_ref().unwrap().0, artifact(&build_id));
-	let logs = db
-		.store
+	assert_eq!(ready.artifact.as_ref().unwrap(), &artifact(&build_id));
+	let logs = store
 		.build_logs_page(&build_id, crate::store::builds::LogLevel::Debug, 0, 100)
 		.await
 		.unwrap();
@@ -401,7 +388,7 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 		"Build finished, took 1s"
 	]);
 	assert_eq!(
-		db.store
+		store
 			.tag_build(&registered.template_id, "v1")
 			.await
 			.unwrap()
@@ -432,7 +419,7 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 	})
 	.await;
 	eventually("failed build", || async {
-		db.store
+		store
 			.build(&second.build_id)
 			.await
 			.unwrap()
@@ -441,18 +428,16 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 			== BuildStatus::Error
 	})
 	.await;
-	let failed = db.store.build(&second.build_id).await.unwrap().unwrap();
+	let failed = store.build(&second.build_id).await.unwrap().unwrap();
 	assert!(
 		failed
 			.reason
 			.unwrap()
-			.0
 			.message
 			.contains("no longer available")
 	);
 
 	driver.shutdown().await;
-	db.drop_db().await;
 }
 
 /// Regression (I/O stalls on a single driver): the lease was only renewed
@@ -463,9 +448,7 @@ async fn supervisor_drives_builds_to_ready_and_fails_them_when_the_builder_dies(
 /// by someone else stops supervision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_build_lease_survives_slow_polls_and_lapses_and_yields_only_to_another_holder() {
-	let Some(f) = fixture().await else {
-		return;
-	};
+	let f = fixture().await;
 	let me = f.driver.local_id().to_string();
 	let slow = f.start("slow").await;
 	let taken = f.start("taken").await;
@@ -520,9 +503,7 @@ async fn the_build_lease_survives_slow_polls_and_lapses_and_yields_only_to_anoth
 /// after) they ran. The clock starts when the builder reports `building`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn time_queued_on_the_builder_does_not_count_toward_the_build_timeout() {
-	let Some(f) = fixture().await else {
-		return;
-	};
+	let f = fixture().await;
 	let queued = f.start("queued").await;
 	f.fake.lock().builds.get_mut(&queued).unwrap().state = BuildState::Waiting;
 	tokio::spawn(supervisor::run(f.state.clone(), supervisor::Timing {
@@ -534,14 +515,13 @@ async fn time_queued_on_the_builder_does_not_count_toward_the_build_timeout() {
 		snapshot_stale: Duration::from_hours(1),
 	}));
 	eventually("queued build polled", || async { f.polls(&queued) > 2 }).await;
-	let row = f.db.store.build(&queued).await.unwrap().unwrap();
+	let row = f.store.build(&queued).await.unwrap().unwrap();
 	assert_eq!(row.status(), BuildStatus::Building);
 	assert_eq!(row.started_at, None, "still queued on the builder");
 
 	f.fake.lock().builds.get_mut(&queued).unwrap().state = BuildState::Building;
 	eventually("the start recorded", || async {
-		f.db
-			.store
+		f.store
 			.build(&queued)
 			.await
 			.unwrap()
@@ -555,9 +535,6 @@ async fn time_queued_on_the_builder_does_not_count_toward_the_build_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
-	let Some(db) = TestDb::create().await else {
-		return;
-	};
 	let dir = tempfile::tempdir().unwrap();
 	let driver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let driver = start_cluster(
@@ -568,6 +545,7 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 		vec![],
 	)
 	.await;
+	let store = Store::new(driver.kv.clone());
 	let driver_router = driver.router();
 	tokio::spawn(async move { axum::serve(driver_listener, driver_router).await.unwrap() });
 	// The fake node serves the manifest of its peer-fetched copy.
@@ -591,7 +569,7 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 		object_store:   None,
 	};
 	let state =
-		AppState::new(config, db.store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
+		AppState::new(config, store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
 	eventually("raft leadership", || async { driver.is_leader() }).await;
 
 	let build_id = uuid::Uuid::new_v4().to_string();
@@ -621,5 +599,4 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 	);
 
 	driver.shutdown().await;
-	db.drop_db().await;
 }

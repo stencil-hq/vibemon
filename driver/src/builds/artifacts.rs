@@ -111,7 +111,7 @@ pub(super) async fn collect_garbage(state: &AppState) -> anyhow::Result<()> {
 	// dropping the route, resume admits the route before updating the row), but
 	// both are read at different instants: reading paused rows on both sides of
 	// the route listing also catches a sandbox pausing or resuming meanwhile.
-	// A failed query aborts the pass before anything is deleted.
+	// A failed read aborts the pass before anything is deleted.
 	let mut in_use: HashSet<String> = state
 		.store
 		.builds_of_paused_sandboxes()

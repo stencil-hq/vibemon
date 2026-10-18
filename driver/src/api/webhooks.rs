@@ -68,7 +68,7 @@ impl From<WebhookRow> for WebhookDto {
 			created_at: row.created_at,
 			url:        row.url,
 			enabled:    row.enabled,
-			events:     row.events.0,
+			events:     row.events,
 		}
 	}
 }

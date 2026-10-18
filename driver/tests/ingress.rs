@@ -3,8 +3,8 @@
 //! A single-driver in-process cluster holds the routes; a node-role cluster
 //! member advertises a fake node server that implements
 //! `GET /node/v1/sandboxes/{id}/tunnel/{port}` by serving an in-process
-//! "guest" HTTP app on the upgraded connection. Needs `MySQL` at
-//! `VMON_TEST_MYSQL` (default `mysql://root:vmon@127.0.0.1:13306/vmon`).
+//! "guest" HTTP app on the upgraded connection. The store lives in the
+//! driver's raft KV.
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -252,10 +252,7 @@ async fn harness() -> Harness {
 	};
 	let node = Cluster::start(node_cfg, node_meta).await.unwrap();
 
-	let mysql = std::env::var("VMON_TEST_MYSQL")
-		.unwrap_or_else(|_| "mysql://root:vmon@127.0.0.1:13306/vmon".into());
-	let store = Store::connect(&mysql).await.unwrap();
-	store.migrate().await.unwrap();
+	let store = Store::new(driver.kv.clone());
 	let config = DriverConfig {
 		domain:         DOMAIN.into(),
 		public_url:     "http://127.0.0.1".into(),
@@ -500,7 +497,7 @@ async fn ingress_end_to_end() {
 	);
 	assert_eq!(h.dials(8200), 5);
 
-	// Unknown sandbox: no route, nothing paused in MySQL.
+	// Unknown sandbox: no route, nothing paused in the store.
 	let unknown = "iunknown0000000000000";
 	let response = h
 		.get_host(&format!("49983-{unknown}.{DOMAIN}"), "/health")

@@ -1,12 +1,12 @@
 # vmon admin commands
 
-Complete reference for `vmon admin`, the operator tool for teams, users, API keys, limits, and system teams. It talks to MySQL directly; no server needs to be running. Task-oriented walkthroughs are in [Administration](../operate/admin.md).
+Complete reference for `vmon admin`, the operator tool for teams, users, API keys, limits, and system teams. It reads and writes the cluster's store through the cluster listener of a running driver, so at least one driver must be up. Task-oriented walkthroughs are in [Administration](../operate/admin.md).
 
 ```text
-Usage: vmon admin [OPTIONS] --mysql-url <MYSQL_URL> <COMMAND>
+Usage: vmon admin [OPTIONS] <COMMAND>
 ```
 
-Every invocation connects to the database and applies pending schema migrations before running the command. Failures print `vmon: error: <message>` to stderr and exit with status 1; invalid arguments are reported by the argument parser with status 2. `vmon admin help [COMMAND]` prints the help of any subcommand.
+Every invocation connects to the first reachable `--cluster-url`; a write reaches the raft leader through it, and reads are linearizable (they see every write acknowledged before them). Failures print `vmon: error: <message>` to stderr and exit with status 1; invalid arguments are reported by the argument parser with status 2. `vmon admin help [COMMAND]` prints the help of any subcommand.
 
 ## Global options
 
@@ -14,8 +14,8 @@ Global options go between `admin` and the subcommand. Every subcommand also acce
 
 | Option | Env | Default | Description |
 |---|---|---|---|
-| `--mysql-url <MYSQL_URL>` | `VMON_MYSQL_URL` | required | Database URL of the cluster (`mysql://…`). |
-| `--cluster-secret <CLUSTER_SECRET>` | `VMON_CLUSTER_SECRET` | `<data-dir>/cluster-secret` | Cluster secret. API keys are stored encrypted with a key derived from it, so it must match the drivers' secret. |
+| `--cluster-url <CLUSTER_URL>` | `VMON_CLUSTER_URL` | `http://127.0.0.1:7947` | Cluster listener URL(s) of running drivers, comma-separated; requests go to the first that answers. |
+| `--cluster-secret <CLUSTER_SECRET>` | `VMON_CLUSTER_SECRET` | `<data-dir>/cluster-secret` | Cluster secret. It authenticates the cluster requests, and API keys are stored encrypted with a key derived from it, so it must match the drivers' secret. |
 | `--data-dir <DATA_DIR>` | `VMON_HOME` | `/var/lib/vmon` as root on Linux, else `~/.vmon` | State directory holding `cluster-secret` when `--cluster-secret` is unset. |
 | `-h`, `--help` | | | Print help. |
 
@@ -55,7 +55,7 @@ Values are unsigned integers. An omitted option means "keep the base value": the
 Create a team and print its first API key.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> create-team [OPTIONS] <NAME>
+Usage: vmon admin create-team [OPTIONS] <NAME>
 ```
 
 | Argument / option | Description |
@@ -81,7 +81,7 @@ The plaintext key is only shown here.
 List teams.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> list-teams
+Usage: vmon admin list-teams
 ```
 
 Prints one [team line](#team-lines) per team, oldest first.
@@ -91,7 +91,7 @@ Prints one [team line](#team-lines) per team, oldest first.
 Mint another API key for a team (id or slug).
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> create-api-key [OPTIONS] <TEAM>
+Usage: vmon admin create-api-key [OPTIONS] <TEAM>
 ```
 
 | Argument / option | Default | Description |
@@ -106,7 +106,7 @@ Prints only the new key (`e2b_` + 40 lowercase hex) on one line. The key is stor
 Create a CLI login user, optionally in a team (id or slug) as its default team.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> create-user [OPTIONS] --password <PASSWORD> <EMAIL>
+Usage: vmon admin create-user [OPTIONS] --password <PASSWORD> <EMAIL>
 ```
 
 | Argument / option | Env | Description |
@@ -126,7 +126,7 @@ user <email> (<id>)
 Add an existing user to a team.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> add-member [OPTIONS] <EMAIL> <TEAM>
+Usage: vmon admin add-member [OPTIONS] <EMAIL> <TEAM>
 ```
 
 | Argument / option | Description |
@@ -142,7 +142,7 @@ If the user is already a member, the membership's default flag is set to the val
 Change a team's limits (omitted flags keep their current values).
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> set-limits [OPTIONS] <TEAM>
+Usage: vmon admin set-limits [OPTIONS] <TEAM>
 ```
 
 | Argument / option | Description |
@@ -157,7 +157,7 @@ All six limit columns are written in one update. Each value comes from its optio
 Block a team: its credentials may still read, every change is refused with 403 `team is blocked`.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> block <TEAM>
+Usage: vmon admin block <TEAM>
 ```
 
 Sets the team's blocked flag. All of its credentials keep authenticating, but every team-scoped request with a method other than `GET`, `HEAD`, `OPTIONS`, or `TRACE` is rejected with 403 `team is blocked`; running sandboxes are not stopped. Drivers cache API-key lookups for 30 seconds, so API-key callers see the change within that window. Prints the updated [team line](#team-lines).
@@ -167,7 +167,7 @@ Sets the team's blocked flag. All of its credentials keep authenticating, but ev
 Unblock a team.
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> unblock <TEAM>
+Usage: vmon admin unblock <TEAM>
 ```
 
 Clears the blocked flag. Prints the updated [team line](#team-lines).
@@ -177,7 +177,7 @@ Clears the blocked flag. Prints the updated [team line](#team-lines).
 Make a team a system team (its public templates claim free bare aliases).
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> set-system <TEAM>
+Usage: vmon admin set-system <TEAM>
 ```
 
 Sets the system flag and, in the same transaction, claims a bare alias for each name of the team's public, non-deleted templates whose bare alias no other template holds. Prints the updated [team line](#team-lines). See [System teams](../concepts/auth.md#system-teams).
@@ -187,7 +187,7 @@ Sets the system flag and, in the same transaction, claims a bare alias for each 
 Make a system team an ordinary team (releases its bare aliases).
 
 ```text
-Usage: vmon admin --mysql-url <MYSQL_URL> unset-system <TEAM>
+Usage: vmon admin unset-system <TEAM>
 ```
 
 Clears the system flag and, in the same transaction, deletes every bare alias held by the team's templates. The team's namespaced aliases (`<slug>/<alias>`) are unaffected. Prints the updated [team line](#team-lines).

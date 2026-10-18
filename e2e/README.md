@@ -14,7 +14,7 @@ The upstream monorepo is fetched as a tarball at the pinned commit
 ## One command
 
 ```sh
-just e2e python                 # build + sign vmon, build the musl agent, start MySQL, run
+just e2e python                 # build + sign vmon, build the musl agent, run
 just e2e js
 just e2e all -- -k sandbox      # args after `--` go to pytest/vitest
 python3 e2e/run.py all --ingress tls     # direct; uses $CARGO_TARGET_DIR binaries
@@ -23,19 +23,18 @@ python3 e2e/run.py serve --ingress tls   # stack only; prints `e2e: stack ready:
 
 Each run, from a clean slate:
 
-1. drops/creates MySQL database `vmon_<name>` (Docker container `vmon-mysql`,
-   or a local `mysql` client with `--mysql-container ''`);
-2. `vmon admin create-team` → API key;
-3. starts `vmon serve` (node + driver) on slot ports
-   (`--slot 31`: API `3100`, cluster `7147`, gossip `7146`) with data dir
-   `/tmp/vmon-<name>`; `--sudo` runs it via `sudo -n` (Linux TAP);
-4. builds templates with the pinned SDK (`build_templates.py`): `base`
+1. starts `vmon serve` (node + driver) on slot ports
+   (`--slot 31`: API `3100`, cluster `7147`, gossip `7146`) with a fresh data
+   dir `/tmp/vmon-<name>` (which holds all driver state); `--sudo` runs it via
+   `sudo -n` (Linux TAP);
+2. `vmon admin --cluster-url http://127.0.0.1:<cluster port> create-team` → API key;
+3. builds templates with the pinned SDK (`build_templates.py`): `base`
    (`e2bdev/base`, as upstream's `templates/base`), `httpbin` (upstream
    `templates/httpbin/e2b.Dockerfile`, go-httpbin start + ready command, as
    upstream's `templates.yml`) and `e2e-warm-ubuntu` (warms the
    `ubuntu:22.04` layer cache many template tests start from);
-5. runs the suite(s), prints junit counts (`/tmp/vmon-<name>-*-junit.xml`);
-6. tears down: serve, leftover VMMs, database, data dir (`--keep` keeps
+4. runs the suite(s), prints junit counts (`/tmp/vmon-<name>-*-junit.xml`);
+5. tears down: serve, leftover VMMs, data dir (`--keep` keeps
    them, `--reuse` restarts on a kept stack and skips existing templates).
 
 OCI blobs and manifests are cached across runs in `e2e/.cache/oci`
@@ -137,13 +136,13 @@ defaults to true. The JS legs and the template HTTP tests reach Jupyter's
 Reproduce (macOS / HVF, 2026-10-12):
 
 ```sh
-# stack: TLS ingress, fresh data dir + DB, the run.py team = non-system key
+# stack: TLS ingress, fresh data dir, the run.py team = non-system key
 python3 e2e/run.py serve --name ci --slot 36 --ingress tls --keep \
   --kernel target/kernel/Image-aarch64 --serve-arg=--registry-mirror=https://mirror.gcr.io
 # (run.py's own base/httpbin builds land in the e2e team's namespace and do not
 #  affect `code-interpreter-v1` resolution; the run above skipped them)
 # default templates as the system team (secret: /tmp/vmon-ci/e2e-state.json)
-VMON_BIN=$CARGO_TARGET_DIR/debug/vmon VMON_MYSQL_URL=mysql://root:vmon@127.0.0.1:13306/vmon_ci \
+VMON_BIN=$CARGO_TARGET_DIR/debug/vmon VMON_CLUSTER_URL=http://127.0.0.1:7647 \
   VMON_CLUSTER_SECRET=<secret> E2B_API_URL=http://127.0.0.1:3600 \
   uv run templates/build.py base code-interpreter-v1 --skip-cache
 # suites, from an E2B df6c368 checkout (deps installed as in upstream CI)

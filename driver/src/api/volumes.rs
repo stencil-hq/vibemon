@@ -24,7 +24,7 @@ use crate::{
 	auth::TeamAuth,
 	error::{ApiError, ApiResult},
 	state::AppState,
-	store::VolumeRow,
+	store::{self, VolumeRow},
 };
 
 /// Lifetime of volume-content tokens.
@@ -200,7 +200,7 @@ async fn create_volume(
 		.await
 	{
 		Ok(row) => row,
-		Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+		Err(store::Error::Duplicate(_)) => {
 			return Err(ApiError::conflict(format!(
 				"Volume with name '{}' already exists",
 				body.name
@@ -300,8 +300,8 @@ impl From<ApiError> for ContentError {
 	}
 }
 
-impl From<sqlx::Error> for ContentError {
-	fn from(error: sqlx::Error) -> Self {
+impl From<store::Error> for ContentError {
+	fn from(error: store::Error) -> Self {
 		ApiError::from(error).into()
 	}
 }

@@ -18,7 +18,7 @@ use crate::{
 	auth::TeamAuth,
 	error::{ApiError, ApiResult},
 	state::AppState,
-	store::{SecretRow, secrets::SECRET_ID_PREFIX},
+	store::{self, SecretRow, secrets::SECRET_ID_PREFIX},
 };
 
 /// Longest secret name.
@@ -59,7 +59,7 @@ impl From<SecretRow> for SecretDto {
 			secret_id:       row.id,
 			name:            row.name,
 			current_version: row.current_version,
-			metadata:        row.metadata.0,
+			metadata:        row.metadata,
 			created_at:      row.created_at,
 			updated_at:      row.updated_at,
 		}
@@ -184,7 +184,7 @@ async fn create_secret(
 		.await
 	{
 		Ok(row) => Ok((StatusCode::CREATED, Json(SecretDto::from(row))).into_response()),
-		Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+		Err(store::Error::Duplicate(_)) => {
 			Err(ApiError::conflict(format!("Secret with name '{name}' already exists")))
 		},
 		Err(e) => Err(e.into()),

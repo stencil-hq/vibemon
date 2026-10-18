@@ -3,8 +3,8 @@
 //! deviations").
 //!
 //! Validated at create; the non-secret part of every mount is stored in
-//! `sandboxes.s3_mounts`, inline credentials only encrypted
-//! (`sandboxes.s3_mounts_enc`), and `credentialsSecret` references are
+//! the sandbox record's `s3_mounts`, inline credentials only encrypted
+//! (`s3_mounts_enc`), and `credentialsSecret` references are
 //! re-resolved from the team's secrets on every create, resume, and fork, so
 //! a rotated secret applies at the next resume. Credentials are never logged
 //! or returned.
@@ -52,14 +52,14 @@ impl std::fmt::Debug for S3MountRequest {
 	}
 }
 
-/// Resolved mounts of a launch: what the node gets and what `MySQL` keeps.
+/// Resolved mounts of a launch: what the node gets and what the store keeps.
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedS3Mounts {
 	/// Forwarded to the node (with credentials).
 	pub mounts:  Vec<S3Mount>,
-	/// `sandboxes.s3_mounts` (no credentials).
+	/// [`SandboxRow::s3_mounts`] (no credentials).
 	pub records: Vec<S3MountRecord>,
-	/// `sandboxes.s3_mounts_enc`: encrypted inline credentials by index.
+	/// [`SandboxRow::s3_mounts_enc`]: encrypted inline credentials by index.
 	pub enc:     Option<Vec<u8>>,
 }
 
@@ -206,14 +206,14 @@ pub async fn resolve(
 }
 
 /// The mounts of an existing sandbox (resume, fork), credentials re-read
-/// from the encrypted column and the referenced secrets.
+/// from the encrypted record field and the referenced secrets.
 ///
 /// # Errors
 ///
 /// `500` when stored credentials cannot be decrypted; `400` when a
 /// referenced secret was deleted or no longer parses.
 pub async fn restore(state: &AppState, row: &SandboxRow) -> ApiResult<Vec<S3Mount>> {
-	let Some(records) = row.s3_mounts.as_ref().map(|json| &json.0) else {
+	let Some(records) = &row.s3_mounts else {
 		return Ok(Vec::new());
 	};
 	let inline: Vec<Option<S3MountCredentials>> = match row.s3_mounts_enc.as_deref() {

@@ -7,6 +7,7 @@ pub mod meta;
 
 use std::{
 	convert::Infallible,
+	future::Future,
 	net::SocketAddr,
 	path::PathBuf,
 	sync::Arc,
@@ -25,6 +26,7 @@ use axum::{
 pub use meta::{MemberMeta, NodeCapacity, NodeId, RaftStatus, Roles};
 use parking_lot::Mutex;
 use tokio::{
+	net::TcpListener,
 	sync::{Notify, watch},
 	task::JoinHandle,
 };
@@ -170,6 +172,12 @@ impl Cluster {
 		}
 	}
 
+	/// Serves the KV over the Redis protocol (`AUTH <cluster secret>`) on
+	/// `listener` until `shutdown` resolves; `vmon serve --kv-resp-listen`.
+	pub async fn serve_resp(&self, listener: TcpListener, shutdown: impl Future<Output = ()>) {
+		kv::serve_resp(listener, self.kv.clone(), self.inner.secret.clone(), shutdown).await;
+	}
+
 	/// This process's id.
 	pub fn local_id(&self) -> NodeId {
 		self.inner.id
@@ -307,7 +315,7 @@ impl MetaPublisher {
 	}
 }
 
-fn bearer(secret: &[u8]) -> anyhow::Result<HeaderValue> {
+pub(crate) fn bearer(secret: &[u8]) -> anyhow::Result<HeaderValue> {
 	let mut value = b"Bearer ".to_vec();
 	value.extend_from_slice(secret);
 	let mut header =

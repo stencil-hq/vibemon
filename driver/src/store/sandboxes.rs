@@ -1,18 +1,38 @@
-//! `sandboxes` table (ARCHITECTURE.md §7): the durable record of every
-//! sandbox. Written by [`crate::lifecycle`]; read by the sandbox API and the
-//! reconciler.
+//! Durable sandbox records (ARCHITECTURE.md §7). Written by
+//! [`crate::lifecycle`]; read by the sandbox API and the reconciler.
+//!
+//! Keys:
+//! - `db/sandbox/<id>` → [`SandboxRow`] (JSON; ciphertexts base64). Records of
+//!   killed sandboxes keep no secrets (`env_enc`, `egress_enc`, `s3_mounts_enc`
+//!   emptied) and expire [`HISTORY_TTL`] after the kill.
+//! - `db/sandbox.live/<team>/<id>` → empty: index of the team's running and
+//!   paused sandboxes (team listings, counts, the reconciler, artifact GC).
+//!   Written with the record by [`Store::insert_sandbox`], removed by
+//!   [`Store::mark_sandbox_killed`].
+//!
+//! Guards: [`Store::insert_sandbox`] requires the record to be absent; every
+//! state transition is a guarded read of the record checking its current
+//! state (the old `WHERE state = …`), and commits the record change together
+//! with its event ([`super::events`]) in one transaction.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, QueryBuilder, types::Json};
 use vmon_node::api::VolumeMount;
 
-use super::{NewSandboxEvent, Store, events::insert_event, retry_deadlocks};
+use super::{
+	HISTORY_TTL, NewSandboxEvent, Read, Result, Store, Tx, events::stage_event, key, last_segment,
+	prefix,
+};
 use crate::lifecycle::network::NetworkConfig;
 
-/// Durable sandbox state (`sandboxes.state`).
+/// Sandbox records.
+const SANDBOXES: &str = "db/sandbox";
+/// Live (running/paused) index per team.
+const LIVE: &str = "db/sandbox.live";
+
+/// Durable sandbox state ([`SandboxRow::state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxState {
@@ -22,7 +42,7 @@ pub enum SandboxState {
 }
 
 impl SandboxState {
-	/// Column value.
+	/// Stored value.
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::Running => "running",
@@ -31,7 +51,7 @@ impl SandboxState {
 		}
 	}
 
-	/// Parses a column value; unknown values read as `Killed` (never served).
+	/// Parses a stored value; unknown values read as `Killed` (never served).
 	pub fn parse(raw: &str) -> Self {
 		match raw {
 			"running" => Self::Running,
@@ -41,7 +61,7 @@ impl SandboxState {
 	}
 }
 
-/// Lifecycle settings stored in the `lifecycle` JSON column.
+/// Lifecycle settings of a sandbox ([`SandboxRow::lifecycle`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleExtra {
@@ -49,7 +69,7 @@ pub struct LifecycleExtra {
 	pub auto_resume_timeout_s: u64,
 }
 
-/// Non-secret part of a `vmonS3Mounts` item (`sandboxes.s3_mounts`).
+/// Non-secret part of a `vmonS3Mounts` item ([`SandboxRow::s3_mounts`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct S3MountRecord {
@@ -65,8 +85,8 @@ pub struct S3MountRecord {
 	pub credentials_secret: Option<String>,
 }
 
-/// One `sandboxes` row.
-#[derive(Clone, Debug, sqlx::FromRow)]
+/// One sandbox record (`db/sandbox/<id>`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxRow {
 	pub id:                    String,
 	pub team_id:               String,
@@ -74,21 +94,24 @@ pub struct SandboxRow {
 	pub build_id:              String,
 	pub alias:                 Option<String>,
 	pub node_id:               String,
+	/// [`SandboxState::as_str`].
 	pub state:                 String,
 	pub execution_id:          String,
 	pub vcpus:                 u32,
 	pub memory_mb:             u64,
 	pub disk_mb:               u64,
-	pub metadata:              Json<BTreeMap<String, String>>,
+	pub metadata:              BTreeMap<String, String>,
+	#[serde(with = "crate::store::b64_opt")]
 	pub env_enc:               Option<Vec<u8>>,
 	pub auto_pause:            bool,
 	pub auto_pause_memory:     bool,
 	pub auto_resume:           bool,
 	pub allow_internet_access: Option<bool>,
-	pub network:               Json<NetworkConfig>,
+	pub network:               NetworkConfig,
+	#[serde(with = "crate::store::b64")]
 	pub egress_enc:            Vec<u8>,
-	pub volume_mounts:         Json<Vec<VolumeMount>>,
-	pub lifecycle:             Json<LifecycleExtra>,
+	pub volume_mounts:         Vec<VolumeMount>,
+	pub lifecycle:             LifecycleExtra,
 	pub envd_version:          String,
 	pub started_at:            DateTime<Utc>,
 	pub end_at:                DateTime<Utc>,
@@ -96,8 +119,9 @@ pub struct SandboxRow {
 	pub ended_at:              Option<DateTime<Utc>>,
 	pub snapshot_build_id:     Option<String>,
 	/// `vmonS3Mounts` without credentials.
-	pub s3_mounts:             Option<Json<Vec<S3MountRecord>>>,
+	pub s3_mounts:             Option<Vec<S3MountRecord>>,
 	/// Encrypted inline credentials of `s3_mounts`, by index.
+	#[serde(with = "crate::store::b64_opt")]
 	pub s3_mounts_enc:         Option<Vec<u8>>,
 }
 
@@ -105,6 +129,35 @@ impl SandboxRow {
 	/// Typed `state`.
 	pub fn state(&self) -> SandboxState {
 		SandboxState::parse(&self.state)
+	}
+
+	/// Whether the row passes `filter` (states default to running + paused).
+	fn matches(&self, filter: &SandboxFilter<'_>) -> bool {
+		let state = self.state();
+		let state_ok = if filter.states.is_empty() {
+			state != SandboxState::Killed
+		} else {
+			filter.states.contains(&state)
+		};
+		state_ok
+			&& filter.team_id.is_none_or(|team| team == self.team_id)
+			&& filter
+				.metadata
+				.iter()
+				.all(|(k, v)| self.metadata.get(k) == Some(v))
+			// Inclusive like upstream, on the stored millisecond grid: a client
+			// feeding back a sandbox's own `startedAt` must still see it.
+			&& filter
+				.started_after
+				.is_none_or(|after| self.started_at >= after.trunc_subsecs(3))
+			// Template ids and aliases compare case-insensitively.
+			&& filter.template.is_none_or(|template| {
+				self.template_id.eq_ignore_ascii_case(template)
+					|| self
+						.alias
+						.as_deref()
+						.is_some_and(|alias| alias.eq_ignore_ascii_case(template))
+			})
 	}
 }
 
@@ -136,6 +189,43 @@ pub struct NewSandboxRow<'a> {
 	pub end_at:                DateTime<Utc>,
 	pub s3_mounts:             &'a [S3MountRecord],
 	pub s3_mounts_enc:         Option<Vec<u8>>,
+}
+
+impl NewSandboxRow<'_> {
+	/// The stored record (state `running`, timestamps on the ms grid).
+	fn record(&self) -> SandboxRow {
+		SandboxRow {
+			id:                    self.id.to_owned(),
+			team_id:               self.team_id.to_owned(),
+			template_id:           self.template_id.to_owned(),
+			build_id:              self.build_id.to_owned(),
+			alias:                 self.alias.map(str::to_owned),
+			node_id:               self.node_id.to_owned(),
+			state:                 SandboxState::Running.as_str().to_owned(),
+			execution_id:          self.execution_id.to_owned(),
+			vcpus:                 self.vcpus,
+			memory_mb:             self.memory_mb,
+			disk_mb:               self.disk_mb,
+			metadata:              self.metadata.clone(),
+			env_enc:               self.env_enc.clone(),
+			auto_pause:            self.auto_pause,
+			auto_pause_memory:     self.auto_pause_memory,
+			auto_resume:           self.auto_resume,
+			allow_internet_access: self.allow_internet_access,
+			network:               self.network.clone(),
+			egress_enc:            self.egress_enc.clone(),
+			volume_mounts:         self.volume_mounts.to_vec(),
+			lifecycle:             self.lifecycle,
+			envd_version:          self.envd_version.to_owned(),
+			started_at:            self.started_at.trunc_subsecs(3),
+			end_at:                self.end_at.trunc_subsecs(3),
+			paused_at:             None,
+			ended_at:              None,
+			snapshot_build_id:     None,
+			s3_mounts:             (!self.s3_mounts.is_empty()).then(|| self.s3_mounts.to_vec()),
+			s3_mounts_enc:         self.s3_mounts_enc.clone(),
+		}
+	}
 }
 
 /// Sort direction of sandbox listings (by `started_at`, then `id`).
@@ -177,22 +267,6 @@ pub struct ResumedExecution<'a> {
 	pub end_at:       DateTime<Utc>,
 }
 
-/// Inserts `event` and commits when the guarded update `applied`; otherwise
-/// rolls back so neither the state change nor the event is written.
-async fn commit_with_event(
-	mut tx: sqlx::Transaction<'_, MySql>,
-	applied: bool,
-	event: &NewSandboxEvent<'_>,
-) -> sqlx::Result<bool> {
-	if !applied {
-		tx.rollback().await?;
-		return Ok(false);
-	}
-	insert_event(&mut *tx, event).await?;
-	tx.commit().await?;
-	Ok(true)
-}
-
 /// Keyset position: rows strictly after `(started_at, id)` in the list order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListAfter {
@@ -200,71 +274,87 @@ pub struct ListAfter {
 	pub id:         String,
 }
 
-const COLUMNS: &str = "id, team_id, template_id, build_id, alias, node_id, state, execution_id, \
-                       vcpus, memory_mb, disk_mb, metadata, env_enc, auto_pause, \
-                       auto_pause_memory, auto_resume, allow_internet_access, network, \
-                       egress_enc, volume_mounts, lifecycle, envd_version, started_at, end_at, \
-                       paused_at, ended_at, snapshot_build_id, s3_mounts, s3_mounts_enc";
+fn sandbox_key(id: &str) -> String {
+	key(SANDBOXES, &[id])
+}
+
+fn live_key(team_id: &str, id: &str) -> String {
+	key(LIVE, &[team_id, id])
+}
+
+/// Stages `row` at its key. Killed records lose their secrets and expire
+/// [`HISTORY_TTL`] after this write.
+fn stage_row(tx: &mut Tx<'_>, row: &mut SandboxRow) {
+	let key = sandbox_key(&row.id);
+	if row.state() == SandboxState::Killed {
+		row.env_enc = None;
+		row.egress_enc = Vec::new();
+		row.s3_mounts_enc = None;
+		tx.put_ttl(key, row, HISTORY_TTL);
+	} else {
+		tx.put(key, row);
+	}
+}
+
+/// Running and paused records of one team (`Some`) or of every team.
+async fn live_rows(r: &Read<'_>, team_id: Option<&str>) -> Result<Vec<SandboxRow>> {
+	let index = match team_id {
+		Some(team_id) => prefix(LIVE, &[team_id]),
+		None => prefix(LIVE, &[]),
+	};
+	let mut rows = Vec::new();
+	for entry in r.keys(&index).await? {
+		let id = last_segment(&entry);
+		if let Some(row) = r.get::<SandboxRow>(&sandbox_key(&id)).await?
+			&& row.state() != SandboxState::Killed
+		{
+			rows.push(row);
+		}
+	}
+	Ok(rows)
+}
+
+/// `build_id` of every running or paused sandbox (artifact GC keeps them).
+pub(super) async fn live_build_ids(r: &Read<'_>) -> Result<HashSet<String>> {
+	Ok(live_rows(r, None)
+		.await?
+		.into_iter()
+		.map(|row| row.build_id)
+		.collect())
+}
 
 impl Store {
 	/// Records a freshly created sandbox (state `running`) together with its
 	/// `created` event, in one transaction.
+	///
+	/// # Errors
+	///
+	/// [`super::Error::Duplicate`] when a sandbox with this id exists.
 	pub async fn insert_sandbox(
 		&self,
 		row: &NewSandboxRow<'_>,
 		event: &NewSandboxEvent<'_>,
-	) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			sqlx::query(
-				"INSERT INTO sandboxes (id, team_id, template_id, build_id, alias, node_id, state, \
-				 execution_id, vcpus, memory_mb, disk_mb, metadata, env_enc, auto_pause, \
-				 auto_pause_memory, auto_resume, allow_internet_access, network, egress_enc, \
-				 volume_mounts, lifecycle, envd_version, started_at, end_at, s3_mounts, \
-				 s3_mounts_enc) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-				 ?, ?, ?, ?, ?, ?, ?, ?)",
-			)
-			.bind(row.id)
-			.bind(row.team_id)
-			.bind(row.template_id)
-			.bind(row.build_id)
-			.bind(row.alias)
-			.bind(row.node_id)
-			.bind(row.execution_id)
-			.bind(row.vcpus)
-			.bind(row.memory_mb)
-			.bind(row.disk_mb)
-			.bind(Json(row.metadata))
-			.bind(row.env_enc.as_deref())
-			.bind(row.auto_pause)
-			.bind(row.auto_pause_memory)
-			.bind(row.auto_resume)
-			.bind(row.allow_internet_access)
-			.bind(Json(row.network))
-			.bind(row.egress_enc.as_slice())
-			.bind(Json(row.volume_mounts))
-			.bind(Json(row.lifecycle))
-			.bind(row.envd_version)
-			.bind(row.started_at)
-			.bind(row.end_at)
-			.bind((!row.s3_mounts.is_empty()).then_some(Json(row.s3_mounts)))
-			.bind(row.s3_mounts_enc.as_deref())
-			.execute(&mut *tx)
-			.await?;
-			insert_event(&mut *tx, event).await?;
-			tx.commit().await
-		})
-		.await
+	) -> Result<()> {
+		let record = row.record();
+		let key = sandbox_key(row.id);
+		let mut tx = self.tx().await?;
+		loop {
+			if tx.get::<SandboxRow>(&key).await?.is_some() {
+				return Err(super::Error::Duplicate("sandbox"));
+			}
+			tx.put(&key, &record);
+			tx.mark(live_key(row.team_id, row.id), None);
+			stage_event(&mut tx, event);
+			if tx.commit().await? {
+				return Ok(());
+			}
+		}
 	}
 
-	/// Row by sandbox ID regardless of team or state.
-	pub async fn sandbox(&self, id: &str) -> sqlx::Result<Option<SandboxRow>> {
-		sqlx::query_as::<_, SandboxRow>(sqlx::AssertSqlSafe(format!(
-			"SELECT {COLUMNS} FROM sandboxes WHERE id = ?"
-		)))
-		.bind(id)
-		.fetch_optional(self.pool())
-		.await
+	/// Row by sandbox ID regardless of team or state (killed rows until they
+	/// expire).
+	pub async fn sandbox(&self, id: &str) -> Result<Option<SandboxRow>> {
+		self.read().await?.get(&sandbox_key(id)).await
 	}
 
 	/// Paused → running after a resume (new execution, node, and lifetime
@@ -274,23 +364,17 @@ impl Store {
 		&self,
 		resumed: &ResumedExecution<'_>,
 		event: &NewSandboxEvent<'_>,
-	) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			let done = sqlx::query(
-				"UPDATE sandboxes SET state = 'running', node_id = ?, execution_id = ?, started_at = \
-				 ?, end_at = ?, paused_at = NULL WHERE id = ? AND state = 'paused'",
-			)
-			.bind(resumed.node_id)
-			.bind(resumed.execution_id)
-			.bind(resumed.started_at)
-			.bind(resumed.end_at)
-			.bind(resumed.id)
-			.execute(&mut *tx)
-			.await?;
-			commit_with_event(tx, done.rows_affected() == 1, event).await
-		})
-		.await
+	) -> Result<bool> {
+		self
+			.transition(resumed.id, SandboxState::Paused, event, |row| {
+				SandboxState::Running.as_str().clone_into(&mut row.state);
+				resumed.node_id.clone_into(&mut row.node_id);
+				resumed.execution_id.clone_into(&mut row.execution_id);
+				row.started_at = resumed.started_at.trunc_subsecs(3);
+				row.end_at = resumed.end_at.trunc_subsecs(3);
+				row.paused_at = None;
+			})
+			.await
 	}
 
 	/// Running → paused plus `event`, atomically; `false` (nothing written)
@@ -300,56 +384,93 @@ impl Store {
 		id: &str,
 		paused_at: DateTime<Utc>,
 		event: &NewSandboxEvent<'_>,
-	) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			let done = sqlx::query(
-				"UPDATE sandboxes SET state = 'paused', paused_at = ? WHERE id = ? AND state = \
-				 'running'",
-			)
-			.bind(paused_at)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-			commit_with_event(tx, done.rows_affected() == 1, event).await
-		})
-		.await
+	) -> Result<bool> {
+		self
+			.transition(id, SandboxState::Running, event, |row| {
+				SandboxState::Paused.as_str().clone_into(&mut row.state);
+				row.paused_at = Some(paused_at.trunc_subsecs(3));
+			})
+			.await
 	}
 
 	/// Running/paused → killed plus `event`, atomically; `false` (nothing
-	/// written) when the row was already killed or missing.
+	/// written) when the row was already killed or missing. The record drops
+	/// out of the live index, loses its secrets, and expires after
+	/// [`HISTORY_TTL`].
 	pub async fn mark_sandbox_killed(
 		&self,
 		id: &str,
 		ended_at: DateTime<Utc>,
 		event: &NewSandboxEvent<'_>,
-	) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			let done = sqlx::query(
-				"UPDATE sandboxes SET state = 'killed', ended_at = ? WHERE id = ? AND state <> \
-				 'killed'",
-			)
-			.bind(ended_at)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-			commit_with_event(tx, done.rows_affected() == 1, event).await
-		})
-		.await
+	) -> Result<bool> {
+		let key = sandbox_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(mut row) = tx.get::<SandboxRow>(&key).await? else {
+				return Ok(false);
+			};
+			if row.state() == SandboxState::Killed {
+				return Ok(false);
+			}
+			SandboxState::Killed.as_str().clone_into(&mut row.state);
+			row.ended_at = Some(ended_at.trunc_subsecs(3));
+			tx.delete(live_key(&row.team_id, id));
+			stage_row(&mut tx, &mut row);
+			stage_event(&mut tx, event);
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
+	}
+
+	/// `from` → whatever `change` sets, plus `event`, in one transaction;
+	/// `false` (nothing written) unless the row is in state `from`. The live
+	/// index is unchanged (both states are live).
+	async fn transition(
+		&self,
+		id: &str,
+		from: SandboxState,
+		event: &NewSandboxEvent<'_>,
+		change: impl Fn(&mut SandboxRow),
+	) -> Result<bool> {
+		let key = sandbox_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(mut row) = tx.get::<SandboxRow>(&key).await? else {
+				return Ok(false);
+			};
+			if row.state() != from {
+				return Ok(false);
+			}
+			change(&mut row);
+			stage_row(&mut tx, &mut row);
+			stage_event(&mut tx, event);
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
+	}
+
+	/// Applies `change` to the row (any state); no-op when it is missing.
+	async fn update_sandbox(&self, id: &str, change: impl Fn(&mut SandboxRow)) -> Result<()> {
+		let key = sandbox_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(mut row) = tx.get::<SandboxRow>(&key).await? else {
+				return Ok(());
+			};
+			change(&mut row);
+			stage_row(&mut tx, &mut row);
+			if tx.commit().await? {
+				return Ok(());
+			}
+		}
 	}
 
 	/// New expiry of a running sandbox.
-	pub async fn set_sandbox_end_at(&self, id: &str, end_at: DateTime<Utc>) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			sqlx::query("UPDATE sandboxes SET end_at = ? WHERE id = ?")
-				.bind(end_at)
-				.bind(id)
-				.execute(self.pool())
-				.await
-		})
-		.await?;
-		Ok(())
+	pub async fn set_sandbox_end_at(&self, id: &str, end_at: DateTime<Utc>) -> Result<()> {
+		let end_at = end_at.trunc_subsecs(3);
+		self.update_sandbox(id, |row| row.end_at = end_at).await
 	}
 
 	/// Replaced egress configuration (`PUT /sandboxes/{id}/network`).
@@ -359,34 +480,21 @@ impl Store {
 		network: &NetworkConfig,
 		egress_enc: &[u8],
 		allow_internet_access: Option<bool>,
-	) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			sqlx::query(
-				"UPDATE sandboxes SET network = ?, egress_enc = ?, allow_internet_access = ? WHERE id \
-				 = ?",
-			)
-			.bind(Json(network))
-			.bind(egress_enc)
-			.bind(allow_internet_access)
-			.bind(id)
-			.execute(self.pool())
+	) -> Result<()> {
+		self
+			.update_sandbox(id, |row| {
+				row.network = network.clone();
+				egress_enc.clone_into(&mut row.egress_enc);
+				row.allow_internet_access = allow_internet_access;
+			})
 			.await
-		})
-		.await?;
-		Ok(())
 	}
 
 	/// Remembers the latest snapshot build captured from a sandbox.
-	pub async fn set_sandbox_snapshot_build(&self, id: &str, build_id: &str) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			sqlx::query("UPDATE sandboxes SET snapshot_build_id = ? WHERE id = ?")
-				.bind(build_id)
-				.bind(id)
-				.execute(self.pool())
-				.await
-		})
-		.await?;
-		Ok(())
+	pub async fn set_sandbox_snapshot_build(&self, id: &str, build_id: &str) -> Result<()> {
+		self
+			.update_sandbox(id, |row| row.snapshot_build_id = Some(build_id.to_owned()))
+			.await
 	}
 
 	/// One page of sandboxes. Returns up to `limit` rows after `after`.
@@ -396,64 +504,59 @@ impl Store {
 		order: ListOrder,
 		after: Option<&ListAfter>,
 		limit: u32,
-	) -> sqlx::Result<Vec<SandboxRow>> {
-		let mut query = QueryBuilder::<MySql>::new(format!("SELECT {COLUMNS} FROM sandboxes"));
-		push_filter(&mut query, filter);
-		let (cmp, dir) = match order {
-			ListOrder::Asc => (">", "ASC"),
-			ListOrder::Desc => ("<", "DESC"),
-		};
-		if let Some(after) = after {
-			query.push(format!(" AND (started_at {cmp} "));
-			query.push_bind(after.started_at);
-			query.push(" OR (started_at = ");
-			query.push_bind(after.started_at);
-			query.push(format!(" AND id {cmp} "));
-			query.push_bind(after.id.clone());
-			query.push("))");
+	) -> Result<Vec<SandboxRow>> {
+		let r = self.read().await?;
+		let mut rows: Vec<SandboxRow> = live_rows(&r, filter.team_id)
+			.await?
+			.into_iter()
+			.filter(|row| row.matches(filter))
+			.filter(|row| {
+				after.is_none_or(|after| {
+					let position = (row.started_at, row.id.as_str());
+					let cursor = (after.started_at, after.id.as_str());
+					match order {
+						ListOrder::Asc => position > cursor,
+						ListOrder::Desc => position < cursor,
+					}
+				})
+			})
+			.collect();
+		rows.sort_by(|a, b| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
+		if order == ListOrder::Desc {
+			rows.reverse();
 		}
-		query.push(format!(" ORDER BY started_at {dir}, id {dir} LIMIT "));
-		query.push_bind(limit);
-		query
-			.build_query_as::<SandboxRow>()
-			.fetch_all(self.pool())
-			.await
+		rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+		Ok(rows)
 	}
 
 	/// Number of rows matching `filter` (pagination-independent totals).
-	pub async fn count_sandboxes(&self, filter: &SandboxFilter<'_>) -> sqlx::Result<u64> {
-		let mut query = QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM sandboxes");
-		push_filter(&mut query, filter);
-		let count: i64 = query.build_query_scalar().fetch_one(self.pool()).await?;
-		Ok(u64::try_from(count).unwrap_or_default())
+	pub async fn count_sandboxes(&self, filter: &SandboxFilter<'_>) -> Result<u64> {
+		let r = self.read().await?;
+		let rows = live_rows(&r, filter.team_id).await?;
+		let count = rows.iter().filter(|row| row.matches(filter)).count();
+		Ok(u64::try_from(count).unwrap_or(u64::MAX))
 	}
 
 	/// IDs and states of a team's running and paused sandboxes (admin kill).
-	pub async fn team_live_sandboxes(&self, team_id: &str) -> sqlx::Result<Vec<(String, String)>> {
-		sqlx::query_as(
-			"SELECT id, state FROM sandboxes WHERE team_id = ? AND state IN ('running', 'paused')",
-		)
-		.bind(team_id)
-		.fetch_all(self.pool())
-		.await
+	pub async fn team_live_sandboxes(&self, team_id: &str) -> Result<Vec<(String, String)>> {
+		let r = self.read().await?;
+		Ok(live_rows(&r, Some(team_id))
+			.await?
+			.into_iter()
+			.map(|row| (row.id, row.state))
+			.collect())
 	}
 
-	/// Running/paused row counts per team (one grouped query); teams without
-	/// live sandboxes are absent.
-	pub async fn live_counts_by_team(&self) -> sqlx::Result<HashMap<String, LiveCounts>> {
-		let rows: Vec<(String, String, i64)> = sqlx::query_as(
-			"SELECT team_id, state, COUNT(*) FROM sandboxes WHERE state IN ('running', 'paused') \
-			 GROUP BY team_id, state",
-		)
-		.fetch_all(self.pool())
-		.await?;
+	/// Running/paused counts per team; teams without live sandboxes are
+	/// absent.
+	pub async fn live_counts_by_team(&self) -> Result<HashMap<String, LiveCounts>> {
+		let r = self.read().await?;
 		let mut counts: HashMap<String, LiveCounts> = HashMap::new();
-		for (team_id, state, n) in rows {
-			let entry = counts.entry(team_id).or_default();
-			let n = u64::try_from(n).unwrap_or_default();
-			match SandboxState::parse(&state) {
-				SandboxState::Running => entry.running = n,
-				SandboxState::Paused => entry.paused = n,
+		for row in live_rows(&r, None).await? {
+			let entry = counts.entry(row.team_id.clone()).or_default();
+			match row.state() {
+				SandboxState::Running => entry.running += 1,
+				SandboxState::Paused => entry.paused += 1,
 				SandboxState::Killed => {},
 			}
 		}
@@ -461,60 +564,46 @@ impl Store {
 	}
 
 	/// `(id, state, node_id)` of every running or paused sandbox (reconciler).
-	pub async fn live_sandboxes(&self) -> sqlx::Result<Vec<(String, String, String)>> {
-		sqlx::query_as(
-			"SELECT id, state, node_id FROM sandboxes WHERE state IN ('running', 'paused')",
-		)
-		.fetch_all(self.pool())
-		.await
+	pub async fn live_sandboxes(&self) -> Result<Vec<(String, String, String)>> {
+		let r = self.read().await?;
+		Ok(live_rows(&r, None)
+			.await?
+			.into_iter()
+			.map(|row| (row.id, row.state, row.node_id))
+			.collect())
+	}
+
+	/// Build ids referenced by paused sandboxes (artifacts must stay).
+	pub async fn builds_of_paused_sandboxes(&self) -> Result<Vec<String>> {
+		let r = self.read().await?;
+		let builds: HashSet<String> = live_rows(&r, None)
+			.await?
+			.into_iter()
+			.filter(|row| row.state() == SandboxState::Paused)
+			.map(|row| row.build_id)
+			.collect();
+		Ok(builds.into_iter().collect())
 	}
 }
 
-fn push_filter(query: &mut QueryBuilder<MySql>, filter: &SandboxFilter<'_>) {
-	query.push(" WHERE state IN (");
-	let mut states = query.separated(", ");
-	for state in &filter.states {
-		states.push_bind(state.as_str());
-	}
-	if filter.states.is_empty() {
-		states.push("'running', 'paused'");
-	}
-	query.push(")");
-	if let Some(team_id) = filter.team_id {
-		query.push(" AND team_id = ");
-		query.push_bind(team_id);
-	}
-	if !filter.metadata.is_empty() {
-		query.push(" AND JSON_CONTAINS(metadata, CAST(");
-		query.push_bind(serde_json::to_string(&filter.metadata).unwrap_or_default());
-		query.push(" AS JSON))");
-	}
-	if let Some(after) = filter.started_after {
-		// Inclusive like upstream, on the column's millisecond grid: a client
-		// feeding back a sandbox's own `startedAt` must still see it.
-		query.push(" AND started_at >= ");
-		query.push_bind(after.trunc_subsecs(3));
-	}
-	if let Some(template) = filter.template {
-		query.push(" AND (template_id = ");
-		query.push_bind(template);
-		query.push(" OR alias = ");
-		query.push_bind(template);
-		query.push(")");
+#[cfg(test)]
+impl Store {
+	/// Rewrites a stored sandbox record in place (tests that simulate state
+	/// the API cannot produce, e.g. a lost owner node).
+	pub(crate) async fn edit_sandbox_for_test(&self, id: &str, change: impl Fn(&mut SandboxRow)) {
+		self
+			.update_sandbox(id, change)
+			.await
+			.expect("edit sandbox record");
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	//! Gated on `VMON_MYSQL_TEST_URL` (see [`crate::store::testdb`]).
-
 	use chrono::Duration;
 
 	use super::*;
-	use crate::{
-		state::TeamLimits,
-		store::{EventQuery, event_types, testdb::TestDb},
-	};
+	use crate::store::{Error, EventQuery, event_types, now, testing::TestStore};
 
 	fn event<'a>(id: &'a str, team: &'a str, event_type: &'static str) -> NewSandboxEvent<'a> {
 		NewSandboxEvent {
@@ -581,18 +670,13 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn s3_mounts_round_trip_without_credentials() {
-		let Some(db) = TestDb::create().await else {
-			return;
-		};
-		let store = db.store.clone();
-		let team = store
-			.create_team("sandbox-s3", TeamLimits::default())
-			.await
-			.unwrap();
+	async fn s3_mounts_round_trip_and_secrets_are_dropped_on_kill() {
+		let db = TestStore::start().await;
+		let store = &db.store;
+		let team = "team-s3";
 		let net = NetworkConfig::default();
 		let meta = BTreeMap::new();
-		let id = format!("i{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+		let id = "is3000000000000000000";
 		let records = [S3MountRecord {
 			path:               "/data".into(),
 			uri:                "s3://bucket/prefix".into(),
@@ -601,45 +685,76 @@ mod tests {
 			region:             None,
 			credentials_secret: Some("bucket-keys".into()),
 		}];
-		let mut row = new_row(&id, &team.id, Utc::now().trunc_subsecs(3), &meta, &net);
+		let mut row = new_row(id, team, now(), &meta, &net);
 		row.s3_mounts = &records;
 		row.s3_mounts_enc = Some(vec![9, 9, 9]);
+		row.env_enc = Some(vec![7]);
 		store
-			.insert_sandbox(&row, &event(&id, &team.id, event_types::CREATED))
+			.insert_sandbox(&row, &event(id, team, event_types::CREATED))
 			.await
 			.unwrap();
-		let stored = store.sandbox(&id).await.unwrap().unwrap();
-		assert_eq!(stored.s3_mounts.unwrap().0, records);
+		assert!(matches!(
+			store
+				.insert_sandbox(&row, &event(id, team, event_types::CREATED))
+				.await,
+			Err(Error::Duplicate(_))
+		));
+		let stored = store.sandbox(id).await.unwrap().unwrap();
+		assert_eq!(stored.s3_mounts.as_deref(), Some(records.as_slice()));
 		assert_eq!(stored.s3_mounts_enc.as_deref(), Some([9u8, 9, 9].as_slice()));
+		assert_eq!(stored.env_enc.as_deref(), Some([7u8].as_slice()));
+		assert_eq!(stored.egress_enc, [1u8, 2, 3]);
+
+		let ended_at = now();
+		assert!(
+			store
+				.mark_sandbox_killed(id, ended_at, &event(id, team, event_types::KILLED))
+				.await
+				.unwrap()
+		);
+		let killed = store.sandbox(id).await.unwrap().unwrap();
+		assert_eq!(killed.state(), SandboxState::Killed);
+		assert_eq!(killed.ended_at, Some(ended_at));
+		assert_eq!(killed.s3_mounts.as_deref(), Some(records.as_slice()));
+		assert!(killed.s3_mounts_enc.is_none() && killed.env_enc.is_none());
+		assert_eq!(killed.egress_enc, Vec::<u8>::new());
+		store
+			.set_sandbox_network(id, &net, &[4, 5], None)
+			.await
+			.unwrap();
+		assert!(
+			store
+				.sandbox(id)
+				.await
+				.unwrap()
+				.unwrap()
+				.egress_enc
+				.is_empty(),
+			"killed records never regain secrets"
+		);
+		db.finish().await;
 	}
 
 	#[tokio::test]
 	async fn sandbox_rows_round_trip_filter_and_paginate() {
-		let Some(db) = TestDb::create().await else {
-			return;
-		};
-		let store = db.store.clone();
-		let team = store
-			.create_team("sandbox-store", TeamLimits::default())
-			.await
-			.unwrap();
-		let base = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+		let db = TestStore::start().await;
+		let store = &db.store;
+		let team = "team-store";
+		let base = now();
 		let net = NetworkConfig { allow_public_traffic: Some(false), ..NetworkConfig::default() };
 		let red = BTreeMap::from([
 			("color".to_owned(), "red".to_owned()),
 			("k=&".to_owned(), "v w".to_owned()),
 		]);
 		let blue = BTreeMap::from([("color".to_owned(), "blue".to_owned())]);
-		let ids: Vec<String> = (0..4)
-			.map(|i| format!("i{}{i}", &uuid::Uuid::new_v4().simple().to_string()[..19]))
-			.collect();
+		let ids: Vec<String> = (0..4).map(|i| format!("isandbox00000000000{i}")).collect();
 		for (i, id) in ids.iter().enumerate() {
 			let meta = if i % 2 == 0 { &red } else { &blue };
 			let at = base + Duration::seconds(i64::try_from(i).unwrap());
 			store
 				.insert_sandbox(
-					&new_row(id, &team.id, at, meta, &net),
-					&event(id, &team.id, event_types::CREATED),
+					&new_row(id, team, at, meta, &net),
+					&event(id, team, event_types::CREATED),
 				)
 				.await
 				.unwrap();
@@ -647,16 +762,16 @@ mod tests {
 
 		let row = store.sandbox(&ids[0]).await.unwrap().unwrap();
 		assert_eq!(row.state(), SandboxState::Running);
-		assert_eq!(row.metadata.0, red);
-		assert_eq!(row.network.0, net);
+		assert_eq!(row.metadata, red);
+		assert_eq!(row.network, net);
 		assert_eq!(row.started_at, base);
 		assert_eq!(row.allow_internet_access, Some(false));
-		assert_eq!(row.lifecycle.0.auto_resume_timeout_s, 300);
+		assert_eq!(row.lifecycle.auto_resume_timeout_s, 300);
 
 		// State transitions only apply from the expected source state.
-		let paused = |id| event(id, &team.id, event_types::PAUSED);
-		let killed = |id| event(id, &team.id, event_types::KILLED);
-		let resumed_event = |id| event(id, &team.id, event_types::RESUMED);
+		let paused = |id| event(id, team, event_types::PAUSED);
+		let killed = |id| event(id, team, event_types::KILLED);
+		let resumed_event = |id| event(id, team, event_types::RESUMED);
 		assert!(
 			store
 				.mark_sandbox_paused(&ids[1], base, &paused(&ids[1]))
@@ -678,6 +793,12 @@ mod tests {
 		assert!(
 			!store
 				.mark_sandbox_killed(&ids[3], base, &killed(&ids[3]))
+				.await
+				.unwrap()
+		);
+		assert!(
+			!store
+				.mark_sandbox_killed("imissing", base, &killed("imissing"))
 				.await
 				.unwrap()
 		);
@@ -708,21 +829,25 @@ mod tests {
 				.await
 				.unwrap()
 		);
+		assert_eq!(store.builds_of_paused_sandboxes().await.unwrap(), [
+			"00000000-0000-4000-8000-000000000000"
+		]);
 		// Every applied transition wrote exactly one event; refused ones wrote
 		// none.
-		assert_eq!(event_types_of(&store, &team.id, &ids[0]).await, [event_types::CREATED]);
-		assert_eq!(event_types_of(&store, &team.id, &ids[1]).await, [
+		assert_eq!(event_types_of(store, team, &ids[0]).await, [event_types::CREATED]);
+		assert_eq!(event_types_of(store, team, &ids[1]).await, [
 			event_types::CREATED,
 			event_types::PAUSED,
 			event_types::RESUMED,
 			event_types::PAUSED
 		]);
-		assert_eq!(event_types_of(&store, &team.id, &ids[3]).await, [
+		assert_eq!(event_types_of(store, team, &ids[3]).await, [
 			event_types::CREATED,
 			event_types::KILLED
 		]);
+		assert_eq!(event_types_of(store, team, "imissing").await.len(), 0);
 
-		let all = SandboxFilter { team_id: Some(&team.id), ..SandboxFilter::default() };
+		let all = SandboxFilter { team_id: Some(team), ..SandboxFilter::default() };
 		let listed = store
 			.list_sandboxes(&all, ListOrder::Desc, None, 10)
 			.await
@@ -768,34 +893,25 @@ mod tests {
 		let after_first =
 			SandboxFilter { started_after: Some(base + Duration::milliseconds(1)), ..all.clone() };
 		assert_eq!(store.count_sandboxes(&after_first).await.unwrap(), 2);
-		let by_alias = SandboxFilter { template: Some("base"), ..all.clone() };
+		let by_alias = SandboxFilter { template: Some("BASE"), ..all.clone() };
 		assert_eq!(store.count_sandboxes(&by_alias).await.unwrap(), 3);
 		let by_other = SandboxFilter { template: Some("other"), ..all };
 		assert_eq!(store.count_sandboxes(&by_other).await.unwrap(), 0);
 
-		let live = store.team_live_sandboxes(&team.id).await.unwrap();
+		let live = store.team_live_sandboxes(team).await.unwrap();
 		assert_eq!(live.len(), 3);
-		db.drop_db().await;
+		db.finish().await;
 	}
 
 	#[tokio::test]
 	async fn listing_without_team_spans_teams_and_counts_group_by_team() {
-		let Some(db) = TestDb::create().await else {
-			return;
-		};
-		let store = db.store.clone();
-		let a = store
-			.create_team("list-a", TeamLimits::default())
-			.await
-			.unwrap();
-		let b = store
-			.create_team("list-b", TeamLimits::default())
-			.await
-			.unwrap();
-		let base = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+		let db = TestStore::start().await;
+		let store = &db.store;
+		let (a, b) = ("team-a", "team-b");
+		let base = now();
 		let net = NetworkConfig::default();
 		let meta = BTreeMap::new();
-		let rows = [("ilista0", &a.id), ("ilista1", &a.id), ("ilistb0", &b.id), ("ilistb1", &b.id)];
+		let rows = [("ilista0", a), ("ilista1", a), ("ilistb0", b), ("ilistb1", b)];
 		for (i, (id, team)) in rows.iter().enumerate() {
 			let at = base + Duration::seconds(i64::try_from(i).unwrap());
 			store
@@ -808,13 +924,13 @@ mod tests {
 		}
 		assert!(
 			store
-				.mark_sandbox_paused("ilista1", base, &event("ilista1", &a.id, event_types::PAUSED))
+				.mark_sandbox_paused("ilista1", base, &event("ilista1", a, event_types::PAUSED))
 				.await
 				.unwrap()
 		);
 		assert!(
 			store
-				.mark_sandbox_killed("ilistb1", base, &event("ilistb1", &b.id, event_types::KILLED))
+				.mark_sandbox_killed("ilistb1", base, &event("ilistb1", b, event_types::KILLED))
 				.await
 				.unwrap()
 		);
@@ -839,7 +955,7 @@ mod tests {
 		let running = SandboxFilter { states: vec![SandboxState::Running], ..every };
 		assert_eq!(store.count_sandboxes(&running).await.unwrap(), 2);
 
-		let only_a = SandboxFilter { team_id: Some(&a.id), ..SandboxFilter::default() };
+		let only_a = SandboxFilter { team_id: Some(a), ..SandboxFilter::default() };
 		let listed = store
 			.list_sandboxes(&only_a, ListOrder::Desc, None, 10)
 			.await
@@ -852,78 +968,20 @@ mod tests {
 		assert_eq!(
 			counts,
 			HashMap::from([
-				(a.id.clone(), LiveCounts { running: 1, paused: 1 }),
-				(b.id.clone(), LiveCounts { running: 1, paused: 0 }),
+				(a.to_owned(), LiveCounts { running: 1, paused: 1 }),
+				(b.to_owned(), LiveCounts { running: 1, paused: 0 }),
 			])
 		);
-		db.drop_db().await;
-	}
-
-	/// A state change and its event commit together: when the event insert
-	/// fails, the transition is rolled back too (no killed row without its
-	/// `killed` event, no created row without `created`).
-	#[tokio::test]
-	async fn state_change_rolls_back_when_its_event_cannot_be_written() {
-		let Some(db) = TestDb::create().await else {
-			return;
-		};
-		let store = db.store.clone();
-		let team = store
-			.create_team("sandbox-atomic", TeamLimits::default())
-			.await
-			.unwrap();
-		let base = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
-		let net = NetworkConfig::default();
-		let meta = BTreeMap::new();
-		let id = "iatomic0000000000000a";
-		// `sandbox_events.type` is VARCHAR(64): an overlong type makes the event
-		// insert fail.
-		const BROKEN: &str =
-			"sandbox.lifecycle.this-event-type-is-longer-than-the-sixty-four-char-column";
-		const _: () = assert!(BROKEN.len() > 64);
-		let broken = BROKEN;
-
-		let row = new_row(id, &team.id, base, &meta, &net);
-		assert!(
-			store
-				.insert_sandbox(&row, &event(id, &team.id, broken))
-				.await
-				.is_err()
-		);
-		assert!(store.sandbox(id).await.unwrap().is_none(), "the create rolled back with its event");
-
-		store
-			.insert_sandbox(&row, &event(id, &team.id, event_types::CREATED))
-			.await
-			.unwrap();
-		assert!(
-			store
-				.mark_sandbox_killed(id, base, &event(id, &team.id, broken))
-				.await
-				.is_err()
-		);
-		assert_eq!(store.sandbox(id).await.unwrap().unwrap().state(), SandboxState::Running);
-		assert!(
-			store
-				.mark_sandbox_paused(id, base, &event(id, &team.id, broken))
-				.await
-				.is_err()
-		);
-		assert_eq!(store.sandbox(id).await.unwrap().unwrap().state(), SandboxState::Running);
-		assert_eq!(event_types_of(&store, &team.id, id).await, [event_types::CREATED]);
-
-		// A retry after the failure applies the transition with its event.
-		assert!(
-			store
-				.mark_sandbox_killed(id, base, &event(id, &team.id, event_types::KILLED))
-				.await
-				.unwrap()
-		);
-		assert_eq!(store.sandbox(id).await.unwrap().unwrap().state(), SandboxState::Killed);
-		assert_eq!(event_types_of(&store, &team.id, id).await, [
-			event_types::CREATED,
-			event_types::KILLED
+		let mut live = store.live_sandboxes().await.unwrap();
+		live.sort();
+		assert_eq!(live.iter().map(|(id, ..)| id.as_str()).collect::<Vec<_>>(), [
+			"ilista0", "ilista1", "ilistb0"
 		]);
-		db.drop_db().await;
+		let r = store.read().await.unwrap();
+		assert_eq!(
+			live_build_ids(&r).await.unwrap(),
+			HashSet::from(["00000000-0000-4000-8000-000000000000".to_owned()])
+		);
+		db.finish().await;
 	}
 }

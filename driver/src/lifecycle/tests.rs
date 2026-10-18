@@ -1,7 +1,6 @@
 //! Sandbox lifecycle end to end through the HTTP API: a real single-process
 //! [`Cluster`] (driver + node roles) whose cluster URL also serves an
-//! in-process fake node (`/node/v1/sandboxes*`), and `MySQL` (gated on
-//! `VMON_MYSQL_TEST_URL`).
+//! in-process fake node (`/node/v1/sandboxes*`), with the store on its raft KV.
 
 use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
@@ -36,8 +35,7 @@ use crate::{
 	state::{AppState, DriverConfig, TeamLimits},
 	store::{
 		EventQuery, Store, Team,
-		templates::{RegisterBuild, RegisterOutcome},
-		testdb::TestDb,
+		templates::{RegisterBuild, RegisterOutcome, TemplateKind},
 	},
 };
 
@@ -312,7 +310,7 @@ impl Api {
 /// A driver whose cluster URL also serves the fake node, a team limited to
 /// two concurrent sandboxes, and its ready template `my-tpl`.
 struct Harness {
-	db:          TestDb,
+	store:       Store,
 	_dir:        tempfile::TempDir,
 	cluster:     Cluster,
 	fake:        Shared,
@@ -323,9 +321,7 @@ struct Harness {
 	template_id: String,
 }
 
-/// `None` (test skipped) without `VMON_MYSQL_TEST_URL`.
-async fn harness() -> Option<Harness> {
-	let db = TestDb::create().await?;
+async fn harness() -> Harness {
 	let dir = tempfile::tempdir().unwrap();
 
 	// One process serving both roles; its cluster URL also hosts the fake node
@@ -362,6 +358,7 @@ async fn harness() -> Option<Harness> {
 	)
 	.await
 	.unwrap();
+	let store = Store::new(cluster.kv.clone());
 	let fake: Shared = Arc::default();
 	let served = cluster.router().merge(fake_routes(Arc::clone(&fake)));
 	tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
@@ -377,7 +374,7 @@ async fn harness() -> Option<Harness> {
 		object_store:   None,
 	};
 	let state =
-		AppState::new(config, db.store.clone(), cluster.clone(), Keys::derive(SECRET.as_bytes()));
+		AppState::new(config, store.clone(), cluster.clone(), Keys::derive(SECRET.as_bytes()));
 	eventually("raft leadership", || async { cluster.is_leader() }).await;
 	eventually("the node in gossip", || async {
 		state.node_members().iter().any(|(id, _)| *id == NODE)
@@ -387,10 +384,9 @@ async fn harness() -> Option<Harness> {
 
 	// A team limited to two concurrent sandboxes, with one ready template.
 	let limits = TeamLimits { max_concurrent_sandboxes: 2, ..TeamLimits::default() };
-	let team = db.store.create_team("Acme", limits).await.unwrap();
+	let team = store.create_team("Acme", limits).await.unwrap();
 	let build_id = uuid::Uuid::new_v4().to_string();
-	let registered = db
-		.store
+	let registered = store
 		.register_build(&RegisterBuild {
 			team_id:               &team.id,
 			namespace:             &team.slug,
@@ -410,7 +406,7 @@ async fn harness() -> Option<Harness> {
 		panic!("{registered:?}")
 	};
 	assert!(
-		db.store
+		store
 			.finish_build_ready(&build_id, &artifact(&build_id))
 			.await
 			.unwrap()
@@ -422,13 +418,12 @@ async fn harness() -> Option<Harness> {
 		.unwrap();
 
 	let api = Api { router: api::router(state.clone()), team_id: team.id.clone() };
-	Some(Harness { db, _dir: dir, cluster, fake, state, api, team, build_id, template_id })
+	Harness { store, _dir: dir, cluster, fake, state, api, team, build_id, template_id }
 }
 
 impl Harness {
 	async fn finish(self) {
 		self.cluster.shutdown().await;
-		self.db.drop_db().await;
 	}
 
 	/// Admission index entries (`team/<team>/sbx/*`) of the team.
@@ -461,33 +456,39 @@ impl Harness {
 
 /// `(id, retired)` of every hidden fork template, oldest first.
 async fn fork_templates(store: &Store) -> Vec<(String, bool)> {
-	let rows: Vec<(String, i64)> = sqlx::query_as(
-		"SELECT id, CAST(deleted_at IS NOT NULL AS SIGNED) FROM templates WHERE kind = 'fork' ORDER \
-		 BY created_at, id",
-	)
-	.fetch_all(store.pool())
-	.await
-	.unwrap();
-	rows
+	let mut forks: Vec<_> = store
+		.stored_templates()
+		.await
+		.unwrap()
 		.into_iter()
-		.map(|(id, retired)| (id, retired == 1))
+		.filter(|t| t.is(TemplateKind::Fork))
+		.collect();
+	forks.sort_by(|a, b| {
+		a.created_at
+			.cmp(&b.created_at)
+			.then_with(|| a.id.cmp(&b.id))
+	});
+	forks
+		.into_iter()
+		.map(|t| (t.id, t.deleted_at.is_some()))
 		.collect()
 }
 
-/// Rows of snapshot builds (fork builds included) still in `MySQL`.
-async fn snapshot_builds(store: &Store) -> i64 {
-	sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE kind = 'snapshot'")
-		.fetch_one(store.pool())
+/// Snapshot builds (fork builds included) still stored.
+async fn snapshot_builds(store: &Store) -> usize {
+	store
+		.stored_builds()
 		.await
 		.unwrap()
+		.iter()
+		.filter(|b| b.kind == "snapshot")
+		.count()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_timeout_autopause_connect_kill_and_admission_limit() {
-	let Some(h) = harness().await else {
-		return;
-	};
-	let Harness { db, cluster, fake, state, api, team, template_id, .. } = &h;
+	let h = harness().await;
+	let Harness { store, cluster, fake, state, api, team, template_id, .. } = &h;
 
 	// create: 201 with tokens; the node got the merged env and a deadline.
 	let (status, created, _) = api
@@ -635,8 +636,7 @@ async fn create_timeout_autopause_connect_kill_and_admission_limit() {
 		.await;
 	assert_eq!(status, StatusCode::CREATED, "{third}");
 
-	let events = db
-		.store
+	let events = store
 		.list_events(&team.id, &EventQuery {
 			sandbox_id: Some(id.clone()),
 			limit: 10,
@@ -653,7 +653,7 @@ async fn create_timeout_autopause_connect_kill_and_admission_limit() {
 		"sandbox.lifecycle.updated",
 		"sandbox.lifecycle.killed"
 	]);
-	assert_eq!(events.last().unwrap().data.as_ref().unwrap().0["kill_reason"], "request");
+	assert_eq!(events.last().unwrap().data.as_ref().unwrap()["kill_reason"], "request");
 
 	h.finish().await;
 }
@@ -663,9 +663,7 @@ async fn create_timeout_autopause_connect_kill_and_admission_limit() {
 /// the VM and delete the paused state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resumes_the_node_completed_despite_an_error_keep_the_sandbox() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (status, created) = h.create().await;
 	assert_eq!(status, StatusCode::CREATED, "{created}");
 	let id = created["sandboxID"].as_str().unwrap().to_owned();
@@ -716,9 +714,7 @@ async fn resumes_the_node_completed_despite_an_error_keep_the_sandbox() {
 /// is never declared lost just because its VM is not listed yet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_whose_lock_lapsed_is_not_killed_while_its_vm_boots() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let kv = &h.cluster.kv;
 
 	// Lease semantics shared by sandbox locks and build supervision.
@@ -763,13 +759,11 @@ async fn a_create_whose_lock_lapsed_is_not_killed_while_its_vm_boots() {
 
 /// Regression (node out of disk during fork benchmarks): failed creates and
 /// forks must give back every admission slot and leave no hidden fork
-/// template behind; a fork's build is reclaimed (node artifacts and `MySQL`
+/// template behind; a fork's build is reclaimed (node artifacts and store
 /// rows) once its last child is gone, not before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let kv = &h.cluster.kv;
 	const STALE: Duration = Duration::from_mins(30);
 
@@ -808,7 +802,7 @@ async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed
 		.await;
 	assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
 	assert_eq!(h.admitted().await, 1);
-	let forks = fork_templates(&h.db.store).await;
+	let forks = fork_templates(&h.store).await;
 	assert_eq!(forks.len(), 2);
 	assert!(forks.iter().all(|(_, retired)| *retired), "{forks:?}");
 	assert_eq!(get_route(kv, &source).await.unwrap().unwrap().state, RouteState::Running);
@@ -835,7 +829,7 @@ async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed
 	let fork_build = h.fake.lock().snapshots.last().unwrap().clone();
 	assert_ne!(fork_build, h.build_id);
 	assert!(
-		fork_templates(&h.db.store)
+		fork_templates(&h.store)
 			.await
 			.iter()
 			.all(|(_, retired)| *retired)
@@ -846,16 +840,16 @@ async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed
 		assert!(!fake.deleted_artifacts.contains(&fork_build), "in use by the running child");
 		assert_eq!(fake.deleted_artifacts.len(), 2, "both failed forks' builds are collected");
 	}
-	assert_eq!(fork_templates(&h.db.store).await.len(), 1, "collected forks are purged");
+	assert_eq!(fork_templates(&h.store).await.len(), 1, "collected forks are purged");
 
 	// Last user gone → artifacts deleted on the node, rows purged; nothing
 	// admitted after the source goes too.
 	h.kill(&child).await;
 	builds::housekeeping(&h.state, STALE).await;
 	assert!(h.fake.lock().deleted_artifacts.contains(&fork_build));
-	let templates = fork_templates(&h.db.store).await;
+	let templates = fork_templates(&h.store).await;
 	assert!(templates.is_empty(), "unexpected fork templates: {templates:?}");
-	assert_eq!(snapshot_builds(&h.db.store).await, 0);
+	assert_eq!(snapshot_builds(&h.store).await, 0);
 	let artifacts = kv.list(&format!("art/{fork_build}/")).await.unwrap();
 	assert!(artifacts.is_empty(), "unexpected artifacts: {artifacts:?}");
 	h.kill(&source).await;
@@ -873,7 +867,7 @@ async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed
 		.await;
 	let id = h.fake.lock().sandboxes.keys().next().unwrap().clone();
 	eventually("the abandoned create to be recorded", || async {
-		h.db.store.sandbox(&id).await.unwrap().is_some()
+		h.store.sandbox(&id).await.unwrap().is_some()
 	})
 	.await;
 	assert_eq!(h.admitted().await, 1);

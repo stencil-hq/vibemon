@@ -17,7 +17,7 @@ use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
-	Entry, KvError, Txn, TxnResult,
+	Entry, KvError, Range, Txn, TxnResult,
 	raft::{RaftKv, TypeConfig},
 };
 use crate::meta::NodeId;
@@ -85,6 +85,8 @@ pub fn routes(kv: Arc<RaftKv>) -> Router {
 		.route("/cluster/v1/raft/snapshot", post(snapshot))
 		.route("/cluster/v1/kv/get", post(kv_get))
 		.route("/cluster/v1/kv/list", post(kv_list))
+		.route("/cluster/v1/kv/range", post(kv_range))
+		.route("/cluster/v1/kv/sync", post(kv_sync))
 		.route("/cluster/v1/kv/txn", post(kv_txn))
 		.layer(DefaultBodyLimit::max(RAFT_BODY_LIMIT))
 		.with_state(kv)
@@ -130,6 +132,19 @@ async fn kv_list(
 	Json(req): Json<ListRequest>,
 ) -> Json<Reply<Vec<Entry>>> {
 	Json(kv.list_served(&req.prefix).await.into())
+}
+
+async fn kv_range(
+	State(kv): State<Arc<RaftKv>>,
+	Json(range): Json<Range>,
+) -> Json<Reply<Vec<Entry>>> {
+	Json(kv.range_served(&range).await.into())
+}
+
+/// Leader's applied revision (read barrier of a follower).
+async fn kv_sync(State(kv): State<Arc<RaftKv>>, headers: HeaderMap) -> Json<Reply<u64>> {
+	let hop = Hop::from_headers(&headers);
+	Json(kv.leader_revision(hop == Hop::Forwarded).await.into())
 }
 
 async fn kv_txn(

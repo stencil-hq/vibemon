@@ -79,6 +79,10 @@ pub struct ServeArgs {
 	/// URL peers use to reach `--cluster-listen` (default: http://<detected-ip>:<port>).
 	#[arg(long, env = "VMON_CLUSTER_ADVERTISE")]
 	cluster_advertise: Option<String>,
+	/// Redis-protocol (RESP2) listener for the cluster KV; clients `AUTH` with
+	/// the cluster secret (off when unset).
+	#[arg(long, env = "VMON_KV_RESP_LISTEN")]
+	kv_resp_listen:    Option<SocketAddr>,
 	/// Gossip listener (UDP probes + TCP push-pull).
 	#[arg(long, env = "VMON_GOSSIP_LISTEN", default_value = "0.0.0.0:7946")]
 	gossip_listen:     SocketAddr,
@@ -114,9 +118,6 @@ pub struct ServeArgs {
 	/// Public base URL of this driver (signed upload URLs point here).
 	#[arg(long, env = "VMON_PUBLIC_URL")]
 	public_url:  Option<String>,
-	/// Database URL (driver), e.g. `mysql://user:pass@host:3306/vmon`.
-	#[arg(long, env = "VMON_MYSQL_URL", hide_env_values = true)]
-	mysql_url:   Option<String>,
 	/// Token accepted in `X-Admin-Token` for admin endpoints.
 	#[arg(long, env = "VMON_ADMIN_TOKEN", hide_env_values = true)]
 	admin_token: Option<String>,
@@ -206,9 +207,6 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 		Roles { node: args.role.contains(&Role::Node), driver: args.role.contains(&Role::Driver) };
 	if !roles.node && !roles.driver {
 		bail!("--role must include node and/or driver");
-	}
-	if roles.driver && args.mysql_url.is_none() {
-		bail!("the driver role needs --mysql-url (VMON_MYSQL_URL)");
 	}
 
 	let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
@@ -319,7 +317,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 		None
 	};
 
-	let driver = if let Some(mysql_url) = args.mysql_url.as_deref().filter(|_| roles.driver) {
+	let driver = if roles.driver {
 		let config = DriverConfig {
 			domain: args.domain.clone(),
 			public_url,
@@ -330,11 +328,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			shared_volumes: args.shared_volumes,
 			object_store,
 		};
-		Some(
-			Driver::start(config, mysql_url, cluster.clone())
-				.await
-				.context("starting driver role")?,
-		)
+		Some(Driver::start(config, cluster.clone()))
 	} else {
 		None
 	};
@@ -346,6 +340,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 	let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 	let mut servers = tokio::task::JoinSet::new();
 	servers.spawn(serve_plain(args.cluster_listen, cluster_router, shutdown_rx.clone()));
+	if let Some(addr) = args.kv_resp_listen {
+		servers.spawn(serve_resp(addr, cluster.clone(), shutdown_rx.clone()));
+		tracing::info!(kv_resp_listen = %addr, "serving the cluster KV over the Redis protocol");
+	}
 	if node.is_some() {
 		tracing::info!(cluster_listen = %args.cluster_listen, "node role serving the node API");
 	}
@@ -426,6 +424,18 @@ async fn serve_plain(
 	axum::serve(listener, router)
 		.with_graceful_shutdown(wait_shutdown(shutdown))
 		.await?;
+	Ok(())
+}
+
+async fn serve_resp(
+	addr: SocketAddr,
+	cluster: Cluster,
+	shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+	let listener = tokio::net::TcpListener::bind(addr)
+		.await
+		.with_context(|| format!("binding {addr}"))?;
+	cluster.serve_resp(listener, wait_shutdown(shutdown)).await;
 	Ok(())
 }
 

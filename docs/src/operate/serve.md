@@ -8,13 +8,13 @@ A `vmon serve` process runs one or both roles, selected with `--role` (default `
 
 | Role | Does | Needs |
 |---|---|---|
-| `driver` | E2B REST API, sandbox ingress, auth, placement, lifecycle and build supervision. Drivers are the raft voters of the cluster KV. | `--mysql-url` (the driver refuses to start without it). Optional: `--admin-token` for the admin endpoints, and `--tls-*` for HTTPS. |
+| `driver` | E2B REST API, sandbox ingress, auth, placement, lifecycle and build supervision. Drivers are the raft voters of the cluster KV. | Nothing external: durable state lives in the raft KV under `<data-dir>/raft/`. Optional: `--admin-token` for the admin endpoints, and `--tls-*` for HTTPS. |
 | `node` | Runs microVMs (`vmon vmm` children), builds templates, stores artifacts and volumes, serves the node API and guest tunnels. | A guest kernel and a static guest agent, the hypervisor (`/dev/kvm` on Linux, Hypervisor.framework on macOS), and TAP privileges on Linux. Template builds also need e2fsprogs (`mkfs.ext4`, `e2fsck`, `resize2fs`). On macOS vmon also looks for these in the Homebrew `e2fsprogs` keg. |
 
 Both topologies use the same binary and flags:
 
-- **Monolithic:** one `vmon serve --role node,driver` process with a MySQL database. No gossip seeds are needed.
-- **Distributed:** any number of `--role driver` and `--role node` processes (or mixed ones) that share one MySQL database and one cluster secret, and find each other through gossip seeds (`--join`). See [Clusters](cluster.md).
+- **Monolithic:** one `vmon serve --role node,driver` process; its single-voter raft KV holds all state. No gossip seeds are needed.
+- **Distributed:** any number of `--role driver` and `--role node` processes (or mixed ones) that share one cluster secret, replicate all state in the drivers' raft KV, and find each other through gossip seeds (`--join`). See [Clusters](cluster.md).
 
 The node role runs on Linux with KVM (x86_64 and aarch64 guests) and on macOS 15+ on Apple Silicon with HVF (aarch64 guests). The macOS binary must be ad-hoc signed with `hvf.entitlements`. The driver role runs on both. Windows builds contain only `vmon vmm`. See [Installation](../get-started/installation.md).
 
@@ -26,12 +26,13 @@ The node role runs on Linux with KVM (x86_64 and aarch64 guests) and on macOS 15
 | `--tls-listen` | off | drivers | Same clients over HTTPS (`h2`/`http/1.1` via ALPN). See [Domains, TLS, and ingress](ingress.md). |
 | `--cluster-listen` | `0.0.0.0:7947` | every process | Drivers, which call other drivers for raft and KV and call nodes for the node API and tunnels. Nodes, which forward KV calls to drivers and fetch artifacts and build file contexts from other nodes. |
 | `--gossip-listen` | `0.0.0.0:7946` | every process | Every other process, on both UDP and TCP. |
+| `--kv-resp-listen` | off | any process | Operator tools speaking the Redis protocol (`redis-cli`, `redis-benchmark`) that inspect or load-test the cluster KV. Clients `AUTH` with the cluster secret. |
 
 Peers dial the advertised addresses (`--cluster-advertise`, `--gossip-advertise`), not the bind addresses. When unset, both are derived from the IP of `--cluster-listen`, or from the host's outbound IPv4 address when it binds `0.0.0.0` (details in [Cluster and gossip](../reference/serve.md#cluster-and-gossip)).
 
 Cluster HTTP requires `Authorization: Bearer <cluster secret>`. Gossip packets carry an HMAC tag keyed from the same secret, and unauthenticated packets are dropped. Even so, keep both internal listeners on a private network, because the node API controls every VM.
 
-`GET /health` on the public listener needs no authentication. It returns 204 while MySQL answers and the local KV replica is readable, so load balancers can use it as a health check.
+`GET /health` on the public listener needs no authentication. It returns 204 while the driver can serve linearizable reads of the cluster KV (a raft leader is reachable and the local replica has caught up), so load balancers can use it as a health check.
 
 ## Data and run directories
 
@@ -40,7 +41,7 @@ Cluster HTTP requires `Authorization: Bearer <cluster secret>`. Gossip packets c
 ```text
 node-id                     random 64-bit member ID, written on first start
 cluster-secret              generated secret (0600) when --cluster-secret is unset
-raft/                       drivers: raft log, vote, snapshots (fsync'd)
+raft/                       drivers: raft log, vote, snapshots (fsync'd) of the KV holding all driver state
 assets/                     nodes: pinned fallback kernel, when downloaded
 egress/                     Linux nodes: node-local MITM CA for egress header rules
 files/<templateID>/<hash>.tar   nodes: build file-context archives
@@ -52,7 +53,7 @@ paused/<sandboxID>/         nodes: paused sandbox state
 volumes/<volumeID>/         nodes: volume contents (unless --volumes-dir)
 ```
 
-Keep the data directory across restarts. Its `node-id` is the process's identity in gossip, raft, and `GET /nodes`, and a restarted node adopts its running sandboxes only from the same directory. Node free disk is measured on the data directory. For the storage layout of disks, pauses, and volumes, see [Storage, object store, and volumes](storage.md).
+Keep the data directory across restarts; a driver's `raft/` is its replica of every team, key, template, and sandbox record. Its `node-id` is the process's identity in gossip, raft, and `GET /nodes`, and a restarted node adopts its running sandboxes only from the same directory. Node free disk is measured on the data directory. For the storage layout of disks, pauses, and volumes, see [Storage, object store, and volumes](storage.md).
 
 `--run-dir` holds one short subdirectory per VM with its `api.sock` and `agent.sock`. It defaults to `$XDG_RUNTIME_DIR/vmon`, or to `/tmp/vmon-<uid>`. The path must stay short because of the 104-byte macOS `sun_path` limit.
 
@@ -67,15 +68,15 @@ Keep the release assets next to `vmon`, or pass both flags explicitly. See [Gues
 
 ## Cluster secret
 
-The cluster secret authenticates cluster HTTP and gossip. It is also the root of every derived key: JWTs, envd and traffic access tokens, signed upload URLs, and the AES key for API keys, env vars, secrets, and webhook secrets stored in MySQL.
+The cluster secret authenticates cluster HTTP and gossip. It is also the root of every derived key: JWTs, envd and traffic access tokens, signed upload URLs, and the AES key for API keys, env vars, secrets, and webhook secrets stored in the cluster KV.
 
 - When `--cluster-secret` (`VMON_CLUSTER_SECRET`) is unset, `vmon serve` uses `<data-dir>/cluster-secret`, and generates the file on first start (64 hex characters, mode `0600`) with a warning.
 - Every process in a cluster must use the same secret. Generate it once and distribute it, for example by copying the first process's `cluster-secret` file into `VMON_CLUSTER_SECRET` for the others.
 - `vmon admin` needs the same secret to encrypt the API keys it creates. It reads `--cluster-secret`, or else `<data-dir>/cluster-secret`. See [Administration](admin.md).
-- Changing the secret invalidates stored ciphertexts, JWTs, and derived envd and traffic tokens; database-backed refresh tokens are not derived from it.
+- Changing the secret invalidates stored ciphertexts, JWTs, and derived envd and traffic tokens; stored refresh tokens are not derived from it.
 
 > [!TIP]
-> Pass secrets through `VMON_CLUSTER_SECRET`, `VMON_MYSQL_URL`, and `VMON_ADMIN_TOKEN` instead of flags. `--help` hides these values, but command-line arguments show up in process listings.
+> Pass secrets through `VMON_CLUSTER_SECRET` and `VMON_ADMIN_TOKEN` instead of flags. `--help` hides these values, but command-line arguments show up in process listings.
 
 ## Logging
 
@@ -141,10 +142,9 @@ Size the pool for the total RAM of the restored sandboxes you expect to run at o
 
 ## Example: monolithic Linux host
 
-One root process with both roles, HTTPS ingress on a wildcard domain, internal listeners on loopback, and VMMs dropped to an unprivileged uid. Place `vmon-kernel-<arch>` and `vmon-agent-<arch>` next to `vmon`, create the `vmon` database, and point `*.sbx.example.com` and `api.sbx.example.com` at the host.
+One root process with both roles, HTTPS ingress on a wildcard domain, internal listeners on loopback, and VMMs dropped to an unprivileged uid. Place `vmon-kernel-<arch>` and `vmon-agent-<arch>` next to `vmon`, and point `*.sbx.example.com` and `api.sbx.example.com` at the host.
 
 ```sh
-export VMON_MYSQL_URL='mysql://vmon:<password>@db.internal:3306/vmon'
 export VMON_ADMIN_TOKEN='<random admin token>'
 
 vmon serve \
@@ -163,4 +163,4 @@ vmon serve \
   --log-json
 ```
 
-On first start this generates `/var/lib/vmon/cluster-secret`. Run `vmon admin` on the same host (it reads that file by default) to create the first team. With `--tls-listen`, `--public-url` defaults to `https://api.sbx.example.com`. Clients need only `E2B_API_KEY` and `E2B_DOMAIN=sbx.example.com`; see [Connecting SDKs and the CLI](../get-started/clients.md).
+On first start this generates `/var/lib/vmon/cluster-secret`. Run `vmon admin` on the same host while the server runs (it reads that file and reaches the driver at `http://127.0.0.1:7947` by default) to create the first team. With `--tls-listen`, `--public-url` defaults to `https://api.sbx.example.com`. Clients need only `E2B_API_KEY` and `E2B_DOMAIN=sbx.example.com`; see [Connecting SDKs and the CLI](../get-started/clients.md).

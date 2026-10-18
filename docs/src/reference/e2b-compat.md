@@ -27,7 +27,7 @@ and [`e2e/README.md`](https://github.com/stencil-hq/vibemon/blob/main/e2e/README
 | Guest agent channel (GC4 over virtio-console) | ✅ exec, PTY, fs read/write/list/stat/mkdir/remove, net_config, mount | Byte-stream tunnels with flow control, OCI unpack, provisioning, poweroff, time set. |
 | In-guest E2B `envd` (port 49983, Connect + REST) | ❌ | Implement in `vmon-agent` (§3). |
 | Guest port reachability from host | ⚠️ TAP-only `TunnelSet` in the old server; none on macOS | GC4 `tcp_connect` tunnels (all platforms). |
-| Control plane, auth, persistence, scheduling, ingress | ❌ (old server removed) | `driver` crate + MySQL + raft KV + gossip. |
+| Control plane, auth, persistence, scheduling, ingress | ❌ (old server removed) | `driver` crate + raft KV (all durable state under `db/…`) + gossip. |
 | Template build (OCI image → bootable rootfs → snapshot) | ❌ | Node build pipeline with in-guest OCI unpack (§4). |
 
 ## 2. Control-plane REST API (`spec/e2b/infra/spec/openapi.yml`)
@@ -37,18 +37,18 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 
 | Method | Path | Used by | Implementation |
 |---|---|---|---|
-| GET | `/health` | SDK | 204 when MySQL + KV reachable. |
+| GET | `/health` | SDK | 204 when the driver can serve linearizable KV reads. |
 | GET | `/teams` | CLI | User JWT → `[{teamID, name, apiKey, isDefault}]` (API key decrypted from `key_enc`). |
-| GET | `/teams/{teamID}/metrics` | dashboard | From `sandbox_events` aggregates (concurrent sandboxes, start rate). |
+| GET | `/teams/{teamID}/metrics` | dashboard | From lifecycle event aggregates (concurrent sandboxes, start rate). |
 | GET | `/teams/{teamID}/metrics/max` | dashboard | Same source, max over window. |
-| GET | `/sandboxes` | deprecated | Running sandboxes of the team (KV catalog + MySQL detail). |
+| GET | `/sandboxes` | deprecated | Running sandboxes of the team (KV catalog + store detail). |
 | POST | `/sandboxes` | deprecated | Same handler as v2 with v1 defaults (`timeout` 15 s). |
 | POST | `/v2/sandboxes` | SDK | Full `NewSandboxV2`: template/alias/tag resolution, team limits (KV txn), placement, node create, `/init`, envd + traffic tokens, `Idempotency-Key`. |
 | GET | `/v2/sandboxes` | SDK | `state` (CSV), `metadata` filter, `order`, `startedAfter`, `template`, pagination, `X-Total-Running`. |
 | GET | `/sandboxes/metrics` | SDK | Latest sample per ID from nodes. |
 | GET | `/sandboxes/{id}/logs` | CLI | Node log store (console + agent logs); `logs[].line` is the raw JSON line (`{…fields, level, message}`) that `e2b sandbox logs` parses. |
 | GET | `/v2/sandboxes/{id}/logs` | SDK | Cursor/direction/level/search over node log store. |
-| GET | `/sandboxes/{id}` | SDK | Running → KV + MySQL; paused → MySQL snapshot row. |
+| GET | `/sandboxes/{id}` | SDK | Running → KV route + store record; paused → store record. |
 | DELETE | `/sandboxes/{id}` | SDK | Kill running and/or delete paused state; 404 if neither. |
 | GET | `/sandboxes/{id}/metrics` | SDK | Node `metrics.jsonl`, stepped by range. |
 | POST | `/sandboxes/{id}/pause` | SDK | Node pause (memory snapshot, or disk-only when `memory=false`); 409 if paused. |
@@ -70,7 +70,7 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | PATCH | `/templates/{id}` | deprecated | `public` toggle; bare aliases only for system teams (§5). |
 | POST | `/v2/templates/{id}/builds/{buildID}` | SDK | Validate steps, place on a node, start build → 202. |
 | PATCH | `/v2/templates/{id}` | CLI | `public` toggle → `TemplateUpdateResponse`; a system team's publish claims the bare aliases (§5). |
-| GET | `/templates/{id}/builds/{buildID}/status` | SDK | MySQL status + log page (`logsOffset`, `limit`, `level`). |
+| GET | `/templates/{id}/builds/{buildID}/status` | SDK | Stored status + log page (`logsOffset`, `limit`, `level`). |
 | GET | `/templates/{id}/builds/{buildID}/logs` | SDK | Cursor/direction/level/source log API. |
 | POST | `/templates/tags` | SDK | Assign tags to a build. |
 | DELETE | `/templates/tags` | SDK | Remove tags. |
@@ -83,19 +83,19 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | GET | `/admin/sandboxes/running-counts` | Admin | Counts from KV catalog. |
 | GET | `/admin/sandboxes/{id}` | Admin | Team + state. |
 | GET | `/admin/cluster` | Admin | vmon extension (dashboard): gossip members with roles, raft view, node capacity/status/create counters, plus 1 h of 5 s fleet samples. |
-| GET | `/admin/teams` | Admin | vmon extension (dashboard): every team with limits and MySQL running/paused counts, by name. |
+| GET | `/admin/teams` | Admin | vmon extension (dashboard): every team with limits and stored running/paused counts, by name. |
 | GET | `/admin/sandboxes` | Admin | vmon extension (dashboard): every team's running/paused sandboxes (`ListedSandbox` + `teamID`, `teamName`, `nodeID`), newest first; `state`, `team`, `limit` ≤ 1000 (default 500), `nextToken`/`X-Next-Token`; `id` returns just that sandbox (`[]` when killed/unknown). |
 | POST | `/admin/teams/{teamID}/builds/cancel` | Admin | Cancel team builds. |
 | POST | `/admin/teams/{teamID}/api-keys` | Admin | Create key. |
 | DELETE | `/admin/teams/{teamID}/api-keys/{id}` | Admin | Delete key. |
 | GET/POST | `/api-keys` | dashboard | User JWT + `X-Team-ID`. |
 | PATCH/DELETE | `/api-keys/{id}` | dashboard | Same. |
-| GET/POST | `/volumes` | SDK | MySQL row + JWT volume token. With `--object-store`: the volume is the prefix `volumes/<id>/` in the object store, mountable on any node with feature `object-store` (write-back S3 mount); otherwise a node directory. |
+| GET/POST | `/volumes` | SDK | Store record + JWT volume token. With `--object-store`: the volume is the prefix `volumes/<id>/` in the object store, mountable on any node with feature `object-store` (write-back S3 mount); otherwise a node directory. |
 | GET/DELETE | `/volumes/{id}` | SDK | Same; `DELETE` removes the whole prefix (object store) or directory. |
-| GET/POST | `/secrets` | SDK | Encrypted versions in MySQL. |
+| GET/POST | `/secrets` | SDK | Encrypted versions in the store. |
 | GET/POST/DELETE | `/secrets/{id}` | SDK | Same. |
 | GET/PUT/DELETE | `/clusters/{clusterID}/rigs…` (5 ops) | Admin | **501** `Not implemented by this deployment` (the spec's documented answer for deployments without rigs/autoscaling). |
-| GET | `/events/sandboxes`, `/events/sandboxes/{id}` | dashboard | `sandbox_events`. |
+| GET | `/events/sandboxes`, `/events/sandboxes/{id}` | dashboard | Stored lifecycle events (kept 7 days). |
 | * | `/events/webhooks…` (7 ops) | dashboard | Webhooks with signed (`e2b-signature` = base64 SHA-256(secret + body)) lifecycle event delivery by the raft leader, ≤ 3 attempts, delivery log/stats. |
 | POST/DELETE | `/access-tokens…` | removed upstream | **410** with the upstream deprecation message. |
 | POST | `/templates`, `/templates/{id}`, `/templates/{id}/builds/{buildID}` (legacy v1) | removed upstream | Not served (404), matching current upstream; current CLIs use v2. |
@@ -175,7 +175,7 @@ Details and the fixes made are listed in [`e2e/README.md`](https://github.com/st
   credentials requests are anonymous (never the node's identity). Endpoints
   resolving to private/loopback addresses are refused unless the node runs
   with `--s3-mounts-allow-private`. Credentials are never logged or
-  returned; MySQL stores them only encrypted. Unmodified SDKs cannot send
+  returned; the store keeps them only encrypted. Unmodified SDKs cannot send
   extension fields; use raw HTTP and then `Sandbox.connect`:
 
   ```sh

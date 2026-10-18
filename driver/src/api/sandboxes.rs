@@ -407,10 +407,10 @@ fn listed(row: &SandboxRow, live: &Live) -> Option<ListedSandboxDto> {
 		cpu_count: row.vcpus,
 		memory_mb: row.memory_mb,
 		disk_size_mb: row.disk_mb,
-		metadata: row.metadata.0.clone(),
+		metadata: row.metadata.clone(),
 		state,
 		envd_version: row.envd_version.clone(),
-		volume_mounts: row.volume_mounts.0.iter().map(MountDto::from).collect(),
+		volume_mounts: row.volume_mounts.iter().map(MountDto::from).collect(),
 	})
 }
 
@@ -525,7 +525,7 @@ async fn detail(
 			"running",
 			route.as_ref().map_or(row.end_at, |r| datetime(r.end_at_ms)),
 			domain(&state),
-			Some(row.volume_mounts.0.iter().map(MountDto::from).collect()),
+			Some(row.volume_mounts.iter().map(MountDto::from).collect()),
 		),
 		Live::Paused => ("paused", row.paused_at.unwrap_or(row.end_at), None, None),
 	};
@@ -547,9 +547,9 @@ async fn detail(
 		cpu_count: row.vcpus,
 		memory_mb: row.memory_mb,
 		disk_size_mb: row.disk_mb,
-		metadata: row.metadata.0.clone(),
+		metadata: row.metadata.clone(),
 		state: state_name,
-		network: row.network.0.redacted(),
+		network: row.network.redacted(),
 		lifecycle: LifecycleDto {
 			auto_resume: row.auto_resume,
 			on_timeout:  if row.auto_pause { "pause" } else { "kill" },

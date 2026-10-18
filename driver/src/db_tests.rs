@@ -1,8 +1,8 @@
-//! MySQL-backed API tests for the core driver surface (auth, CLI login,
-//! secrets, volumes, pagination, webhooks). Gated on `VMON_MYSQL_TEST_URL`;
-//! each test uses its own throwaway database.
+//! Store-backed API tests for the core driver surface (auth, CLI login,
+//! secrets, volumes, pagination, webhooks). Each test runs its own
+//! single-driver cluster ([`TestStore`]).
 
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
 	Router,
@@ -14,56 +14,37 @@ use http_body_util::BodyExt;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use vmon_cluster::{Cluster, ClusterConfig, MemberMeta, NodeId, Roles};
+use vmon_cluster::NodeId;
 
 use crate::{
 	admin, api, crypto,
 	state::{AppState, DriverConfig, TeamLimits},
-	store::{NewSandboxEvent, event_types, testdb::TestDb},
+	store::{NewSandboxEvent, event_types, testing::TestStore},
 };
 
 const ADMIN_TOKEN: &str = "admin-secret";
 
 struct TestApp {
-	db:      TestDb,
-	state:   AppState,
-	router:  Router,
-	cluster: Cluster,
+	db:     TestStore,
+	state:  AppState,
+	router: Router,
 }
 
 impl TestApp {
-	async fn start() -> Option<Self> {
-		let db = TestDb::create().await?;
-		let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
-		let cluster = Cluster::start(
-			ClusterConfig {
-				id:               NodeId::random(),
-				data_dir:         PathBuf::from("/nonexistent"),
-				roles:            Roles { node: false, driver: false },
-				gossip_bind:      any,
-				gossip_advertise: any,
-				cluster_url:      "http://127.0.0.1:1".into(),
-				join:             Vec::new(),
-				secret:           b"test-secret".to_vec(),
-				bootstrap_expect: 1,
-				raft_reap_after:  Duration::from_mins(10),
-			},
-			MemberMeta::default(),
-		)
-		.await
-		.expect("start role-less cluster");
+	async fn start() -> Self {
+		let db = TestStore::start().await;
 		let config = DriverConfig {
 			domain:         "vmon.test".into(),
 			public_url:     "http://api.vmon.test".into(),
 			admin_token:    Some(ADMIN_TOKEN.into()),
-			cluster_secret: "test-secret".into(),
+			cluster_secret: crate::store::testing::SECRET.into(),
 			data_dir:       PathBuf::from("/nonexistent"),
 			default_limits: TeamLimits::default(),
 			shared_volumes: false,
 			object_store:   None,
 		};
 		let keys = crypto::Keys::derive(config.cluster_secret.as_bytes());
-		let state = AppState::new(config, db.store.clone(), cluster.clone(), keys);
+		let state = AppState::new(config, db.store.clone(), db.cluster.clone(), keys);
 		let router = Router::new()
 			.merge(api::teams::routes())
 			.merge(api::keys::routes())
@@ -74,12 +55,11 @@ impl TestApp {
 			.merge(api::webhooks::routes())
 			.merge(api::admin::routes())
 			.with_state(state.clone());
-		Some(Self { db, state, router, cluster })
+		Self { db, state, router }
 	}
 
 	async fn finish(self) {
-		self.cluster.shutdown().await;
-		self.db.drop_db().await;
+		self.db.finish().await;
 	}
 
 	async fn call(&self, request: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
@@ -127,36 +107,8 @@ fn form(uri: &str, fields: &[(&str, &str)]) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn migrations_apply_cleanly_twice() {
-	let Some(db) = TestDb::create().await else {
-		return;
-	};
-	db.store.migrate().await.expect("second migrate is a no-op");
-	let tables: Vec<String> = sqlx::query_scalar(
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY \
-		 table_name",
-	)
-	.fetch_all(db.store.pool())
-	.await
-	.unwrap();
-	for table in [
-		"api_keys",
-		"refresh_tokens",
-		"sandbox_events",
-		"secret_versions",
-		"teams",
-		"webhook_deliveries",
-	] {
-		assert!(tables.iter().any(|t| t == table), "missing table {table}: {tables:?}");
-	}
-	db.drop_db().await;
-}
-
-#[tokio::test]
 async fn api_key_auth_valid_invalid_blocked_and_deleted() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, key) = app.team("Acme").await;
 
 	let (status, ..) = app
@@ -311,9 +263,7 @@ async fn cli_login(
 
 #[tokio::test]
 async fn cli_login_jwt_expiry_refresh_rotation_and_revoke() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, _) = app.team("Login Team").await;
 	let user =
 		admin::create_user(&app.state.store, "Dev@Example.com", "correct horse", Some(&team.slug))
@@ -460,9 +410,7 @@ async fn cli_login_jwt_expiry_refresh_rotation_and_revoke() {
 
 #[tokio::test]
 async fn secret_versioning_and_pagination() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, key) = app.team("Secrets").await;
 	let auth = [("x-api-key", key.as_str())];
 
@@ -606,9 +554,7 @@ async fn secret_versioning_and_pagination() {
 
 #[tokio::test]
 async fn volume_tokens_are_scoped_to_one_volume() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, key) = app.team("Vols").await;
 	let missing_node = NodeId(0xdead_beef).to_string();
 	let a = app
@@ -689,9 +635,7 @@ async fn volume_tokens_are_scoped_to_one_volume() {
 
 #[tokio::test]
 async fn webhook_delivery_is_signed_and_recorded() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, key) = app.team("Hooks").await;
 	let auth = [("x-api-key", key.as_str())];
 
@@ -821,9 +765,7 @@ async fn webhook_delivery_is_signed_and_recorded() {
 
 #[tokio::test]
 async fn team_metrics_follow_lifecycle_events() {
-	let Some(app) = TestApp::start().await else {
-		return;
-	};
+	let app = TestApp::start().await;
 	let (team, key) = app.team("Metrics").await;
 	for (id, ty) in
 		[("i1", event_types::CREATED), ("i2", event_types::CREATED), ("i1", event_types::KILLED)]

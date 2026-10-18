@@ -22,11 +22,10 @@ any node.
 Monolithic server on macOS Apple Silicon, from a checkout:
 
 ```sh
-just mysql                       # MySQL 8.4 in Docker on :13306
 just kernel --arch aarch64       # vmon guest kernel → target/kernel/ (Docker)
 just serve                       # builds vmon + the guest agent, serves the API on 127.0.0.1:3000
 just templates base              # builds `base` as a public system template (no E2B_API_KEY set)
-"$(just bin)" admin --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon create-team dev   # prints an e2b_… key
+"$(just bin)" admin create-team dev   # via the running driver; prints an e2b_… key
 ```
 
 On Linux/KVM the node needs root or `CAP_NET_ADMIN` for TAP networking, so
@@ -77,7 +76,7 @@ wildcard certificate for `*.<domain>` and `api.<domain>`; the SDKs then use
 ## Architecture
 
 <p align="center">
-  <img src="assets/architecture.png" alt="Clients, driver, node, and vmon vmm tiers with MySQL, raft KV, gossip, and object store" width="100%" />
+  <img src="assets/architecture.png" alt="Clients, driver, node, and vmon vmm tiers with raft KV, gossip, and object store" width="100%" />
 </p>
 
 One Rust binary, three entry points:
@@ -86,12 +85,14 @@ One Rust binary, three entry points:
 |---|---|
 | `vmon serve --role node,driver` | Runs the **node** role (hosts microVMs, builds templates), the **driver** role (E2B REST API, sandbox ingress, scheduling), or both. |
 | `vmon vmm …` | The per-VM monitor (KVM / Hypervisor.framework / WHP). Spawned by nodes, never by hand. |
-| `vmon admin …` | Teams, users, API keys, limits, system teams (talks to MySQL directly). |
+| `vmon admin …` | Teams, users, API keys, limits, system teams (talks to a running driver's cluster listener). |
 
 - **Monolithic**: one process with both roles.
 - **Distributed**: any number of driver and node processes, discovered through
-  a gossip memberlist (`--join`). Drivers form a raft KV for live cluster
-  state (sandbox routes, admission, locks); MySQL holds durable state.
+  a gossip memberlist (`--join`). Drivers form a raft KV that holds all
+  state: live cluster state (sandbox routes, admission, locks) and the durable
+  records (teams, keys, templates, builds, sandboxes, events, …). There is no
+  external database.
 
 ## Highlights
 
@@ -134,7 +135,6 @@ and NFS features that templates and Docker-in-sandbox rely on.
 
 ```sh
 just build | just lint | just test     # workspace build, clippy -D warnings, unit tests
-just test-db                           # driver tests against MySQL (`just mysql`)
 just agent-musl                        # static guest agent → target/test-assets/
 just integration                       # VMM integration tests (VMON_E2E=1)
 just cluster-e2e                       # 3 drivers + 2 nodes failover test
@@ -148,7 +148,7 @@ mdbook serve docs --port 3100          # documentation site on http://localhost:
 | `agent/` | `vmon-agent` | Guest agent: GC4 control channel, tunnels, OCI unpack, and an envd reimplementation. |
 | `cluster/` | `vmon-cluster` | Gossip memberlist, raft KV (openraft), `Cluster` facade. |
 | `node/` | `vmon-node` | VM runtime, sandboxes, template builds, artifacts, egress, node API. |
-| `driver/` | `vmon-driver` | E2B API, MySQL store, auth, scheduler, lifecycle, ingress. |
+| `driver/` | `vmon-driver` | E2B API, KV store, auth, scheduler, lifecycle, ingress. |
 | `cloud/` | `vmon-cloud` | Cloud workload identity, request signing, and the S3 client (object store, bucket mounts). |
 | `src/` | `vmon` | The binary: `serve`, `admin`, `vmm` dispatch. |
 | `docs/` | — | The documentation site (mdBook). |

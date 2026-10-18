@@ -11,7 +11,7 @@ How to build vibemon from source, run its test tiers, and follow the code conven
 | `cloud/` | `vmon-cloud` | Cloud workload identity, request signing, and the S3 client. |
 | `cluster/` | `vmon-cluster` | Gossip memberlist, raft KV (openraft), `Cluster` facade. |
 | `node/` | `vmon-node` | VM runtime, sandboxes, template builds, artifacts, egress, node API. |
-| `driver/` | `vmon-driver` | E2B API, MySQL store, auth, scheduler, lifecycle, ingress. |
+| `driver/` | `vmon-driver` | E2B API, KV-backed store, auth, scheduler, lifecycle, ingress. |
 | `src/` | `vmon` | The binary: `serve`, `admin`, `vmm` dispatch. |
 
 Other directories: `templates/` (default templates), `kernel/` (guest kernel), `e2e/` (upstream SDK suites), `spec/e2b/` (vendored upstream specs), `tests/` (VMM integration tests and the distributed test).
@@ -23,7 +23,7 @@ Other directories: `templates/` (default templates), `kernel/` (guest kernel), `
 - **macOS native deps:** `brew install libslirp pkg-config` (as in CI).
 - **Windows:** only `vmon vmm` builds; CI installs `libslirp` through vcpkg.
 - **`cargo-zigbuild` + zig:** static guest agent and Linux cross checks. CI installs `ziglang==0.13.0` and `cargo-zigbuild` with pip.
-- **Docker:** `just mysql` (MySQL 8.4) and, on macOS, `just kernel`.
+- **Docker:** `just kernel` on macOS.
 - **Python `uv`:** `just templates` and the e2e harness; the JS e2e suite also needs `pnpm` and `node`.
 - **`cargo-deny`:** `just license-check`.
 - **Lima:** for the `lima-*` recipes and `seccomp-audit` on macOS.
@@ -49,10 +49,8 @@ Host recipes pick the platform implementation automatically: KVM on Linux, HVF o
 | `codesign` | Ad-hoc sign the built binary with `hvf.entitlements` (macOS; no-op on Linux). |
 | `bin` | Print the path of the built `vmon`. |
 | `run *args` | Build and run `vmon` (under `sudo` on Linux for `/dev/kvm` and TAP). |
-| `serve *args` | `build` + `agent-musl`, then a monolithic `vmon serve` against `just mysql` on `127.0.0.1:3000`, domain `localhost`; extra args are forwarded. |
-| `mysql` | Start (or create) the `vmon-mysql` Docker container: MySQL 8.4, root password `vmon`, database `vmon`, port 13306. |
-| `test *args` | `cargo test`; hypervisor-gated cases skip. |
-| `test-db` | `vmon-driver` tests against `just mysql` (`VMON_MYSQL_TEST_URL`). |
+| `serve *args` | `build` + `agent-musl`, then a monolithic `vmon serve` on `127.0.0.1:3000`, domain `localhost`; extra args are forwarded. |
+| `test *args` | `cargo test`, including the driver store and API tests (each on a private one-voter KV cluster); hypervisor-gated cases skip. |
 | `format` / `fmt-check` | `cargo fmt --all`, or check only (CI gate). |
 | `lint` | `cargo clippy --workspace --all-targets -- -D warnings`. |
 | `check` | `cargo check --workspace --all-targets`, plus `cargo zigbuild --release -p vmon-agent` for both musl targets. |
@@ -82,9 +80,8 @@ limactl start --vm-type=vz --set='.nestedVirtualization=true' --name=kvm templat
 ## Local development loop
 
 ```sh
-just mysql
 just serve                                  # API on 127.0.0.1:3000
-vmon admin --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon create-team dev
+vmon admin create-team dev                  # via the server's cluster listener
 just templates base
 ```
 
@@ -95,17 +92,17 @@ Use the printed key with the E2B SDKs as described in [Quickstart](../get-starte
 | Tier | Command | Gate |
 |---|---|---|
 | Unit tests | `just test`, `cargo test -p <crate>` | none; hypervisor-dependent cases skip |
-| Driver store and API tests | `just test-db` | `VMON_MYSQL_TEST_URL` (MySQL server URL; tests create throwaway databases) |
+| Driver store and API tests | `just test`, `cargo test -p vmon-driver` | none; each test starts a private one-voter KV cluster (`store::testing::TestStore`) |
 | VMM integration (`tests/`) | `just integration`, `just smoke` | `VMON_E2E=1`, a usable hypervisor |
 | Jail rows | `just smoke-jail` | `VMON_E2E=1 VMON_JAIL=1`, root, Linux |
 | Soak | `just soak` | `VMON_E2E=1 VMON_SOAK=1` |
 | Template build e2e (`node/src/build/e2e.rs`) | `VMON_BUILD_E2E=1 cargo test -p vmon-node` | `VMON_BUILD_E2E=1`, plus `VMON_BIN` (signed `vmon`), `VMON_KERNEL`, `VMON_AGENT` (static agent), Docker Hub access; `VMON_BUILD_E2E_ONLY=alpine\|python\|ubuntu` runs one case |
-| Distributed (`tests/cluster.rs`) | `just cluster-e2e` | `VMON_CLUSTER_E2E=1`, hypervisor, MySQL |
-| Upstream SDK suites | `just e2e` | MySQL in Docker, `uv`, `pnpm`, `node` |
+| Distributed (`tests/cluster.rs`) | `just cluster-e2e` | `VMON_CLUSTER_E2E=1`, hypervisor |
+| Upstream SDK suites | `just e2e` | `uv`, `pnpm`, `node` |
 
 Without their gate variables the gated tests skip. On macOS, run gated VM tests through `demo/hvf-test-runner.sh` (set `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER` and `VMON_ENTITLEMENTS`, as the recipes do).
 
-CI (`.github/workflows/ci.yml`) runs on Linux: license check, `cargo fmt --check`, `cargo check` and `cargo clippy -D warnings` for the host and `aarch64-unknown-linux-gnu`, `cargo test` with MySQL (`VMON_MYSQL_TEST_URL` set), static agent builds for both musl targets, and `cargo audit`. On macOS it builds, signs, and compiles the tests; on Windows it checks `vmon` and lints and unit-tests the `vmm` crate. A separate workflow runs `VMON_E2E=1` on a KVM runner.
+CI (`.github/workflows/ci.yml`) runs on Linux: license check, `cargo fmt --check`, `cargo check` and `cargo clippy -D warnings` for the host and `aarch64-unknown-linux-gnu`, `cargo test` (driver store tests included), static agent builds for both musl targets, and `cargo audit`. On macOS it builds, signs, and compiles the tests; on Windows it checks `vmon` and lints and unit-tests the `vmm` crate. A separate workflow runs `VMON_E2E=1` on a KVM runner.
 
 ## Cross checks for Linux-only code
 
@@ -147,7 +144,7 @@ The full list is in [`AGENTS.md`](https://github.com/stencil-hq/vibemon/blob/mai
 - **Dependencies:** versions live in the root `[workspace.dependencies]`.
 - **Async:** tokio/axum/hyper in `cluster`, `node`, `driver`, and envd; the `vmm` crate stays synchronous.
 - **Errors:** E2B-shaped API errors (`{code, message, error_code?}`, `driver/src/error.rs`); node API errors `{code, message}` with stable codes; the VMM uses `vmm/src/result.rs`.
-- **sqlx:** built without its `macros` feature, so no `query!` or `sqlx::migrate!`. Use runtime queries with `#[derive(sqlx::FromRow)]`, add migrations as `driver/migrations/NNNN_*.sql`, and register each one by hand in `MIGRATIONS` in `driver/src/store/mod.rs`. Never edit an applied migration.
+- **Driver store:** records are serde structs under `db/<table>/…` keys in the raft KV (ARCHITECTURE.md §7). Read through `Store::read()`; write in a `Store::tx()` loop (guarded reads, staged writes, rerun when `commit()` returns `false`). There are no migrations: new record fields need `#[serde(default)]`.
 - **E2B fidelity:** match upstream wire behavior using `spec/e2b/`; protocol identifiers (`E2B_*`, `/.e2b`, `/run/e2b`, aliases) stay as upstream, user-visible branding is vibemon.
 - **Platform code:** keep OS and arch differences behind `vmm/src/{os,hv,arch}`, `node/src/net`, and `node/src/egress` with `#[cfg]`.
 - **Design changes:** keep `ARCHITECTURE.md` in sync with behavior.

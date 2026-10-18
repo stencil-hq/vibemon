@@ -8,8 +8,8 @@
 Vibemon is one Rust binary, `vmon`. A **driver** role serves the E2B REST API,
 sandbox ingress, and scheduling; a **node** role hosts the microVMs and builds
 templates. Run both in one process on a laptop, or any number of each across
-hosts, joined by gossip, with drivers sharing a raft-replicated KV and MySQL
-holding durable state. There is no vibemon SDK: the clients are the official
+hosts, joined by gossip, with drivers sharing a raft-replicated KV that holds
+all state; there is no external database. There is no vibemon SDK: the clients are the official
 `e2b`, `e2b_code_interpreter` / `@e2b/code-interpreter`, `e2b_desktop` /
 `@e2b/desktop` packages and the `e2b` CLI, unmodified.
 

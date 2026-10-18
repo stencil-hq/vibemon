@@ -9,7 +9,8 @@ plane. One Rust binary:
 - `vmon serve --role node,driver`: the node role (`vmon-node`: hosts VMs,
   builds templates) and/or the driver role (`vmon-driver`: E2B REST API,
   sandbox ingress, scheduling). A process runs either role or both.
-- `vmon admin …`: operator tooling (teams, users, API keys, system teams) against MySQL.
+- `vmon admin …`: operator tooling (teams, users, API keys, system teams)
+  through a running driver's cluster listener.
 
 The official E2B SDKs and the `e2b` CLI are the clients. There is no vibemon
 SDK and no other API.
@@ -28,7 +29,7 @@ operator documentation: the mdBook site in `docs/` (`docs/src/SUMMARY.md`).
 E2B SDKs / e2b CLI
    │ HTTPS api.<domain>, <port>-<sandboxID>.<domain> (or E2b-Sandbox-* headers)
 driver (vmon-driver): E2B API, auth, scheduler, lifecycle, build supervision, ingress proxy
-   │ MySQL (durable state)        raft KV (live routes, admission, locks)
+   │ raft KV: durable records under db/… + live routes, admission, locks
    │ node API /node/v1 + upgrade tunnels on the cluster listener
 node (vmon-node): VM runtime, sandboxes, template builds, artifacts, egress, volumes
    │ spawns `vmon vmm …` per VM; GC4 frames over virtio-console (agent.sock)
@@ -59,9 +60,9 @@ guest: systemd/OpenRC + vmon-agent installed as /usr/bin/envd (envd on :49983)
 - `node/`: `vmon-node`. `api.rs` (node API DTOs + KV records), `client.rs`
   (`NodeClient`), `vm/`, `gc4/`, `sandbox/`, `build/`, `oci/`,
   `artifacts/`, `egress/`, `net/`, `server.rs`.
-- `driver/`: `vmon-driver`. `api/` (E2B routes), `store/` + `migrations/`
-  (MySQL; migrations are registered by hand in `store/mod.rs`), `lifecycle/`,
-  `scheduler.rs`, `builds/`, `ingress/`, `auth.rs`, `crypto.rs`, `admin.rs`.
+- `driver/`: `vmon-driver`. `api/` (E2B routes), `store/` (durable records
+  in the raft KV), `lifecycle/`, `scheduler.rs`, `builds/`, `ingress/`,
+  `auth.rs`, `crypto.rs`, `admin.rs`.
 - `ui/`: the admin dashboard (React + Vite, `bun`). `just ui` builds it into
   `driver/web/`, which `driver/src/dashboard.rs` embeds at `/dashboard/`;
   commit the built files with the sources.
@@ -80,8 +81,7 @@ guest: systemd/OpenRC + vmon-agent installed as /usr/bin/envd (envd on :49983)
 ```bash
 just build | just release        # build (+ HVF codesign on macOS)
 just format | just lint | just check
-just test                        # unit tests (HV-gated cases skip)
-just mysql && just test-db       # driver tests against MySQL (VMON_MYSQL_TEST_URL)
+just test                        # unit + driver store tests (HV-gated cases skip)
 just agent-musl                  # static guest agent → target/test-assets/vmon-agent-<arch>
 just kernel                      # guest kernel → target/kernel/ (Docker on macOS, capped CPUs)
 just serve                       # monolithic dev server on 127.0.0.1:3000
@@ -107,9 +107,10 @@ run `codesign --sign - --entitlements hvf.entitlements --force <vmon>`.
 - **Errors:** E2B-shaped API errors (`driver/src/error.rs`:
   `{code, message, error_code?}`); node API errors are `{code, message}` with
   stable codes (`not_found`, `busy`, `port_closed`, …); the VMM uses `vmm/src/result.rs`.
-- **sqlx:** no `macros` feature (its proc-macro dylib fails to load on macOS 27).
-  Use runtime queries plus `#[derive(sqlx::FromRow)]`, and register each new
-  migration in `store/mod.rs` `MIGRATIONS`. Never edit an applied migration.
+- **Driver store:** records are serde structs under `db/<table>/…` keys in the
+  raft KV. Read through `Store::read()`; write in a `Store::tx()` loop (guarded
+  reads, staged writes, rerun when `commit()` returns `false`). There are no
+  migrations: new record fields need `#[serde(default)]`.
 - **E2B fidelity:** match upstream wire behavior, using `spec/e2b/` and the
   upstream sources cited in `docs/src/reference/e2b-compat.md`. Protocol identifiers (`E2B_*`
   env vars, `/.e2b`, `/run/e2b`, aliases) stay as upstream. User-visible
@@ -119,8 +120,8 @@ run `codesign --sign - --entitlements hvf.entitlements --force <vmon>`.
 
 ## Testing
 
-- Unit tests per crate (`cargo test -p <crate>`). Driver store tests need
-  `VMON_MYSQL_TEST_URL`.
+- Unit tests per crate (`cargo test -p <crate>`). Driver store tests run on a
+  private one-voter cluster (`store::testing::TestStore`).
 - Real-VM tests are gated (`VMON_E2E=1`, `VMON_CLUSTER_E2E=1`,
   `VMON_BUILD_E2E=1`). On macOS, run them through `demo/hvf-test-runner.sh` (see justfile).
 - E2B compatibility is proven by the upstream SDK suites (`just e2e`). Record
@@ -135,5 +136,5 @@ run `codesign --sign - --entitlements hvf.entitlements --force <vmon>`.
   Linux targets for the agent and cross checks).
 - Python (templates, e2e harness): `uv`. JS (e2e): `bun`.
 - Env vars: `VMON_*` mirror every `vmon serve` flag (`vmon serve --help`).
-  Common ones are `VMON_MYSQL_URL`, `VMON_CLUSTER_SECRET`, `VMON_JOIN`, `VMON_DOMAIN`,
+  Common ones are `VMON_CLUSTER_SECRET`, `VMON_JOIN`, `VMON_DOMAIN`,
   `VMON_KERNEL`, `VMON_AGENT`, `VMON_ADMIN_TOKEN`.

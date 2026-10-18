@@ -17,7 +17,6 @@ VMON_ENTITLEMENTS=$PWD/hvf.entitlements VMON_CLUSTER_E2E=1 \
 
 Requirements:
 
-- MySQL from `just mysql`. Point `VMON_CLUSTER_MYSQL_URL` at another server (the URL without a database). The test creates and drops the `vmon_cluster_e2e_<pid>` database.
 - `target/test-assets/{Image,vmon-agent}-<arch>`, or set `VMON_KERNEL` and `VMON_AGENT`.
 - Optional: `VMON_CLUSTER_NET` (nodes' `--net`, default `user`) and `VMON_CLUSTER_IMAGE` (default `alpine:3.20`).
 
@@ -43,16 +42,15 @@ The test starts 3 `--role driver --bootstrap-expect 3` processes and 2 `--role n
 ```sh
 limactl shell kvm -- bash -lc 'cd <worktree> && . ~/.cargo/env && \
   CARGO_TARGET_DIR=$HOME/target-<you> cargo build -p vmon'
-# root is needed for TAP and iptables; MySQL runs on the host:
+# root is needed for TAP and iptables:
 limactl shell kvm -- sudo -E $HOME/target-<you>/debug/vmon serve \
   --data-dir /tmp/<you>/mono --run-dir /tmp/<you>-run \
-  --mysql-url mysql://root:vmon@host.lima.internal:13306/<db> \
   --listen 127.0.0.1:3500 --cluster-listen 127.0.0.1:3501 --gossip-listen 127.0.0.1:3502 \
   --net tap --net-pool 172.29.0.0/16 --kernel <Image-aarch64> --agent <static vmon-agent> \
   --cluster-secret <s> --domain cluster.test
 ```
 
-1. Create a key with `vmon admin --mysql-url … create-team kvm`.
+1. Create a key with `vmon admin --cluster-url http://127.0.0.1:3501 --cluster-secret <s> create-team kvm` (inside Lima).
 2. Build `alp` with `Template().from_image("alpine:3.20")`. This takes about 6½ minutes under nested KVM.
 3. Run `uv run --with e2b python e2e/cluster/linux.py` inside Lima with:
 

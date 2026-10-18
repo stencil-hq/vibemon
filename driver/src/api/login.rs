@@ -18,7 +18,7 @@ use crate::{
 	crypto,
 	error::{ApiError, ApiResult},
 	state::AppState,
-	store::Rotation,
+	store::{self, Rotation},
 };
 
 /// Access token lifetime.
@@ -151,7 +151,7 @@ async fn issue_tokens(
 	state: &AppState,
 	user_id: &str,
 	email: &str,
-) -> sqlx::Result<(String, String)> {
+) -> store::Result<(String, String)> {
 	let access = state
 		.keys
 		.access_token(user_id, email, ACCESS_TOKEN_TTL_SECS);

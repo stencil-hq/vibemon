@@ -21,13 +21,12 @@ The guest boots its distro init: systemd on Debian, Ubuntu, Fedora, CentOS, Rock
 
 | Store | Holds | Owner |
 |---|---|---|
-| MySQL | Durable system of record: teams, users, API keys, templates, aliases, tags, builds and build logs, sandboxes (running, paused, killed), snapshots, volumes, secrets, lifecycle events, webhooks. | Drivers (`--mysql-url`). `vmon admin` writes to it directly. |
-| Raft KV | Hot, cluster-coordinated state: the live sandbox catalog (`sbx/<id>`, the route to the owning node), per-team admission counters, per-sandbox and per-build locks, which nodes hold which build artifacts, node status overrides, `Idempotency-Key` records. | Replicated across drivers (raft voters). Node-only processes forward KV calls to a driver. Stored under `<data-dir>/raft/`. |
+| Raft KV | The durable system of record under `db/…`: teams, users, API keys, refresh tokens, templates, aliases, tags, builds and build logs, sandboxes (running, paused, killed), snapshots, volumes, secrets, lifecycle events, webhooks and deliveries. Also hot, cluster-coordinated state: the live sandbox catalog (`sbx/<id>`, the route to the owning node), per-team admission counters, per-sandbox and per-build locks, which nodes hold which build artifacts, node status overrides, `Idempotency-Key` records. | Replicated across drivers (raft voters), in memory and snapshotted under `<data-dir>/raft/`; there is no external database. Node-only processes forward KV calls to a driver; `vmon admin` goes through a driver's cluster listener. Events, webhook deliveries, build logs, and killed sandboxes expire after 7 days. |
 | Gossip metadata | Membership, liveness, roles, addresses, node capacity (arch, backend, CPUs, memory, running sandboxes, draining flag, features). | Every process. |
 | Node disk | Template artifacts (`builds/<buildID>/`: rootfs + memory snapshot), running sandboxes' disk overlays and logs, paused sandboxes (`paused/<id>/`), OCI layer and step caches, volumes. | Each node, under `--data-dir`. |
 | Object store (optional) | Published template builds, portable paused sandboxes, object-store volumes. | Nodes and drivers with `--object-store`. |
 
-A paused sandbox has no KV route. It exists as a `paused` MySQL row plus the paused state on its node, or in the object store. Data layout and the object store: [Storage, object store, and volumes](../operate/storage.md). Cluster mechanics: [Clusters](../operate/cluster.md).
+A paused sandbox has no KV route. It exists as a `paused` sandbox record in the store plus the paused state on its node, or in the object store. Data layout and the object store: [Storage, object store, and volumes](../operate/storage.md). Cluster mechanics: [Clusters](../operate/cluster.md).
 
 ## Listeners
 
@@ -37,6 +36,7 @@ A paused sandbox has no KV route. It exists as a `paused` MySQL row plus the pau
 | `--tls-listen` | off | Same | The same router over HTTPS (h2 / HTTP/1.1). |
 | `--cluster-listen` | `0.0.0.0:7947` | Other vmon processes | Raft and KV (`/cluster/v1/*`), node API and guest tunnels (`/node/v1/*`). |
 | `--gossip-listen` | `0.0.0.0:7946` | Other vmon processes | Gossip: UDP probes and TCP push-pull. |
+| `--kv-resp-listen` | off | Operators, `redis-cli`, `redis-benchmark` | The cluster KV over the Redis protocol, after `AUTH <cluster secret>`. |
 
 The cluster listener and gossip are authenticated with the shared cluster secret: a bearer token on cluster HTTP, and an HMAC tag on every gossip packet. Never expose them publicly. Guest ports are never reached over the guest network. Ingress always goes through GC4 tunnels, so no inbound NAT is needed. Details: [Running vmon serve](../operate/serve.md#listeners).
 
@@ -53,7 +53,7 @@ See [Domains, TLS, and ingress](../operate/ingress.md#routing).
         │  HTTPS: api.<domain>, <port>-<id>.<domain>
         ▼
  ┌─────────────┐  raft (cluster HTTP)  ┌─────────────┐
- │   driver    │◄─────────────────────►│   driver    │──► MySQL
+ │   driver    │◄─────────────────────►│   driver    │  raft KV: all state
  └──────┬──────┘   gossip (all procs)  └─────────────┘
         │ cluster HTTP: node API, tunnels
         ▼
@@ -72,7 +72,7 @@ See [Domains, TLS, and ingress](../operate/ingress.md#routing).
 3. Placement picks a node from the gossip members. Candidates are alive, not draining, of the build's architecture, with the required features. Nodes with free headroom and nodes that already hold the build's artifacts score higher. The driver calls the node's `POST /node/v1/sandboxes`. An unreachable or busy node is skipped and another is tried, up to 3 attempts; other node errors fail the create immediately.
 4. If the node lacks the artifacts, it fetches them from a peer that holds the build, or from the object store. When a reusable memory snapshot and matching mount devices are available, it starts `vmon vmm` as a copy-on-write fork over a block overlay of the rootfs. Otherwise it cold-boots; node-local volume mounts always require a cold boot.
 5. The node requests a guest kernel RNG reseed on memory restores (failures only warn), configures the network, and attaches the egress policy. It then calls envd `POST /init` through the tunnel with the env vars, the sandbox's envd access token, and the default user and workdir.
-6. The driver records the MySQL row and a `sandbox.lifecycle.created` event. It returns 201 with `sandboxID`, `envdVersion`, `envdAccessToken`, `trafficAccessToken` (when public traffic is off), and `domain`.
+6. The driver records the sandbox in the store and a `sandbox.lifecycle.created` event. It returns 201 with `sandboxID`, `envdVersion`, `envdAccessToken`, `trafficAccessToken` (when public traffic is off), and `domain`.
 
 Every create runs to completion even if the client disconnects. A failure after admission rolls back the route and the admission slot. Lifecycle details: [Sandboxes](sandboxes.md).
 
@@ -96,7 +96,7 @@ The same path serves any guest port. For ports other than `49983`, ingress also 
 2. For every `COPY` step, the client asks `GET /templates/{id}/files/{hash}`. If the archive is missing, the client uploads it to the signed URL the driver returns. The driver streams each upload to the alive, non-draining node with the most free disk.
 3. `POST /v2/templates/{id}/builds/{buildID}` validates the steps and picks a builder node. Builders are alive and not draining, of the parent template's architecture, else of the cluster's majority architecture. The most free capacity wins. The driver then calls `POST /node/v1/builds`.
 4. The node pulls the OCI image and unpacks and provisions it inside a build VM. It runs the steps with the step cache, boots the result with its own init, runs the start and ready commands, and snapshots the VM.
-5. Whichever driver holds the build's lease polls the builder every 500 ms. It copies log lines into MySQL, and on success records which node holds the artifacts and assigns the tags. Clients poll `GET /templates/{id}/builds/{buildID}/status`.
+5. Whichever driver holds the build's lease polls the builder every 500 ms. It copies log lines into the store, and on success records which node holds the artifacts and assigns the tags. Clients poll `GET /templates/{id}/builds/{buildID}/status`.
 
 Pipeline details: [Templates](templates.md).
 

@@ -1,8 +1,8 @@
 //! Lifecycle webhook delivery, run by the raft-leader driver.
 //!
-//! Polls `sandbox_events` past each enabled webhook's cursor, POSTs the
+//! Polls the sandbox event log past each enabled webhook's cursor, POSTs the
 //! signed payload (`e2b-signature` = unpadded base64(SHA-256(secret + body))),
-//! retries up to 3 attempts, and records every attempt in `webhook_deliveries`.
+//! retries up to 3 attempts, and records every attempt as a webhook delivery.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use http::{HeaderMap, HeaderValue};
 use crate::{
 	crypto,
 	state::AppState,
-	store::{NewDelivery, SandboxEventRow, WebhookRow},
+	store::{self, NewDelivery, SandboxEventRow, WebhookRow},
 };
 
 /// Poll interval of the delivery loop.
@@ -48,7 +48,12 @@ pub fn spawn_delivery(state: AppState) {
 }
 
 /// One delivery pass over every enabled webhook.
-pub async fn deliver_pending(state: &AppState) -> sqlx::Result<()> {
+///
+/// # Errors
+///
+/// Store failures while listing the webhooks (per-webhook failures are
+/// logged).
+pub async fn deliver_pending(state: &AppState) -> store::Result<()> {
 	let hooks = state.store.enabled_webhooks().await?;
 	let results = join_all(hooks.iter().map(|hook| deliver_hook(state, hook))).await;
 	for (hook, result) in hooks.iter().zip(results) {
@@ -59,10 +64,10 @@ pub async fn deliver_pending(state: &AppState) -> sqlx::Result<()> {
 	Ok(())
 }
 
-async fn deliver_hook(state: &AppState, hook: &WebhookRow) -> sqlx::Result<()> {
+async fn deliver_hook(state: &AppState, hook: &WebhookRow) -> store::Result<()> {
 	let events = state
 		.store
-		.events_after(&hook.team_id, hook.last_event_seq, &hook.events.0, BATCH)
+		.events_after(&hook.team_id, hook.last_event_seq, &hook.events, BATCH)
 		.await?;
 	if events.is_empty() {
 		return Ok(());
@@ -208,7 +213,6 @@ mod tests {
 	use base64::Engine;
 	use parking_lot::Mutex;
 	use sha2::{Digest, Sha256};
-	use sqlx::types::Json;
 
 	use super::*;
 
@@ -218,7 +222,7 @@ mod tests {
 			team_id: "team".into(),
 			name: "h".into(),
 			url,
-			events: Json(vec![crate::store::event_types::KILLED.into()]),
+			events: vec![crate::store::event_types::KILLED.into()],
 			enabled: true,
 			signature_secret_enc: Vec::new(),
 			last_event_seq: 0,
@@ -238,7 +242,7 @@ mod tests {
 			build_id:     "b".into(),
 			event_type:   crate::store::event_types::KILLED.into(),
 			ts:           Utc::now(),
-			data:         Some(Json(serde_json::json!({"kill_reason": "request"}))),
+			data:         Some(serde_json::json!({"kill_reason": "request"})),
 		}
 	}
 

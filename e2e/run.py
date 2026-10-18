@@ -9,15 +9,14 @@ One command, end to end (see e2e/README.md):
     python3 e2e/run.py serve           # bring the stack up, print the SDK env, block
     python3 e2e/run.py shell           # stack up + interactive $SHELL with the SDK env
 
-Steps: fetch upstream E2B at a pinned commit into e2e/.cache, create a MySQL
-database, mint a team + API key with `vmon admin`, start `vmon serve` with a
-clean data dir, build the `base` and `httpbin` templates with the official
-SDK, run the suite with the SDK environment, and tear everything down (server,
-leftover VMMs, database, data dir) unless --keep is given.
+Steps: fetch upstream E2B at a pinned commit into e2e/.cache, start `vmon
+serve` with a clean data dir, mint a team + API key with `vmon admin` against
+its cluster listener, build the `base` and `httpbin` templates with the
+official SDK, run the suite with the SDK environment, and tear everything down
+(server, leftover VMMs, data dir) unless --keep is given.
 
 Standard library only; needs `uv` (Python suite + template builds), `pnpm` and
-`node` (JS suite), and either Docker with the MySQL container or a `mysql`
-client.
+`node` (JS suite).
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ import sys
 import tarfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -82,35 +80,6 @@ def fetch_e2b(ref: str) -> Path:
     return dest
 
 
-# -------------------------------------------------------------------- MySQL
-
-
-class MySQL:
-    """Creates/drops one database, via `docker exec` or a local `mysql`."""
-
-    def __init__(self, url: str, container: str):
-        parsed = urllib.parse.urlparse(url)
-        self.url = url.rstrip("/")
-        self.user = urllib.parse.unquote(parsed.username or "root")
-        self.password = urllib.parse.unquote(parsed.password or "")
-        self.host = parsed.hostname or "127.0.0.1"
-        self.port = parsed.port or 3306
-        self.container = container
-
-    def exec(self, sql: str) -> None:
-        if self.container:
-            cmd = ["docker", "exec", self.container, "mysql", f"-u{self.user}"]
-        else:
-            cmd = ["mysql", "-h", self.host, "-P", str(self.port), f"-u{self.user}"]
-        env = dict(os.environ, MYSQL_PWD=self.password)
-        if self.container:
-            cmd[2:2] = ["-e", f"MYSQL_PWD={self.password}"]
-        run(cmd + ["-e", sql], env=env, stdout=subprocess.DEVNULL)
-
-    def db_url(self, db: str) -> str:
-        return f"{self.url}/{db}"
-
-
 # ---------------------------------------------------------------- the stack
 
 
@@ -119,8 +88,6 @@ class Stack:
         self.args = args
         self.name = args.name
         self.data_dir = Path(args.data_dir or f"/tmp/vmon-{self.name}")
-        self.db = f"vmon_{self.name}".replace("-", "_")
-        self.mysql = MySQL(args.mysql_url, args.mysql_container)
         slot = args.slot
         self.api_port = slot * 100
         self.cluster_port = 7047 + (slot - 30) * 100
@@ -140,7 +107,7 @@ class Stack:
         reuse = args.reuse and self.state_file.exists()
         if reuse:
             self.state = json.loads(self.state_file.read_text())
-            log(f"reusing {self.data_dir} and database {self.db}")
+            log(f"reusing {self.data_dir}")
         else:
             self.destroy_persistent()
             self.data_dir.mkdir(parents=True)
@@ -152,10 +119,12 @@ class Stack:
                 (self.data_dir / "cache" / "oci").symlink_to(Path(args.oci_cache).resolve())
             if self.tls:
                 self.make_certs()
-            self.mysql.exec(f"CREATE DATABASE `{self.db}`")
             self.state = {"secret": secrets.token_hex(24)}
+        self.start_server()
+        if not reuse:
+            # `vmon admin` writes through the running driver's cluster listener.
             out = subprocess.run(
-                [args.vmon, "admin", "--mysql-url", self.mysql.db_url(self.db),
+                [args.vmon, "admin", "--cluster-url", f"http://127.0.0.1:{self.cluster_port}",
                  "--cluster-secret", self.state["secret"], "create-team", f"e2e-{self.name}"],
                 check=True, capture_output=True, text=True,
             ).stdout
@@ -163,7 +132,6 @@ class Stack:
                 line.split()[-1] for line in out.splitlines() if line.startswith("api key")
             )
             self.state_file.write_text(json.dumps(self.state))
-        self.start_server()
         self.build_templates()
         for name, pyqwest in (("env.sh", True), ("env-node.sh", False)):
             (self.data_dir / name).write_text(
@@ -180,7 +148,6 @@ class Stack:
             args.vmon, "serve",
             "--data-dir", str(self.data_dir),
             "--cluster-secret", self.state["secret"],
-            "--mysql-url", self.mysql.db_url(self.db),
             "--listen", f"127.0.0.1:{self.api_port}",
             "--cluster-listen", f"127.0.0.1:{self.cluster_port}",
             "--gossip-listen", f"127.0.0.1:{self.gossip_port}",
@@ -282,7 +249,6 @@ class Stack:
             os.killpg(self.server.pid, getattr(signal, f"SIG{sig}"))
 
     def destroy_persistent(self) -> None:
-        self.mysql.exec(f"DROP DATABASE IF EXISTS `{self.db}`")
         if self.data_dir.exists():
             if self.sudo:
                 subprocess.run(self.sudo + ["rm", "-rf", str(self.data_dir)], check=True)
@@ -420,10 +386,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sudo", action="store_true", help="run vmon serve via `sudo -n` (Linux TAP networking)")
     p.add_argument("--oci-cache", default=os.environ.get("VMON_E2E_OCI_CACHE", str(CACHE / "oci")),
                    help="persistent OCI blob cache shared across runs ('' = per-run)")
-    p.add_argument("--mysql-url", default=os.environ.get("VMON_E2E_MYSQL", "mysql://root:vmon@127.0.0.1:13306"),
-                   help="server URL without database")
-    p.add_argument("--mysql-container", default=os.environ.get("VMON_E2E_MYSQL_CONTAINER", "vmon-mysql"),
-                   help="Docker container to run `mysql` in ('' = local mysql client)")
     p.add_argument("--e2b-ref", default=E2B_REF)
     p.add_argument("--templates", nargs="*", default=["base", "httpbin", "e2e-warm-ubuntu"])
     p.add_argument("--workers", type=int, default=4, help="pytest-xdist workers (upstream CI: 4)")

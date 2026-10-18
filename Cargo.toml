@@ -53,9 +53,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# No `macros`: on macOS 27, sqlx-macros built with `tls-rustls` produces a proc-macro dylib
-# dyld refuses to load ("mis-aligned LINKEDIT string pool"). Migrations are embedded by hand.
-sqlx = { version = "0.9", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls", "migrate", "derive", "chrono", "json", "uuid"] }
 tar = "0.4"
 tempfile = "3"
 thiserror = "2"
@@ -205,11 +202,11 @@ flume = { version = "0.11", default-features = false }
 libc = "0.2"
 reqwest.workspace = true
 serde_json = "1"
-sqlx.workspace = true
 vmon-agent = { path = "agent" }
 
 [patch."https://github.com/insula-rs/libwhp"]
-# Vendored to relax its exact `byteorder = "=1.2.1"` pin, which conflicts with sqlx.
+# Vendored to relax its exact `byteorder = "=1.2.1"` pin, which conflicts with the `byteorder`
+# requirement of other dependencies (e.g. vfio-ioctls).
 libwhp = { path = "vendor/libwhp-0.1.4" }
 
 [patch.crates-io]

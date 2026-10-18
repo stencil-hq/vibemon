@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use crate::{
 	crypto::{self, Keys},
 	state::TeamLimits,
-	store::{ApiKeyRow, NewApiKey, Store, Team, User},
+	store::{self, ApiKeyRow, NewApiKey, Store, Team, User},
 };
 
 /// Name of the key minted together with a new team.
@@ -19,7 +19,7 @@ pub async fn create_api_key(
 	team_id: &str,
 	name: &str,
 	created_by: Option<&str>,
-) -> sqlx::Result<(ApiKeyRow, String)> {
+) -> store::Result<(ApiKeyRow, String)> {
 	let key = crypto::generate_api_key();
 	let hash = crypto::hash_api_key(&key).expect("generated keys are well-formed");
 	let (mask_prefix, mask_suffix) = crypto::mask_api_key(&key);

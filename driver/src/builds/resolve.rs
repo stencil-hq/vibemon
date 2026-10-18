@@ -165,11 +165,8 @@ pub async fn resolve_template(
 		.build(&build_id)
 		.await?
 		.ok_or_else(|| template_not_found(template_ref))?;
-	let artifact = match (build.status(), build.artifact) {
-		(BuildStatus::Ready, Some(artifact)) => artifact.0,
-		_ => {
-			return Err(ApiError::not_found(format!("template '{}' has no ready build", template.id)));
-		},
+	let (BuildStatus::Ready, Some(artifact)) = (build.status(), build.artifact) else {
+		return Err(ApiError::not_found(format!("template '{}' has no ready build", template.id)));
 	};
 	let sources = artifact_sources(state, &build_id).await?;
 	let alias = match alias_used {

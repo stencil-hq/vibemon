@@ -1,13 +1,27 @@
-//! `teams` and `team_members`.
+//! Teams and team memberships.
+//!
+//! Keys:
+//! - `db/team/<id>` → [`Team`] (read by other store modules via [`team_key`]).
+//! - `db/team.slug/<slug>` → team id (JSON string); unique slug index.
+//!   [`Store::create_team`] guards it absent and moves on to the next suffixed
+//!   candidate when it is taken.
+//! - `db/member/<team>/<user>` → `Member` (`is_default`, `created_at`).
+//! - `db/member.user/<user>/<team>` → empty; reverse index of the user's
+//!   memberships, written and deleted together with the member record.
+//!   [`Store::add_team_member`] guards the user's memberships it reads when
+//!   clearing their default flags.
 
 use chrono::{DateTime, Utc};
-use sqlx::FromRow;
+use serde::{Deserialize, Serialize};
 
-use super::{Store, retry_deadlocks};
+use super::{Error, Result, Store, key, last_segment, prefix};
 use crate::state::TeamLimits;
 
+/// Slug candidates [`Store::create_team`] tries (`slug`, `slug-2`, …).
+const SLUG_ATTEMPTS: u32 = 100;
+
 /// A tenant (E2B "team"/"project"); every API-key and sandbox belongs to one.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Team {
 	/// UUID v4.
 	pub id:         String,
@@ -23,53 +37,30 @@ pub struct Team {
 	pub created_at: DateTime<Utc>,
 }
 
-#[derive(FromRow)]
-struct TeamRecord {
-	id: String,
-	name: String,
-	slug: String,
-	created_at: DateTime<Utc>,
-	max_concurrent_sandboxes: u32,
-	max_concurrent_builds: u32,
-	max_vcpus: u32,
-	max_memory_mb: u64,
-	max_disk_mb: u64,
-	max_length_hours: u32,
-	blocked: bool,
-	is_system: bool,
-}
-
-impl From<TeamRecord> for Team {
-	fn from(r: TeamRecord) -> Self {
-		Self {
-			id:         r.id,
-			name:       r.name,
-			slug:       r.slug,
-			limits:     TeamLimits {
-				max_concurrent_sandboxes: r.max_concurrent_sandboxes,
-				max_concurrent_builds:    r.max_concurrent_builds,
-				max_vcpus:                r.max_vcpus,
-				max_memory_mb:            r.max_memory_mb,
-				max_disk_mb:              r.max_disk_mb,
-				max_length_hours:         r.max_length_hours,
-			},
-			blocked:    r.blocked,
-			system:     r.is_system,
-			created_at: r.created_at,
-		}
-	}
-}
-
-#[derive(FromRow)]
-struct MemberTeamRecord {
-	#[sqlx(flatten)]
-	team:       TeamRecord,
+/// Membership of a user in a team.
+#[derive(Serialize, Deserialize)]
+struct Member {
+	/// The user's default team (at most one flagged per user).
 	is_default: bool,
+	created_at: DateTime<Utc>,
 }
 
-const TEAM_COLUMNS: &str = "t.id, t.name, t.slug, t.created_at, t.max_concurrent_sandboxes, \
-                            t.max_concurrent_builds, t.max_vcpus, t.max_memory_mb, t.max_disk_mb, \
-                            t.max_length_hours, t.blocked, t.is_system";
+/// Key of the [`Team`] record `id`.
+pub(super) fn team_key(id: &str) -> String {
+	key("db/team", &[id])
+}
+
+fn slug_key(slug: &str) -> String {
+	key("db/team.slug", &[slug])
+}
+
+fn member_key(team_id: &str, user_id: &str) -> String {
+	key("db/member", &[team_id, user_id])
+}
+
+fn user_member_key(user_id: &str, team_id: &str) -> String {
+	key("db/member.user", &[user_id, team_id])
+}
 
 /// Lower-case, `[a-z0-9-]` slug of a team name (never empty).
 pub fn slugify(name: &str) -> String {
@@ -94,139 +85,121 @@ pub fn slugify(name: &str) -> String {
 impl Store {
 	/// Inserts a team with a unique slug derived from `name` (suffixing
 	/// `-2`, `-3`, … on collision).
-	pub async fn create_team(&self, name: &str, limits: TeamLimits) -> sqlx::Result<Team> {
-		let id = uuid::Uuid::new_v4().to_string();
+	///
+	/// # Errors
+	///
+	/// [`Error::Duplicate`] when every slug candidate is taken; store
+	/// failures.
+	pub async fn create_team(&self, name: &str, limits: TeamLimits) -> Result<Team> {
 		let base = slugify(name);
-		let mut attempt = 1u32;
-		loop {
-			let slug = if attempt == 1 {
-				base.clone()
-			} else {
-				format!("{base}-{attempt}")
-			};
-			let (id, slug) = (id.as_str(), slug.as_str());
-			let inserted = retry_deadlocks(|| async move {
-				sqlx::query(
-					"INSERT INTO teams (id, name, slug, max_concurrent_sandboxes, \
-					 max_concurrent_builds, max_vcpus, max_memory_mb, max_disk_mb, max_length_hours) \
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				)
-				.bind(id)
-				.bind(name)
-				.bind(slug)
-				.bind(limits.max_concurrent_sandboxes)
-				.bind(limits.max_concurrent_builds)
-				.bind(limits.max_vcpus)
-				.bind(limits.max_memory_mb)
-				.bind(limits.max_disk_mb)
-				.bind(limits.max_length_hours)
-				.execute(self.pool())
-				.await
-			})
-			.await;
-			match inserted {
-				Ok(_) => break,
-				Err(sqlx::Error::Database(e)) if e.is_unique_violation() && attempt < 100 => {
-					attempt += 1;
-				},
-				Err(e) => return Err(e),
+		let mut team = Team {
+			id: uuid::Uuid::new_v4().to_string(),
+			name: name.to_owned(),
+			slug: String::new(),
+			limits,
+			blocked: false,
+			system: false,
+			created_at: super::now(),
+		};
+		let mut tx = self.tx().await?;
+		'commit: loop {
+			for attempt in 1..=SLUG_ATTEMPTS {
+				let slug = if attempt == 1 {
+					base.clone()
+				} else {
+					format!("{base}-{attempt}")
+				};
+				let index = slug_key(&slug);
+				if tx.get::<String>(&index).await?.is_some() {
+					continue;
+				}
+				team.slug = slug;
+				tx.put(team_key(&team.id), &team);
+				tx.put(index, &team.id);
+				if tx.commit().await? {
+					return Ok(team);
+				}
+				continue 'commit;
 			}
+			return Err(Error::Duplicate("team slug"));
 		}
-		self.team_by_id(&id).await?.ok_or(sqlx::Error::RowNotFound)
 	}
 
 	/// Team by id.
-	pub async fn team_by_id(&self, id: &str) -> sqlx::Result<Option<Team>> {
-		let sql = format!("SELECT {TEAM_COLUMNS} FROM teams t WHERE t.id = ?");
-		let row: Option<TeamRecord> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(id)
-			.fetch_optional(self.pool())
-			.await?;
-		Ok(row.map(Team::from))
+	pub async fn team_by_id(&self, id: &str) -> Result<Option<Team>> {
+		self.read().await?.get(&team_key(id)).await
 	}
 
-	/// Team by id or slug (admin tooling accepts either).
-	pub async fn team_by_ref(&self, id_or_slug: &str) -> sqlx::Result<Option<Team>> {
-		let sql = format!("SELECT {TEAM_COLUMNS} FROM teams t WHERE t.id = ? OR t.slug = ? LIMIT 1");
-		let row: Option<TeamRecord> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(id_or_slug)
-			.bind(id_or_slug)
-			.fetch_optional(self.pool())
-			.await?;
-		Ok(row.map(Team::from))
+	/// Team by id or (case-insensitive) slug (admin tooling accepts either).
+	pub async fn team_by_ref(&self, id_or_slug: &str) -> Result<Option<Team>> {
+		let r = self.read().await?;
+		if let Some(team) = r.get(&team_key(id_or_slug)).await? {
+			return Ok(Some(team));
+		}
+		let Some(id) = r
+			.get::<String>(&slug_key(&id_or_slug.to_lowercase()))
+			.await?
+		else {
+			return Ok(None);
+		};
+		r.get(&team_key(&id)).await
 	}
 
 	/// Every team, oldest first.
-	pub async fn list_teams(&self) -> sqlx::Result<Vec<Team>> {
-		let sql = format!("SELECT {TEAM_COLUMNS} FROM teams t ORDER BY t.created_at, t.id");
-		let rows: Vec<TeamRecord> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.fetch_all(self.pool())
-			.await?;
-		Ok(rows.into_iter().map(Team::from).collect())
+	pub async fn list_teams(&self) -> Result<Vec<Team>> {
+		let mut teams: Vec<Team> = self.read().await?.list(&prefix("db/team", &[])).await?;
+		teams.sort_by(|a, b| {
+			a.created_at
+				.cmp(&b.created_at)
+				.then_with(|| a.id.cmp(&b.id))
+		});
+		Ok(teams)
 	}
 
 	/// Replaces a team's limits; `false` when the team does not exist.
-	pub async fn set_team_limits(&self, id: &str, limits: TeamLimits) -> sqlx::Result<bool> {
-		// MySQL reports 0 affected rows when nothing changed, so existence is
-		// checked separately.
-		retry_deadlocks(|| async move {
-			sqlx::query(
-				"UPDATE teams SET max_concurrent_sandboxes = ?, max_concurrent_builds = ?, max_vcpus \
-				 = ?, max_memory_mb = ?, max_disk_mb = ?, max_length_hours = ? WHERE id = ?",
-			)
-			.bind(limits.max_concurrent_sandboxes)
-			.bind(limits.max_concurrent_builds)
-			.bind(limits.max_vcpus)
-			.bind(limits.max_memory_mb)
-			.bind(limits.max_disk_mb)
-			.bind(limits.max_length_hours)
-			.bind(id)
-			.execute(self.pool())
-			.await
-		})
-		.await?;
-		Ok(self.team_by_id(id).await?.is_some())
+	pub async fn set_team_limits(&self, id: &str, limits: TeamLimits) -> Result<bool> {
+		self.update_team(id, |team| team.limits = limits).await
 	}
 
 	/// Blocks or unblocks a team; `false` when the team does not exist.
-	pub async fn set_team_blocked(&self, id: &str, blocked: bool) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			sqlx::query("UPDATE teams SET blocked = ? WHERE id = ?")
-				.bind(blocked)
-				.bind(id)
-				.execute(self.pool())
-				.await
-		})
-		.await?;
-		Ok(self.team_by_id(id).await?.is_some())
+	pub async fn set_team_blocked(&self, id: &str, blocked: bool) -> Result<bool> {
+		self.update_team(id, |team| team.blocked = blocked).await
 	}
 
 	/// Marks or unmarks a team as a system team; `false` when the team does
 	/// not exist. Marking claims the free bare aliases of its public
 	/// templates; unmarking releases the bare aliases of its templates.
-	pub async fn set_team_system(&self, id: &str, system: bool) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			sqlx::query("UPDATE teams SET is_system = ? WHERE id = ?")
-				.bind(system)
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
-			if system {
-				super::templates::claim_bare_aliases(&mut tx, "t.team_id = ?", id).await?;
-			} else {
-				sqlx::query(
-					"DELETE a FROM template_aliases a JOIN templates t ON t.id = a.template_id WHERE \
-					 a.namespace = '' AND t.team_id = ?",
-				)
-				.bind(id)
-				.execute(&mut *tx)
-				.await?;
+	pub async fn set_team_system(&self, id: &str, system: bool) -> Result<bool> {
+		let key = team_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(mut team) = tx.get::<Team>(&key).await? else {
+				return Ok(false);
+			};
+			team.system = system;
+			tx.put(key.as_str(), &team);
+			super::templates::sync_system_aliases(&mut tx, &team, system).await?;
+			if tx.commit().await? {
+				return Ok(true);
 			}
-			tx.commit().await
-		})
-		.await?;
-		Ok(self.team_by_id(id).await?.is_some())
+		}
+	}
+
+	/// Applies `change` to the team record `id`; `false` when it does not
+	/// exist.
+	async fn update_team(&self, id: &str, change: impl Fn(&mut Team)) -> Result<bool> {
+		let key = team_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(mut team) = tx.get::<Team>(&key).await? else {
+				return Ok(false);
+			};
+			change(&mut team);
+			tx.put(key.as_str(), &team);
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
 	}
 
 	/// Adds (or updates) a membership. Making it the default clears the
@@ -236,68 +209,81 @@ impl Store {
 		team_id: &str,
 		user_id: &str,
 		is_default: bool,
-	) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
+	) -> Result<()> {
+		let key = member_key(team_id, user_id);
+		let mut tx = self.tx().await?;
+		loop {
 			if is_default {
-				sqlx::query("UPDATE team_members SET is_default = FALSE WHERE user_id = ?")
-					.bind(user_id)
-					.execute(&mut *tx)
-					.await?;
+				for index in tx.keys(&prefix("db/member.user", &[user_id])).await? {
+					let other = last_segment(&index);
+					if other == team_id {
+						continue;
+					}
+					let other_key = member_key(&other, user_id);
+					if let Some(mut member) = tx.get::<Member>(&other_key).await?
+						&& member.is_default
+					{
+						member.is_default = false;
+						tx.put(other_key, &member);
+					}
+				}
 			}
-			sqlx::query(
-				"INSERT INTO team_members (team_id, user_id, is_default) VALUES (?, ?, ?) ON \
-				 DUPLICATE KEY UPDATE is_default = VALUES(is_default)",
-			)
-			.bind(team_id)
-			.bind(user_id)
-			.bind(is_default)
-			.execute(&mut *tx)
-			.await?;
-			tx.commit().await
-		})
-		.await
+			let created_at = tx
+				.get::<Member>(&key)
+				.await?
+				.map_or_else(super::now, |m| m.created_at);
+			tx.put(key.as_str(), &Member { is_default, created_at });
+			tx.mark(user_member_key(user_id, team_id), None);
+			if tx.commit().await? {
+				return Ok(());
+			}
+		}
 	}
 
-	/// Teams the user belongs to with their `is_default` flag. When no
-	/// membership is flagged default, the oldest membership is reported as
-	/// default so the CLI always finds one.
-	pub async fn user_teams(&self, user_id: &str) -> sqlx::Result<Vec<(Team, bool)>> {
-		let sql = format!(
-			"SELECT {TEAM_COLUMNS}, m.is_default FROM team_members m JOIN teams t ON t.id = \
-			 m.team_id WHERE m.user_id = ? ORDER BY m.created_at, t.id"
-		);
-		let rows: Vec<MemberTeamRecord> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(user_id)
-			.fetch_all(self.pool())
-			.await?;
-		let any_default = rows.iter().any(|r| r.is_default);
+	/// Teams the user belongs to with their `is_default` flag, oldest
+	/// membership first. When no membership is flagged default, the oldest
+	/// membership is reported as default so the CLI always finds one.
+	pub async fn user_teams(&self, user_id: &str) -> Result<Vec<(Team, bool)>> {
+		let r = self.read().await?;
+		let mut rows = Vec::new();
+		for index in r.keys(&prefix("db/member.user", &[user_id])).await? {
+			let team_id = last_segment(&index);
+			let Some(member) = r.get::<Member>(&member_key(&team_id, user_id)).await? else {
+				continue;
+			};
+			let Some(team) = r.get::<Team>(&team_key(&team_id)).await? else {
+				continue;
+			};
+			rows.push((member, team));
+		}
+		rows.sort_by(|(ma, ta), (mb, tb)| {
+			ma.created_at
+				.cmp(&mb.created_at)
+				.then_with(|| ta.id.cmp(&tb.id))
+		});
+		let any_default = rows.iter().any(|(m, _)| m.is_default);
 		Ok(rows
 			.into_iter()
 			.enumerate()
-			.map(|(i, r)| {
-				let is_default = r.is_default || (!any_default && i == 0);
-				(Team::from(r.team), is_default)
-			})
+			.map(|(i, (m, team))| (team, m.is_default || (!any_default && i == 0)))
 			.collect())
 	}
 
 	/// The team `team_id` if `user_id` is a member of it.
-	pub async fn user_team(&self, user_id: &str, team_id: &str) -> sqlx::Result<Option<Team>> {
-		let sql = format!(
-			"SELECT {TEAM_COLUMNS} FROM team_members m JOIN teams t ON t.id = m.team_id WHERE \
-			 m.user_id = ? AND m.team_id = ?"
-		);
-		let row: Option<TeamRecord> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(user_id)
-			.bind(team_id)
-			.fetch_optional(self.pool())
-			.await?;
-		Ok(row.map(Team::from))
+	pub async fn user_team(&self, user_id: &str, team_id: &str) -> Result<Option<Team>> {
+		let r = self.read().await?;
+		if r
+			.get::<Member>(&member_key(team_id, user_id))
+			.await?
+			.is_none()
+		{
+			return Ok(None);
+		}
+		r.get(&team_key(team_id)).await
 	}
 
 	/// The user's default team (see [`Store::user_teams`] for the fallback).
-	pub async fn default_team(&self, user_id: &str) -> sqlx::Result<Option<Team>> {
+	pub async fn default_team(&self, user_id: &str) -> Result<Option<Team>> {
 		Ok(self
 			.user_teams(user_id)
 			.await?
@@ -309,12 +295,79 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-	use super::slugify;
+	use std::time::Duration;
+
+	use super::*;
+	use crate::store::testing::TestStore;
+
+	/// Lets [`super::super::now`] advance, so records created next sort after.
+	async fn tick() {
+		tokio::time::sleep(Duration::from_millis(3)).await;
+	}
 
 	#[test]
 	fn slugify_normalizes_and_never_returns_empty() {
 		assert_eq!(slugify("My Team!"), "my-team");
 		assert_eq!(slugify("  --a__b--  "), "a-b");
 		assert_eq!(slugify("ÄÖÜ"), "team");
+	}
+
+	#[tokio::test]
+	async fn create_team_suffixes_taken_slugs() {
+		let t = TestStore::start().await;
+		let store = &t.store;
+		let first = store
+			.create_team("Acme", TeamLimits::default())
+			.await
+			.unwrap();
+		tick().await;
+		let second = store
+			.create_team("ACME", TeamLimits::default())
+			.await
+			.unwrap();
+		tick().await;
+		let third = store
+			.create_team("acme!", TeamLimits::default())
+			.await
+			.unwrap();
+		let slugs = [&first.slug, &second.slug, &third.slug];
+		assert_eq!(slugs, ["acme", "acme-2", "acme-3"]);
+		assert_eq!(store.team_by_ref("ACME-2").await.unwrap(), Some(second.clone()));
+		assert_eq!(store.team_by_ref(&third.id).await.unwrap(), Some(third.clone()));
+		let ids: Vec<_> = store
+			.list_teams()
+			.await
+			.unwrap()
+			.into_iter()
+			.map(|t| t.id)
+			.collect();
+		assert_eq!(ids, [first.id, second.id, third.id]);
+		t.finish().await;
+	}
+
+	#[tokio::test]
+	async fn memberships_track_one_default_with_fallback() {
+		let t = TestStore::start().await;
+		let store = &t.store;
+		let a = store.create_team("A", TeamLimits::default()).await.unwrap();
+		let b = store.create_team("B", TeamLimits::default()).await.unwrap();
+		let user = store.create_user("Dev@Example.com", "hash").await.unwrap();
+		assert!(matches!(
+			store.create_user("dev@example.COM ", "hash").await,
+			Err(Error::Duplicate(_))
+		));
+
+		store.add_team_member(&a.id, &user.id, false).await.unwrap();
+		tick().await;
+		store.add_team_member(&b.id, &user.id, false).await.unwrap();
+		assert_eq!(store.default_team(&user.id).await.unwrap(), Some(a.clone()), "oldest fallback");
+
+		store.add_team_member(&b.id, &user.id, true).await.unwrap();
+		store.add_team_member(&a.id, &user.id, true).await.unwrap();
+		let teams = store.user_teams(&user.id).await.unwrap();
+		assert_eq!(teams, [(a.clone(), true), (b.clone(), false)]);
+		assert_eq!(store.user_team(&user.id, &b.id).await.unwrap(), Some(b));
+		assert_eq!(store.user_team("nobody", &a.id).await.unwrap(), None);
+		t.finish().await;
 	}
 }

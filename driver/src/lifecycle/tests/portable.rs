@@ -71,20 +71,16 @@ async fn portable_paused(h: &Harness) -> (String, Remote) {
 /// The paused sandbox's holder disappears (row names a dead node; the
 /// fake node forgets it).
 async fn lose_paused_owner(h: &Harness, id: &str) {
-	sqlx::query("UPDATE sandboxes SET node_id = ? WHERE id = ?")
-		.bind(NodeId(0xdead).to_string())
-		.bind(id)
-		.execute(h.db.store.pool())
-		.await
-		.unwrap();
+	let dead = NodeId(0xdead).to_string();
+	h.store
+		.edit_sandbox_for_test(id, |row| row.node_id.clone_from(&dead))
+		.await;
 	h.fake.lock().sandboxes.remove(id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_only_pauses_write_no_portable_keys() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let id = create(&h).await;
 	lifecycle::pause(&h.state, Some(&h.team.id), &id, true)
 		.await
@@ -116,9 +112,7 @@ async fn local_only_pauses_write_no_portable_keys() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_resume_prefers_the_live_owner_and_offers_the_record() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (id, remote) = portable_paused(&h).await;
 	let (status, body, _) = h
 		.api
@@ -144,9 +138,7 @@ async fn portable_resume_prefers_the_live_owner_and_offers_the_record() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_resume_relocates_from_a_dead_owner() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (id, remote) = portable_paused(&h).await;
 	lose_paused_owner(&h, &id).await;
 	lifecycle::resume(&h.state, &h.team, &id, 600_000, false)
@@ -175,16 +167,14 @@ async fn portable_resume_relocates_from_a_dead_owner() {
 			.node_id,
 		NODE
 	);
-	assert_eq!(h.db.store.sandbox(&id).await.unwrap().unwrap().node_id, NODE.to_string());
+	assert_eq!(h.store.sandbox(&id).await.unwrap().unwrap().node_id, NODE.to_string());
 	h.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_resume_cold_boots_on_backend_or_cpu_mismatch_but_never_changes_arch() {
 	for mismatch in ["backend", "cpu", "arch"] {
-		let Some(h) = harness().await else {
-			return;
-		};
+		let h = harness().await;
 		let (id, _) = portable_paused(&h).await;
 		lose_paused_owner(&h, &id).await;
 		let resumes = h.fake.lock().resumes.len();
@@ -217,9 +207,7 @@ async fn portable_resume_cold_boots_on_backend_or_cpu_mismatch_but_never_changes
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn portable_resume_needs_an_object_store_node_and_keeps_volume_pins() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (id, _) = portable_paused(&h).await;
 	lose_paused_owner(&h, &id).await;
 	h.cluster.update_meta(|meta| {
@@ -248,18 +236,17 @@ async fn portable_resume_needs_an_object_store_node_and_keeps_volume_pins() {
 	object_store_node(&h, |_| {}).await;
 	let dead = NodeId(0xdead).to_string();
 	let volume = h
-		.db
 		.store
 		.insert_volume(&h.team.id, "pinned", Some(&dead), false)
 		.await
 		.unwrap();
-	let mounts = serde_json::json!([{"volumeId": volume.id, "name": volume.name, "path": "/data"}]);
-	sqlx::query("UPDATE sandboxes SET volume_mounts = ? WHERE id = ?")
-		.bind(mounts.to_string())
-		.bind(&id)
-		.execute(h.db.store.pool())
-		.await
-		.unwrap();
+	let mounts: Vec<vmon_node::api::VolumeMount> = serde_json::from_value(serde_json::json!([
+		{"volumeId": volume.id, "name": volume.name, "path": "/data"}
+	]))
+	.unwrap();
+	h.store
+		.edit_sandbox_for_test(&id, |row| row.volume_mounts.clone_from(&mounts))
+		.await;
 	let resumes = h.fake.lock().resumes.len();
 	let error = lifecycle::resume(&h.state, &h.team, &id, 600_000, false)
 		.await
@@ -267,15 +254,13 @@ async fn portable_resume_needs_an_object_store_node_and_keeps_volume_pins() {
 	assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE, "a dead volume pin never migrates");
 	assert_eq!(h.fake.lock().resumes.len(), resumes);
 	assert!(get_route(&h.cluster.kv, &id).await.unwrap().is_none());
-	assert_eq!(h.db.store.sandbox(&id).await.unwrap().unwrap().node_id, dead);
+	assert_eq!(h.store.sandbox(&id).await.unwrap().unwrap().node_id, dead);
 	h.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kill_fences_late_uploads_and_keeps_the_record_until_cleanup_succeeds() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (id, mut remote) = portable_paused(&h).await;
 	lose_paused_owner(&h, &id).await;
 	// An unusable store fails the object cleanup.
@@ -327,7 +312,7 @@ async fn kill_fences_late_uploads_and_keeps_the_record_until_cleanup_succeeds() 
 		.await
 		.unwrap();
 	assert_eq!(
-		h.db.store.sandbox(&id).await.unwrap().unwrap().state(),
+		h.store.sandbox(&id).await.unwrap().unwrap().state(),
 		crate::store::sandboxes::SandboxState::Killed
 	);
 	assert!(
@@ -345,14 +330,11 @@ async fn kill_fences_late_uploads_and_keeps_the_record_until_cleanup_succeeds() 
 /// and refresh routes of its own sandbox and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn envd_token_keeps_only_its_own_sandbox_alive() {
-	let Some(h) = harness().await else {
-		return;
-	};
+	let h = harness().await;
 	let (api, state, fake) = (&h.api, &h.state, &h.fake);
-	let api_key =
-		crate::admin::create_team_api_key(&h.db.store, &state.keys, &h.team.id, "keepalive")
-			.await
-			.unwrap();
+	let api_key = crate::admin::create_team_api_key(&h.store, &state.keys, &h.team.id, "keepalive")
+		.await
+		.unwrap();
 	let id = create(&h).await;
 	let other = create(&h).await;
 	let token = state.keys.envd_token(&id);

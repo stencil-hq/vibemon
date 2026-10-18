@@ -1,6 +1,5 @@
 use axum::{body::Body, http::Request};
 use chrono::TimeZone;
-use sqlx::types::Json as SqlJson;
 use tower::ServiceExt;
 use vmon_node::api::BuildReason;
 
@@ -9,29 +8,30 @@ use super::*;
 fn build(status: &str, reason: Option<BuildReason>) -> BuildRow {
 	let at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
 	BuildRow {
-		id:               "11111111-1111-4111-8111-111111111111".into(),
-		template_id:      "tpl".into(),
-		team_id:          "team".into(),
-		status:           status.into(),
-		kind:             "build".into(),
-		vcpus:            2,
-		memory_mb:        1024,
-		disk_mb:          4096,
+		id: "11111111-1111-4111-8111-111111111111".into(),
+		template_id: "tpl".into(),
+		team_id: "team".into(),
+		status: status.into(),
+		kind: "build".into(),
+		vcpus: 2,
+		memory_mb: 1024,
+		disk_mb: 4096,
 		min_free_disk_mb: None,
-		envd_version:     None,
-		arch:             None,
-		node_id:          None,
-		tags:             SqlJson(vec!["default".into()]),
-		spec:             None,
+		envd_version: None,
+		arch: None,
+		node_id: None,
+		tags: vec!["default".into()],
+		spec: None,
 		template_version: None,
-		start_cmd:        None,
-		ready_cmd:        None,
-		reason:           reason.map(SqlJson),
-		artifact:         None,
-		created_at:       at,
-		updated_at:       at,
-		started_at:       None,
-		finished_at:      None,
+		start_cmd: None,
+		ready_cmd: None,
+		reason,
+		artifact: None,
+		created_at: at,
+		updated_at: at,
+		started_at: None,
+		finished_at: None,
+		artifacts_gc_at: None,
 	}
 }
 

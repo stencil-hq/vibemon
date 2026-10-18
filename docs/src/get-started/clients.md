@@ -101,8 +101,7 @@ print(desktop.stream.get_url())   # https://6080-<sandboxId>.<domain>/vnc.html?a
 The `e2b` CLI authenticates with `E2B_API_KEY`, or with the key that `e2b auth login` stores in `~/.e2b/config.json`. Login needs a user, created by an operator:
 
 ```sh
-vmon admin --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
-  create-user dev@example.com --password 'change-me' --team dev
+vmon admin create-user dev@example.com --password 'change-me' --team dev
 ```
 
 `--team` takes the team's id or slug and makes it the user's default team. Then:

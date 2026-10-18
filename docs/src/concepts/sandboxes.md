@@ -15,7 +15,7 @@ How a sandbox lives: create, timeouts, pause and resume, fork, snapshots, kill, 
 | running | kill, or timeout without `autoPause` | killed |
 | paused | kill | killed |
 
-Transitions of one sandbox are serialized by a per-sandbox lock in the raft KV, except that an uncontended running-sandbox kill atomically removes the route without acquiring that lock. A request that finds another transition in progress waits for it, up to 2 minutes. A running sandbox has a route in the KV. A paused sandbox has only its MySQL row and its paused state, on its node or in the object store. Lifecycle operations finish even if the client disconnects. See [Architecture](architecture.md).
+Transitions of one sandbox are serialized by a per-sandbox lock in the raft KV, except that an uncontended running-sandbox kill atomically removes the route without acquiring that lock. A request that finds another transition in progress waits for it, up to 2 minutes. A running sandbox has a route in the KV. A paused sandbox has only its sandbox record in the driver store and its paused state, on its node or in the object store. Lifecycle operations finish even if the client disconnects. See [Architecture](architecture.md).
 
 ## Create
 
@@ -202,7 +202,7 @@ e2b sandbox logs <sandbox-id> --level info -f
 
 ## Events
 
-Every lifecycle change is recorded in MySQL as an event of type `sandbox.lifecycle.created`, `killed` (with `kill_reason`: `request`, `timeout`, `admin`, or `orphaned`), `updated` (timeout or network change), `paused`, `resumed`, or `checkpointed`.
+Every lifecycle change is recorded in the driver store (kept for 7 days) as an event of type `sandbox.lifecycle.created`, `killed` (with `kill_reason`: `request`, `timeout`, `admin`, or `orphaned`), `updated` (timeout or network change), `paused`, `resumed`, or `checkpointed`.
 
 ```sh
 curl -s "$E2B_API_URL/events/sandboxes/$SANDBOX_ID?limit=50&orderAsc=true" -H "X-API-Key: $E2B_API_KEY"

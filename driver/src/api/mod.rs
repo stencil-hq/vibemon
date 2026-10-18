@@ -35,10 +35,9 @@ pub fn router(state: AppState) -> Router {
 		.with_state(state)
 }
 
-/// `GET /health` (unauthenticated): 204 while the database answers and the
-/// local KV replica is readable; 500/503 otherwise.
+/// `GET /health` (unauthenticated): 204 while this driver can serve
+/// linearizable store reads; 503 (500 on other store failures) otherwise.
 async fn health(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
-	sqlx::query("SELECT 1").execute(state.store.pool()).await?;
-	state.cluster.kv.get("health").await?;
+	state.store.ping().await?;
 	Ok(StatusCode::NO_CONTENT)
 }

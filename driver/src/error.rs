@@ -110,10 +110,19 @@ impl IntoResponse for ApiError {
 	}
 }
 
-impl From<sqlx::Error> for ApiError {
-	fn from(error: sqlx::Error) -> Self {
-		tracing::error!(%error, "database error");
-		Self::internal("database error")
+impl From<crate::store::Error> for ApiError {
+	fn from(error: crate::store::Error) -> Self {
+		use vmon_cluster::kv::KvError;
+
+		use crate::store::Error;
+		match error {
+			Error::Kv(error @ (KvError::NoLeader | KvError::Unavailable(_))) => error.into(),
+			Error::Duplicate(what) => Self::conflict(format!("{what} already exists")),
+			error => {
+				tracing::error!(%error, "database error");
+				Self::internal("database error")
+			},
+		}
 	}
 }
 

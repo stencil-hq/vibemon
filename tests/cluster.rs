@@ -1,8 +1,8 @@
 //! Distributed `vmon serve` end to end (ARCHITECTURE.md §5, §9.4).
 //!
-//! Gated by `VMON_CLUSTER_E2E=1` (plus a usable hypervisor and `MySQL`). Starts
-//! three driver-only and two node-only processes on loopback, sharing one
-//! fresh `MySQL` database and cluster secret, then proves:
+//! Gated by `VMON_CLUSTER_E2E=1` (plus a usable hypervisor). Starts three
+//! driver-only and two node-only processes on loopback, sharing one fresh
+//! cluster secret (and so one raft KV holding the driver store), then proves:
 //!
 //! - raft bootstraps exactly once and every driver sees both nodes;
 //! - a template builds on a node; sandboxes created through one driver are
@@ -13,15 +13,14 @@
 //! - SIGKILL of the raft leader: a new leader is elected, the API keeps
 //!   answering on the survivors, and the new leader's reaper still enforces
 //!   timeouts; the restarted driver rejoins without a second bootstrap;
-//! - SIGKILL of a node: its sandboxes become killed (`MySQL` + events),
-//!   placement avoids it, and its restart kills the orphaned VMM;
+//! - SIGKILL of a node: its sandboxes become killed (store + events), placement
+//!   avoids it, and its restart kills the orphaned VMM;
 //! - SIGTERM + restart of a node (gossip `Left`): its sandboxes survive and are
 //!   adopted.
 //!
-//! Environment: `VMON_CLUSTER_MYSQL_URL` (server URL without database,
-//! default `mysql://root:vmon@127.0.0.1:13306`), `VMON_KERNEL`, `VMON_AGENT`
-//! (default `target/test-assets/{Image,vmon-agent}-<arch>`), `VMON_CLUSTER_NET`
-//! (`--net` of the nodes, default `user`), `VMON_CLUSTER_IMAGE` (template base
+//! Environment: `VMON_KERNEL`, `VMON_AGENT` (default
+//! `target/test-assets/{Image,vmon-agent}-<arch>`), `VMON_CLUSTER_NET` (`--net`
+//! of the nodes, default `user`), `VMON_CLUSTER_IMAGE` (template base
 //! image, default `alpine:3.20`). The portable-pause case additionally requires
 //! `VMON_CLUSTER_OBJECT_STORE` (a dedicated writable S3 URL; normal S3
 //! credentials and endpoint configuration apply). The other case leaves object
@@ -138,8 +137,6 @@ impl Proc {
 
 struct Cluster {
 	procs:        Vec<Proc>,
-	mysql:        String,
-	db:           String,
 	join:         String,
 	kernel:       PathBuf,
 	agent:        PathBuf,
@@ -160,7 +157,6 @@ impl Cluster {
 	}
 
 	fn spawn(&mut self, name: &str) {
-		let mysql_url = format!("{}/{}", self.mysql, self.db);
 		let (join, kernel, agent, net) =
 			(self.join.clone(), self.kernel.clone(), self.agent.clone(), self.net.clone());
 		let object_store = self.object_store.clone();
@@ -187,7 +183,7 @@ impl Cluster {
 			.stdout(log.try_clone().unwrap())
 			.stderr(log);
 		if p.driver {
-			cmd.args(["--bootstrap-expect", "3", "--mysql-url", &mysql_url])
+			cmd.args(["--bootstrap-expect", "3"])
 				.args(["--admin-token", ADMIN_TOKEN])
 				.args(["--raft-reap-after", &RAFT_REAP_AFTER_SECS.to_string()]);
 		} else {
@@ -442,16 +438,10 @@ struct Sandbox {
 	token: String,
 }
 
-/// Kill the topology before removing its database and per-case directories.
-async fn cleanup(c: Cluster) {
-	let (mysql, db, root) = (c.mysql.clone(), c.db.clone(), c.root.clone());
+/// Kill the topology before removing its per-case directories.
+fn cleanup(c: Cluster) {
+	let root = c.root.clone();
 	drop(c);
-	use sqlx::Connection as _;
-	if let Ok(mut conn) = sqlx::MySqlConnection::connect(&mysql).await {
-		let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS `{db}`")))
-			.execute(&mut conn)
-			.await;
-	}
 	let _ = fs::remove_dir_all(&root);
 }
 
@@ -463,26 +453,9 @@ fn log_count(cluster: &Cluster, needle: &str) -> usize {
 		.sum()
 }
 
-/// Each case gets isolated process directories and a database, even when run in
-/// parallel.
+/// Each case gets isolated process directories and its own raft KV, even when
+/// run in parallel.
 async fn topology(suffix: &str, object_store: Option<String>) -> Cluster {
-	let mysql = std::env::var("VMON_CLUSTER_MYSQL_URL")
-		.unwrap_or_else(|_| "mysql://root:vmon@127.0.0.1:13306".into());
-	let db = format!("vmon_cluster_e2e_{}{suffix}", std::process::id());
-	{
-		use sqlx::Connection as _;
-		let mut conn = sqlx::MySqlConnection::connect(&mysql)
-			.await
-			.expect("MySQL reachable");
-		// `db` is generated from the pid and a fixed test suffix: no untrusted
-		// input.
-		sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-			"DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`"
-		)))
-		.execute(&mut conn)
-		.await
-		.unwrap();
-	}
 	// Short root: per-VM Unix sockets live under the run dirs (104-byte limit).
 	let root = PathBuf::from(format!("/tmp/vce{suffix}-{}", std::process::id()));
 	let _ = fs::remove_dir_all(&root);
@@ -511,8 +484,6 @@ async fn topology(suffix: &str, object_store: Option<String>) -> Cluster {
 		.join(",");
 	let mut c = Cluster {
 		procs,
-		mysql: mysql.clone(),
-		db: db.clone(),
 		join,
 		kernel: asset("VMON_KERNEL", &format!("Image-{}", arch())),
 		agent: asset("VMON_AGENT", &format!("vmon-agent-{}", arch())),
@@ -562,9 +533,14 @@ async fn topology(suffix: &str, object_store: Option<String>) -> Cluster {
 	eprintln!("[topology] 3 drivers + 2 nodes converged in {took:?}");
 	assert_eq!(log_count(&c, "bootstrapping raft cluster"), 1, "raft bootstraps exactly once");
 
-	// Team + API key (the drivers migrated the database).
+	// Team + API key, written through the drivers' cluster KV.
+	let cluster_urls = ["d1", "d2", "d3"]
+		.iter()
+		.map(|d| format!("http://127.0.0.1:{}", c.get(d).cluster))
+		.collect::<Vec<_>>()
+		.join(",");
 	let out = Command::new(env!("CARGO_BIN_EXE_vmon"))
-		.args(["admin", "--mysql-url", &format!("{mysql}/{db}"), "--cluster-secret", SECRET])
+		.args(["admin", "--cluster-url", &cluster_urls, "--cluster-secret", SECRET])
 		.args(["create-team", "cluster-e2e"])
 		.output()
 		.unwrap();
@@ -613,7 +589,7 @@ async fn build_template(c: &Cluster) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_topology_survives_driver_and_node_failures() {
 	if !enabled() {
-		eprintln!("skipping: set VMON_CLUSTER_E2E=1 on a host with KVM/HVF and MySQL");
+		eprintln!("skipping: set VMON_CLUSTER_E2E=1 on a host with KVM/HVF");
 		return;
 	}
 	let mut c = topology("", None).await;
@@ -792,7 +768,7 @@ async fn distributed_topology_survives_driver_and_node_failures() {
 	let s3 = c.create("d2", 600).await;
 	assert_eq!(c.node_of("d2", &s3).await, other, "placement avoids the dead node");
 	eprintln!(
-		"[node-loss] SIGKILL {builder}: {} killed (MySQL + event) after {detected:?}; new sandbox \
+		"[node-loss] SIGKILL {builder}: {} killed (store + event) after {detected:?}; new sandbox \
 		 on {other}",
 		s1.id
 	);
@@ -872,7 +848,7 @@ async fn distributed_topology_survives_driver_and_node_failures() {
 		by_node.insert(n.into(), c.node_inventory(n).await);
 	}
 	eprintln!("[cleanup] node inventories after kill: {by_node:?}");
-	cleanup(c).await;
+	cleanup(c);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -880,7 +856,7 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 	use vmon_node::paused_store::{Remote, Store};
 
 	if !enabled() {
-		eprintln!("skipping: set VMON_CLUSTER_E2E=1 on a host with KVM/HVF and MySQL");
+		eprintln!("skipping: set VMON_CLUSTER_E2E=1 on a host with KVM/HVF");
 		return;
 	}
 	let Ok(url) = std::env::var("VMON_CLUSTER_OBJECT_STORE") else {
@@ -1103,5 +1079,5 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 			.is_some_and(|ids| !ids.contains(&resumed.id))
 	})
 	.await;
-	cleanup(c).await;
+	cleanup(c);
 }

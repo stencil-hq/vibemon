@@ -286,8 +286,7 @@
 
     <div class="side">
       <div class="spacer"></div>
-      <div class="store"><div class="n"><span class="sq"></span>MySQL</div><div class="d">Durable state: teams, keys, templates, builds, paused sandboxes, events.</div></div>
-      <div class="store"><div class="n"><span class="sq"></span>raft KV</div><div class="d">Live state on the drivers: sandbox routes, admission, locks. Nodes forward KV calls.</div></div>
+      <div class="store"><div class="n"><span class="sq"></span>raft KV</div><div class="d">All driver state, replicated across drivers: teams, keys, templates, builds, sandboxes, events, plus routes, admission, locks. Nodes forward KV calls.</div></div>
       <div class="store"><div class="n"><span class="sq"></span>gossip <span class="o">:7946</span></div><div class="d">SWIM memberlist: roles, URLs, capacity. Seeds via <span class="mono">--join</span>.</div></div>
       <div class="store"><div class="n"><span class="sq"></span>object store <span class="o">optional</span></div><div class="d">Templates, paused sandboxes, and volumes portable across nodes.</div></div>
     </div>

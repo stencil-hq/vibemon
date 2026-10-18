@@ -8,9 +8,13 @@ use std::{
 	time::Duration,
 };
 
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+	io::{AsyncReadExt, AsyncWriteExt},
+	net::{TcpListener, TcpStream},
+	task::JoinHandle,
+};
 
-use super::{Compare, KvError, Op, Txn, WatchEvent};
+use super::{Compare, Kv, KvError, Op, Range, Txn, WatchEvent};
 use crate::{Cluster, ClusterConfig, MemberMeta, NodeId, Roles};
 
 const DRIVER: Roles = Roles { node: false, driver: true };
@@ -20,18 +24,20 @@ const WAIT: Duration = Duration::from_secs(30);
 struct Proc {
 	cluster: Cluster,
 	server:  JoinHandle<()>,
+	url:     String,
 }
 
 impl Proc {
 	async fn start(id: u64, dir: &Path, roles: Roles, seeds: &[&Self], expect: usize) -> Self {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
 		let cfg = ClusterConfig {
 			id: NodeId(id),
 			data_dir: dir.join(format!("{id:x}")),
 			roles,
 			gossip_bind: "127.0.0.1:0".parse().unwrap(),
 			gossip_advertise: "127.0.0.1:0".parse().unwrap(),
-			cluster_url: format!("http://{}", listener.local_addr().unwrap()),
+			cluster_url: url.clone(),
 			join: seeds
 				.iter()
 				.map(|p| p.cluster.gossip.local_addr().to_string())
@@ -48,7 +54,7 @@ impl Proc {
 		let server = tokio::spawn(async move {
 			axum::serve(listener, router).await.unwrap();
 		});
-		Self { cluster, server }
+		Self { cluster, server, url }
 	}
 
 	async fn kill(self) {
@@ -409,6 +415,57 @@ async fn kv_three_drivers_bootstrap_add_late_voter_and_survive_leader_loss() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn kv_sync_makes_follower_reads_see_every_acknowledged_write() {
+	let (_tmp, dir) = dir();
+	let a = Proc::start(0x40, &dir, DRIVER, &[], 3).await;
+	let b = Proc::start(0x41, &dir, DRIVER, &[&a], 3).await;
+	let c = Proc::start(0x42, &dir, DRIVER, &[&a], 3).await;
+	let procs = [&a, &b, &c];
+	let leader = leader_of(&procs).await;
+	eventually("every driver applied state", || async {
+		procs.iter().all(|p| p.cluster_id().is_some()).then_some(())
+	})
+	.await;
+	let followers: Vec<&Proc> = procs.iter().copied().filter(|p| p.id() != leader).collect();
+
+	// Write through one driver, read right away on a follower after `sync`.
+	for i in 0..60 {
+		let writer = procs[i % 3];
+		let reader = followers[i % 2];
+		let key = format!("seen/{i:03}");
+		writer.cluster.kv.put(&key, vec![1], None).await.unwrap();
+		reader.cluster.kv.sync().await.unwrap();
+		assert!(reader.cluster.kv.get(&key).await.unwrap().is_some(), "{key} not visible after sync");
+	}
+
+	// Range pages over HTTP from a handle outside the cluster.
+	let outside = Kv::connect(vec![followers[0].url.clone()], b"test-secret").unwrap();
+	outside.put("seen/zzz", vec![2], None).await.unwrap();
+	let page = Range {
+		prefix:  "seen/".into(),
+		after:   Some("seen/057".into()),
+		limit:   Some(2),
+		reverse: false,
+	};
+	let keys: Vec<String> = outside
+		.range(&page)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|e| e.key)
+		.collect();
+	assert_eq!(keys, ["seen/058", "seen/059"]);
+	let last = Range { limit: Some(1), reverse: true, after: None, ..page };
+	assert_eq!(outside.range(&last).await.unwrap()[0].key, "seen/zzz");
+	let wrong = Kv::connect(vec![followers[0].url.clone()], b"wrong").unwrap();
+	assert!(matches!(wrong.get("seen/000").await, Err(KvError::Rejected(_))));
+
+	for p in [a, b, c] {
+		p.kill().await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn kv_restarted_former_leader_never_claims_leadership_while_another_leads() {
 	let (_tmp, dir) = dir();
 	let a = Proc::start(0x40, &dir, DRIVER, &[], 3).await;
@@ -476,4 +533,50 @@ async fn kv_restarted_former_leader_never_claims_leadership_while_another_leads(
 	for p in all {
 		p.kill().await;
 	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_resp_requires_auth_and_maps_set_get_del_exists_onto_the_kv() {
+	let (_tmp, dir) = dir();
+	let a = Proc::start(0x50, &dir, DRIVER, &[], 1).await;
+	leader_of(&[&a]).await;
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let cluster = a.cluster.clone();
+	let server =
+		tokio::spawn(async move { cluster.serve_resp(listener, std::future::pending()).await });
+
+	// One pipelined write; QUIT closes the connection after the last reply.
+	let requests: [(&[u8], &str); 17] = [
+		(b"GET k\r\n", "-NOAUTH Authentication required.\r\n"),
+		(b"AUTH wrong\r\n", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"),
+		(b"AUTH default test-secret\r\n", "+OK\r\n"),
+		(b"*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nv 1\r\n\r\n$2\r\nNX\r\n", "+OK\r\n"),
+		(b"SET k w NX\r\n", "$-1\r\n"),
+		(b"SET missing x XX\r\n", "$-1\r\n"),
+		(b"GET k\r\n", "$5\r\nv 1\r\n\r\n"),
+		(b"SET k w XX\r\n", "+OK\r\n"),
+		(b"GET k\r\n", "$1\r\nw\r\n"),
+		// A malformed key fails the whole DEL before any key is deleted.
+		(b"*3\r\n$3\r\nDEL\r\n$1\r\nk\r\n$1\r\n\xff\r\n", "-ERR key is not valid UTF-8\r\n"),
+		(b"GET k\r\n", "$1\r\nw\r\n"),
+		(b"SET lease l PX 60000\r\n", "+OK\r\n"),
+		(b"EXISTS k missing k\r\n", ":2\r\n"),
+		(b"DEL k missing\r\n", ":1\r\n"),
+		(b"GET k\r\n", "$-1\r\n"),
+		(b"SET k\r\n", "-ERR wrong number of arguments for 'set' command\r\n"),
+		(b"QUIT\r\n", "+OK\r\n"),
+	];
+	let mut stream = TcpStream::connect(addr).await.unwrap();
+	let pipeline: Vec<u8> = requests.iter().flat_map(|(request, _)| *request).copied().collect();
+	stream.write_all(&pipeline).await.unwrap();
+	let mut replies = String::new();
+	stream.read_to_string(&mut replies).await.unwrap();
+	let expected: String = requests.iter().map(|(_, reply)| *reply).collect();
+	assert_eq!(replies, expected);
+
+	let lease = a.cluster.kv.get_consistent("lease").await.unwrap().unwrap();
+	assert!(lease.expires_at_ms.is_some(), "PX sets a TTL");
+	server.abort();
+	a.kill().await;
 }

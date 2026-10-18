@@ -206,9 +206,9 @@ pub async fn team_for_api_key(state: &AppState, key: &str) -> Result<Team, ApiEr
 	};
 	state.auth_cache.put(hash, team.clone());
 	if state.auth_cache.claim_stamp(&key_id) {
-		let state = state.clone();
+		let (state, team_id) = (state.clone(), team.id.clone());
 		tokio::spawn(async move {
-			if let Err(error) = state.store.touch_api_key(&key_id).await {
+			if let Err(error) = state.store.touch_api_key(&team_id, &key_id).await {
 				tracing::debug!(%error, "updating api key last_used_at failed");
 			}
 			state.auth_cache.stamp_done(&key_id);

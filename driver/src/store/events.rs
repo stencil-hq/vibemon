@@ -1,12 +1,30 @@
-//! `sandbox_events`: the sandbox lifecycle event log (events API, webhooks,
-//! team metrics). Written by the sandbox lifecycle via
-//! [`Store::record_event`].
+//! Sandbox lifecycle event log (events API, webhooks, team metrics). Written
+//! by the sandbox lifecycle through [`Store::record_event`] or, together with
+//! a state change, by the transitions in [`super::sandboxes`].
+//!
+//! Keys (every one written with [`HISTORY_TTL`] in the event's commit):
+//! - `db/event/<stamp>` → [`SandboxEventRow`] (JSON; `seq` is not stored): the
+//!   log in global commit order. `<stamp>` is the commit revision
+//!   ([`vmon_cluster::kv::stamp`]) and is the event's `seq`.
+//! - `db/event.team/<team>/<stamp>` → `{type, ts}`: the team's events in commit
+//!   order (events API, webhook cursor, metrics timeline).
+//! - `db/event.sandbox/<team>/<sandbox>/<stamp>` → `{type, ts}`: one sandbox's
+//!   events (events API with a sandbox filter).
+//!
+//! The index values carry the event type and time so type filters and the
+//! metrics timeline never load records they discard; only returned events
+//! read their `db/event/<stamp>` record. A commit stages at most one event
+//! (all stamped keys of a commit share its stamp). No guards: events are
+//! append-only.
+
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{FromRow, MySql, QueryBuilder, types::Json};
+use vmon_cluster::kv::{Range, stamp};
 
-use super::{Store, retry_deadlocks};
+use super::{Error, HISTORY_TTL, Read, Result, Store, Tx, last_segment, prefix};
 
 /// Event type names (`SandboxEvent.type`, webhook subscriptions).
 pub mod event_types {
@@ -28,8 +46,23 @@ pub mod event_types {
 
 /// Version stamped into every serialized event.
 pub const EVENT_VERSION: &str = "v2";
-/// Retention advertised in webhook payloads.
-pub const EVENTS_TTL_DAYS: u32 = 30;
+/// Retention advertised in webhook payloads: events expire after
+/// [`HISTORY_TTL`].
+#[expect(clippy::cast_possible_truncation, reason = "asserted at compile time to fit in u32")]
+pub const EVENTS_TTL_DAYS: u32 = {
+	let days = HISTORY_TTL.as_secs() / DAY.as_secs();
+	assert!(days * DAY.as_secs() == HISTORY_TTL.as_secs(), "HISTORY_TTL is whole days");
+	assert!(days < 1 << 32, "HISTORY_TTL in days fits in u32");
+	days as u32
+};
+const DAY: Duration = Duration::from_hours(24);
+
+/// Primary records, in commit order.
+const EVENTS: &str = "db/event";
+/// Per-team index.
+const BY_TEAM: &str = "db/event.team";
+/// Per-(team, sandbox) index.
+const BY_SANDBOX: &str = "db/event.sandbox";
 
 /// Insert payload for [`Store::record_event`].
 #[derive(Clone, Debug)]
@@ -48,10 +81,12 @@ pub struct NewSandboxEvent<'a> {
 	pub data:         Value,
 }
 
-/// A stored event.
-#[derive(Clone, Debug, FromRow)]
+/// A stored event (`db/event/<stamp>`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxEventRow {
-	/// Monotonic insertion sequence (webhook cursor).
+	/// Commit revision stamped into the event's key: monotonic in commit
+	/// order (webhook cursor). Not stored in the record.
+	#[serde(skip)]
 	pub seq:          u64,
 	pub id:           String,
 	pub team_id:      String,
@@ -59,10 +94,20 @@ pub struct SandboxEventRow {
 	pub execution_id: String,
 	pub template_id:  String,
 	pub build_id:     String,
-	#[sqlx(rename = "type")]
+	#[serde(rename = "type")]
 	pub event_type:   String,
 	pub ts:           DateTime<Utc>,
-	pub data:         Option<Json<Value>>,
+	#[serde(default)]
+	pub data:         Option<Value>,
+}
+
+/// Value of the index keys; also decodes the type and time of a full
+/// [`SandboxEventRow`] record (same field names).
+#[derive(Debug, Serialize, Deserialize)]
+struct EventRef {
+	#[serde(rename = "type")]
+	event_type: String,
+	ts:         DateTime<Utc>,
 }
 
 /// Filters of the events API.
@@ -104,7 +149,7 @@ impl SandboxEventRow {
 			"type": self.event_type,
 			"eventCategory": "lifecycle",
 			"eventLabel": event_label(&self.event_type),
-			"eventData": self.data.as_ref().map(|d| &d.0),
+			"eventData": self.data,
 			"timestamp": rfc3339(self.ts),
 			"sandboxId": self.sandbox_id,
 			"sandboxExecutionId": self.execution_id,
@@ -123,7 +168,7 @@ impl SandboxEventRow {
 			"timestamp": rfc3339(self.ts),
 			"event_category": "lifecycle",
 			"event_label": event_label(&self.event_type),
-			"event_data": self.data.as_ref().map(|d| &d.0),
+			"event_data": self.data,
 			"sandbox_id": self.sandbox_id,
 			"sandbox_execution_id": self.execution_id,
 			"sandbox_template_id": self.template_id,
@@ -134,82 +179,116 @@ impl SandboxEventRow {
 	}
 }
 
-const EVENT_COLUMNS: &str =
-	"seq, id, team_id, sandbox_id, execution_id, template_id, build_id, type, ts, data";
-
-/// Inserts one event on `executor` (the pool, or a transaction so a sandbox
-/// state change and its event commit together) and returns the event id.
-pub(super) async fn insert_event<'e, E>(
-	executor: E,
-	event: &NewSandboxEvent<'_>,
-) -> sqlx::Result<String>
-where
-	E: sqlx::Executor<'e, Database = MySql>,
-{
+/// Stages `event` (record and both index keys) into `tx` and returns its id.
+/// The event commits iff the transaction does; a transaction stages at most
+/// one event.
+pub(super) fn stage_event(tx: &mut Tx<'_>, event: &NewSandboxEvent<'_>) -> String {
 	let id = uuid::Uuid::new_v4().to_string();
-	sqlx::query(
-		"INSERT INTO sandbox_events (id, team_id, sandbox_id, execution_id, template_id, build_id, \
-		 type, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-	)
-	.bind(&id)
-	.bind(event.team_id)
-	.bind(event.sandbox_id)
-	.bind(event.execution_id)
-	.bind(event.template_id)
-	.bind(event.build_id)
-	.bind(event.event_type)
-	.bind(Json(&event.data))
-	.execute(executor)
-	.await?;
-	Ok(id)
+	let ts = super::now();
+	let row = SandboxEventRow {
+		seq: 0,
+		id: id.clone(),
+		team_id: event.team_id.to_owned(),
+		sandbox_id: event.sandbox_id.to_owned(),
+		execution_id: event.execution_id.to_owned(),
+		template_id: event.template_id.to_owned(),
+		build_id: event.build_id.to_owned(),
+		event_type: event.event_type.to_owned(),
+		ts,
+		data: Some(event.data.clone()),
+	};
+	let index = EventRef { event_type: event.event_type.to_owned(), ts };
+	let ttl = Some(HISTORY_TTL);
+	tx.put_stamped(prefix(EVENTS, &[]), "", &row, ttl);
+	tx.put_stamped(prefix(BY_TEAM, &[event.team_id]), "", &index, ttl);
+	tx.put_stamped(prefix(BY_SANDBOX, &[event.team_id, event.sandbox_id]), "", &index, ttl);
+	id
 }
 
-fn push_types(builder: &mut QueryBuilder<MySql>, types: &[String]) {
-	if types.is_empty() {
-		return;
+/// `seq` of the event at a stamped key (its last segment).
+fn seq_of(key: &str) -> Result<u64> {
+	last_segment(key)
+		.parse()
+		.map_err(|error: std::num::ParseIntError| Error::Corrupt {
+			key:   key.to_owned(),
+			error: error.to_string(),
+		})
+}
+
+/// Loads the records of `seqs` in order, skipping expired ones.
+async fn load(r: &Read<'_>, seqs: Vec<u64>) -> Result<Vec<SandboxEventRow>> {
+	let mut rows = Vec::with_capacity(seqs.len());
+	for seq in seqs {
+		let key = format!("{}{}", prefix(EVENTS, &[]), stamp(seq));
+		if let Some(mut row) = r.get::<SandboxEventRow>(&key).await? {
+			row.seq = seq;
+			rows.push(row);
+		}
 	}
-	builder.push(" AND type IN (");
-	let mut separated = builder.separated(", ");
-	for ty in types {
-		separated.push_bind(ty.clone());
-	}
-	separated.push_unseparated(")");
+	Ok(rows)
+}
+
+/// Whether `event_type` passes a type filter (empty = all).
+fn wanted(types: &[String], event_type: &str) -> bool {
+	types.is_empty() || types.iter().any(|t| t == event_type)
 }
 
 impl Store {
 	/// Appends an event and returns its id. Webhook delivery picks it up on
 	/// its next poll.
-	pub async fn record_event(&self, event: &NewSandboxEvent<'_>) -> sqlx::Result<String> {
-		retry_deadlocks(|| insert_event(self.pool(), event)).await
+	pub async fn record_event(&self, event: &NewSandboxEvent<'_>) -> Result<String> {
+		let mut tx = self.tx().await?;
+		loop {
+			let id = stage_event(&mut tx, event);
+			if tx.commit().await? {
+				return Ok(id);
+			}
+		}
 	}
 
-	/// Events API page (offset pagination, newest first unless `order_asc`).
+	/// Events API page (offset pagination, newest first unless `order_asc`;
+	/// commit order).
 	pub async fn list_events(
 		&self,
 		team_id: &str,
 		query: &EventQuery,
-	) -> sqlx::Result<Vec<SandboxEventRow>> {
-		let mut builder = QueryBuilder::<MySql>::new(format!(
-			"SELECT {EVENT_COLUMNS} FROM sandbox_events WHERE team_id = "
-		));
-		builder.push_bind(team_id.to_owned());
-		if let Some(sandbox_id) = &query.sandbox_id {
-			builder
-				.push(" AND sandbox_id = ")
-				.push_bind(sandbox_id.clone());
+	) -> Result<Vec<SandboxEventRow>> {
+		if query.limit == 0 {
+			return Ok(Vec::new());
 		}
-		push_types(&mut builder, &query.types);
-		builder.push(if query.order_asc {
-			" ORDER BY ts ASC, seq ASC"
-		} else {
-			" ORDER BY ts DESC, seq DESC"
-		});
-		builder
-			.push(" LIMIT ")
-			.push_bind(query.limit)
-			.push(" OFFSET ")
-			.push_bind(query.offset);
-		builder.build_query_as().fetch_all(self.pool()).await
+		let index = match &query.sandbox_id {
+			Some(sandbox_id) => prefix(BY_SANDBOX, &[team_id, sandbox_id]),
+			None => prefix(BY_TEAM, &[team_id]),
+		};
+		let range = Range { prefix: index, reverse: !query.order_asc, ..Range::default() };
+		let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
+		let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
+		let r = self.read().await?;
+		let mut skipped = 0;
+		let mut seqs = Vec::new();
+		let mut corrupt = None;
+		r.scan_all::<EventRef>(&range, |key, event| {
+			if !wanted(&query.types, &event.event_type) {
+				return true;
+			}
+			if skipped < offset {
+				skipped += 1;
+				return true;
+			}
+			match seq_of(&key) {
+				Ok(seq) => seqs.push(seq),
+				Err(error) => {
+					corrupt = Some(error);
+					return false;
+				},
+			}
+			seqs.len() < limit
+		})
+		.await?;
+		if let Some(error) = corrupt {
+			return Err(error);
+		}
+		load(&r, seqs).await
 	}
 
 	/// Events of a team with `seq > after_seq` (oldest first) restricted to
@@ -220,82 +299,108 @@ impl Store {
 		after_seq: u64,
 		types: &[String],
 		limit: u32,
-	) -> sqlx::Result<Vec<SandboxEventRow>> {
-		let mut builder = QueryBuilder::<MySql>::new(format!(
-			"SELECT {EVENT_COLUMNS} FROM sandbox_events WHERE team_id = "
-		));
-		builder
-			.push_bind(team_id.to_owned())
-			.push(" AND seq > ")
-			.push_bind(after_seq);
-		push_types(&mut builder, types);
-		builder.push(" ORDER BY seq ASC LIMIT ").push_bind(limit);
-		builder.build_query_as().fetch_all(self.pool()).await
+	) -> Result<Vec<SandboxEventRow>> {
+		if limit == 0 {
+			return Ok(Vec::new());
+		}
+		let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+		let index = prefix(BY_TEAM, &[team_id]);
+		let range = Range {
+			after: Some(format!("{index}{}", stamp(after_seq))),
+			prefix: index,
+			..Range::default()
+		};
+		let r = self.read().await?;
+		let mut seqs = Vec::new();
+		let mut corrupt = None;
+		r.scan_all::<EventRef>(&range, |key, event| {
+			if !wanted(types, &event.event_type) {
+				return true;
+			}
+			match seq_of(&key) {
+				Ok(seq) => seqs.push(seq),
+				Err(error) => {
+					corrupt = Some(error);
+					return false;
+				},
+			}
+			seqs.len() < limit
+		})
+		.await?;
+		if let Some(error) = corrupt {
+			return Err(error);
+		}
+		load(&r, seqs).await
 	}
 
-	/// Highest event sequence number so far (0 when empty).
-	pub async fn max_event_seq(&self) -> sqlx::Result<u64> {
-		let max: Option<u64> = sqlx::query_scalar("SELECT MAX(seq) FROM sandbox_events")
-			.fetch_one(self.pool())
-			.await?;
-		Ok(max.unwrap_or(0))
+	/// Highest retained event sequence number (0 when none).
+	pub async fn max_event_seq(&self) -> Result<u64> {
+		let range =
+			Range { prefix: prefix(EVENTS, &[]), limit: Some(1), reverse: true, ..Range::default() };
+		let last = self.read().await?.scan::<EventRef>(&range).await?;
+		last.first().map_or(Ok(0), |(key, _)| seq_of(key))
 	}
 
 	/// Cluster-wide start events (created + resumed) with `seq > after_seq`,
-	/// and the highest `seq` of any type (`after_seq` when none); one PK range
-	/// scan, used as the fleet sampler's cursor.
-	pub async fn start_events_after(&self, after_seq: u64) -> sqlx::Result<(u64, u64)> {
-		let (starts, max): (i64, Option<u64>) = sqlx::query_as(
-			"SELECT COUNT(CASE WHEN type IN (?, ?) THEN 1 END), MAX(seq) FROM sandbox_events WHERE \
-			 seq > ?",
-		)
-		.bind(event_types::CREATED)
-		.bind(event_types::RESUMED)
-		.bind(after_seq)
-		.fetch_one(self.pool())
-		.await?;
-		Ok((u64::try_from(starts).unwrap_or_default(), max.unwrap_or(after_seq)))
+	/// and the highest `seq` of any type (`after_seq` when none); one ordered
+	/// scan of the log, used as the fleet sampler's cursor.
+	pub async fn start_events_after(&self, after_seq: u64) -> Result<(u64, u64)> {
+		let events = prefix(EVENTS, &[]);
+		let range = Range {
+			after: Some(format!("{events}{}", stamp(after_seq))),
+			prefix: events,
+			..Range::default()
+		};
+		let mut starts = 0;
+		let mut last = None;
+		self
+			.read()
+			.await?
+			.scan_all::<EventRef>(&range, |key, event| {
+				starts += u64::from(is_start(&event.event_type));
+				last = Some(key);
+				true
+			})
+			.await?;
+		let max = last.as_deref().map_or(Ok(after_seq), seq_of)?;
+		Ok((starts, max))
 	}
 
 	/// `(ts, type)` of a team's start/stop events in `[start, end]`, oldest
-	/// first, plus the net running count before `start` (team metrics).
+	/// first, plus the net running count before `start` over the retained
+	/// events, clamped at 0 (team metrics).
 	pub async fn lifecycle_timeline(
 		&self,
 		team_id: &str,
 		start: DateTime<Utc>,
 		end: DateTime<Utc>,
-	) -> sqlx::Result<(i64, Vec<(DateTime<Utc>, String)>)> {
-		let counts: Vec<(String, i64)> = sqlx::query_as(
-			"SELECT type, COUNT(*) FROM sandbox_events WHERE team_id = ? AND ts < ? AND type IN (?, \
-			 ?, ?, ?) GROUP BY type",
-		)
-		.bind(team_id)
-		.bind(start)
-		.bind(event_types::CREATED)
-		.bind(event_types::RESUMED)
-		.bind(event_types::PAUSED)
-		.bind(event_types::KILLED)
-		.fetch_all(self.pool())
-		.await?;
-		let baseline = counts
-			.iter()
-			.map(|(ty, n)| if is_start(ty) { *n } else { -n })
-			.sum::<i64>()
-			.max(0);
-		let events = sqlx::query_as(
-			"SELECT ts, type FROM sandbox_events WHERE team_id = ? AND ts >= ? AND ts <= ? AND type \
-			 IN (?, ?, ?, ?) ORDER BY ts, seq",
-		)
-		.bind(team_id)
-		.bind(start)
-		.bind(end)
-		.bind(event_types::CREATED)
-		.bind(event_types::RESUMED)
-		.bind(event_types::PAUSED)
-		.bind(event_types::KILLED)
-		.fetch_all(self.pool())
-		.await?;
-		Ok((baseline, events))
+	) -> Result<(i64, Vec<(DateTime<Utc>, String)>)> {
+		let range = Range { prefix: prefix(BY_TEAM, &[team_id]), ..Range::default() };
+		let mut baseline = 0i64;
+		let mut events = Vec::new();
+		self
+			.read()
+			.await?
+			.scan_all::<EventRef>(&range, |key, event| {
+				let delta = if is_start(&event.event_type) {
+					1
+				} else if is_stop(&event.event_type) {
+					-1
+				} else {
+					return true;
+				};
+				if event.ts < start {
+					baseline += delta;
+				} else if event.ts <= end {
+					events.push((event.ts, key, event.event_type));
+				}
+				true
+			})
+			.await?;
+		// Index keys are in commit order; timestamps are minted just before
+		// the commit, so order by time with the commit as tie-breaker.
+		events.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+		Ok((baseline.max(0), events.into_iter().map(|(ts, _, ty)| (ts, ty)).collect()))
 	}
 }
 
@@ -311,48 +416,128 @@ pub fn is_stop(event_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-	//! Gated on `VMON_MYSQL_TEST_URL` (see [`crate::store::testdb`]).
-
 	use super::*;
-	use crate::store::testdb::TestDb;
+	use crate::store::testing::TestStore;
+
+	const TEAM: &str = "00000000-0000-4000-8000-0000000000aa";
+
+	fn new_event<'a>(sandbox_id: &'a str, event_type: &'static str) -> NewSandboxEvent<'a> {
+		NewSandboxEvent {
+			team_id: TEAM,
+			sandbox_id,
+			execution_id: "00000000-0000-4000-8000-000000000001",
+			template_id: "tpl00000000000000000",
+			build_id: "00000000-0000-4000-8000-000000000000",
+			event_type,
+			data: json!({"n": 1}),
+		}
+	}
 
 	async fn record(store: &Store, event_type: &'static str) {
 		store
-			.record_event(&NewSandboxEvent {
-				team_id: "00000000-0000-4000-8000-0000000000aa",
-				sandbox_id: "icursor",
-				execution_id: "00000000-0000-4000-8000-000000000001",
-				template_id: "tpl00000000000000000",
-				build_id: "00000000-0000-4000-8000-000000000000",
-				event_type,
-				data: json!({}),
-			})
+			.record_event(&new_event("icursor", event_type))
 			.await
 			.unwrap();
 	}
 
 	#[tokio::test]
 	async fn start_cursor_counts_creates_and_resumes_and_advances_past_other_types() {
-		let Some(db) = TestDb::create().await else {
-			return;
-		};
-		let store = db.store.clone();
+		let db = TestStore::start().await;
+		let store = &db.store;
 		let start = store.max_event_seq().await.unwrap();
 		assert_eq!(store.start_events_after(start).await.unwrap(), (0, start));
 
 		for ty in
 			[event_types::CREATED, event_types::PAUSED, event_types::RESUMED, event_types::KILLED]
 		{
-			record(&store, ty).await;
+			record(store, ty).await;
 		}
 		let max = store.max_event_seq().await.unwrap();
 		assert_eq!(store.start_events_after(start).await.unwrap(), (2, max));
 		assert_eq!(store.start_events_after(max).await.unwrap(), (0, max));
 
-		record(&store, event_types::UPDATED).await;
+		record(store, event_types::UPDATED).await;
 		let (starts, next) = store.start_events_after(max).await.unwrap();
 		assert_eq!(starts, 0);
 		assert!(next > max, "non-start events still advance the cursor");
-		db.drop_db().await;
+		db.finish().await;
+	}
+
+	#[tokio::test]
+	async fn listings_filter_paginate_and_follow_the_cursor() {
+		let db = TestStore::start().await;
+		let store = &db.store;
+		let types = [event_types::CREATED, event_types::PAUSED, event_types::RESUMED];
+		for ty in types {
+			store.record_event(&new_event("ia", ty)).await.unwrap();
+			store.record_event(&new_event("ib", ty)).await.unwrap();
+		}
+		store
+			.record_event(&NewSandboxEvent {
+				team_id: "other",
+				..new_event("ia", event_types::KILLED)
+			})
+			.await
+			.unwrap();
+
+		let all = EventQuery { limit: 100, ..EventQuery::default() };
+		let newest_first = store.list_events(TEAM, &all).await.unwrap();
+		assert_eq!(newest_first.len(), 6, "other teams' events are not listed");
+		assert!(newest_first.windows(2).all(|w| w[0].seq > w[1].seq));
+		assert_eq!(newest_first[0].data, Some(json!({"n": 1})));
+
+		let query = EventQuery {
+			sandbox_id: Some("ia".into()),
+			types:      vec![event_types::PAUSED.into(), event_types::RESUMED.into()],
+			offset:     1,
+			limit:      10,
+			order_asc:  true,
+		};
+		let page = store.list_events(TEAM, &query).await.unwrap();
+		assert_eq!(page.len(), 1);
+		assert_eq!(
+			(page[0].sandbox_id.as_str(), page[0].event_type.as_str()),
+			("ia", event_types::RESUMED)
+		);
+
+		let first = newest_first.last().unwrap().seq;
+		let after = store
+			.events_after(TEAM, first, &[event_types::CREATED.into()], 10)
+			.await
+			.unwrap();
+		assert_eq!(
+			after
+				.iter()
+				.map(|e| e.sandbox_id.as_str())
+				.collect::<Vec<_>>(),
+			["ib"]
+		);
+		let limited = store.events_after(TEAM, 0, &[], 2).await.unwrap();
+		assert_eq!(limited.iter().map(|e| e.seq).collect::<Vec<_>>(), [
+			newest_first[5].seq,
+			newest_first[4].seq
+		]);
+		db.finish().await;
+	}
+
+	#[tokio::test]
+	async fn timeline_counts_the_baseline_and_lists_the_window() {
+		let db = TestStore::start().await;
+		let store = &db.store;
+		record(store, event_types::CREATED).await;
+		record(store, event_types::CREATED).await;
+		record(store, event_types::PAUSED).await;
+		tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		let start = Utc::now();
+		tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		record(store, event_types::UPDATED).await;
+		record(store, event_types::KILLED).await;
+		let (baseline, events) = store
+			.lifecycle_timeline(TEAM, start, Utc::now())
+			.await
+			.unwrap();
+		assert_eq!(baseline, 1);
+		assert_eq!(events.into_iter().map(|(_, ty)| ty).collect::<Vec<_>>(), [event_types::KILLED]);
+		db.finish().await;
 	}
 }

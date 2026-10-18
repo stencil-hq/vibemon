@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 
 use super::{
-	Entry, KvError, Txn, TxnResult, WatchEvent,
+	Entry, KvError, Range, Txn, TxnResult, WatchEvent,
 	http::{CallError, GetRequest, Hop, KvClient, ListRequest},
 	log_store::LogStore,
 	machine::Command,
@@ -177,14 +177,58 @@ impl RaftKv {
 		self.sm.list(prefix)
 	}
 
+	pub fn range_local(&self, range: &Range) -> Vec<Entry> {
+		self.sm.range(range)
+	}
+
 	pub fn watch(&self, prefix: &str) -> mpsc::Receiver<WatchEvent> {
 		self.sm.watch(prefix)
 	}
 
-	/// Follower read served to a remote client; a driver without state asks the
-	/// leader.
+	/// Read barrier ([`super::Kv::sync`]): free on a confirmed leader; a
+	/// follower fetches the leader's applied revision and waits to apply it.
+	pub async fn sync(&self) -> Result<(), KvError> {
+		if self.is_leader() {
+			return Ok(());
+		}
+		let revision = self.leader_revision(false).await?;
+		self.sm.wait_revision(revision, LEADER_WAIT).await
+	}
+
+	/// Applied revision of the confirmed leader, forwarded there when this node
+	/// is a follower. Every write the leader acknowledged is applied at it.
+	pub async fn leader_revision(&self, forwarded: bool) -> Result<u64, KvError> {
+		let hop = if forwarded {
+			Hop::Forwarded
+		} else {
+			Hop::Entry
+		};
+		self
+			.via_leader("sync", &(), hop, || async {
+				if self.is_leader() {
+					return Attempt::Done(Ok(self.sm.revision()));
+				}
+				let metrics = self.raft.metrics().borrow().clone();
+				match metrics.current_leader.filter(|leader| *leader != self.id) {
+					Some(leader) => Attempt::Forward(
+						metrics
+							.membership_config
+							.membership()
+							.get_node(&leader)
+							.map(|peer| peer.cluster_url.clone()),
+					),
+					// Leadership not confirmed yet (election, fresh term).
+					None => Attempt::Retry,
+				}
+			})
+			.await
+	}
+
+	/// Follower read served to a remote client (after a read barrier); a driver
+	/// without state asks the leader.
 	pub async fn get_served(&self, key: &str) -> Result<Option<Entry>, KvError> {
 		if self.has_state() {
+			self.sync().await?;
 			return Ok(self.get_local(key));
 		}
 		let req = GetRequest { key: key.to_owned(), consistent: false };
@@ -197,11 +241,24 @@ impl RaftKv {
 	/// leader.
 	pub async fn list_served(&self, prefix: &str) -> Result<Vec<Entry>, KvError> {
 		if self.has_state() {
+			self.sync().await?;
 			return Ok(self.list_local(prefix));
 		}
 		let req = ListRequest { prefix: prefix.to_owned() };
 		self
 			.via_leader("list", &req, Hop::Entry, || async { Attempt::Forward(None) })
+			.await
+	}
+
+	/// Range read served to a remote client (after a read barrier); a driver
+	/// without state asks the leader.
+	pub async fn range_served(&self, range: &Range) -> Result<Vec<Entry>, KvError> {
+		if self.has_state() {
+			self.sync().await?;
+			return Ok(self.range_local(range));
+		}
+		self
+			.via_leader("range", range, Hop::Entry, || async { Attempt::Forward(None) })
 			.await
 	}
 

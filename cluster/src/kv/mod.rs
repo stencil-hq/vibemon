@@ -2,20 +2,26 @@
 //!
 //! Drivers run a raft voter ([`raft`]) whose state machine ([`machine`]) is an
 //! ordered map with revisions and deterministic TTLs. Node-only processes get a
-//! [`Kv`] that forwards every call to a live driver found through gossip.
+//! [`Kv`] that forwards every call to a live driver found through gossip;
+//! [`Kv::connect`] gives tools outside the cluster (`vmon admin`) the same
+//! forwarding handle over fixed driver URLs.
 
+#[cfg(test)]
+mod compat_tests;
 mod http;
 mod log_store;
 mod machine;
 mod membership;
 mod network;
 mod raft;
+mod resp;
 mod state_machine;
 #[cfg(test)]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -24,6 +30,7 @@ pub(crate) use self::{
 	http::{KvClient, routes},
 	membership::Reconciler,
 	raft::RaftKv,
+	resp::serve_resp,
 };
 use crate::{gossip::Gossip, meta::NodeId};
 
@@ -76,6 +83,39 @@ pub enum Op {
 	Delete { key: String },
 	/// Removes every key starting with `prefix`.
 	DeletePrefix { prefix: String },
+	/// Writes `{prefix}{stamp}{suffix}`, where `stamp` is [`stamp`] of the
+	/// revision this transaction commits at (a versionstamped key): keys
+	/// written this way sort in commit order, and every stamped op of one
+	/// transaction shares the stamp.
+	PutStamped {
+		prefix: String,
+		suffix: String,
+		#[serde(with = "hex_bytes")]
+		value:  Vec<u8>,
+		ttl_ms: Option<u64>,
+	},
+}
+
+/// Key fragment [`Op::PutStamped`] substitutes for `revision`: zero-padded so
+/// that stamped keys sort numerically.
+pub fn stamp(revision: u64) -> String {
+	format!("{revision:020}")
+}
+
+/// Ordered prefix scan for [`Kv::range`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Range {
+	/// Only keys starting with this prefix.
+	pub prefix:  String,
+	/// Resume strictly after this key (strictly before it when `reverse`).
+	#[serde(default)]
+	pub after:   Option<String>,
+	/// At most this many entries; `None` returns every match.
+	#[serde(default)]
+	pub limit:   Option<usize>,
+	/// Descending key order.
+	#[serde(default)]
+	pub reverse: bool,
 }
 
 /// Compare-and-swap transaction: `success` runs iff every compare holds, else
@@ -149,7 +189,8 @@ impl Kv {
 		client: KvClient,
 		local: Option<Arc<RaftKv>>,
 	) -> Self {
-		Self { inner: Arc::new(KvInner { local, remote: Remote { self_id, gossip, client } }) }
+		let remote = Remote { drivers: Drivers::Gossip { self_id, gossip }, client };
+		Self { inner: Arc::new(KvInner { local, remote }) }
 	}
 
 	/// Driver-side raft handle, if this process runs raft.
@@ -180,6 +221,34 @@ impl Kv {
 		match self.ready_local() {
 			Some(local) => Ok(local.list_local(prefix)),
 			None => self.inner.remote.list(prefix).await,
+		}
+	}
+
+	/// Live entries matching `range`, in its order (local applied state).
+	pub async fn range(&self, range: &Range) -> Result<Vec<Entry>, KvError> {
+		match self.ready_local() {
+			Some(local) => Ok(local.range_local(range)),
+			None => self.inner.remote.range(range).await,
+		}
+	}
+
+	/// Read barrier: once it returns, reads through this handle observe every
+	/// write acknowledged before the call.
+	///
+	/// A confirmed leader returns at once; a follower asks the leader for its
+	/// applied revision and waits until local state has applied it. Handles
+	/// without local state need no barrier: drivers serve their remote reads
+	/// after one of their own.
+	///
+	/// # Errors
+	///
+	/// [`KvError::NoLeader`] when no leader confirmed its revision within the
+	/// leader wait, [`KvError::Unavailable`] when local state did not catch up
+	/// in that time.
+	pub async fn sync(&self) -> Result<(), KvError> {
+		match self.ready_local() {
+			Some(local) => local.sync().await,
+			None => Ok(()),
 		}
 	}
 
@@ -231,13 +300,49 @@ impl Kv {
 	fn ready_local(&self) -> Option<&Arc<RaftKv>> {
 		self.inner.local.as_ref().filter(|local| local.has_state())
 	}
+
+	/// Handle for a process outside the cluster (`vmon admin`): every call goes
+	/// to the first reachable of `drivers` (cluster URLs serving
+	/// `/cluster/v1/kv/*`), authenticated with the cluster `secret`.
+	///
+	/// # Errors
+	///
+	/// Fails when `drivers` is empty, the secret is empty or not a valid header
+	/// value, or the HTTP client cannot be built.
+	pub fn connect(drivers: Vec<String>, secret: &[u8]) -> anyhow::Result<Self> {
+		anyhow::ensure!(!drivers.is_empty(), "no driver URL given");
+		anyhow::ensure!(!secret.is_empty(), "cluster secret must not be empty");
+		let http = reqwest::Client::builder()
+			.connect_timeout(Duration::from_secs(2))
+			.build()
+			.context("building cluster http client")?;
+		let client = KvClient::new(http, Arc::new(crate::bearer(secret)?));
+		let remote = Remote { drivers: Drivers::Fixed(drivers), client };
+		Ok(Self { inner: Arc::new(KvInner { local: None, remote }) })
+	}
 }
 
-/// Client side used by node-only processes (and drivers that have not joined
-/// raft yet).
+/// Where a [`Remote`] sends calls.
+enum Drivers {
+	/// Live drivers from gossip (believed leader first), excluding this process.
+	Gossip { self_id: NodeId, gossip: Gossip },
+	/// Fixed URLs, in order ([`Kv::connect`]).
+	Fixed(Vec<String>),
+}
+
+impl Drivers {
+	fn urls(&self) -> Vec<String> {
+		match self {
+			Self::Gossip { self_id, gossip } => membership::driver_urls(gossip, *self_id),
+			Self::Fixed(urls) => urls.clone(),
+		}
+	}
+}
+
+/// Client side used by node-only processes, drivers that have not joined raft
+/// yet, and [`Kv::connect`] handles.
 struct Remote {
-	self_id: NodeId,
-	gossip:  Gossip,
+	drivers: Drivers,
 	client:  KvClient,
 }
 
@@ -254,6 +359,10 @@ impl Remote {
 			.await
 	}
 
+	async fn range(&self, range: &Range) -> Result<Vec<Entry>, KvError> {
+		self.call("range", range).await
+	}
+
 	async fn txn(&self, txn: &Txn) -> Result<TxnResult, KvError> {
 		self.call("txn", txn).await
 	}
@@ -265,9 +374,9 @@ impl Remote {
 		Req: Serialize + Sync,
 		Resp: serde::de::DeserializeOwned,
 	{
-		let drivers = membership::driver_urls(&self.gossip, self.self_id);
+		let drivers = self.drivers.urls();
 		if drivers.is_empty() {
-			return Err(KvError::Unavailable("no live driver in gossip".into()));
+			return Err(KvError::Unavailable("no live driver known".into()));
 		}
 		let mut last = String::new();
 		for url in drivers {

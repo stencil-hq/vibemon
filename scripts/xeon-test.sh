@@ -22,7 +22,6 @@ mode=${1:-all}
 skip_prepare=${VMON_TEST_SKIP_PREPARE:-0}
 tap=${VMON_TEST_TAP:-vmon0}
 host_ip=${VMON_TEST_HOST_IP:-192.168.249.1}
-mysql_url=${VMON_TEST_MYSQL_URL:-mysql://root:vmon@127.0.0.1:13306}
 registry_mirror=${VMON_TEST_REGISTRY_MIRROR:-https://mirror.gcr.io}
 
 case "$mode" in
@@ -38,7 +37,7 @@ if [ "${VMON_TEST_NO_SYNC:-0}" != "1" ]; then
 fi
 
 exec ssh "$host" bash -s -- \
-    "$remote_repo" "$mode" "$skip_prepare" "$tap" "$host_ip" "$mysql_url" \
+    "$remote_repo" "$mode" "$skip_prepare" "$tap" "$host_ip" \
     "$registry_mirror" <<'REMOTE'
 set -euo pipefail
 
@@ -47,8 +46,7 @@ mode=$2
 skip_prepare=$3
 tap=$4
 host_ip=$5
-mysql_url=$6
-registry_mirror=$7
+registry_mirror=$6
 kernel="$repo/target/kernel/bzImage-x86_64"
 
 cd "$repo"
@@ -77,7 +75,6 @@ cluster_e2e() {
     echo '==> distributed failover suite (3 drivers + 2 nodes)'
     VMON_CLUSTER_E2E=1 \
     VMON_E2E=1 \
-    VMON_CLUSTER_MYSQL_URL="$mysql_url" \
     VMON_KERNEL="$kernel" \
     VMON_AGENT="$repo/target/test-assets/vmon-agent-x86_64" \
         cargo test --test cluster -- --test-threads=1
@@ -88,7 +85,6 @@ sdk_e2e() {
     python3 e2e/run.py all \
         --ingress tls \
         --sudo \
-        --mysql-url "$mysql_url" \
         --kernel "$kernel" \
         --agent "$repo/target/test-assets/vmon-agent-x86_64" \
         --serve-arg="--registry-mirror=$registry_mirror"

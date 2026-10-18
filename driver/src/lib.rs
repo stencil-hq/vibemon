@@ -1,7 +1,7 @@
 //! Vibemon driver role: the E2B-compatible control plane (ARCHITECTURE.md §9).
 //!
 //! A driver serves the public E2B REST API and sandbox ingress, keeps durable
-//! state in `MySQL` ([`store`]), coordinates live state through the raft KV of
+//! state ([`store`]) and coordinates live state in the raft KV of
 //! [`vmon_cluster`], and drives nodes through [`vmon_node::client`].
 
 pub mod admin;
@@ -32,16 +32,11 @@ pub struct Driver {
 }
 
 impl Driver {
-	/// Connects to `MySQL`, applies migrations, and starts background work
-	/// (reaper, reconciler, build supervisor, spawn counts, webhook delivery,
-	/// fleet sampler).
-	pub async fn start(
-		config: DriverConfig,
-		mysql_url: &str,
-		cluster: Cluster,
-	) -> anyhow::Result<Self> {
-		let store = store::Store::connect(mysql_url).await?;
-		store.migrate().await?;
+	/// Opens the store on the cluster KV and starts background work (reaper,
+	/// reconciler, build supervisor, spawn counts, webhook delivery, fleet
+	/// sampler). Must run inside a Tokio runtime.
+	pub fn start(config: DriverConfig, cluster: Cluster) -> Self {
+		let store = store::Store::new(cluster.kv.clone());
 		let keys = crypto::Keys::derive(config.cluster_secret.as_bytes());
 		let state = AppState::new(config, store, cluster, keys);
 		lifecycle::spawn_background(state.clone());
@@ -49,7 +44,7 @@ impl Driver {
 		builds::spawn_spawn_writer(state.clone());
 		webhooks::spawn_delivery(state.clone());
 		stats::spawn_sampler(state.clone());
-		Ok(Self { state })
+		Self { state }
 	}
 
 	/// Public router: sandbox ingress (by Host / `E2b-Sandbox-*` headers) in
@@ -60,7 +55,7 @@ impl Driver {
 	}
 
 	/// Writes state still buffered in memory (template spawn counts) before the
-	/// process exits; bounded so a stalled `MySQL` cannot hang shutdown.
+	/// process exits; bounded so a stalled KV cannot hang shutdown.
 	pub async fn shutdown(&self) {
 		const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 		let flushed = tokio::time::timeout(FLUSH_TIMEOUT, builds::flush_spawns(&self.state)).await;

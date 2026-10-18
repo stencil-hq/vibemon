@@ -66,7 +66,7 @@ static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 
 /// One record of the log.
 #[derive(Serialize, Deserialize)]
-enum Record {
+pub(super) enum Record {
 	Entry(LogEntry),
 	/// Remove entries with index >= this.
 	Truncate(u64),

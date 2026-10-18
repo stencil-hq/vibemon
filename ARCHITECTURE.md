@@ -13,7 +13,7 @@ One binary, `vmon`, three entry points:
 |---|---|
 | `vmon vmm …` | Per-VM monitor (the `vmm` crate). Spawned by the node role; never by users. |
 | `vmon serve --role node,driver …` | Long-running server. A process runs the **node** role (hosts microVMs), the **driver** role (E2B API, scheduling, ingress), or both. |
-| `vmon admin …` | Operator tooling against MySQL (teams, users, API keys, limits, system teams). The admin token is `vmon serve --admin-token`. |
+| `vmon admin …` | Operator tooling (teams, users, API keys, limits, system teams) against the store of a running driver, through its cluster listener (`--cluster-url`). The admin token is `vmon serve --admin-token`. |
 
 ```mermaid
 graph TD
@@ -23,7 +23,6 @@ graph TD
   D1 <-->|gossip| N1[node]
   D2 <-->|gossip| N2[node]
   D1 <-->|raft over cluster HTTP| D2
-  D1 & D2 -->|SQL| M[(MySQL)]
   D1 -->|cluster HTTP: node API, tunnels| N1 & N2
   N1 -->|spawn| V1[vmon vmm] --> G1[guest: systemd/OpenRC + vmon-agent as envd]
 ```
@@ -33,9 +32,10 @@ graph TD
   nodes and drivers find each other.
 - **Raft KV** (`cluster::kv`): drivers are raft voters; node-only processes are
   KV clients that forward to a driver. Holds hot, cluster-coordinated state
-  (live sandbox catalog, admission counters, locks, artifact locations).
-- **MySQL** (`driver::store`): durable system of record (teams, keys,
-  templates, builds, sandboxes, snapshots, volumes, secrets, events).
+  (live sandbox catalog, admission counters, locks, artifact locations, §6)
+  and, under `db/…`, the driver's durable system of record (`driver::store`,
+  §7: teams, keys, templates, builds, sandboxes, volumes, secrets, events,
+  webhooks). There is no external database.
 - **Node** (`node` crate): runs VMs, builds templates, stores artifacts and
   volumes, exposes the node API and guest tunnels on the cluster listener.
 - **Driver** (`driver` crate): E2B REST API, auth, placement, lifecycle
@@ -58,7 +58,7 @@ processes discover each other through gossip seeds (`--join`).
 | `cloud/` | `vmon-cloud` | Object auth helpers used by `vmm` remote rootfs. |
 | `cluster/` | `vmon-cluster` | `gossip`, `kv` (openraft), `meta` (typed member metadata), `Cluster` facade, cluster HTTP auth helpers. |
 | `node/` | `vmon-node` | VM runtime, GC4 host client, tunnels, networking, egress proxy, images/builds, artifacts, volumes, metrics/logs, node API server (`node::api`) and client (`node::client`). |
-| `driver/` | `vmon-driver` | E2B API (`driver::api`), MySQL store (`driver::store`), auth, scheduler, lifecycle, builds, ingress proxy, admin commands. Depends on `vmon-node` for `node::api` DTOs and `node::client`. |
+| `driver/` | `vmon-driver` | E2B API (`driver::api`), KV-backed store (`driver::store`), auth, scheduler, lifecycle, builds, ingress proxy, admin commands. Depends on `vmon-node` for `node::api` DTOs and `node::client`. |
 | `src/` | `vmon` (bin) | Argument parsing, config, role wiring, `vmon admin`. |
 | `e2e/` | — | Real-SDK end-to-end suites (Python `e2b`, JS `e2b`) driven against a live `vmon serve`. |
 | `templates/` | — | Template definitions we ship (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`, and the `ubuntu-systemd` reference template) as E2B v2 build scripts. |
@@ -66,8 +66,8 @@ processes discover each other through gossip seeds (`--join`).
 | `spec/e2b/` | — | Vendored upstream specs (OpenAPI, envd protos). |
 
 Runtime: tokio (multi-thread) in `serve`; axum 0.8 / hyper 1 for HTTP;
-reqwest (rustls) for outbound HTTP; sqlx 0.9 (MySQL); openraft 0.9. The `vmm`
-crate stays synchronous.
+reqwest (rustls) for outbound HTTP; openraft 0.9. The `vmm` crate stays
+synchronous.
 
 ## 3. Listeners and addressing
 
@@ -77,6 +77,7 @@ crate stays synchronous.
 | `--tls-listen` + `--tls-cert/--tls-key` | off | public HTTPS (h2/http1.1 ALPN) | same router as `--listen` |
 | `--cluster-listen` / `--cluster-advertise` | `0.0.0.0:7947` / derived | internal HTTP | `/cluster/v1/*` (raft, kv), `/node/v1/*` (node API, tunnels) |
 | `--gossip-listen` / `--gossip-advertise` | `0.0.0.0:7946` / derived | UDP (probes) + TCP (push-pull) | gossip |
+| `--kv-resp-listen` | off | Redis protocol (RESP2) | cluster KV for `redis-cli`/`redis-benchmark` (§5.3) |
 
 Cluster HTTP and gossip are authenticated with the shared `--cluster-secret`
 (`VMON_CLUSTER_SECRET`): HTTP uses `Authorization: Bearer <secret>`
@@ -210,15 +211,20 @@ pub struct Entry { pub key: String, pub value: Vec<u8>, pub create_rev: u64, pub
 pub enum Compare { Exists(String), Missing(String), ModRev { key: String, rev: u64 },
                    Value { key: String, value: Vec<u8> }, CountBelow { prefix: String, limit: u64 } }
 pub enum Op { Put { key: String, value: Vec<u8>, ttl_ms: Option<u64> }, Delete { key: String },
-              DeletePrefix { prefix: String } }
+              DeletePrefix { prefix: String },
+              PutStamped { prefix: String, suffix: String, value: Vec<u8>, ttl_ms: Option<u64> } }
 pub struct Txn { pub compare: Vec<Compare>, pub success: Vec<Op>, pub failure: Vec<Op> }
 pub struct TxnResult { pub succeeded: bool, pub revision: u64 }
+pub struct Range { pub prefix: String, pub after: Option<String>, pub limit: Option<usize>, pub reverse: bool }
 
 pub struct Kv; // Clone
 impl Kv {
+    pub fn connect(drivers: Vec<String>, secret: &[u8]) -> anyhow::Result<Kv>;      // remote handle over fixed driver URLs (`vmon admin`)
     pub async fn get(&self, key: &str) -> Result<Option<Entry>, KvError>;            // follower-local read (may lag ≤ heartbeat)
     pub async fn get_consistent(&self, key: &str) -> Result<Option<Entry>, KvError>; // leader read-index
     pub async fn list(&self, prefix: &str) -> Result<Vec<Entry>, KvError>;           // follower-local
+    pub async fn range(&self, range: &Range) -> Result<Vec<Entry>, KvError>;         // follower-local, ordered page
+    pub async fn sync(&self) -> Result<(), KvError>;                                 // read barrier for the local reads above
     pub async fn txn(&self, txn: Txn) -> Result<TxnResult, KvError>;                 // forwarded to leader
     pub async fn put(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<u64, KvError>;
     pub async fn delete(&self, key: &str) -> Result<bool, KvError>;
@@ -233,9 +239,33 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   their expiry relative to the last applied time.
 - Node-only processes: `Kv` is a client that sends every call to a live driver
   (`POST /cluster/v1/kv/{op}`), retrying the next driver on connection failure.
-- Drivers serve `/cluster/v1/raft/{append,vote,snapshot}` and `/cluster/v1/kv/{get,list,txn}`
-  (replies are HTTP 200 `{"ok": T}` / `{"err": KvError}`); followers forward
-  writes and consistent reads to the leader once (`x-vmon-kv-forwarded`).
+  `Kv::connect` builds the same client over fixed driver URLs for processes
+  outside the cluster (`vmon admin`).
+- Drivers serve `/cluster/v1/raft/{append,vote,snapshot}` and
+  `/cluster/v1/kv/{get,list,range,sync,txn}` (replies are HTTP 200
+  `{"ok": T}` / `{"err": KvError}`); followers forward writes, consistent
+  reads, and `sync` to the leader once (`x-vmon-kv-forwarded`). A driver
+  serves remote `get`/`list`/`range` after its own read barrier, so remote
+  reads are linearizable.
+- Read barrier (`sync`): a confirmed leader (§5.5) returns at once, since it
+  applied every write it acknowledged. A follower asks the leader for its
+  applied revision (`/kv/sync`) and waits (≤ ~8 s) until its own state
+  machine has applied that revision; local reads after it observe every
+  write acknowledged before the call. The driver store (§7) runs one before
+  each read view and transaction attempt.
+- `range`: keys under `prefix`, ascending (descending with `reverse`),
+  strictly after (before) `after`, at most `limit` live entries.
+- `PutStamped` writes `{prefix}{stamp}{suffix}` where `stamp` is the commit
+  revision zero-padded to 20 digits (`kv::stamp`), a versionstamped key:
+  such keys sort in commit order without a shared counter, and all stamped
+  ops of one txn share the stamp.
+- `--kv-resp-listen` serves the same `Kv` handle over RESP2 (`kv::resp`):
+  `AUTH [default] <cluster secret>` first, then `PING`, `QUIT`, `GET`
+  (`get_consistent`), `SET key value [NX|XX] [EX s|PX ms]` (one txn,
+  `NX`/`XX` → `Missing`/`Exists` compare), `DEL`/`EXISTS key…` (one call per
+  key). Commands of a connection run in order (pipelines read their own
+  writes). Before `AUTH`, requests are capped at 10 arguments and 16 KiB bulk
+  strings; afterwards at 16 MiB bulk strings and 64 MiB of buffered input.
 - Semantics: expired keys count as missing; `ModRev{rev: 0}` matches a missing
   key; a txn whose chosen branch changes nothing does not bump the revision;
   `WatchEvent = Put(Entry) | Delete{key, revision}`; a watch channel (capacity
@@ -245,12 +275,14 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   `log.1` (header page with magic + epoch + checksum, then checksummed
   records: entries, truncations, purges; zero-filled to the end, 8 MiB
   steps), `vote.json`, `committed.bin`, `snapshot.bin` (snapshot meta + full
-  map). Open replays the slot with the highest valid epoch up to the first
-  undecodable record and zeroes a torn tail. Appends overwrite the written
-  zeros in place and are fdatasync'd: size and block map never change, so
-  the `fdatasync` needs no filesystem journal commit (on ext4 `data=ordered`
-  a commit waits for all other newly allocated dirty data on the disk,
-  e.g. template builds' images, which held KV writes for over a minute).
+  map; built from a copy of the map, serialized outside the state lock so
+  applies only wait for the copy). Open replays the slot with the highest
+  valid epoch up to the first undecodable record and zeroes a torn tail.
+  Appends overwrite the written zeros in place and are fdatasync'd: size and
+  block map never change, so the `fdatasync` needs no filesystem journal
+  commit (on ext4 `data=ordered` a commit waits for all other newly
+  allocated dirty data on the disk, e.g. template builds' images, which held
+  KV writes for over a minute).
   Only growing a slot (zero-fill + fsync) commits the journal. Compaction
   after purges writes the live records into the other slot, zeroes its stale
   tail, syncs, then seals it with the next epoch (a crash before the seal
@@ -320,6 +352,7 @@ in raft membership, which rebuilds the replication streams immediately.
 | `paused/<sandboxID>/deleted` | `true` (TTL 7 d) | driver | Kill fence: a late upload of a partitioned holder cannot publish after the kill; resume answers 404. |
 | `file/<templateID>/<hash>` | `{node: NodeId, size}` | driver | Where a build file-context archive is stored. |
 | `node/<nodeID>/status` | `"draining"|"unhealthy"` | driver (admin API) | Admin node status override; absent = ready (`POST /nodes/{id}` with `ready` deletes it). |
+| `db/…` | JSON records | driver (`driver::store`) | Durable system of record, §7. |
 | `idem/<teamID>/<key>` | `{hash, createdMs, response?}` | driver | `Idempotency-Key` of `POST /v2/sandboxes` (24 h TTL): same body replays the 201, other body → 409 `idempotency_request_mismatch`, pending → 409 `idempotency_in_progress` (422 `idempotency_outcome_unknown` after 10 min). |
 
 ```rust
@@ -333,32 +366,109 @@ pub enum RouteState { Running, Pausing, Resuming, Killing, Snapshotting }
 
 `SandboxRoute` and `ArtifactInfo` are defined in `node::api` (shared DTO module).
 
-## 7. MySQL schema (driver)
+## 7. Driver store (KV)
 
-Migrations embedded with `sqlx::migrate!` (`driver/migrations/`). Tables
-(columns abbreviated; all timestamps `DATETIME(3)` UTC):
+`driver::store::Store` is one struct over the cluster `Kv` handle (drivers use
+their raft replica; `vmon admin` uses `Kv::connect` against `--cluster-url`),
+with methods grouped by record type, no ORM. Records are serde/JSON values
+under `db/<table>/…` keys; secondary indexes and unique constraints are extra
+keys under `db/<table>.<index>/…` (empty, an id, or the few fields their scans
+filter on), written by the same transaction. Key segments are escaped (`%` →
+`%25`, `/` → `%2F`); `<t>` below is a zero-padded µs timestamp, `<seq>` a
+zero-padded number, `<stamp>` a commit revision (`kv::stamp`). The KV holds
+everything in memory on every driver and snapshots it to `<data>/raft/`
+(§5.3). There are no schema migrations: a record field
+added later is `#[serde(default)]`. Timestamps are UTC with millisecond
+precision.
 
-- `users(id, email UNIQUE, password_hash, created_at)`
-- `teams(id, name, slug UNIQUE, created_at, max_concurrent_sandboxes, max_concurrent_builds, max_vcpus, max_memory_mb, max_disk_mb, max_length_hours, blocked, is_system)`
-- `team_members(team_id, user_id, is_default)`
-- `api_keys(id, team_id, key_hash UNIQUE, key_enc, mask_prefix, mask_suffix, name, created_by, created_at, last_used_at)`
-- `refresh_tokens(id, user_id, token_hash UNIQUE, created_at, expires_at, revoked_at)` (CLI login)
-- `templates(id, team_id, public, kind('template'|'snapshot'|'fork'), source_sandbox_id, created_at, updated_at, spawn_count, last_spawned_at, build_count, deleted_at)` (`fork` = hidden template behind `POST /sandboxes/{id}/fork`: soft-deleted as soon as the fork's children are started or the fork failed, hard-deleted with its builds once artifact GC collected them; snapshot builds record the capturing node in `builds.node_id`; `spawn_count`/`last_spawned_at` are counted in memory when a create resolves the template and written by one background task per driver, one `UPDATE` per template at a time, so creates never queue on the template row)
-- `template_aliases(namespace, alias, template_id)` PK `(namespace, alias)`; `namespace` = team slug, `''` = bare alias (system teams only, see below)
-- `template_tags(template_id, tag, build_id, created_at)` PK `(template_id, tag)`
-- `builds(id, template_id, team_id, status('waiting'|'building'|'ready'|'error'), kind('build'|'snapshot'|'pause'), vcpus, memory_mb, disk_mb, min_free_disk_mb, envd_version, vmm_version, kernel, arch, node_id, tags JSON (requested; assigned when ready), spec JSON (no credentials), template_version, start_cmd, ready_cmd, reason JSON, artifact JSON (ArtifactInfo), created_at, updated_at, started_at, finished_at, artifacts_gc_at)`
-- `build_logs(build_id, seq, ts, level, step, message)` PK `(build_id, seq)`
-- `sandboxes(id, team_id, template_id, build_id, alias, node_id, state('running'|'paused'|'killed'), execution_id, vcpus, memory_mb, disk_mb, metadata JSON, env_enc, auto_pause, auto_pause_memory, auto_resume, allow_internet_access, network JSON (redacted E2B config), egress_enc (encrypted node NetworkPolicy), volume_mounts JSON, lifecycle JSON, envd_version, started_at, end_at, paused_at, ended_at, snapshot_build_id, s3_mounts JSON (`vmonS3Mounts` without credentials), s3_mounts_enc (encrypted inline credentials by index))`; keys `(team_id, state, started_at, id)` (team listings), `(state, started_at, id)` (team-less admin listings, reconciler), `(node_id, state)`
-- `sandbox_events(seq AUTO_INCREMENT PK, id UNIQUE, team_id, sandbox_id, execution_id, template_id, build_id, type, ts, data JSON)` — written via `Store::record_event`; types `sandbox.lifecycle.{created,killed,updated,paused,resumed,checkpointed}`; `seq` is the webhook delivery cursor; team metrics derive running counts from created/resumed (+1) and paused/killed (−1)
-- `volumes(id, team_id, name, node_id, created_at, object_store)` UNIQUE `(team_id, name)` (`object_store`: lives under `volumes/<id>/` in the operator store, `node_id` NULL)
-- `secrets(id 'sec_…', team_id, name (lower-cased) UNIQUE per team, current_version, metadata JSON, created_at, updated_at)` + `secret_versions(secret_id, version, value_enc, created_at)`
-- `webhooks(id, team_id, name, url, events JSON, enabled, signature_secret_enc, last_event_seq, created_at, updated_at)` + `webhook_deliveries(id, team_id, webhook_id, event_id, sandbox_id, event_type, status, duration_ms, request_url/headers/body, response_status/headers/body, error_class, error_message, ts)`
+- **Reads** (`Store::read` → `Read`) are linearizable: a read barrier
+  (`Kv::sync`) first; a follower fetches the leader's applied revision
+  (`/cluster/v1/kv/sync`) and waits until it has applied it, so a read sees
+  every write acknowledged before it, on any driver.
+- **Writes** (`Store::tx` → `Tx`) are optimistic transactions. Every key a
+  `Tx` reads becomes a `ModRev` guard (absent keys stay absent); writes are
+  staged (`put`, `put_ttl`, `mark` for index keys, `put_stamped`, `delete`,
+  `delete_prefix`) and `commit()` submits one KV txn. `false` means a guard
+  was lost to a concurrent writer: the caller reruns its loop on fresh state
+  (`store::Error::Contention` after too many losses). Reads in a `Tx` do not
+  see its own staged writes.
+- **Uniqueness**: one index key per unique value (lower-cased where the value
+  compared case-insensitively, e.g. emails, slugs, secret/volume names,
+  aliases), guarded by a read or `Compare::Missing`; a conflict surfaces as
+  `store::Error::Duplicate` (HTTP 409) or the method's typed outcome.
+- **Admission and limits**: an index prefix per counted set, checked locally
+  and guarded with `Compare::CountBelow { prefix, limit }`.
+- **Ordered history** (events, deliveries, build logs): keys sort by a
+  zero-padded segment; sandbox events use versionstamped keys
+  (`Op::PutStamped`), so an event's `seq` is the commit revision stamped into
+  its key, and the webhook cursor is that revision. Scans page with
+  `Range { after, limit, reverse }`.
+- **Retention** (`store::HISTORY_TTL`, 7 days): sandbox events, webhook
+  deliveries, build log lines, and records of killed sandboxes (stripped of
+  their encrypted env, egress policy, and S3 credentials) are written with
+  that TTL, including their index keys; readers tolerate expired references.
+  Webhook payloads advertise `events_ttl_days: 7`.
+- **Errors**: `store::Error::Kv` (no leader / unreachable) maps to 503,
+  `Duplicate` to 409, `Corrupt`/`Contention` to 500 `database error`.
+
+Keys (each store module's `//!` docs also list the guards of its writes):
+
+| Key | Value | Purpose |
+|---|---|---|
+| `db/user/<id>` | `User` | Users. |
+| `db/user.email/<lower-cased email>` | user id | Unique email. |
+| `db/team/<id>` | `Team` (limits, `blocked`, `system`) | Teams. |
+| `db/team.slug/<slug>` | team id | Unique slug (`-2`, `-3`, … on collision). |
+| `db/member/<team>/<user>` | `{is_default, created_at}` | Membership; default team per user. |
+| `db/member.user/<user>/<team>` | empty | A user's teams. |
+| `db/apikey/<team>/<id>` | `ApiKeyRow` (encrypted key, mask) | API keys. |
+| `db/apikey.hash/<sha256>` | `{team_id, id}` | Auth lookup; unique hash. |
+| `db/rtoken/<hash>` | `RefreshTokenRow` | CLI-login refresh tokens; TTL at expiry. |
+| `db/rtoken.user/<user>/<hash>` | empty | A user's token family (reuse revokes all); TTL at expiry. |
+| `db/template/<id>` | `TemplateRow` | Templates (`template`/`snapshot`/`fork`), live and soft-deleted. |
+| `db/template.team/<team>/<kind>/<t>/<id>` | template id | A team's live templates, newest-first listings. |
+| `db/template.fork/<id>` | template id | Forks until purged. |
+| `db/alias/<namespace>/<alias>` | `AliasRow` | Unique name → template; namespace = team slug, `""` = bare (system teams, below); lower-cased segments. |
+| `db/alias.template/<template>/<namespace>/<alias>` | `AliasRow` | A template's names. |
+| `db/tag/<template>/<tag>` | `TagRow` | Tag → build. |
+| `db/build/<id>` | `BuildRow` | Builds. |
+| `db/build.template/<template>/<t>/<id>` | build id | A template's builds (cursor pages, latest build). |
+| `db/build.ready/<template>/<t>/<id>` | build id | Latest ready build, `ready_only` listings. |
+| `db/build.unfinished/<team>/<kind>/<id>` | build id | `waiting`/`building` builds: concurrency limit (`CountBelow`). |
+| `db/build.building/<kind>/<t>/<id>` | build id | Supervisor work list, stale snapshot builds. |
+| `db/build.gc/<t>/<id>` | build id | Builds of deleted templates awaiting artifact GC. |
+| `db/blog/<build>/<seq>` | `LogRow` | Build log lines; `HISTORY_TTL`, deleted with the build. |
+| `db/blog.ts/<build>/<t>/<seq>` | `{seq, level}` | Time-cursor log pages; `HISTORY_TTL`. |
+| `db/sandbox/<id>` | `SandboxRow` | Sandboxes; killed ones stripped of secrets and kept `HISTORY_TTL`. |
+| `db/sandbox.live/<team>/<id>` | empty | Running and paused sandboxes (listings, counts, reconciler, artifact GC). |
+| `db/event/<stamp>` | `SandboxEventRow` | Lifecycle events in commit order (`seq` = stamp); `HISTORY_TTL`. |
+| `db/event.team/<team>/<stamp>` | `{type, ts}` | Team events, webhook cursor, team metrics; `HISTORY_TTL`. |
+| `db/event.sandbox/<team>/<sandbox>/<stamp>` | `{type, ts}` | One sandbox's events; `HISTORY_TTL`. |
+| `db/webhook/<id>` | `WebhookRow` | Webhooks (encrypted signature secret, forward-only `last_event_seq`). |
+| `db/webhook.team/<team>/<id>` | empty | A team's webhooks. |
+| `db/delivery/<webhook>/<event>/<t>/<id>` | `DeliveryRow` | Delivery attempts per event; `HISTORY_TTL`, deleted with the webhook. |
+| `db/delivery.event/<webhook>/<event>` | first attempt time | Creates an event's group once; `HISTORY_TTL`. |
+| `db/delivery.group/<webhook>/<t>/<event>` | event type | Delivery groups by first attempt; `HISTORY_TTL`. |
+| `db/delivery.ts/<webhook>/<t>/<id>` | time, status, type, duration | Delivery stats buckets; `HISTORY_TTL`. |
+| `db/secret/<team>/<id>` | `SecretRow` | Secrets (metadata, current version). |
+| `db/secret.name/<team>/<lower-cased name>` | secret id | Unique name per team. |
+| `db/secret.version/<team>/<id>/<seq>` | encrypted value | Secret versions. |
+| `db/volume/<team>/<id>` | `VolumeRow` | Volumes (node or object store). |
+| `db/volume.name/<team>/<lower-cased name>` | volume id | Unique name per team. |
+
+`fork` templates are the hidden templates behind `POST /sandboxes/{id}/fork`:
+soft-deleted as soon as the fork's children are started or the fork failed,
+hard-deleted with their builds once artifact GC collected them. Template spawn
+counts are counted in memory when a create resolves the template and written
+by one background task per driver, one update per template at a time, so
+creates never contend on the template record. Team metrics derive running
+counts from created/resumed (+1) and paused/killed (−1) events.
 
 **Default templates and bare aliases.** The SDKs default to the unqualified
 aliases `base`, `code-interpreter-v1`, `desktop` and `mcp-gateway`, which
 upstream are public bare (non-namespaced) aliases of E2B's own team. Here a
 bare alias is held only by a public template of a *system team*
-(`teams.is_system`, `vmon admin create-team --system` / `set-system` /
+(`Team::system`, `vmon admin create-team --system` / `set-system` /
 `unset-system`): publishing one of its templates (`PATCH /v2/templates/{id}`
 or the v1 `PATCH`, `public: true`) claims a free bare alias for each of the
 template's names; unpublishing, deleting the template, or unsetting the
@@ -394,18 +504,6 @@ normalized name (exact, then suffix, then the only remaining setting).
 `mcp-gateway pull <ids…>` (`Template.add_mcp_server`) pulls catalog images,
 running a temporary `dockerd` when PID 1 is the agent (build steps). Needs the
 `kernel/` guest kernel (Docker requirements).
-
-Migrations are embedded by hand in `driver::store` (`MIGRATIONS`): sqlx is
-built without its `macros` feature, so `sqlx::migrate!` is unavailable.
-
-Store API is `driver::store::Store` (one struct over a `MySqlPool`, methods
-grouped by table, no ORM). Every write (one statement, or one whole
-transaction from `BEGIN`) runs through `store::retry_deadlocks`, which reruns
-it after a short jittered backoff when `InnoDB` picks it as a deadlock victim
-(1213; up to 8 runs). Lock wait timeouts (1205) are not rerun. Transactions
-that touch a template and its builds lock the template row first; the fork
-purge deletes candidates one by one by id, so it never locks other template
-rows.
 
 ## 8. Node
 
@@ -945,10 +1043,10 @@ served at `/dashboard/` on the public listeners):
   capacity, `cachedBuilds` count, this driver's create counters), and
   `history`: the driver's in-memory fleet samples (every 5 s, newest 720,
   oldest first; `nodes` and capacity sums over alive node members, `starts` =
-  `sandbox.lifecycle.created|resumed` events since the previous sample via a
-  `sandbox_events.seq` cursor; a DB error yields `starts: 0`).
+  `sandbox.lifecycle.created|resumed` events since the previous sample via an
+  event `seq` cursor; a store error yields `starts: 0`).
 - `GET /admin/teams`: every team (limits, `blocked`, `system`) with its
-  running/paused `sandboxes` counts from MySQL, sorted by name.
+  running/paused `sandboxes` counts from the store, sorted by name.
 - `GET /admin/sandboxes`: every team's running/paused sandboxes, newest
   first (`state` CSV, `team`, `limit` 1..=1000 default 500, `nextToken` /
   `X-Next-Token` as `/v2/sandboxes`); `ListedSandbox` fields plus `teamID`,
@@ -995,11 +1093,11 @@ top candidates; on `busy`/failure retry the next (max 3).
 stateDiagram-v2
   [*] --> Running: create (txn admit + route)
   Running --> Pausing: pause / timeout+autoPause
-  Pausing --> Paused: node snapshot ok (route deleted, MySQL state=paused)
+  Pausing --> Paused: node snapshot ok (route deleted, store state=paused)
   Paused --> Resuming: connect / resume / ingress autoResume
   Resuming --> Running
-  Running --> [*]: kill / timeout (route deleted, node kill, MySQL state=killed)
-  Paused --> [*]: kill (node kill, MySQL state=killed)
+  Running --> [*]: kill / timeout (route deleted, node kill, store state=killed)
+  Paused --> [*]: kill (node kill, store state=killed)
   Running --> Snapshotting: snapshots / fork
   Snapshotting --> Running
 ```
@@ -1028,11 +1126,11 @@ or a hidden fork template. The raft-leader driver runs:
 the **reaper** (every 1 s: routes past `endAtMs` → pause or kill; a route
 still in a transitional state with its lock free was abandoned by a dead
 driver → kill), the
-**reconciler** (every 10 s, in its own task so a pass stalled on MySQL never
+**reconciler** (every 10 s, in its own task so a pass stalled on the store never
 delays the reaper; a sandbox whose repair fails is logged and retried next
 pass: compare node `GET /sandboxes` with KV routes; routes
 of `Dead` nodes, and of `Left` nodes that have not rejoined within 60 s — a
-gracefully restarted node keeps its VMMs and adopts them — → MySQL `killed` +
+gracefully restarted node keeps its VMMs and adopts them — → store `killed` +
 events; an unlocked running route older than 2 min whose VM its alive node
 does not list counts as lost too (younger ones may still be booting even if
 their create lock lapsed); running rows without a route, unlocked and
@@ -1057,7 +1155,7 @@ a dead driver's builds are adopted once its lease lapses; supervision stops
 only when another driver holds the lease or the KV stays unreachable for a
 whole TTL. The
 holder polls the builder's `GET /node/v1/builds/{id}?logsOffset` every
-500 ms, appends new lines to `build_logs` (draining all lines before
+500 ms, appends new lines to the build log (`db/blog…`, draining all lines before
 recording a terminal state), and on `ready` writes `art/<build>/<node>`,
 the build's `artifact`, and its tags. A builder that is `Dead`/`Left` in
 gossip (or lost the build) fails it. `started_at` is set when the builder
@@ -1155,11 +1253,11 @@ at the requested path. The volume-content API is proxied by the driver to
 
 - Unit tests per crate (gossip convergence/failure detection with in-process
   sockets, raft KV linearizability/TTL/txn with in-process clusters, store
-  queries against MySQL in Docker when `VMON_MYSQL_TEST_URL` is set, envd
+  methods on a private one-voter cluster (`store::testing::TestStore`), envd
   protocol handlers on the host build of the agent).
 - `tests/` (repo root): VMM-only integration tests (`VMON_E2E=1`).
 - `e2e/`: official E2B SDK suites (Python + JS) against a live monolithic
-  `vmon serve` (`just e2e`, MySQL via Docker); the distributed topology is
+  `vmon serve` (`just e2e`); the distributed topology is
   covered by `tests/cluster.rs` and the scripts in `e2e/cluster/`.
 - `tests/cluster.rs` (`VMON_CLUSTER_E2E=1`, `just cluster-e2e`): 3 drivers + 2
   nodes; raft bootstrap, cross-driver ingress, leader and node failover,

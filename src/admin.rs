@@ -1,6 +1,7 @@
-//! `vmon admin`: operator tooling that talks to the database directly (teams,
-//! users, API keys, limits). Uses the cluster secret to encrypt stored API
-//! keys, so it must match the secret of the running drivers.
+//! `vmon admin`: operator tooling (teams, users, API keys, limits) that reads
+//! and writes the driver store through the cluster KV of a running driver. Uses
+//! the cluster secret to authenticate to the cluster listener and to encrypt
+//! stored API keys, so it must match the secret of the running drivers.
 
 use std::path::PathBuf;
 
@@ -15,9 +16,15 @@ use vmon_driver::{
 /// Flags shared by every `vmon admin` subcommand.
 #[derive(Args, Debug)]
 pub struct AdminArgs {
-	/// Database URL of the cluster (`mysql://…`).
-	#[arg(long, env = "VMON_MYSQL_URL", hide_env_values = true)]
-	mysql_url:      String,
+	/// Cluster listener URL(s) of running drivers (comma-separated); requests
+	/// go to the first that answers.
+	#[arg(
+		long,
+		env = "VMON_CLUSTER_URL",
+		default_value = "http://127.0.0.1:7947",
+		value_delimiter = ','
+	)]
+	cluster_url:    Vec<String>,
 	/// Cluster secret (default: `<data-dir>/cluster-secret`).
 	#[arg(long, env = "VMON_CLUSTER_SECRET", hide_env_values = true)]
 	cluster_secret: Option<String>,
@@ -119,11 +126,11 @@ impl LimitArgs {
 
 /// Runs one `vmon admin` subcommand.
 pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
-	let store = Store::connect(&args.mysql_url)
-		.await
-		.context("connecting to MySQL")?;
-	store.migrate().await.context("applying migrations")?;
-	let keys = Keys::derive(cluster_secret(&args)?.as_bytes());
+	let secret = cluster_secret(&args)?;
+	let kv = vmon_cluster::kv::Kv::connect(args.cluster_url.clone(), secret.as_bytes())
+		.context("connecting to the cluster KV")?;
+	let store = Store::new(kv);
+	let keys = Keys::derive(secret.as_bytes());
 	match args.command {
 		AdminCommand::CreateTeam { name, system, limits } => {
 			let (mut team, key) =

@@ -13,6 +13,7 @@ use std::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
 	},
+	time::Duration,
 };
 
 use openraft::{
@@ -20,10 +21,10 @@ use openraft::{
 	StorageError, StoredMembership, storage::RaftStateMachine,
 };
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{
-	Entry, TxnResult, WATCH_CAPACITY, WatchEvent,
+	Entry, KvError, Range, TxnResult, WATCH_CAPACITY, WatchEvent,
 	log_store::replace_file,
 	machine::KvState,
 	raft::{LogEntry, RaftPeer, TypeConfig},
@@ -47,6 +48,8 @@ struct Shared {
 	snapshot:     Mutex<Option<(Meta, Vec<u8>)>>,
 	watchers:     Mutex<Vec<(String, mpsc::Sender<WatchEvent>)>>,
 	snapshot_seq: AtomicU64,
+	/// Applied KV revision, for [`StateMachineStore::wait_revision`].
+	revision:     watch::Sender<u64>,
 }
 
 struct AppliedState {
@@ -77,6 +80,7 @@ impl StateMachineStore {
 		};
 		let shared = Shared {
 			dir:          dir.to_owned(),
+			revision:     watch::Sender::new(applied.kv.revision()),
 			state:        RwLock::new(applied),
 			snapshot:     Mutex::new(snapshot),
 			watchers:     Mutex::new(Vec::new()),
@@ -99,6 +103,34 @@ impl StateMachineStore {
 	/// Live entries under `prefix` in applied state.
 	pub fn list(&self, prefix: &str) -> Vec<Entry> {
 		self.shared.state.read().kv.list(prefix)
+	}
+
+	/// Live entries matching `range` in applied state.
+	pub fn range(&self, range: &Range) -> Vec<Entry> {
+		self.shared.state.read().kv.range(range)
+	}
+
+	/// Revision of the last applied change.
+	pub fn revision(&self) -> u64 {
+		*self.shared.revision.borrow()
+	}
+
+	/// Waits until applied state has reached `revision`.
+	///
+	/// # Errors
+	///
+	/// [`KvError::Unavailable`] when it does not within `timeout`.
+	pub async fn wait_revision(&self, revision: u64, timeout: Duration) -> Result<(), KvError> {
+		let mut applied = self.shared.revision.subscribe();
+		match tokio::time::timeout(timeout, applied.wait_for(|at| *at >= revision)).await {
+			Ok(Ok(_)) => Ok(()),
+			// The sender lives in `self`, so the channel cannot close while we wait.
+			Ok(Err(_)) | Err(_) => Err(KvError::Unavailable(format!(
+				"local state at revision {} did not reach leader revision {revision} within \
+				 {timeout:?}",
+				self.revision()
+			))),
+		}
 	}
 
 	/// Cluster UUID recorded in applied state.
@@ -160,7 +192,9 @@ fn snapshot_err(error: io::Error) -> StorageError<NodeId> {
 
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
 	async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-		let (meta, data) = {
+		// Copy the state under the lock and serialize it outside, so applies
+		// only wait for the copy.
+		let (meta, kv) = {
 			let applied = self.shared.state.read();
 			let seq = self.shared.snapshot_seq.fetch_add(1, Ordering::Relaxed);
 			let snapshot_id = match applied.last_applied {
@@ -172,15 +206,18 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
 				last_membership: applied.membership.clone(),
 				snapshot_id,
 			};
-			(meta, applied.kv.to_snapshot())
+			(meta, applied.kv.clone())
 		};
 		let this = self.clone();
-		let (meta2, data2) = (meta.clone(), data.clone());
-		tokio::task::spawn_blocking(move || this.persist_snapshot(&meta2, &data2))
-			.await
-			.map_err(io::Error::other)
-			.and_then(|r| r)
-			.map_err(snapshot_err)?;
+		let meta2 = meta.clone();
+		let data = tokio::task::spawn_blocking(move || {
+			let data = kv.to_snapshot();
+			this.persist_snapshot(&meta2, &data).map(|()| data)
+		})
+		.await
+		.map_err(io::Error::other)
+		.and_then(|r| r)
+		.map_err(snapshot_err)?;
 		*self.shared.snapshot.lock() = Some((meta.clone(), data.clone()));
 		Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data)) })
 	}
@@ -211,7 +248,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 	{
 		let mut events = Vec::new();
 		let mut replies = Vec::new();
-		{
+		let revision = {
 			let mut applied = self.shared.state.write();
 			for entry in entries {
 				applied.last_applied = Some(entry.log_id);
@@ -225,7 +262,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 				};
 				replies.push(reply);
 			}
-		}
+			applied.kv.revision()
+		};
+		self.shared.revision.send_replace(revision);
 		self.notify(events);
 		Ok(replies)
 	}
@@ -268,15 +307,16 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 			.map_err(io::Error::other)
 			.and_then(|r| r)
 			.map_err(snapshot_err)?;
-		let events = {
+		let (events, revision) = {
 			let mut applied = self.shared.state.write();
 			let events = applied.kv.diff(&kv);
 			applied.kv = kv;
 			applied.last_applied = meta.last_log_id;
 			applied.membership = meta.last_membership.clone();
-			events
+			(events, applied.kv.revision())
 		};
 		*self.shared.snapshot.lock() = Some((meta.clone(), data));
+		self.shared.revision.send_replace(revision);
 		self.notify(events);
 		Ok(())
 	}

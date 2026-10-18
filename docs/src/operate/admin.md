@@ -6,21 +6,21 @@ Day-to-day operator tasks: creating teams, keys, and CLI users, setting limits, 
 
 | Tool | Talks to | Use it for |
 |---|---|---|
-| `vmon admin …` | MySQL directly | Teams, users, memberships, limits, blocking, system teams, minting keys |
+| `vmon admin …` | A running driver's cluster listener | Teams, users, memberships, limits, blocking, system teams, minting keys |
 | Admin dashboard (`/dashboard/`) | A running driver, in a browser | Fleet capacity and activity charts; every team's sandboxes with a terminal, file browser, metrics, and logs; pause, resume, kill, timeouts; node draining |
 | Admin HTTP API (`X-Admin-Token`) | A running driver | Listing, minting, and deleting keys; killing a team's sandboxes; cancelling builds; node status and draining |
 
 ## Running vmon admin
 
-`vmon admin` needs the cluster's database URL and its cluster secret:
+`vmon admin` needs the cluster listener of a running driver and the cluster secret:
 
 ```sh
-export VMON_MYSQL_URL=mysql://user:pass@db:3306/vmon
+export VMON_CLUSTER_URL=http://10.0.0.1:7947,http://10.0.0.2:7947   # drivers' --cluster-listen
 export VMON_CLUSTER_SECRET=…        # the drivers' --cluster-secret
 vmon admin list-teams
 ```
 
-- **MySQL URL** (`--mysql-url`, `VMON_MYSQL_URL`): the same database the drivers use. Every invocation connects and applies pending schema migrations first, so it also works against a fresh database before any driver has started.
+- **Cluster URL** (`--cluster-url`, `VMON_CLUSTER_URL`; default `http://127.0.0.1:7947`, the local driver): one or more driver cluster-listener URLs, comma-separated; requests go to the first that answers. The drivers keep all durable state in their raft KV, so `vmon admin` works only once a driver has started.
 - **Cluster secret** (`--cluster-secret`, `VMON_CLUSTER_SECRET`): API keys are stored encrypted with AES-256-GCM under a key derived from the cluster secret (next to a SHA-256 hash used for lookups). `vmon admin` derives that key itself, so it must use the drivers' secret. When the flag is unset it reads `<data-dir>/cluster-secret` (`--data-dir`, `VMON_HOME`; default `/var/lib/vmon` as root on Linux, else `~/.vmon`), which is where `vmon serve` stores a generated secret. Running on a server host with the server's data dir therefore needs no secret flag. `vmon admin` never generates a secret; without one it fails with `no cluster secret: pass --cluster-secret (VMON_CLUSTER_SECRET) or --data-dir of a server (<path> missing)`.
 
 Global options go before the subcommand. Commands that take a team accept its ID or its slug.
@@ -90,7 +90,7 @@ A blocked team can still read, but every mutating team-scoped request is 403 `te
 
 ## System team for the default templates
 
-The SDKs' default aliases (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`) resolve for every team only when a system team publishes them. `just templates` (`templates/build.py`) builds and publishes them. When `E2B_API_KEY` is unset or empty, it runs `vmon admin` to find the team with slug `--team` (default `system`), marks it as a system team if needed or creates it with `create-team --system`, and mints a key; a supplied key is used without checking whether its team is a system team. `vmon admin` reads `VMON_MYSQL_URL` and `VMON_CLUSTER_SECRET` / `VMON_HOME` from the environment as usual. Doing it by hand:
+The SDKs' default aliases (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`) resolve for every team only when a system team publishes them. `just templates` (`templates/build.py`) builds and publishes them. When `E2B_API_KEY` is unset or empty, it runs `vmon admin` to find the team with slug `--team` (default `system`), marks it as a system team if needed or creates it with `create-team --system`, and mints a key; a supplied key is used without checking whether its team is a system team. `vmon admin` reads `VMON_CLUSTER_URL` and `VMON_CLUSTER_SECRET` / `VMON_HOME` from the environment as usual, and needs a running driver. Doing it by hand:
 
 ```sh
 vmon admin create-team system --system      # or: vmon admin set-system <team>

@@ -12,21 +12,6 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: vmon
-          MYSQL_DATABASE: vmon
-        ports:
-          - 13306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -pvmon"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      VMON_MYSQL_TEST_URL: mysql://root:vmon@127.0.0.1:13306/vmon
     steps:
       - name: Checkout
         uses: actions/checkout@v4

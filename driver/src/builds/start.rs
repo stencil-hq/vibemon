@@ -242,7 +242,7 @@ pub async fn start_build(
 
 	for other in state
 		.store
-		.template_building_builds(&template.id, &build.tags.0)
+		.template_building_builds(&template.id, &build.tags)
 		.await?
 	{
 		let reason = "The build was canceled because a newer build of the template was started.";

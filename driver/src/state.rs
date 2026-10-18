@@ -2,6 +2,7 @@
 
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use vmon_cluster::{Cluster, MemberMeta, NodeId, gossip::MemberState};
 use vmon_node::client::NodeClient;
 
@@ -34,8 +35,8 @@ pub struct DriverConfig {
 	pub object_store:   Option<vmon_cloud::s3::S3Client>,
 }
 
-/// Per-team resource limits (E2B tier limits), stored on the `teams` row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Per-team resource limits (E2B tier limits), stored in the team record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamLimits {
 	/// Concurrent running sandboxes (429 beyond).
 	pub max_concurrent_sandboxes: u32,

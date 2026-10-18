@@ -1,6 +1,6 @@
 # Clusters
 
-A distributed deployment runs separate driver and node processes that find each other through gossip. The drivers replicate live state in a raft KV, and all of them share one MySQL database. This page covers how to start such a cluster, how work is placed, and what happens when processes fail. For a single host, see [Running vmon serve](serve.md).
+A distributed deployment runs separate driver and node processes that find each other through gossip. The drivers replicate all state, live and durable, in a raft KV; there is no external database. This page covers how to start such a cluster, how work is placed, and what happens when processes fail. For a single host, see [Running vmon serve](serve.md).
 
 ## Shape
 
@@ -10,7 +10,7 @@ A distributed deployment runs separate driver and node processes that find each 
        ┌───────────────┼───────────────┐
    driver d1       driver d2       driver d3     raft voters, E2B API, ingress
        │ ╲             │             ╱ │
-       │   ╲  MySQL (durable state)    │
+       │   ╲  raft KV (all state)      │
        │                               │
    ──────── gossip :7946 (every process) ────────
    ──────── cluster HTTP :7947 (raft, KV, node API, tunnels) ────────
@@ -21,10 +21,9 @@ A distributed deployment runs separate driver and node processes that find each 
 | Layer | Members | Holds |
 |---|---|---|
 | Gossip memberlist (SWIM) | every process | Membership, liveness, per-member metadata: roles, addresses, capacity, features, cached builds, raft status. |
-| Raft KV (openraft) | voters = drivers; node-only processes are clients | Live sandbox routes, admission counters, locks, artifact locations, admin node status. |
-| MySQL | drivers (and `vmon admin`) | Teams, keys, templates, builds, sandboxes, volumes, secrets, events, webhooks. |
+| Raft KV (openraft) | voters = drivers; node-only processes and `vmon admin` are clients | Live sandbox routes, admission counters, locks, artifact locations, admin node status, and, under `db/…`, the durable records: teams, users, API keys, refresh tokens, templates, aliases, tags, builds and build logs, sandboxes, events, webhooks and deliveries, secrets, volumes. |
 
-All processes need the same `--cluster-secret`. All drivers need the same `--mysql-url`, and should share `--domain`, `--admin-token`, `--shared-volumes`, and `--object-store` so that every driver behaves the same.
+All processes need the same `--cluster-secret`. All drivers should share `--domain`, `--admin-token`, `--shared-volumes`, and `--object-store` so that every driver behaves the same.
 
 ## Gossip
 
@@ -41,7 +40,7 @@ Failure detection: each member probes one peer per second. An unanswered probe (
 
 ## Raft
 
-Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`.
+Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`: every driver holds the whole KV in memory and snapshots it there. Sandbox events, webhook deliveries, build logs, and records of killed sandboxes expire after 7 days, which bounds its size.
 
 - **Bootstrap:** start the initial drivers with `--bootstrap-expect N`, where N is the number of initial drivers. A driver with uninitialized raft waits until gossip shows N alive drivers that have no cluster ID yet. The driver with the smallest node ID among them then initializes raft with exactly those N voters.
 - **Joining later:** a driver that sees any peer with a cluster ID never bootstraps. The leader reconciles membership every 2 s, adding new alive drivers as learners and promoting them to voters once they have caught up.
@@ -51,7 +50,7 @@ Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`.
 > [!WARNING]
 > `--bootstrap-expect` defaults to 1. A lone driver with the default bootstraps as soon as it sees itself, so if several drivers start with the default before gossip connects them, more than one raft cluster can form. Give every initial driver the same `--bootstrap-expect`. It only matters while `raft/` is empty.
 
-Raft needs a majority of voters to elect a leader and commit writes, so three drivers tolerate the loss of one. KV calls wait up to about 8 s for a reachable leader and then fail. Ingress reads sandbox routes from the driver's local replica.
+Raft needs a majority of voters to elect a leader and commit writes, so three drivers tolerate the loss of one. KV calls wait up to about 8 s for a reachable leader and then fail. Ingress reads sandbox routes from the driver's local replica. API reads of durable records are linearizable on every driver: a follower first fetches the leader's applied revision and waits until its replica has applied it. Writes are optimistic KV transactions, guarded on the revisions of the records they read and rerun on a conflict.
 
 ## Placement
 
@@ -113,7 +112,7 @@ Details are in [Storage, object store, and volumes](storage.md).
 
 ## Example: 3 drivers and N nodes
 
-Hosts: drivers `10.0.0.1`–`10.0.0.3`, nodes `10.0.1.1`…`10.0.1.N`, a MySQL server `db.internal`, and an S3 bucket. Generate the cluster secret once (for example `openssl rand -hex 32`) and set the same environment on every host:
+Hosts: drivers `10.0.0.1`–`10.0.0.3`, nodes `10.0.1.1`…`10.0.1.N`, and an S3 bucket. Generate the cluster secret once (for example `openssl rand -hex 32`) and set the same environment on every host:
 
 ```sh
 export VMON_CLUSTER_SECRET='<64 hex chars>'
@@ -124,7 +123,6 @@ export VMON_OBJECT_STORE='s3://vmon-state/prod'    # credentials from the AWS en
 Each driver (here `10.0.0.1`):
 
 ```sh
-export VMON_MYSQL_URL='mysql://vmon:<password>@db.internal:3306/vmon'
 export VMON_ADMIN_TOKEN='<admin token, same on every driver>'
 
 vmon serve --role driver \
@@ -152,4 +150,8 @@ Binding the internal listeners to the host's private IP also makes it the advert
 curl -s https://api.sbx.example.com/nodes -H "X-Admin-Token: $VMON_ADMIN_TOKEN"
 ```
 
-Run `vmon admin` against the same MySQL URL with the same `VMON_CLUSTER_SECRET`.
+Run `vmon admin` against the drivers' cluster listeners with the same `VMON_CLUSTER_SECRET`:
+
+```sh
+VMON_CLUSTER_URL=http://10.0.0.1:7947,http://10.0.0.2:7947,http://10.0.0.3:7947 vmon admin list-teams
+```

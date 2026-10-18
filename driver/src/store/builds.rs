@@ -1,13 +1,59 @@
-//! `builds` and `build_logs` (ARCHITECTURE.md §7).
+//! Template builds and their logs (ARCHITECTURE.md §7).
 //!
 //! Owned by the template workstream; written by the build API and the build
 //! supervisor ([`crate::builds`]), read by the template API.
+//!
+//! Keys (`<t>` = [`time_segment`] of `created_at`; index entries hold the
+//! build id as a JSON string so ranged scans decode them):
+//! - `db/build/<id>` → [`BuildRow`].
+//! - `db/build.template/<template_id>/<t>/<id>`: every build of a template in
+//!   creation order ([`Store::template_builds`], [`Store::latest_builds`],
+//!   template deletes).
+//! - `db/build.ready/<template_id>/<t>/<id>`: `ready` builds
+//!   ([`Store::latest_ready_builds`], `ready_only` template listings).
+//! - `db/build.unfinished/<team_id>/<kind>/<id>`: a team's `waiting` and
+//!   `building` builds. [`Store::register_build`] admits a build with
+//!   `CountBelow` over the team's `build` kind (see [`super::templates`]).
+//! - `db/build.building/<kind>/<t>/<id>`: `building` builds by kind (the
+//!   supervisor work list, stale snapshots).
+//! - `db/build.gc/<updated_at>/<id>`: finished builds of deleted templates
+//!   whose artifacts are not collected yet; written by template deletes,
+//!   removed by [`Store::mark_artifacts_collected`].
+//! - `db/blog/<build_id>/<seq>` → [`LogRow`] and
+//!   `db/blog.ts/<build_id>/<ts>/<seq>` → `{seq, level}`: log lines in sequence
+//!   and in time order, written with [`HISTORY_TTL`] and deleted with their
+//!   build.
+//!
+//! [`put_build`] moves the status indexes with the record. Each transition
+//! reads the build (and the template it changes) in its transaction, so a
+//! concurrent transition fails the commit and the rerun sees its status.
 
-use chrono::{DateTime, Utc};
-use sqlx::{FromRow, MySql, QueryBuilder, Transaction, types::Json};
+use std::collections::HashSet;
+
+use chrono::{DateTime, SubsecRound, Utc};
+use serde::{Deserialize, Serialize};
+use vmon_cluster::kv::{Compare, Range};
 use vmon_node::api::{ArtifactInfo, BuildReason};
 
-use super::{Cursor, Store, from_micros, retry_deadlocks, templates::upsert_tags};
+use super::{
+	Cursor, HISTORY_TTL, Read, Result, Store, Tx, from_micros, key, now, prefix, seq,
+	templates::{TemplateRow, template_key, upsert_tags},
+	time_segment,
+};
+
+const BUILD: &str = "db/build";
+const BY_TEMPLATE: &str = "db/build.template";
+const READY: &str = "db/build.ready";
+const UNFINISHED: &str = "db/build.unfinished";
+const BUILDING: &str = "db/build.building";
+const GC: &str = "db/build.gc";
+const LOG: &str = "db/blog";
+const LOG_BY_TIME: &str = "db/blog.ts";
+
+/// `kind` of builds made from steps (`POST /v3/templates`).
+pub(super) const KIND_BUILD: &str = "build";
+/// `kind` of snapshot and fork captures.
+pub(super) const KIND_SNAPSHOT: &str = "snapshot";
 
 /// Build lifecycle as stored (and as E2B reports it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +65,7 @@ pub enum BuildStatus {
 }
 
 impl BuildStatus {
-	/// Column / wire value.
+	/// Stored / wire value.
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::Waiting => "waiting",
@@ -29,7 +75,7 @@ impl BuildStatus {
 		}
 	}
 
-	/// Parses a column value; unknown values read as `error`.
+	/// Parses a stored value; unknown values read as `error`.
 	pub fn parse(raw: &str) -> Self {
 		match raw {
 			"waiting" => Self::Waiting,
@@ -55,7 +101,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-	/// Column / wire value.
+	/// Stored / wire value.
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::Debug => "debug",
@@ -85,27 +131,17 @@ impl LogLevel {
 			_ => Self::Info,
 		}
 	}
-
-	/// 1-based `MySQL` ENUM index (`level + 0`).
-	const fn enum_index(self) -> u8 {
-		match self {
-			Self::Debug => 1,
-			Self::Info => 2,
-			Self::Warn => 3,
-			Self::Error => 4,
-		}
-	}
 }
 
-/// One `builds` row.
-#[derive(Clone, Debug, FromRow)]
+/// A build record (`db/build/<id>`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BuildRow {
 	pub id:               String,
 	pub template_id:      String,
 	pub team_id:          String,
 	/// See [`BuildStatus`].
 	pub status:           String,
-	/// `build` | `snapshot` | `pause`.
+	/// `build` | `snapshot`.
 	pub kind:             String,
 	pub vcpus:            u32,
 	pub memory_mb:        u64,
@@ -114,17 +150,21 @@ pub struct BuildRow {
 	pub envd_version:     Option<String>,
 	pub arch:             Option<String>,
 	pub node_id:          Option<String>,
-	pub tags:             Json<Vec<String>>,
-	pub spec:             Option<Json<serde_json::Value>>,
+	pub tags:             Vec<String>,
+	pub spec:             Option<serde_json::Value>,
 	pub template_version: Option<String>,
 	pub start_cmd:        Option<String>,
 	pub ready_cmd:        Option<String>,
-	pub reason:           Option<Json<BuildReason>>,
-	pub artifact:         Option<Json<ArtifactInfo>>,
+	pub reason:           Option<BuildReason>,
+	pub artifact:         Option<ArtifactInfo>,
 	pub created_at:       DateTime<Utc>,
 	pub updated_at:       DateTime<Utc>,
 	pub started_at:       Option<DateTime<Utc>>,
 	pub finished_at:      Option<DateTime<Utc>>,
+	/// When the artifacts of this build of a deleted template were deleted
+	/// from every holder.
+	#[serde(default)]
+	pub artifacts_gc_at:  Option<DateTime<Utc>>,
 }
 
 impl BuildRow {
@@ -132,23 +172,10 @@ impl BuildRow {
 	pub fn status(&self) -> BuildStatus {
 		BuildStatus::parse(&self.status)
 	}
-
-	/// Rows matching `condition` (one `?` bound to `arg`) inside a transaction.
-	pub(super) async fn select_where(
-		tx: &mut Transaction<'_, MySql>,
-		condition: &str,
-		arg: &str,
-	) -> sqlx::Result<Vec<Self>> {
-		let sql = format!("SELECT {BUILD_COLUMNS} FROM builds WHERE {condition}");
-		sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(arg)
-			.fetch_all(&mut **tx)
-			.await
-	}
 }
 
-/// One `build_logs` row.
-#[derive(Clone, Debug, PartialEq, Eq, FromRow)]
+/// A stored build log line (`db/blog/<build_id>/<seq>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRow {
 	pub seq:     u64,
 	pub ts:      DateTime<Utc>,
@@ -156,6 +183,14 @@ pub struct LogRow {
 	pub level:   String,
 	pub step:    Option<String>,
 	pub message: String,
+}
+
+/// Value of a `db/blog.ts` entry: what level filtering needs before the line
+/// is loaded.
+#[derive(Serialize, Deserialize)]
+struct LogRef {
+	seq:   u64,
+	level: String,
 }
 
 /// A log line to persist (from a node's `BuildStatus`).
@@ -195,307 +230,523 @@ pub fn superseded_reason() -> BuildReason {
 	}
 }
 
-pub(super) const BUILD_COLUMNS: &str =
-	"id, template_id, team_id, status, kind, vcpus, memory_mb, disk_mb, min_free_disk_mb, \
-	 envd_version, arch, node_id, tags, spec, template_version, start_cmd, ready_cmd, reason, \
-	 artifact, created_at, updated_at, started_at, finished_at";
+/// Key of the [`BuildRow`] `id`.
+pub(super) fn build_key(id: &str) -> String {
+	key(BUILD, &[id])
+}
+
+/// Prefix of the build index of template `template_id`.
+fn template_builds_prefix(template_id: &str) -> String {
+	prefix(BY_TEMPLATE, &[template_id])
+}
+
+/// Prefix of the unfinished builds of `kind` of team `team_id`.
+pub(super) fn unfinished_prefix(team_id: &str, kind: &str) -> String {
+	prefix(UNFINISHED, &[team_id, kind])
+}
+
+/// Status-dependent index keys of `build`.
+fn status_index(build: &BuildRow) -> Vec<String> {
+	let created = time_segment(build.created_at);
+	let status = build.status();
+	let mut keys = Vec::new();
+	if !status.is_terminal() {
+		keys.push(key(UNFINISHED, &[&build.team_id, &build.kind, &build.id]));
+	}
+	match status {
+		BuildStatus::Building => keys.push(key(BUILDING, &[&build.kind, &created, &build.id])),
+		BuildStatus::Ready => keys.push(key(READY, &[&build.template_id, &created, &build.id])),
+		BuildStatus::Waiting | BuildStatus::Error => {},
+	}
+	keys
+}
+
+fn template_index_key(build: &BuildRow) -> String {
+	key(BY_TEMPLATE, &[&build.template_id, &time_segment(build.created_at), &build.id])
+}
+
+fn gc_key(build: &BuildRow) -> String {
+	key(GC, &[&time_segment(build.updated_at), &build.id])
+}
+
+fn log_key(build_id: &str, n: u64) -> String {
+	key(LOG, &[build_id, &seq(n)])
+}
+
+/// Stages `new` (replacing `old`, the record read in this transaction; `None`
+/// for an insert) and moves its status indexes.
+pub(super) fn put_build(tx: &mut Tx<'_>, old: Option<&BuildRow>, new: &BuildRow) {
+	let fresh = status_index(new);
+	let stale = old.map(status_index).unwrap_or_default();
+	for index in stale.iter().filter(|index| !fresh.contains(index)) {
+		tx.delete(index.as_str());
+	}
+	for index in fresh.into_iter().filter(|index| !stale.contains(index)) {
+		tx.put(index, &new.id);
+	}
+	if old.is_none() {
+		tx.put(template_index_key(new), &new.id);
+	}
+	tx.put(build_key(&new.id), new);
+}
+
+/// `build` failed with `reason` at `at`.
+pub(super) fn failed_build(build: &BuildRow, reason: BuildReason, at: DateTime<Utc>) -> BuildRow {
+	BuildRow {
+		status: BuildStatus::Error.as_str().into(),
+		reason: Some(reason),
+		finished_at: Some(at),
+		updated_at: at,
+		..build.clone()
+	}
+}
+
+/// Stages the GC index entry of a finished build of a template being
+/// deleted (unless its artifacts are already collected).
+pub(super) fn mark_pending_gc(tx: &mut Tx<'_>, build: &BuildRow) {
+	if build.artifacts_gc_at.is_none() {
+		tx.put(gc_key(build), &build.id);
+	}
+}
+
+/// Stages the removal of `build` with its indexes and log lines (template
+/// hard deletes).
+pub(super) fn delete_build(tx: &mut Tx<'_>, build: &BuildRow) {
+	for index in status_index(build) {
+		tx.delete(index);
+	}
+	tx.delete(template_index_key(build));
+	tx.delete(gc_key(build));
+	tx.delete_prefix(prefix(LOG, &[&build.id]));
+	tx.delete_prefix(prefix(LOG_BY_TIME, &[&build.id]));
+	tx.delete(build_key(&build.id));
+}
+
+/// Builds of template `template_id` (guarded), oldest first.
+pub(super) async fn builds_of(tx: &mut Tx<'_>, template_id: &str) -> Result<Vec<BuildRow>> {
+	let ids: Vec<String> = tx.list(&template_builds_prefix(template_id)).await?;
+	let mut builds = Vec::with_capacity(ids.len());
+	for id in ids {
+		if let Some(build) = tx.get::<BuildRow>(&build_key(&id)).await? {
+			builds.push(build);
+		}
+	}
+	Ok(builds)
+}
+
+/// Whether template `template_id` has a `ready` build.
+pub(super) async fn has_ready_build(r: &Read<'_>, template_id: &str) -> Result<bool> {
+	let range = Range { prefix: prefix(READY, &[template_id]), limit: Some(1), ..Range::default() };
+	Ok(!r.scan::<String>(&range).await?.is_empty())
+}
+
+/// Whether two tag lists share a tag (`JSON_OVERLAPS`).
+pub(super) fn overlaps(tags: &[String], other: &[String]) -> bool {
+	tags.iter().any(|tag| other.contains(tag))
+}
+
+/// Range limit for a caller-supplied page size.
+pub(super) fn page_limit(limit: u32) -> usize {
+	usize::try_from(limit).unwrap_or(usize::MAX)
+}
 
 impl Store {
 	/// Build by id.
-	pub async fn build(&self, id: &str) -> sqlx::Result<Option<BuildRow>> {
-		let sql = format!("SELECT {BUILD_COLUMNS} FROM builds WHERE id = ?");
-		sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(id)
-			.fetch_optional(self.pool())
-			.await
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn build(&self, id: &str) -> Result<Option<BuildRow>> {
+		self.read().await?.get(&build_key(id)).await
 	}
 
 	/// Builds of a template, newest first, keyset-paginated.
+	///
+	/// # Errors
+	///
+	/// Store failures.
 	pub async fn template_builds(
 		&self,
 		template_id: &str,
 		after: Option<&Cursor>,
 		limit: Option<u32>,
-	) -> sqlx::Result<Vec<BuildRow>> {
-		let mut query = QueryBuilder::<MySql>::new(format!(
-			"SELECT {BUILD_COLUMNS} FROM builds WHERE template_id = "
-		));
-		query.push_bind(template_id);
-		if let Some(cursor) = after {
-			let at = from_micros(cursor.created_at_us);
-			query
-				.push(" AND (created_at < ")
-				.push_bind(at)
-				.push(" OR (created_at = ")
-				.push_bind(at)
-				.push(" AND id < ")
-				.push_bind(cursor.id.clone())
-				.push("))");
+	) -> Result<Vec<BuildRow>> {
+		let r = self.read().await?;
+		let range = Range {
+			prefix:  template_builds_prefix(template_id),
+			after:   after.map(|cursor| {
+				let at = time_segment(from_micros(cursor.created_at_us));
+				key(BY_TEMPLATE, &[template_id, &at, &cursor.id])
+			}),
+			limit:   limit.map(page_limit),
+			reverse: true,
+		};
+		let mut builds = Vec::new();
+		for (_, id) in r.scan::<String>(&range).await? {
+			if let Some(build) = r.get::<BuildRow>(&build_key(&id)).await? {
+				builds.push(build);
+			}
 		}
-		query.push(" ORDER BY created_at DESC, id DESC");
-		if let Some(limit) = limit {
-			query.push(" LIMIT ").push_bind(limit);
-		}
-		query.build_query_as().fetch_all(self.pool()).await
+		Ok(builds)
 	}
 
 	/// Latest build of each template (by `created_at`), any status.
-	pub async fn latest_builds(&self, template_ids: &[String]) -> sqlx::Result<Vec<BuildRow>> {
-		self.latest_builds_where(template_ids, "").await
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn latest_builds(&self, template_ids: &[String]) -> Result<Vec<BuildRow>> {
+		self.latest_builds_in(BY_TEMPLATE, template_ids).await
 	}
 
 	/// Latest `ready` build of each template.
-	pub async fn latest_ready_builds(&self, template_ids: &[String]) -> sqlx::Result<Vec<BuildRow>> {
-		self
-			.latest_builds_where(template_ids, " AND status = 'ready'")
-			.await
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn latest_ready_builds(&self, template_ids: &[String]) -> Result<Vec<BuildRow>> {
+		self.latest_builds_in(READY, template_ids).await
 	}
 
-	async fn latest_builds_where(
-		&self,
-		template_ids: &[String],
-		extra: &str,
-	) -> sqlx::Result<Vec<BuildRow>> {
+	/// Last build of each template in the per-template index `table`.
+	async fn latest_builds_in(&self, table: &str, template_ids: &[String]) -> Result<Vec<BuildRow>> {
 		if template_ids.is_empty() {
 			return Ok(Vec::new());
 		}
-		let mut query = QueryBuilder::<MySql>::new(format!(
-			"SELECT {BUILD_COLUMNS} FROM (SELECT b.*, ROW_NUMBER() OVER (PARTITION BY template_id \
-			 ORDER BY created_at DESC, id DESC) AS rn FROM builds b WHERE template_id IN ("
-		));
-		let mut list = query.separated(", ");
-		for id in template_ids {
-			list.push_bind(id);
+		let r = self.read().await?;
+		let mut builds = Vec::with_capacity(template_ids.len());
+		for template_id in template_ids {
+			let range = Range {
+				prefix: prefix(table, &[template_id]),
+				limit: Some(1),
+				reverse: true,
+				..Range::default()
+			};
+			if let Some((_, id)) = r.scan::<String>(&range).await?.pop()
+				&& let Some(build) = r.get::<BuildRow>(&build_key(&id)).await?
+			{
+				builds.push(build);
+			}
 		}
-		query.push(format!("){extra}) ranked WHERE rn = 1"));
-		query.build_query_as().fetch_all(self.pool()).await
+		Ok(builds)
 	}
 
-	/// Build ids of `kind = 'build'` in `building` (supervisor work list).
-	pub async fn building_build_ids(&self) -> sqlx::Result<Vec<String>> {
-		sqlx::query_scalar(
-			"SELECT id FROM builds WHERE status = 'building' AND kind = 'build' ORDER BY created_at",
-		)
-		.fetch_all(self.pool())
-		.await
-	}
-
-	/// Unfinished builds of a team (admin cancel).
-	pub async fn team_unfinished_builds(&self, team_id: &str) -> sqlx::Result<Vec<BuildRow>> {
-		let sql = format!(
-			"SELECT {BUILD_COLUMNS} FROM builds WHERE team_id = ? AND status IN ('waiting', \
-			 'building') ORDER BY created_at"
-		);
-		sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(team_id)
-			.fetch_all(self.pool())
+	/// Build ids of `kind = 'build'` in `building`, oldest first (supervisor
+	/// work list).
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn building_build_ids(&self) -> Result<Vec<String>> {
+		self
+			.read()
+			.await?
+			.list(&prefix(BUILDING, &[KIND_BUILD]))
 			.await
+	}
+
+	/// Unfinished builds of a team (admin cancel), oldest first.
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn team_unfinished_builds(&self, team_id: &str) -> Result<Vec<BuildRow>> {
+		let r = self.read().await?;
+		let mut builds = Vec::new();
+		for id in r.list::<String>(&prefix(UNFINISHED, &[team_id])).await? {
+			if let Some(build) = r.get::<BuildRow>(&build_key(&id)).await? {
+				builds.push(build);
+			}
+		}
+		builds.sort_by(|a, b| {
+			a.created_at
+				.cmp(&b.created_at)
+				.then_with(|| a.id.cmp(&b.id))
+		});
+		Ok(builds)
 	}
 
 	/// Unfinished `kind = 'build'` builds of a template that request at least
 	/// one of `tags` (cancelled when another build of those tags starts, like
 	/// upstream's `GetConcurrentTemplateBuilds`).
+	///
+	/// # Errors
+	///
+	/// Store failures.
 	pub async fn template_building_builds(
 		&self,
 		template_id: &str,
 		tags: &[String],
-	) -> sqlx::Result<Vec<BuildRow>> {
-		let sql = format!(
-			"SELECT {BUILD_COLUMNS} FROM builds WHERE template_id = ? AND kind = 'build' AND status \
-			 = 'building' AND JSON_OVERLAPS(tags, CAST(? AS JSON))"
-		);
-		sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(template_id)
-			.bind(Json(tags))
-			.fetch_all(self.pool())
-			.await
+	) -> Result<Vec<BuildRow>> {
+		let r = self.read().await?;
+		let mut builds = Vec::new();
+		for id in r.list::<String>(&prefix(BUILDING, &[KIND_BUILD])).await? {
+			if let Some(build) = r.get::<BuildRow>(&build_key(&id)).await?
+				&& build.template_id == template_id
+				&& build.status() == BuildStatus::Building
+				&& overlaps(&build.tags, tags)
+			{
+				builds.push(build);
+			}
+		}
+		Ok(builds)
 	}
 
 	/// Moves a `waiting` build to `building` on a node; `false` when the
 	/// build was no longer waiting.
-	pub async fn mark_build_started(&self, id: &str, start: &BuildStart<'_>) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			let Some((template_id, _)) = lock_build_template(&mut tx, id).await? else {
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn mark_build_started(&self, id: &str, start: &BuildStart<'_>) -> Result<bool> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(build) = tx.get::<BuildRow>(&build_key(id)).await? else {
 				return Ok(false);
 			};
-			let result = sqlx::query(
-				"UPDATE builds SET status = 'building', node_id = ?, arch = ?, spec = ?, \
-				 template_version = ?, start_cmd = ?, ready_cmd = ?, started_at = NULL, updated_at = \
-				 UTC_TIMESTAMP(3) WHERE id = ? AND status = 'waiting'",
-			)
-			.bind(start.node_id)
-			.bind(start.arch)
-			.bind(Json(start.spec))
-			.bind(start.template_version)
-			.bind(start.start_cmd)
-			.bind(start.ready_cmd)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-			if result.rows_affected() == 0 {
+			let Some(mut template) = tx
+				.get::<TemplateRow>(&template_key(&build.template_id))
+				.await?
+			else {
+				return Ok(false);
+			};
+			if build.status() != BuildStatus::Waiting {
 				return Ok(false);
 			}
-			sqlx::query(
-				"UPDATE templates SET build_count = build_count + 1, updated_at = UTC_TIMESTAMP(3) \
-				 WHERE id = ?",
-			)
-			.bind(&template_id)
-			.execute(&mut *tx)
-			.await?;
-			tx.commit().await?;
-			Ok(true)
-		})
-		.await
+			let at = now();
+			let started = BuildRow {
+				status: BuildStatus::Building.as_str().into(),
+				node_id: Some(start.node_id.to_owned()),
+				arch: Some(start.arch.to_owned()),
+				spec: Some(start.spec.clone()),
+				template_version: Some(start.template_version.to_owned()),
+				start_cmd: start.start_cmd.map(str::to_owned),
+				ready_cmd: start.ready_cmd.map(str::to_owned),
+				started_at: None,
+				updated_at: at,
+				..build.clone()
+			};
+			put_build(&mut tx, Some(&build), &started);
+			template.build_count += 1;
+			template.updated_at = at;
+			tx.put(template_key(&template.id), &template);
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
 	}
 
 	/// Records that the builder node started running a dispatched build (it
 	/// left the node's queue); `false` when already recorded or no longer
 	/// building.
-	pub async fn mark_build_running(&self, id: &str) -> sqlx::Result<bool> {
-		let result = retry_deadlocks(|| async move {
-			sqlx::query(
-				"UPDATE builds SET started_at = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE \
-				 id = ? AND status = 'building' AND started_at IS NULL",
-			)
-			.bind(id)
-			.execute(self.pool())
-			.await
-		})
-		.await?;
-		Ok(result.rows_affected() > 0)
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn mark_build_running(&self, id: &str) -> Result<bool> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(build) = tx.get::<BuildRow>(&build_key(id)).await? else {
+				return Ok(false);
+			};
+			if build.status() != BuildStatus::Building || build.started_at.is_some() {
+				return Ok(false);
+			}
+			let at = now();
+			let running = BuildRow { started_at: Some(at), updated_at: at, ..build.clone() };
+			put_build(&mut tx, Some(&build), &running);
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
 	}
 
 	/// Marks an unfinished build `ready` with its artifact, records the
 	/// build facts, and points its requested tags at it. `false` when the
 	/// build had already finished (e.g. cancelled meanwhile).
-	pub async fn finish_build_ready(&self, id: &str, artifact: &ArtifactInfo) -> sqlx::Result<bool> {
-		retry_deadlocks(|| async move {
-			let mut tx = self.pool().begin().await?;
-			let Some((template_id, live)) = lock_build_template(&mut tx, id).await? else {
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn finish_build_ready(&self, id: &str, artifact: &ArtifactInfo) -> Result<bool> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(build) = tx.get::<BuildRow>(&build_key(id)).await? else {
 				return Ok(false);
 			};
-			let result = sqlx::query(
-				"UPDATE builds SET status = 'ready', artifact = ?, envd_version = ?, arch = ?, \
-				 node_id = ?, vcpus = ?, memory_mb = ?, disk_mb = ?, reason = NULL, finished_at = \
-				 UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN \
-				 ('waiting', 'building')",
-			)
-			.bind(Json(artifact))
-			.bind(&artifact.envd_version)
-			.bind(&artifact.arch)
-			.bind(artifact.node_id.to_string())
-			.bind(artifact.vcpus)
-			.bind(artifact.memory_mb)
-			.bind(artifact.disk_mb)
-			.bind(id)
-			.execute(&mut *tx)
-			.await?;
-			if result.rows_affected() == 0 {
+			let Some(mut template) = tx
+				.get::<TemplateRow>(&template_key(&build.template_id))
+				.await?
+			else {
+				return Ok(false);
+			};
+			if build.status().is_terminal() {
 				return Ok(false);
 			}
-			if live {
-				let Json(tags): Json<Vec<String>> =
-					sqlx::query_scalar("SELECT tags FROM builds WHERE id = ?")
-						.bind(id)
-						.fetch_one(&mut *tx)
-						.await?;
-				upsert_tags(&mut tx, &template_id, id, &tags).await?;
-				sqlx::query("UPDATE templates SET updated_at = UTC_TIMESTAMP(3) WHERE id = ?")
-					.bind(&template_id)
-					.execute(&mut *tx)
-					.await?;
+			let at = now();
+			let ready = BuildRow {
+				status: BuildStatus::Ready.as_str().into(),
+				artifact: Some(artifact.clone()),
+				envd_version: Some(artifact.envd_version.clone()),
+				arch: Some(artifact.arch.clone()),
+				node_id: Some(artifact.node_id.to_string()),
+				vcpus: artifact.vcpus,
+				memory_mb: artifact.memory_mb,
+				disk_mb: artifact.disk_mb,
+				reason: None,
+				finished_at: Some(at),
+				updated_at: at,
+				..build.clone()
+			};
+			put_build(&mut tx, Some(&build), &ready);
+			if template.deleted_at.is_none() {
+				upsert_tags(&mut tx, &template.id, id, &build.tags);
+				template.updated_at = at;
+				tx.put(template_key(&template.id), &template);
 			}
-			tx.commit().await?;
-			Ok(true)
-		})
-		.await
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
 	}
 
 	/// Marks an unfinished build `error`; `false` when it had already finished.
-	pub async fn fail_build(&self, id: &str, reason: &BuildReason) -> sqlx::Result<bool> {
-		let result = retry_deadlocks(|| async move {
-			sqlx::query(
-				"UPDATE builds SET status = 'error', reason = ?, finished_at = UTC_TIMESTAMP(3), \
-				 updated_at = UTC_TIMESTAMP(3) WHERE id = ? AND status IN ('waiting', 'building')",
-			)
-			.bind(Json(reason))
-			.bind(id)
-			.execute(self.pool())
-			.await
-		})
-		.await?;
-		Ok(result.rows_affected() == 1)
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn fail_build(&self, id: &str, reason: &BuildReason) -> Result<bool> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(build) = tx.get::<BuildRow>(&build_key(id)).await? else {
+				return Ok(false);
+			};
+			if build.status().is_terminal() {
+				return Ok(false);
+			}
+			put_build(&mut tx, Some(&build), &failed_build(&build, reason.clone(), now()));
+			if tx.commit().await? {
+				return Ok(true);
+			}
+		}
 	}
 
 	/// Number of persisted log lines (= next `seq`).
-	pub async fn build_log_count(&self, build_id: &str) -> sqlx::Result<u64> {
-		let next: i64 = sqlx::query_scalar(
-			"SELECT CAST(COALESCE(MAX(seq) + 1, 0) AS SIGNED) FROM build_logs WHERE build_id = ?",
-		)
-		.bind(build_id)
-		.fetch_one(self.pool())
-		.await?;
-		Ok(u64::try_from(next).unwrap_or(0))
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn build_log_count(&self, build_id: &str) -> Result<u64> {
+		let range = Range {
+			prefix: prefix(LOG, &[build_id]),
+			limit: Some(1),
+			reverse: true,
+			..Range::default()
+		};
+		let last = self.read().await?.scan::<LogRow>(&range).await?;
+		Ok(last.first().map_or(0, |(_, line)| line.seq + 1))
 	}
 
-	/// Appends log lines with consecutive `seq` from `first_seq`; already
-	/// stored sequence numbers are left untouched (idempotent re-delivery).
+	/// Appends log lines with consecutive `seq` from `first_seq` in one
+	/// commit; already stored sequence numbers are left untouched (idempotent
+	/// re-delivery).
+	///
+	/// # Errors
+	///
+	/// Store failures.
 	pub async fn append_build_logs(
 		&self,
 		build_id: &str,
 		first_seq: u64,
 		logs: &[NewLog],
-	) -> sqlx::Result<()> {
-		const CHUNK: usize = 500;
-		let mut base = first_seq;
+	) -> Result<()> {
 		if logs.is_empty() {
 			return Ok(());
 		}
-		for chunk in logs.chunks(CHUNK) {
-			let first = base;
-			retry_deadlocks(|| async move {
-				let mut query = QueryBuilder::<MySql>::new(
-					"INSERT IGNORE INTO build_logs (build_id, seq, ts, level, step, message) ",
-				);
-				query.push_values(chunk.iter().enumerate(), |mut row, (offset, log)| {
-					row.push_bind(build_id)
-						.push_bind(first + offset as u64)
-						.push_bind(log.ts)
-						.push_bind(log.level.as_str())
-						.push_bind(log.step.clone())
-						.push_bind(log.message.clone());
-				});
-				query.build().execute(self.pool()).await
+		let lines: Vec<LogRow> = logs
+			.iter()
+			.zip(first_seq..)
+			.map(|(log, n)| LogRow {
+				seq:     n,
+				ts:      log.ts.trunc_subsecs(3),
+				level:   log.level.as_str().into(),
+				step:    log.step.clone(),
+				message: log.message.clone(),
 			})
-			.await?;
-			base += chunk.len() as u64;
+			.collect();
+		let stored = Range {
+			prefix:  prefix(LOG, &[build_id]),
+			after:   first_seq.checked_sub(1).map(|n| log_key(build_id, n)),
+			limit:   Some(lines.len()),
+			reverse: false,
+		};
+		let mut tx = self.tx().await?;
+		loop {
+			let existing: HashSet<u64> = tx
+				.scan::<LogRow>(&stored)
+				.await?
+				.into_iter()
+				.map(|(_, line)| line.seq)
+				.collect();
+			for line in lines.iter().filter(|line| !existing.contains(&line.seq)) {
+				let line_key = log_key(build_id, line.seq);
+				tx.require(Compare::Missing(line_key.clone()));
+				tx.put_ttl(line_key, line, HISTORY_TTL);
+				tx.put_ttl(
+					key(LOG_BY_TIME, &[build_id, &time_segment(line.ts), &seq(line.seq)]),
+					&LogRef { seq: line.seq, level: line.level.clone() },
+					HISTORY_TTL,
+				);
+			}
+			if tx.commit().await? {
+				return Ok(());
+			}
 		}
-		Ok(())
 	}
 
 	/// `logsOffset`/`limit` page over the lines at or above `min_level`
 	/// (offset counts only matching lines), oldest first.
+	///
+	/// # Errors
+	///
+	/// Store failures.
 	pub async fn build_logs_page(
 		&self,
 		build_id: &str,
 		min_level: LogLevel,
 		offset: u64,
 		limit: u32,
-	) -> sqlx::Result<Vec<LogRow>> {
-		sqlx::query_as(
-			"SELECT seq, ts, level, step, message FROM build_logs WHERE build_id = ? AND level + 0 \
-			 >= ? ORDER BY seq LIMIT ? OFFSET ?",
-		)
-		.bind(build_id)
-		.bind(min_level.enum_index())
-		.bind(limit)
-		.bind(offset)
-		.fetch_all(self.pool())
-		.await
+	) -> Result<Vec<LogRow>> {
+		let want = page_limit(limit);
+		let mut page = Vec::new();
+		if want == 0 {
+			return Ok(page);
+		}
+		let mut skip = offset;
+		let range = Range { prefix: prefix(LOG, &[build_id]), ..Range::default() };
+		self
+			.read()
+			.await?
+			.scan_all::<LogRow>(&range, |_, line| {
+				if LogLevel::normalize(&line.level) >= min_level {
+					if skip > 0 {
+						skip -= 1;
+					} else {
+						page.push(line);
+					}
+				}
+				page.len() < want
+			})
+			.await?;
+		Ok(page)
 	}
 
-	/// Time-cursor page (`GET …/builds/{id}/logs`).
+	/// Time-cursor page (`GET …/builds/{id}/logs`): lines at or above
+	/// `min_level` ordered by `(ts, seq)` from `cursor` in `direction`.
+	///
+	/// # Errors
+	///
+	/// Store failures.
 	pub async fn build_logs_by_time(
 		&self,
 		build_id: &str,
@@ -503,96 +754,130 @@ impl Store {
 		direction: LogDirection,
 		min_level: LogLevel,
 		limit: u32,
-	) -> sqlx::Result<Vec<LogRow>> {
-		let sql = match direction {
-			LogDirection::Forward => {
-				"SELECT seq, ts, level, step, message FROM build_logs WHERE build_id = ? AND level + 0 \
-				 >= ? AND ts >= ? ORDER BY ts, seq LIMIT ?"
+	) -> Result<Vec<LogRow>> {
+		let want = page_limit(limit);
+		if want == 0 {
+			return Ok(Vec::new());
+		}
+		let from = key(LOG_BY_TIME, &[build_id, &time_segment(cursor)]);
+		let range = match direction {
+			// Every key of an instant at or after `cursor` sorts after its bare
+			// time segment.
+			LogDirection::Forward => Range {
+				prefix: prefix(LOG_BY_TIME, &[build_id]),
+				after: Some(from),
+				..Range::default()
 			},
-			LogDirection::Backward => {
-				"SELECT seq, ts, level, step, message FROM build_logs WHERE build_id = ? AND level + 0 \
-				 >= ? AND ts <= ? ORDER BY ts DESC, seq DESC LIMIT ?"
+			// `~` sorts after every `seq` segment of the cursor's instant.
+			LogDirection::Backward => Range {
+				prefix: prefix(LOG_BY_TIME, &[build_id]),
+				after: Some(format!("{from}/~")),
+				reverse: true,
+				..Range::default()
 			},
 		};
-		sqlx::query_as(sql)
-			.bind(build_id)
-			.bind(min_level.enum_index())
-			.bind(cursor)
-			.bind(limit)
-			.fetch_all(self.pool())
-			.await
+		let r = self.read().await?;
+		let mut seqs = Vec::new();
+		r.scan_all::<LogRef>(&range, |_, line| {
+			if LogLevel::normalize(&line.level) >= min_level {
+				seqs.push(line.seq);
+			}
+			seqs.len() < want
+		})
+		.await?;
+		let mut page = Vec::with_capacity(seqs.len());
+		for n in seqs {
+			// Expired lines are skipped.
+			if let Some(line) = r.get::<LogRow>(&log_key(build_id, n)).await? {
+				page.push(line);
+			}
+		}
+		Ok(page)
 	}
 
 	/// `snapshot` builds stuck in `building` since before `before` (their
 	/// driver died mid-snapshot).
-	pub async fn stale_snapshot_builds(&self, before: DateTime<Utc>) -> sqlx::Result<Vec<String>> {
-		sqlx::query_scalar(
-			"SELECT id FROM builds WHERE kind = 'snapshot' AND status = 'building' AND updated_at < ?",
-		)
-		.bind(before)
-		.fetch_all(self.pool())
-		.await
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn stale_snapshot_builds(&self, before: DateTime<Utc>) -> Result<Vec<String>> {
+		let r = self.read().await?;
+		let mut ids = Vec::new();
+		for id in r
+			.list::<String>(&prefix(BUILDING, &[KIND_SNAPSHOT]))
+			.await?
+		{
+			if let Some(build) = r.get::<BuildRow>(&build_key(&id)).await?
+				&& build.updated_at < before
+			{
+				ids.push(build.id);
+			}
+		}
+		Ok(ids)
 	}
 
 	/// Finished builds of deleted templates whose artifacts are not yet
-	/// collected and that no running or paused sandbox row uses (so builds
-	/// that stay in use cannot starve the batch).
-	pub async fn builds_pending_gc(&self, limit: u32) -> sqlx::Result<Vec<BuildRow>> {
-		let sql = format!(
-			"SELECT {BUILD_COLUMNS} FROM builds WHERE artifacts_gc_at IS NULL AND status IN \
-			 ('ready', 'error') AND template_id IN (SELECT id FROM templates WHERE deleted_at IS NOT \
-			 NULL) AND id NOT IN (SELECT build_id FROM sandboxes WHERE state IN ('running', \
-			 'paused')) ORDER BY updated_at LIMIT ?"
-		);
-		sqlx::query_as(sqlx::AssertSqlSafe(sql))
-			.bind(limit)
-			.fetch_all(self.pool())
-			.await
+	/// collected and that no running or paused sandbox uses (so builds that
+	/// stay in use cannot starve the batch), least recently updated first.
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn builds_pending_gc(&self, limit: u32) -> Result<Vec<BuildRow>> {
+		let want = page_limit(limit);
+		if want == 0 {
+			return Ok(Vec::new());
+		}
+		let r = self.read().await?;
+		let in_use = super::sandboxes::live_build_ids(&r).await?;
+		let mut ids = Vec::new();
+		let range = Range { prefix: prefix(GC, &[]), ..Range::default() };
+		r.scan_all::<String>(&range, |_, id| {
+			if !in_use.contains(&id) {
+				ids.push(id);
+			}
+			ids.len() < want
+		})
+		.await?;
+		let mut builds = Vec::with_capacity(ids.len());
+		for id in ids {
+			if let Some(build) = r.get::<BuildRow>(&build_key(&id)).await?
+				&& build.artifacts_gc_at.is_none()
+			{
+				builds.push(build);
+			}
+		}
+		Ok(builds)
 	}
 
 	/// Records that a build's artifacts were deleted from every holder.
-	pub async fn mark_artifacts_collected(&self, id: &str) -> sqlx::Result<()> {
-		retry_deadlocks(|| async move {
-			sqlx::query("UPDATE builds SET artifacts_gc_at = UTC_TIMESTAMP(3) WHERE id = ?")
-				.bind(id)
-				.execute(self.pool())
-				.await
-		})
-		.await?;
-		Ok(())
-	}
-
-	/// Build ids referenced by paused sandboxes (artifacts must stay).
-	pub async fn builds_of_paused_sandboxes(&self) -> sqlx::Result<Vec<String>> {
-		sqlx::query_scalar("SELECT DISTINCT build_id FROM sandboxes WHERE state = 'paused'")
-			.fetch_all(self.pool())
-			.await
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn mark_artifacts_collected(&self, id: &str) -> Result<()> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(build) = tx.get::<BuildRow>(&build_key(id)).await? else {
+				return Ok(());
+			};
+			if build.artifacts_gc_at.is_some() {
+				return Ok(());
+			}
+			tx.delete(gc_key(&build));
+			tx.put(build_key(id), &BuildRow { artifacts_gc_at: Some(now()), ..build });
+			if tx.commit().await? {
+				return Ok(());
+			}
+		}
 	}
 }
 
-/// Locks the template row of build `id` and returns its id and whether it is
-/// live (not deleted); `None` for an unknown build.
-///
-/// A transaction that changes a build and its template locks the template
-/// first, as template deletes and build registrations do. Locking the build
-/// first closed deadlock cycles with them under concurrent builds.
-async fn lock_build_template(
-	tx: &mut Transaction<'_, MySql>,
-	id: &str,
-) -> sqlx::Result<Option<(String, bool)>> {
-	// A build never changes templates, so this plain read needs no lock.
-	let Some(template_id) =
-		sqlx::query_scalar::<_, String>("SELECT template_id FROM builds WHERE id = ?")
-			.bind(id)
-			.fetch_optional(&mut **tx)
-			.await?
-	else {
-		return Ok(None);
-	};
-	let deleted_at: Option<Option<DateTime<Utc>>> =
-		sqlx::query_scalar("SELECT deleted_at FROM templates WHERE id = ? FOR UPDATE")
-			.bind(&template_id)
-			.fetch_optional(&mut **tx)
-			.await?;
-	Ok(deleted_at.map(|deleted_at| (template_id, deleted_at.is_none())))
+#[cfg(test)]
+impl Store {
+	/// Every stored build record (tests).
+	pub(crate) async fn stored_builds(&self) -> Result<Vec<BuildRow>> {
+		self.read().await?.list(&prefix(BUILD, &[])).await
+	}
 }

@@ -1,6 +1,6 @@
 # Installation
 
-What to install on each host: the release assets, platform support, host requirements, the MySQL database drivers need, and building from source. For a single-machine trial, the [Quickstart](quickstart.md) is shorter.
+What to install on each host: the release assets, platform support, host requirements, driver state, and building from source. For a single-machine trial, the [Quickstart](quickstart.md) is shorter.
 
 ## Platform support
 
@@ -72,7 +72,7 @@ Driver-only hosts need just `vmon`. `--kernel` (`VMON_KERNEL`) and `--agent` (`V
 
 ### Drivers
 
-Drivers need MySQL (`--mysql-url`, `VMON_MYSQL_URL`, e.g. `mysql://user:pass@host:3306/vmon`). The project develops and tests against MySQL 8.4 (`just mysql` runs `mysql:8.4`). Drivers apply schema migrations themselves, and so does `vmon admin`. Every driver of a cluster uses the same database and the same cluster secret; see [Running vmon serve](../operate/serve.md#cluster-secret).
+Drivers need no external database: they keep all durable state (teams, keys, templates, builds, sandboxes, events, webhooks, secrets, volumes) in the raft KV they replicate among themselves, in memory and snapshotted under `<data-dir>/raft/`. Keep that directory on persistent storage. Every driver of a cluster uses the same cluster secret; see [Running vmon serve](../operate/serve.md#cluster-secret).
 
 ## Build from source
 
@@ -95,4 +95,4 @@ vmon --version                   # prints `vmon <version>`
 curl -i http://127.0.0.1:3000/health
 ```
 
-`GET /health` on a driver's `--listen` address returns `204 No Content` when MySQL and the raft KV are reachable, and `500` or `503` otherwise.
+`GET /health` on a driver's `--listen` address returns `204 No Content` when the driver can serve linearizable reads of the raft KV, and `500` or `503` otherwise.

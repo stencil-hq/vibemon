@@ -8,30 +8,24 @@ Run a single-process vibemon (node and driver roles in one `vmon serve`) on one 
 |---|---|
 | [rustup](https://rustup.rs) | Installs the pinned nightly toolchain and targets from [`rust-toolchain.toml`](https://github.com/stencil-hq/vibemon/blob/main/rust-toolchain.toml) on first `cargo` run. |
 | [just](https://github.com/casey/just) | Runs the recipes in the [`justfile`](https://github.com/stencil-hq/vibemon/blob/main/justfile). |
-| Docker | `just mysql` runs MySQL 8.4; on macOS `just kernel` builds in a container. |
+| Docker | On macOS `just kernel` builds in a container. |
 | [uv](https://docs.astral.sh/uv/) | `just templates` runs `templates/build.py` with `uv run`. |
 | [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) + [Zig](https://ziglang.org) (optional) | `just agent-musl` uses `cargo zigbuild` for the static guest agent when it is installed, else plain `cargo build`. |
 
 Linux hosts also need `/dev/kvm`, `ip` (iproute2), and `iptables`; see [Installation](installation.md#host-requirements).
 
-## 1. Start MySQL
+No database is needed: the driver keeps all state in its raft KV under the data directory.
 
-```sh
-just mysql
-```
-
-This starts the Docker container `vmon-mysql` (creating it on first run) running `mysql:8.4` on host port `13306` (published on all host interfaces by default), with root password `vmon` and database `vmon`. Every URL below is `mysql://root:vmon@127.0.0.1:13306/vmon`.
-
-## 2. Build the guest kernel (recommended)
+## 1. Build the guest kernel (recommended)
 
 ```sh
 just kernel --arch aarch64          # macOS (in Docker), or an aarch64 Linux host
 just kernel --arch x86_64           # x86_64 Linux host
 ```
 
-Outputs land in `target/kernel/`, where a dev-tree `vmon` finds them. Without this step the node downloads the pinned cloud-hypervisor kernel and logs a warning: that kernel has no netfilter, IPv6, bridge, or NFS, so Docker and some units of the default templates fail. Templates capture the kernel they were built with, so build it before step 4. Details: [Guest kernel](../operate/kernel.md).
+Outputs land in `target/kernel/`, where a dev-tree `vmon` finds them. Without this step the node downloads the pinned cloud-hypervisor kernel and logs a warning: that kernel has no netfilter, IPv6, bridge, or NFS, so Docker and some units of the default templates fail. Templates capture the kernel they were built with, so build it before step 3. Details: [Guest kernel](../operate/kernel.md).
 
-## 3. Start the server
+## 2. Start the server
 
 Leave the server running in its own terminal.
 
@@ -44,14 +38,13 @@ just serve
 `just serve` builds and ad-hoc signs `vmon`, builds the static guest agent into `target/test-assets/`, and runs:
 
 ```text
-vmon serve --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
-  --agent target/test-assets/vmon-agent-<arch> --listen 127.0.0.1:3000 \
+vmon serve --agent target/test-assets/vmon-agent-<arch> --listen 127.0.0.1:3000 \
   --public-url http://127.0.0.1:3000 --domain localhost
 ```
 
 `--public-url` matters with a loopback listener: signed template-file upload URLs point at it, and its default is derived from the cluster listener's address, not from `--listen`.
 
-Extra arguments are forwarded, e.g. add `--registry-mirror https://mirror.gcr.io`. State goes to `~/.vmon`, including the generated `cluster-secret` that `vmon admin` reads.
+Extra arguments are forwarded, e.g. add `--registry-mirror https://mirror.gcr.io`. State goes to `~/.vmon`: the raft KV with every team, key, template, and sandbox record (`raft/`), and the generated `cluster-secret` that `vmon admin` reads.
 
 **Linux**: the node creates TAP devices and NAT rules, which needs root or `CAP_NET_ADMIN`. `just serve` runs unprivileged, so the node starts but rejects sandbox creates and builds. Run the same command under `sudo`. Use an explicit cluster secret so the unprivileged `vmon admin` and `just templates` can use it (as root, the generated secret is written to `/var/lib/vmon/cluster-secret` with mode `0600`):
 
@@ -59,20 +52,19 @@ Extra arguments are forwarded, e.g. add `--registry-mirror https://mirror.gcr.io
 just build agent-musl
 export VMON_CLUSTER_SECRET="$(openssl rand -hex 32)"
 sudo "$(just bin)" serve --cluster-secret "$VMON_CLUSTER_SECRET" \
-  --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
   --agent "$PWD/target/test-assets/vmon-agent-$(uname -m)" \
   --listen 127.0.0.1:3000 --domain localhost --public-url http://127.0.0.1:3000
 ```
 
 Export the same `VMON_CLUSTER_SECRET` in every shell that runs the commands below. Alternatives to running everything as root: [Linux privileges](../operate/serve.md#linux-privileges).
 
-Check that the driver is up. `/health` returns `204` once MySQL and the raft KV answer:
+Check that the driver is up. `/health` returns `204` once the raft KV serves reads:
 
 ```sh
 curl -i http://127.0.0.1:3000/health
 ```
 
-## 4. Build the `base` template
+## 3. Build the `base` template
 
 ```sh
 just templates base
@@ -88,11 +80,13 @@ just templates base
 
 More: [Templates](../concepts/templates.md).
 
-## 5. Create a team and API key
+## 4. Create a team and API key
 
 ```sh
-"$(just bin)" admin --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon create-team dev
+"$(just bin)" admin create-team dev
 ```
+
+`vmon admin` talks to the running server's cluster listener (`http://127.0.0.1:7947` by default).
 
 The output has `team`, `slug`, and `api key` lines. Export the key and point the SDKs at the server:
 
@@ -105,7 +99,7 @@ export E2B_SANDBOX_URL=http://127.0.0.1:3000
 
 `E2B_SANDBOX_URL` sends sandbox (envd) traffic to the API listener, which routes it by the `E2b-Sandbox-*` headers. [Connecting SDKs and the CLI](clients.md) covers the TLS setup that needs only `E2B_DOMAIN`.
 
-## 6. Use a sandbox
+## 5. Use a sandbox
 
 Python:
 
@@ -139,12 +133,11 @@ Lifecycle details (timeouts, auto-pause, fork, snapshots): [Sandboxes](../concep
 
 ## With release binaries (Linux)
 
-Tagged releases ship Linux binaries only (x86_64 and aarch64, static musl); macOS uses the dev path above. Install `vmon`, `vmon-kernel-<arch>`, and `vmon-agent-<arch>` into one directory as described in [Installation](installation.md#install-a-release), here `/opt/vmon`. Then, with MySQL from step 1:
+Tagged releases ship Linux binaries only (x86_64 and aarch64, static musl); macOS uses the dev path above. Install `vmon`, `vmon-kernel-<arch>`, and `vmon-agent-<arch>` into one directory as described in [Installation](installation.md#install-a-release), here `/opt/vmon`. Then:
 
 ```sh
 export VMON_CLUSTER_SECRET="$(openssl rand -hex 32)"
 sudo /opt/vmon/vmon serve --cluster-secret "$VMON_CLUSTER_SECRET" \
-  --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon \
   --listen 127.0.0.1:3000 --domain localhost --public-url http://127.0.0.1:3000
 ```
 
@@ -152,7 +145,7 @@ No `--kernel` or `--agent` is needed: the node picks up the files next to `vmon`
 
 ```sh
 VMON_BIN=/opt/vmon/vmon uv run templates/build.py base
-/opt/vmon/vmon admin --mysql-url mysql://root:vmon@127.0.0.1:13306/vmon create-team dev
+/opt/vmon/vmon admin create-team dev
 ```
 
-Export the printed key and the client variables as in step 5, then continue at step 6.
+Export the printed key and the client variables as in step 4, then continue at step 5.

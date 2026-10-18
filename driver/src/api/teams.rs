@@ -1,5 +1,5 @@
-//! `GET /teams` (CLI login), team metrics derived from `sandbox_events`, and
-//! the admin team overview `GET /admin/teams` (vmon extension).
+//! `GET /teams` (CLI login), team metrics derived from the sandbox event log,
+//! and the admin team overview `GET /admin/teams` (vmon extension).
 
 use axum::{
 	Json, Router,

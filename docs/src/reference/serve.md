@@ -9,13 +9,13 @@ vmon serve [OPTIONS]
 Boolean switches (`--log-json`, `--s3-mounts-allow-private`, `--shared-volumes`) take no value on the command line. Enable them through the environment with `true`, for example `VMON_LOG_JSON=true`. `--lazy-resume` is different: it always takes a value, `true` or `false`.
 
 > [!NOTE]
-> `--help` does not print the values of `VMON_CLUSTER_SECRET`, `VMON_MYSQL_URL`, and `VMON_ADMIN_TOKEN`.
+> `--help` does not print the values of `VMON_CLUSTER_SECRET` and `VMON_ADMIN_TOKEN`.
 
 ## Roles and logging
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--role <ROLE>` | `VMON_ROLE` | `node,driver` | Roles to run, comma separated. `node` hosts microVMs. `driver` serves the E2B API and sandbox ingress and schedules work. At least one role is required. The driver role refuses to start without `--mysql-url`. |
+| `--role <ROLE>` | `VMON_ROLE` | `node,driver` | Roles to run, comma separated. `node` hosts microVMs. `driver` serves the E2B API and sandbox ingress and schedules work. At least one role is required. |
 | `--data-dir <DATA_DIR>` | `VMON_HOME` | see below | State directory. Created if missing. |
 | `--run-dir <RUN_DIR>` | `VMON_RUN_DIR` | see below | Directory for per-VM Unix sockets (`api.sock`, `agent.sock`), one short subdirectory per VM. |
 | `--log <LOG>` | `VMON_LOG` | `info,openraft=warn` | Log filter in `tracing` env-filter syntax, for example `info,vmon_node=debug`. An invalid filter aborts startup. |
@@ -36,6 +36,7 @@ The files kept in both directories are listed in [Data and run directories](../o
 | `--cluster-secret <CLUSTER_SECRET>` | `VMON_CLUSTER_SECRET` | `<data-dir>/cluster-secret` | Shared cluster secret. Must not be empty. See below. |
 | `--cluster-listen <CLUSTER_LISTEN>` | `VMON_CLUSTER_LISTEN` | `0.0.0.0:7947` | Internal HTTP listener: raft and KV (`/cluster/v1/*`, drivers) and the node API and guest tunnels (`/node/v1/*`, nodes). Every request needs `Authorization: Bearer <cluster secret>`. |
 | `--cluster-advertise <CLUSTER_ADVERTISE>` | `VMON_CLUSTER_ADVERTISE` | `http://<advertise-ip>:<cluster-listen port>` | URL that peers use to reach `--cluster-listen`. Published in gossip metadata. |
+| `--kv-resp-listen <KV_RESP_LISTEN>` | `VMON_KV_RESP_LISTEN` | off | Redis-protocol (RESP2) listener for the cluster KV, for `redis-cli`, `redis-benchmark`, and Redis clients. Clients must `AUTH <cluster secret>` first. Supports `PING`, `QUIT`, `GET`, `SET key value [NX\|XX] [EX s\|PX ms]`, `DEL`, and `EXISTS`; keys are the KV's own keys, reads are linearizable, and every write is a raft transaction. |
 | `--gossip-listen <GOSSIP_LISTEN>` | `VMON_GOSSIP_LISTEN` | `0.0.0.0:7946` | Gossip listener. UDP carries probes and updates, TCP on the same port carries push-pull state exchange. |
 | `--gossip-advertise <GOSSIP_ADVERTISE>` | `VMON_GOSSIP_ADVERTISE` | `<advertise-ip>:<gossip-listen port>` | Address that peers use to reach `--gossip-listen`. Must be an `ip:port` socket address, not a host name. |
 | `--join <JOIN>` | `VMON_JOIN` | none | Gossip seeds as `host:port`, comma separated. Host names are resolved through DNS. If no seed answers at startup, the process logs a warning and retries every 2 s in the background. |
@@ -69,7 +70,6 @@ Routing rules, certificates, and DNS are covered in [Domains, TLS, and ingress](
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--mysql-url <MYSQL_URL>` | `VMON_MYSQL_URL` | none | Database URL (driver), for example `mysql://user:pass@host:3306/vmon`. Required by the driver role. The database must already exist. The driver applies its embedded migrations at startup and keeps a pool of up to 32 connections. |
 | `--admin-token <ADMIN_TOKEN>` | `VMON_ADMIN_TOKEN` | none | Token accepted in `X-Admin-Token` on the admin endpoints (`/nodes`, `/admin/*`). When it is unset, every admin request gets 401. |
 
 Admin workflows are covered in [Administration](../operate/admin.md).

@@ -14,10 +14,10 @@ reference template for `fromImage` builds on a plain distro image.
     uv run templates/build.py [NAME ...] [--jobs N] [--skip-cache]
 
 Credentials: `E2B_API_KEY` of a system team, or else `vmon admin` (`$VMON_BIN`,
-default `vmon` on PATH, with `VMON_MYSQL_URL`, `VMON_CLUSTER_SECRET` /
-`VMON_HOME` as for `vmon admin`) finds or creates the system team `--team`
-and mints a key. `E2B_API_URL` defaults to `http://127.0.0.1:3000`
-(`just serve`).
+default `vmon` on PATH, with `VMON_CLUSTER_URL` (default: the local driver's
+`http://127.0.0.1:7947`), `VMON_CLUSTER_SECRET` / `VMON_HOME` as for
+`vmon admin`) finds or creates the system team `--team` and mints a key.
+`E2B_API_URL` defaults to `http://127.0.0.1:3000` (`just serve`).
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ TEMPLATES = {
     "ubuntu-systemd": "ubuntu-systemd",
 }
 DEFAULT_API_URL = "http://127.0.0.1:3000"
-DEFAULT_MYSQL_URL = "mysql://root:vmon@127.0.0.1:13306/vmon"
 
 _print_lock = threading.Lock()
 
@@ -78,10 +77,8 @@ def vmon_admin(*args: str) -> str:
     vmon = os.environ.get("VMON_BIN") or shutil.which("vmon")
     if not vmon:
         sys.exit("build.py: set E2B_API_KEY (system team) or VMON_BIN / put `vmon` on PATH")
-    env = dict(os.environ)
-    env.setdefault("VMON_MYSQL_URL", DEFAULT_MYSQL_URL)
     result = subprocess.run(
-        [vmon, "admin", *args], env=env, check=True, capture_output=True, text=True
+        [vmon, "admin", *args], check=True, capture_output=True, text=True
     )
     return result.stdout
 

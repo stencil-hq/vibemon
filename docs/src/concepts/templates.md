@@ -129,7 +129,7 @@ The CLI converts the Dockerfile into v2 steps (`FROM`, `ENV`, `RUN`, `WORKDIR`, 
 | `GET /templates/{id}/builds/{buildID}/status` | `logsOffset`, `limit` (≤ 100), `level` | `status`, `logEntries`, and for errors `reason {message, step, logEntries}` |
 | `GET /templates/{id}/builds/{buildID}/logs` | `cursor` (ms), `limit` (≤ 100), `direction`, `level`, `source` | `logs[]` |
 
-The supervising driver copies the builder's log into MySQL every 500 ms, so logs outlive the builder. `Template.get_build_status(...)` and `on_build_logs` read these endpoints.
+The supervising driver copies the builder's log into the driver store (the raft KV) every 500 ms, so logs outlive the builder; they are kept for 7 days. `Template.get_build_status(...)` and `on_build_logs` read these endpoints.
 
 ## Names, aliases, and tags
 
@@ -193,7 +193,7 @@ uv run templates/build.py --skip-cache code-interpreter-v1
 | `--jobs`, `-j` | 1 | Concurrent builds |
 | `--skip-cache` | off | Rebuild every layer |
 
-It uses `E2B_API_KEY` if set; that key must belong to a system team. Otherwise it runs `vmon admin` (`$VMON_BIN`, else `vmon` on `PATH`, with `VMON_MYSQL_URL` defaulting to `mysql://root:vmon@127.0.0.1:13306/vmon`) to find or create the system team, mark it system, and mint a key. `E2B_API_URL` defaults to `http://127.0.0.1:3000`. After each build it publishes the template with `PATCH /v2/templates/{id}`, which claims the bare alias.
+It uses `E2B_API_KEY` if set; that key must belong to a system team. Otherwise it runs `vmon admin` (`$VMON_BIN`, else `vmon` on `PATH`, against a running driver's cluster listener, `VMON_CLUSTER_URL` defaulting to `http://127.0.0.1:7947`) to find or create the system team, mark it system, and mint a key. `E2B_API_URL` defaults to `http://127.0.0.1:3000`. After each build it publishes the template with `PATCH /v2/templates/{id}`, which claims the bare alias.
 
 ## Deletion and artifact GC
 
