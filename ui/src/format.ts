@@ -1,5 +1,7 @@
 // Locale-aware display formatting for counts, sizes, durations, and times.
 
+import type { ClusterMember } from "./api.ts";
+
 const integer = new Intl.NumberFormat();
 const decimal = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 const percent = new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 0 });
@@ -63,4 +65,9 @@ export const fmt = {
 /** First 8 characters of a long opaque ID (node IDs, UUIDs). */
 export function shortId(id: string): string {
   return id.length > 12 ? id.slice(0, 8) : id;
+}
+
+/** Display name of a cluster member: its hostname, else its short node ID. */
+export function memberName(member: Pick<ClusterMember, "id" | "hostname">): string {
+  return member.hostname || shortId(member.id);
 }

@@ -294,7 +294,10 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 	.unwrap();
 	let reaper = KillOnDrop(Arc::clone(&manager));
 	let router = axum::Router::new()
-		.nest(vmon_node::api::PREFIX, server::sandbox_routes(Arc::clone(&manager)))
+		.nest(
+			vmon_node::api::PREFIX,
+			server::sandbox_routes(Arc::clone(&manager), server::Peers::default()),
+		)
 		.layer(vmon_cluster::require_secret(Arc::from(SECRET.as_bytes())));
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let url = format!("http://{}", listener.local_addr().unwrap());

@@ -81,6 +81,7 @@ impl Node {
 		.await?;
 		let agent = assets::resolve_agent(config.agent.as_deref(), &config.vmon_bin)?;
 		let cpu_baseline = host::cpu_baseline(&config.vmon_bin).await?;
+		let cpu_model = host::cpu_model();
 		let arch = assets::host_arch().to_owned();
 
 		let net =
@@ -163,8 +164,9 @@ impl Node {
 		// previous process are removed, then one ready TAP per boot slot.
 		net.prewarm(boot_concurrency).await;
 
-		let api = server::sandbox_routes(Arc::clone(&sandboxes))
-			.merge(build::routes(builder.clone()))
+		let peers = server::Peers::new(cluster.clone());
+		let api = server::sandbox_routes(Arc::clone(&sandboxes), peers.clone())
+			.merge(build::routes(builder.clone(), peers))
 			.merge(files::routes(FileStore::new(config.data_dir.join("files"))))
 			.merge(volumes::routes(volumes));
 		let secret: Arc<[u8]> = Arc::from(config.cluster_secret.as_bytes());
@@ -191,6 +193,7 @@ impl Node {
 						arch:           arch.clone(),
 						backend:        host::backend().to_owned(),
 						os:             host::os().to_owned(),
+						cpu_model:      cpu_model.clone(),
 						cpu_baseline:   cpu_baseline.clone(),
 						cpus:           overrides.cpus.unwrap_or_else(host::cpus),
 						memory_mb:      overrides.memory_mb.unwrap_or_else(host::memory_mb),

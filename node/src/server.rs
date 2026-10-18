@@ -8,13 +8,14 @@ use std::sync::Arc;
 
 use axum::{
 	Json, Router,
-	extract::{Path, Query, Request, State},
+	extract::{FromRef, Path, Query, Request, State},
 	http::{StatusCode, header},
 	response::{IntoResponse, Response},
 	routing::{get, post, put},
 };
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use vmon_cluster::{Cluster, NodeId};
 
 use crate::{
 	api::{
@@ -89,8 +90,60 @@ impl IntoResponse for ApiError {
 	}
 }
 
-/// Sandbox routes (relative to `/node/v1`).
-pub fn sandbox_routes(manager: Arc<SandboxManager>) -> Router {
+/// Resolves the peer node ids of driver requests to cluster URLs.
+///
+/// Ids (`artifact_sources`, `file_sources`, …) go through this node's own
+/// view of the cluster ([`Cluster::cluster_url`]), so transfers take the route
+/// this node reaches each peer at (LAN first). Without a cluster (tests)
+/// nothing resolves.
+#[derive(Clone, Default)]
+pub struct Peers(Option<Cluster>);
+
+impl Peers {
+	/// Resolves through `cluster`.
+	pub const fn new(cluster: Cluster) -> Self {
+		Self(Some(cluster))
+	}
+
+	/// Cluster URLs of `ids`, in order; ids unknown to gossip are skipped.
+	pub fn urls(&self, ids: &[NodeId]) -> Vec<String> {
+		let Some(cluster) = &self.0 else {
+			return Vec::new();
+		};
+		ids.iter()
+			.filter_map(|&id| {
+				let url = cluster.cluster_url(id);
+				if url.is_none() {
+					tracing::debug!(node = %id, "skipping a source unknown to gossip");
+				}
+				url
+			})
+			.collect()
+	}
+}
+
+/// State of the sandbox routes.
+#[derive(Clone)]
+struct SandboxApi {
+	manager: Arc<SandboxManager>,
+	peers:   Peers,
+}
+
+impl FromRef<SandboxApi> for Arc<SandboxManager> {
+	fn from_ref(api: &SandboxApi) -> Self {
+		Self::clone(&api.manager)
+	}
+}
+
+impl FromRef<SandboxApi> for Peers {
+	fn from_ref(api: &SandboxApi) -> Self {
+		api.peers.clone()
+	}
+}
+
+/// Sandbox routes (relative to `/node/v1`); `peers` resolves the sources of
+/// create, resume and adopt requests.
+pub fn sandbox_routes(manager: Arc<SandboxManager>, peers: Peers) -> Router {
 	Router::new()
 		.route("/sandboxes", post(create).get(list))
 		.route("/sandboxes/{id}", get(get_one).delete(kill))
@@ -102,16 +155,18 @@ pub fn sandbox_routes(manager: Arc<SandboxManager>) -> Router {
 		.route("/sandboxes/{id}/metrics", get(metrics))
 		.route("/sandboxes/{id}/logs", get(logs))
 		.route("/sandboxes/{id}/tunnel/{port}", get(tunnel))
-		.with_state(manager)
+		.with_state(SandboxApi { manager, peers })
 }
 
 type Manager = State<Arc<SandboxManager>>;
 
 async fn create(
 	State(manager): Manager,
+	State(peers): State<Peers>,
 	Json(req): Json<CreateSandbox>,
 ) -> Result<(StatusCode, Json<SandboxInfo>), ApiError> {
-	let info = detached(async move { manager.create(req).await }).await?;
+	let sources = peers.urls(&req.artifact_sources);
+	let info = detached(async move { manager.create(req, &sources).await }).await?;
 	Ok((StatusCode::CREATED, Json(info)))
 }
 
@@ -151,6 +206,7 @@ async fn pause(
 
 async fn resume(
 	State(manager): Manager,
+	State(peers): State<Peers>,
 	Path(id): Path<String>,
 	Json(req): Json<ResumeSandbox>,
 ) -> Result<Json<SandboxInfo>, ApiError> {

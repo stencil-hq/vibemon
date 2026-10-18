@@ -197,7 +197,7 @@ fn fake_node(guest: Arc<Guest>) -> Router {
 fn cluster_config(
 	dir: &std::path::Path,
 	roles: Roles,
-	cluster_url: String,
+	cluster_port: u16,
 	join: Vec<String>,
 ) -> ClusterConfig {
 	ClusterConfig {
@@ -205,8 +205,8 @@ fn cluster_config(
 		data_dir: dir.to_path_buf(),
 		roles,
 		gossip_bind: "127.0.0.1:0".parse().unwrap(),
-		gossip_advertise: "127.0.0.1:0".parse().unwrap(),
-		cluster_url,
+		advertise: None,
+		cluster_port,
 		join,
 		secret: SECRET.as_bytes().to_vec(),
 		bootstrap_expect: 1,
@@ -220,10 +220,10 @@ async fn harness() -> Harness {
 
 	// Driver cluster: serve its router on a pre-bound port so raft can reach it.
 	let driver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let driver_url = format!("http://{}", driver_listener.local_addr().unwrap());
+	let driver_port = driver_listener.local_addr().unwrap().port();
 	let driver_roles = Roles { node: false, driver: true };
 	let driver_cfg =
-		cluster_config(&dir.path().join("driver"), driver_roles, driver_url, Vec::new());
+		cluster_config(&dir.path().join("driver"), driver_roles, driver_port, Vec::new());
 	let driver =
 		Cluster::start(driver_cfg, MemberMeta { version: "test".into(), ..MemberMeta::default() })
 			.await
@@ -231,12 +231,13 @@ async fn harness() -> Harness {
 	let cluster_router = driver.router();
 	tokio::spawn(async move { axum::serve(driver_listener, cluster_router).await.unwrap() });
 
-	// Node member advertising the fake node server.
+	// Node member whose cluster port is the fake node server (both on
+	// 127.0.0.1).
 	let node_addr = spawn_router(fake_node(guest.clone())).await;
 	let node_cfg = cluster_config(
 		&dir.path().join("node"),
 		Roles { node: true, driver: false },
-		format!("http://{node_addr}"),
+		node_addr.port(),
 		vec![driver.gossip.local_addr().to_string()],
 	);
 	let node_id = node_cfg.id;

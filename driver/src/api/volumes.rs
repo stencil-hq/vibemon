@@ -95,7 +95,7 @@ fn with_token(state: &AppState, row: VolumeRow) -> VolumeAndTokenDto {
 }
 
 /// The alive, non-draining node with the most free disk.
-fn pick_volume_node(state: &AppState) -> Result<(NodeId, String), ApiError> {
+fn pick_volume_node(state: &AppState) -> Result<NodeId, ApiError> {
 	state
 		.node_members()
 		.into_iter()
@@ -103,10 +103,10 @@ fn pick_volume_node(state: &AppState) -> Result<(NodeId, String), ApiError> {
 			meta
 				.node
 				.filter(|cap| !cap.draining)
-				.map(|cap| (id, meta.cluster_url, cap.disk_free_mb))
+				.map(|cap| (id, cap.disk_free_mb))
 		})
-		.max_by_key(|(id, _, free)| (*free, std::cmp::Reverse(id.0)))
-		.map(|(id, url, _)| (id, url))
+		.max_by_key(|(id, free)| (*free, std::cmp::Reverse(id.0)))
+		.map(|(id, _)| id)
 		.ok_or_else(|| ApiError::unavailable("No node is available to host the volume"))
 }
 
@@ -135,8 +135,7 @@ fn volume_node(state: &AppState, volume: &VolumeRow) -> Result<NodeClient, ApiEr
 		})?;
 		state.node(id)
 	} else {
-		let (_, url) = pick_volume_node(state)?;
-		state.node_at(&url)
+		state.node(pick_volume_node(state)?)
 	}
 }
 
@@ -193,7 +192,7 @@ async fn create_volume(
 	let owner = placed
 		.as_ref()
 		.filter(|_| !state.config.shared_volumes)
-		.map(|(node_id, _)| node_id.to_string());
+		.map(NodeId::to_string);
 	let row = match state
 		.store
 		.insert_volume(&auth.team.id, &body.name, owner.as_deref(), placed.is_none())
@@ -208,10 +207,10 @@ async fn create_volume(
 		},
 		Err(e) => return Err(e.into()),
 	};
-	let Some((_, node_url)) = placed else {
+	let Some(node_id) = placed else {
 		return Ok((StatusCode::CREATED, Json(with_token(&state, row))).into_response());
 	};
-	let node = state.node_at(&node_url)?;
+	let node = state.node(node_id)?;
 	if let Err(error) =
 		node_call(&node, Method::POST, &format!("/volumes/{}", row.id), Missing::Error).await
 	{

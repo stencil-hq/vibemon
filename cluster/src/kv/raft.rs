@@ -266,15 +266,27 @@ impl RaftKv {
 	fn to_leader<T>(&self) -> Attempt<T> {
 		let metrics = self.raft.metrics().borrow_watched().clone();
 		match metrics.current_leader.filter(|leader| *leader != self.id) {
-			Some(leader) => Attempt::Forward(
+			Some(leader) => Attempt::Forward(self.forward_url(Some(leader), || {
 				metrics
 					.membership_config
 					.membership()
 					.get_node(&leader)
-					.map(|peer| peer.cluster_url.clone()),
-			),
+					.map(|peer| peer.cluster_url.clone())
+			})),
 			None => Attempt::Retry,
 		}
+	}
+
+	/// URL to forward to `leader` at: this process's gossip route to it (LAN
+	/// first), else the URL raft membership `recorded` for it.
+	fn forward_url(
+		&self,
+		leader: Option<NodeId>,
+		recorded: impl FnOnce() -> Option<String>,
+	) -> Option<String> {
+		leader
+			.and_then(|id| membership::member_url(&self.gossip, id))
+			.or_else(recorded)
 	}
 
 	/// Journal scan ([`super::Kv::scan`]) of local state; a follower whose
@@ -414,7 +426,9 @@ impl RaftKv {
 				match self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
 					Ok(_) => Attempt::Done(Ok(self.get_local(key))),
 					Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(f))) => {
-						Attempt::Forward(f.leader_node.map(|n| n.cluster_url))
+						Attempt::Forward(
+							self.forward_url(f.leader_id, || f.leader_node.map(|n| n.cluster_url)),
+						)
 					},
 					Err(RaftError::APIError(LinearizableReadError::QuorumNotEnough(_))) => {
 						Attempt::Retry
@@ -465,7 +479,9 @@ impl RaftKv {
 			// openraft 0.10 split the two; see `txns` on duplicate commits.
 			Err(RaftError::APIError(
 				ClientWriteError::ForwardToLeader(f) | ClientWriteError::LogEntryDiscarded(f),
-			)) => Err(ProposeError::Forward(f.leader_node.map(|n| n.cluster_url))),
+			)) => Err(ProposeError::Forward(
+				self.forward_url(f.leader_id, || f.leader_node.map(|n| n.cluster_url)),
+			)),
 			Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
 				Err(ProposeError::Failed(KvError::Rejected(e.to_string())))
 			},

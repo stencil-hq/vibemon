@@ -24,18 +24,13 @@ pub async fn record_artifact(state: &AppState, info: &ArtifactInfo) -> ApiResult
 	Ok(())
 }
 
-/// Records `node` (served at `node_url`) as a holder of `build_id`.
+/// Records `node` as a holder of `build_id`.
 ///
 /// Reads the node's own manifest. Called after a sandbox create placed on a
 /// node that fetched the artifacts from a peer, so placement and later
 /// fetches keep finding copies once the original builder is gone.
-pub async fn record_holder(
-	state: &AppState,
-	node: NodeId,
-	node_url: &str,
-	build_id: &str,
-) -> ApiResult<()> {
-	let manifest = state.node_at(node_url)?.artifact_manifest(build_id).await?;
+pub async fn record_holder(state: &AppState, node: NodeId, build_id: &str) -> ApiResult<()> {
+	let manifest = state.node(node)?.artifact_manifest(build_id).await?;
 	if manifest.info.node_id != node || manifest.info.build_id != build_id {
 		return Err(crate::error::ApiError::internal(format!(
 			"node {node} described build {} on node {}",
@@ -85,17 +80,15 @@ pub async fn artifact_sources(state: &AppState, build_id: &str) -> ApiResult<Vec
 	Ok(join_alive(records, &state.node_members()))
 }
 
-/// Keeps the records whose node is an alive member, attaching its URL.
+/// Keeps the records whose node is an alive member.
 pub(super) fn join_alive(
 	records: Vec<ArtifactInfo>,
 	alive: &[(NodeId, MemberMeta)],
 ) -> Vec<ArtifactSource> {
 	records
 		.into_iter()
-		.filter_map(|info| {
-			let (_, meta) = alive.iter().find(|(id, _)| *id == info.node_id)?;
-			Some(ArtifactSource { node_id: info.node_id, cluster_url: meta.cluster_url.clone(), info })
-		})
+		.filter(|info| alive.iter().any(|(id, _)| *id == info.node_id))
+		.map(|info| ArtifactSource { node_id: info.node_id, info })
 		.collect()
 }
 
@@ -134,7 +127,7 @@ pub(super) async fn collect_garbage(state: &AppState) -> anyhow::Result<()> {
 		.members()
 		.into_iter()
 		.filter(|(_, meta)| meta.roles.node)
-		.map(|(member, meta)| (member.id, (member.state, meta.cluster_url)))
+		.map(|(member, meta)| (member.id, (member.state, meta.cluster_url(&member))))
 		.collect();
 	for build in candidates {
 		if in_use.contains(&build.id) {
@@ -231,26 +224,15 @@ mod tests {
 		}
 	}
 
-	fn meta(url: &str) -> MemberMeta {
-		MemberMeta {
-			roles:         Roles { node: true, driver: false },
-			cluster_url:   url.into(),
-			public_url:    None,
-			version:       "test".into(),
-			started_at_ms: 0,
-			node:          None,
-			raft:          None,
-		}
+	fn meta() -> MemberMeta {
+		MemberMeta { roles: Roles { node: true, driver: false }, ..MemberMeta::default() }
 	}
 
 	#[test]
-	fn sources_keep_only_alive_holders_with_their_urls() {
-		let alive = vec![(NodeId(1), meta("http://n1:7947")), (NodeId(3), meta("http://n3:7947"))];
+	fn sources_keep_only_alive_holders() {
+		let alive = vec![(NodeId(1), meta()), (NodeId(3), meta())];
 		let sources = join_alive(vec![info("b", 1), info("b", 2), info("b", 3)], &alive);
-		let urls: Vec<_> = sources
-			.iter()
-			.map(|s| (s.node_id, s.cluster_url.as_str()))
-			.collect();
-		assert_eq!(urls, [(NodeId(1), "http://n1:7947"), (NodeId(3), "http://n3:7947")]);
+		let ids: Vec<_> = sources.iter().map(|s| s.node_id).collect();
+		assert_eq!(ids, [NodeId(1), NodeId(3)]);
 	}
 }

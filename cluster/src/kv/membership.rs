@@ -3,6 +3,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
+	net::SocketAddr,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -58,8 +59,26 @@ pub fn driver_urls(gossip: &Gossip, exclude: NodeId) -> Vec<String> {
 	});
 	found
 		.into_iter()
-		.map(|(_, meta)| meta.cluster_url)
+		.map(|(member, meta)| meta.cluster_url(&member))
 		.collect()
+}
+
+/// Cluster URL of member `id` through this process's gossip route to it;
+/// `None` when gossip does not know the member or its metadata.
+pub fn member_url(gossip: &Gossip, id: NodeId) -> Option<String> {
+	let member = gossip.member(id)?;
+	MemberMeta::decode(&member.meta).map(|meta| meta.cluster_url(&member))
+}
+
+/// Whether `url` (recorded in raft membership) is the cluster URL of one of
+/// `member`'s advertised addresses.
+fn advertises(member: &Member, meta: &MemberMeta, url: &str) -> bool {
+	url.strip_prefix("http://")
+		.and_then(|host| host.parse::<SocketAddr>().ok())
+		.is_some_and(|recorded| {
+			recorded.port() == meta.cluster_port
+				&& member.addrs.iter().any(|addr| addr.ip() == recorded.ip())
+		})
 }
 
 /// Cluster URL of the driver that gossips itself as raft leader (highest term
@@ -69,7 +88,7 @@ pub fn leader_url(gossip: &Gossip, exclude: NodeId) -> Option<String> {
 		.into_iter()
 		.filter(|(member, meta)| claims_leadership(member, meta))
 		.max_by_key(|(_, meta)| meta.raft.as_ref().map_or(0, |raft| raft.term))
-		.map(|(_, meta)| meta.cluster_url)
+		.map(|(member, meta)| meta.cluster_url(&member))
 }
 
 /// Background loop run by every driver.
@@ -190,7 +209,7 @@ impl Reconciler {
 		peers.retain(|(member, _)| member.state == MemberState::Alive);
 		let mut nodes: BTreeMap<NodeId, RaftPeer> = peers
 			.into_iter()
-			.map(|(member, meta)| (member.id, RaftPeer { cluster_url: meta.cluster_url }))
+			.map(|(member, meta)| (member.id, RaftPeer { cluster_url: meta.cluster_url(&member) }))
 			.collect();
 		nodes.insert(self.id, RaftPeer { cluster_url: self.cluster_url.clone() });
 		let Some(voters) = bootstrap_voters(self.id, nodes.keys().copied(), self.expect) else {
@@ -248,24 +267,27 @@ impl Reconciler {
 		}
 		let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
 		let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
-		let alive: BTreeMap<NodeId, String> = drivers(&self.gossip, self.id)
+		let alive: BTreeMap<NodeId, (Member, MemberMeta)> = drivers(&self.gossip, self.id)
 			.into_iter()
 			.filter(|(member, _)| member.state == MemberState::Alive)
-			.map(|(member, meta)| (member.id, meta.cluster_url))
+			.map(|(member, meta)| (member.id, (member, meta)))
 			.collect();
 		let raft = self.kv.raft();
 
-		// Peers that restarted on a new address, or came back after being seen
-		// down: their running replication streams switch to the address, which
-		// a membership entry records for later leaders, and the long unreachable
-		// backoff of a revived peer ends (see `network::PeerClient::backoff`).
+		// Peers whose recorded URL they no longer advertise (restart or address
+		// change), or that came back after being seen down: a membership entry
+		// records this leader's route for later leaders and for processes that
+		// cannot resolve the peer through gossip (everyone else dials its own
+		// gossip route, so route switches alone are not recorded), and the long
+		// unreachable backoff of a revived peer ends (see
+		// `network::PeerClient::backoff`).
 		let refresh: BTreeMap<NodeId, RaftPeer> = membership
 			.nodes()
 			.filter_map(|(id, node)| {
-				let url = alive.get(id)?;
+				let (member, meta) = alive.get(id)?;
 				let revived = self.down_since.contains_key(id);
-				(revived || *url != node.cluster_url)
-					.then(|| (*id, RaftPeer { cluster_url: url.clone() }))
+				(revived || !advertises(member, meta, &node.cluster_url))
+					.then(|| (*id, RaftPeer { cluster_url: meta.cluster_url(member) }))
 			})
 			.collect();
 		if !refresh.is_empty() {
@@ -290,13 +312,14 @@ impl Reconciler {
 				.and_then(|r| r.get(id).copied().flatten())
 				.map(|log_id| log_id.index)
 		};
-		for (id, url) in &alive {
+		for (id, (member, meta)) in &alive {
 			if voters.contains(id) {
 				continue;
 			}
 			if !learners.contains(id) {
 				tracing::info!(node = %id, "adding raft learner");
-				change(raft.add_learner(*id, RaftPeer { cluster_url: url.clone() }, false)).await;
+				let peer = RaftPeer { cluster_url: meta.cluster_url(member) };
+				change(raft.add_learner(*id, peer, false)).await;
 			} else if matched(id).is_some_and(|index| index + PROMOTE_LAG >= last_log) {
 				tracing::info!(node = %id, "promoting raft learner to voter");
 				change(raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::from([*id])), true))
@@ -378,5 +401,25 @@ mod tests {
 		assert_eq!(bootstrap_voters(NodeId(5), ids(), 3), None);
 		assert_eq!(bootstrap_voters(NodeId(2), ids(), 5), None);
 		assert_eq!(bootstrap_voters(NodeId(2), [NodeId(2)].into_iter(), 1), Some(vec![NodeId(2)]));
+	}
+
+	#[test]
+	fn a_recorded_url_counts_while_any_of_its_addresses_is_advertised() {
+		let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+		let member = Member {
+			id:           NodeId(1),
+			addr:         addr("10.0.0.1:7946"),
+			addrs:        vec![addr("10.0.0.1:7946"), addr("[fd7a:115c:a1e0::1]:7946")],
+			state:        MemberState::Alive,
+			incarnation:  1,
+			meta_version: 1,
+			meta:         Vec::new(),
+		};
+		let meta = MemberMeta { cluster_port: 7947, ..MemberMeta::default() };
+		assert!(advertises(&member, &meta, "http://10.0.0.1:7947"));
+		assert!(advertises(&member, &meta, "http://[fd7a:115c:a1e0::1]:7947"));
+		assert!(!advertises(&member, &meta, "http://10.0.0.2:7947"), "address gone");
+		assert!(!advertises(&member, &meta, "http://10.0.0.1:7100"), "port changed");
+		assert!(!advertises(&member, &meta, "garbage"));
 	}
 }

@@ -107,7 +107,7 @@ Every driver serves a web console at `/dashboard/` on its public listener (`--li
 | Overview | Running sandboxes, node health, vCPU and memory allocation, template builds; charts of running sandboxes, starts per minute, vCPU, and memory; cluster members with roles and raft state | None |
 | Sandboxes | Running and paused sandboxes of every team, filterable by state, team, and text (ID, template, metadata) | New sandbox (any team, a template that team can access); pause, resume, kill |
 | Sandbox | Team, node, template, size, lifetime, lifecycle settings, metadata | Terminal (a login shell, as the template's user or root), file browser (navigate, preview, download, upload by drag and drop, rename, delete, new folder), metrics, logs, pause, resume, kill, set timeout |
-| Nodes | Status, platform, sandboxes, vCPU and memory allocation, free disk, create outcomes; per node its sandboxes, features, and host details | Mark ready, drain, mark unhealthy |
+| Nodes | Host name, status, platform, sandboxes, vCPU and memory allocation, free disk, create outcomes; per node its sandboxes, features, and host details (CPU model, advertised IPs) | Mark ready, drain, mark unhealthy |
 | Teams | Limits and running/paused counts | Kill all of a team's sandboxes |
 
 The terminal and the file browser reach the sandbox through the driver's ingress with the sandbox's envd access token, exactly like an SDK, so they work on any node of the cluster. Charts come from the serving driver's in-memory fleet sampler (one sample every 5 seconds, last hour), so they start empty after a driver restart and can differ slightly between drivers. Node create counters are per driver as well.
@@ -166,7 +166,7 @@ The dashboard reads three vmon-specific routes, usable from scripts as well:
 
 | Method | Path | Result |
 |---|---|---|
-| `GET` | `/admin/cluster` | Cluster ID, the serving driver's ID, every gossip member (state, roles, version, raft view, node capacity and status, create counters), and `history`: up to one hour of 5 s fleet samples (nodes, sandboxes, builds, vCPU, memory, starts) |
+| `GET` | `/admin/cluster` | Cluster ID, the serving driver's ID, every gossip member (host name, advertised IPs, the cluster URL this driver reaches it at, state, roles, version, raft view, node capacity, CPU model and status, create counters, GPUs with their holder or problem), and `history`: up to one hour of 5 s fleet samples (nodes, sandboxes, builds, vCPU, memory, starts) |
 | `GET` | `/admin/teams` | Every team with limits, flags, and running/paused sandbox counts |
 | `GET` | `/admin/sandboxes` | Running and paused sandboxes of every team, newest first, with `teamID`, `teamName`, and `nodeID`. Query: `state` (`running`, `paused`, or both), `team`, `id` (one sandbox), `limit` (1–1000, default 500), `nextToken` (from `X-Next-Token`) |
 
@@ -178,7 +178,7 @@ curl -s -H "$AUTH" "$API/admin/sandboxes?state=running&limit=50"
 
 | Method | Path | Result |
 |---|---|---|
-| `GET` | `/nodes` | Every gossip member with the node role, sorted by ID: version, `clusterID`, machine info, `status`, sandbox counts, capacity metrics, create successes/failures |
+| `GET` | `/nodes` | Every gossip member with the node role, sorted by ID: version, `clusterID`, machine info (`cpuModel` and `cpuModelName` are the host CPU model), `status`, sandbox counts, capacity metrics, create successes/failures |
 | `GET` | `/nodes/{nodeID}` | The same plus the node's sandboxes (when the node is alive) and `cachedBuilds` |
 | `POST` | `/nodes/{nodeID}` | Body `{"status": "ready" \| "draining" \| "unhealthy"}`; 204 |
 

@@ -34,15 +34,14 @@ impl TestStore {
 /// Starts a single-member cluster with `roles` under `dir` and, when it is a
 /// driver, waits for its raft leadership.
 pub async fn start_cluster(dir: &tempfile::TempDir, roles: Roles) -> Cluster {
-	let any = "127.0.0.1:0".parse().expect("socket addr");
 	let cluster = Cluster::start(
 		ClusterConfig {
 			id: NodeId::random(),
 			data_dir: dir.path().join("cluster"),
 			roles,
-			gossip_bind: any,
-			gossip_advertise: any,
-			cluster_url: "http://127.0.0.1:1".into(),
+			gossip_bind: "127.0.0.1:0".parse().expect("socket addr"),
+			advertise: None,
+			cluster_port: 1,
 			join: Vec::new(),
 			secret: SECRET.as_bytes().to_vec(),
 			bootstrap_expect: 1,

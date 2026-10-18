@@ -15,7 +15,10 @@ use axum::{
 	routing::get,
 };
 use serde::{Deserialize, Serialize};
-use vmon_cluster::{MemberMeta, NodeId, RaftStatus, Roles, gossip::MemberState};
+use vmon_cluster::{
+	GpuInfo, MemberMeta, NodeId, RaftStatus, Roles,
+	gossip::{Member, MemberState},
+};
 use vmon_node::api::SandboxInfo;
 
 use crate::{
@@ -122,10 +125,14 @@ struct ClusterDto {
 #[serde(rename_all = "camelCase")]
 struct MemberDto {
 	id:          String,
+	hostname:    String,
+	/// Every IP the member advertises, in the order this driver holds them.
+	addrs:       Vec<String>,
 	state:       MemberState,
 	roles:       Roles,
 	version:     String,
 	started_at:  String,
+	/// Cluster listener through the address this driver reaches the member at.
 	#[serde(rename = "clusterURL")]
 	cluster_url: String,
 	#[serde(rename = "publicURL")]
@@ -142,7 +149,7 @@ struct MemberNodeDto {
 	arch:             String,
 	os:               String,
 	backend:          String,
-	cpu_baseline:     String,
+	cpu_model:        String,
 	cpus:             u32,
 	vcpus_used:       u32,
 	#[serde(rename = "memoryMB")]
@@ -197,8 +204,8 @@ fn node_dto(
 		cluster_id:             cluster_id.to_owned(),
 		machine_info:           MachineInfo {
 			cpu_family:       cap.backend.clone(),
-			cpu_model:        cap.cpu_baseline.clone(),
-			cpu_model_name:   format!("{} {}", cap.os, cap.cpu_baseline).trim().to_owned(),
+			cpu_model:        cap.cpu_model.clone(),
+			cpu_model_name:   cap.cpu_model.clone(),
 			cpu_architecture: cap.arch.clone(),
 		},
 		status:                 effective_status(member_state, meta, admin),
@@ -243,8 +250,7 @@ async fn statuses(state: &AppState) -> ApiResult<HashMap<NodeId, NodeStatus>> {
 }
 
 fn member_dto(
-	id: NodeId,
-	member_state: MemberState,
+	member: &Member,
 	meta: MemberMeta,
 	admin: Option<NodeStatus>,
 	counters: NodeCounters,
@@ -254,11 +260,11 @@ fn member_dto(
 		.as_ref()
 		.filter(|_| meta.roles.node)
 		.map(|cap| MemberNodeDto {
-			status:           effective_status(member_state, &meta, admin),
+			status:           effective_status(member.state, &meta, admin),
 			arch:             cap.arch.clone(),
 			os:               cap.os.clone(),
 			backend:          cap.backend.clone(),
-			cpu_baseline:     cap.cpu_baseline.clone(),
+			cpu_model:        cap.cpu_model.clone(),
 			cpus:             cap.cpus,
 			vcpus_used:       cap.vcpus_used,
 			memory_mb:        cap.memory_mb,
@@ -272,13 +278,20 @@ fn member_dto(
 			create_fails:     counters.fails,
 			inflight:         counters.inflight,
 		});
+	let cluster_url = meta.cluster_url(member);
 	MemberDto {
-		id: id.to_string(),
-		state: member_state,
+		id: member.id.to_string(),
+		hostname: meta.hostname,
+		addrs: member
+			.addrs
+			.iter()
+			.map(|addr| addr.ip().to_string())
+			.collect(),
+		state: member.state,
 		roles: meta.roles,
+		cluster_url,
 		version: meta.version,
 		started_at: rfc3339_ms(meta.started_at_ms),
-		cluster_url: meta.cluster_url,
 		public_url: meta.public_url,
 		raft: meta.raft.filter(|_| meta.roles.driver),
 		node,
@@ -295,7 +308,7 @@ async fn cluster(State(state): State<AppState>, _admin: AdminAuth) -> ApiResult<
 		.into_iter()
 		.map(|(member, meta)| {
 			let c = counters.get(&member.id).copied().unwrap_or_default();
-			member_dto(member.id, member.state, meta, statuses.get(&member.id).copied(), c)
+			member_dto(&member, meta, statuses.get(&member.id).copied(), c)
 		})
 		.collect();
 	members.sort_by(|a, b| a.id.cmp(&b.id));
@@ -352,7 +365,12 @@ async fn detail(
 		&cluster_id(&state),
 	);
 	if member.state == MemberState::Alive {
-		dto.sandboxes = Some(state.node_at(&meta.cluster_url)?.list_sandboxes().await?);
+		dto.sandboxes = Some(
+			state
+				.node_at(&meta.cluster_url(&member))?
+				.list_sandboxes()
+				.await?,
+		);
 	}
 	dto.cached_builds = Some(meta.node.map(|n| n.cached_builds).unwrap_or_default());
 	Ok(Json(dto))

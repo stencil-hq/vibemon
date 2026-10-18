@@ -31,7 +31,7 @@ use self::http::{GetRequest, ListRequest};
 pub use self::journal::RETENTION as JOURNAL_RETENTION;
 pub(crate) use self::{
 	http::{KvClient, routes},
-	membership::Reconciler,
+	membership::{Reconciler, member_url},
 	raft::{RaftKv, maintain_journal},
 	resp::serve_resp,
 };

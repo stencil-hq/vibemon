@@ -1,6 +1,6 @@
 //! In-process gossip clusters on loopback (ephemeral ports, fast timings).
 
-use std::{ops::Range, time::Duration};
+use std::{net::Ipv4Addr, ops::Range, time::Duration};
 
 use tokio::{io::AsyncWriteExt, net::UdpSocket, sync::broadcast::error::RecvError};
 
@@ -19,7 +19,7 @@ fn fast_config(id: u64, secret: &[u8]) -> GossipConfig {
 		suspicion_mult: 3,
 		gossip_interval: Duration::from_millis(30),
 		tcp_timeout: Duration::from_secs(2),
-		..GossipConfig::new(NodeId(id), any, any, secret.to_vec())
+		..GossipConfig::new(NodeId(id), any, Vec::new(), secret.to_vec())
 	}
 }
 
@@ -96,6 +96,34 @@ async fn cluster(ids: Range<u64>) -> Vec<Gossip> {
 	cluster_with(ids, |_| {}).await
 }
 
+/// Whether the host has IPv6 loopback, which the multi-address tests need: a
+/// member bound to `[::]` reached at both `[::1]` and `127.0.0.1`.
+fn dual_stack() -> bool {
+	let ok = std::net::UdpSocket::bind("[::1]:0").is_ok();
+	if !ok {
+		eprintln!("skipped: no IPv6 loopback");
+	}
+	ok
+}
+
+/// Binds `[::]` and advertises `[::1]` (preferred) and `127.0.0.1`: two
+/// addresses of one socket, so blocking one leaves the other working.
+fn dual(cfg: &mut GossipConfig) {
+	cfg.bind = "[::]:0".parse().unwrap();
+	cfg.advertise = vec!["[::1]:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()];
+}
+
+fn dual_config(id: u64) -> GossipConfig {
+	let mut cfg = fast_config(id, SECRET);
+	dual(&mut cfg);
+	cfg
+}
+
+/// The `127.0.0.1` address of a member started with [`dual`].
+fn v4_of(g: &Gossip) -> SocketAddr {
+	SocketAddr::from((Ipv4Addr::LOCALHOST, g.local_addr().port()))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_members_converge_through_one_seed() {
 	let nodes = cluster(1..6).await;
@@ -169,7 +197,7 @@ async fn falsely_suspected_member_refutes_and_stays_alive() {
 	let mut rx = nodes[0].subscribe();
 	let accusation = Update {
 		id,
-		addr: target,
+		addrs: vec![target],
 		state: MemberState::Suspect,
 		incarnation,
 		meta_version: 0,
@@ -237,7 +265,7 @@ async fn packets_with_foreign_secret_are_ignored() {
 	let before = nodes[0].dropped_packets();
 	let known = Update {
 		id:           id_of(&nodes[0]),
-		addr:         nodes[0].local_addr(),
+		addrs:        vec![nodes[0].local_addr()],
 		state:        MemberState::Alive,
 		incarnation:  1,
 		meta_version: 0,
@@ -338,7 +366,7 @@ async fn restarted_member_replaces_old_address() {
 	drop(old);
 	let mut cfg = fast_config(102, SECRET);
 	cfg.bind = "0.0.0.0:0".parse().unwrap();
-	cfg.advertise = "127.0.0.1:0".parse().unwrap();
+	cfg.advertise = vec!["127.0.0.1:0".parse().unwrap()];
 	let reborn = Gossip::start(cfg, b"second-life".to_vec()).await.unwrap();
 	assert_eq!(reborn.local_addr().ip(), std::net::Ipv4Addr::LOCALHOST);
 	assert_ne!(reborn.local_addr(), old_addr);
@@ -365,6 +393,167 @@ async fn restarted_member_replaces_old_address() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocked_route_fails_over_and_moves_back_once_unblocked() {
+	if !dual_stack() {
+		return;
+	}
+	let nodes = cluster_with(110..113, dual).await;
+	let (prober, target) = (&nodes[0], &nodes[2]);
+	let id = id_of(target);
+	let (v6, v4) = (target.local_addr(), v4_of(target));
+	for g in &nodes[..2] {
+		let m = g.member(id).unwrap();
+		assert_eq!((m.addr, m.addrs), (v6, vec![v6, v4]));
+	}
+	let mut rx = prober.subscribe();
+	prober.inner.blocked.lock().insert(v6);
+	let switched = wait_event(
+		&mut rx,
+		Duration::from_secs(2),
+		|e| matches!(e, MemberEvent::Updated(m) if m.id == id && m.addr == v4),
+	)
+	.await;
+	assert!(switched.is_some(), "route did not fail over");
+	tokio::time::sleep(SUSPICION * 3).await;
+	let doubted = wait_event(&mut rx, Duration::from_millis(1), |e| {
+		e.member().id == id && e.member().state != MemberState::Alive
+	})
+	.await;
+	assert_eq!(doubted, None, "a member reachable at another address was suspected");
+	let m = prober.member(id).unwrap();
+	assert_eq!((m.state, m.addr), (MemberState::Alive, v4));
+	prober.inner.blocked.lock().clear();
+	assert!(
+		eventually(Duration::from_secs(2), || prober.member(id).is_some_and(|m| m.addr == v6)).await,
+		"route did not move back to the better-ranked address"
+	);
+	assert!(all_alive(&nodes));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joining_member_route_is_verified_before_any_probe() {
+	if !dual_stack() {
+		return;
+	}
+	let mut cfg = dual_config(120);
+	// No probe rounds: only the join-time verification can move the route.
+	cfg.probe_interval = Duration::from_secs(3600);
+	let observer = Gossip::start(cfg, meta_of(120)).await.unwrap();
+	let joiner = Gossip::start(dual_config(121), meta_of(121)).await.unwrap();
+	let (v6, v4) = (joiner.local_addr(), v4_of(&joiner));
+	observer.inner.blocked.lock().insert(v6);
+	let mut rx = observer.subscribe();
+	assert_eq!(
+		joiner
+			.join(&[observer.local_addr().to_string()])
+			.await
+			.unwrap(),
+		1
+	);
+	let joined = wait_event(&mut rx, Duration::from_secs(1), |e| e.member().id == NodeId(121)).await;
+	assert!(
+		matches!(&joined, Some(MemberEvent::Joined(m)) if m.addr == v6),
+		"a new member starts at its best-ranked address: {joined:?}"
+	);
+	let routed = wait_event(
+		&mut rx,
+		Duration::from_secs(1),
+		|e| matches!(e, MemberEvent::Updated(m) if m.id == NodeId(121) && m.addr == v4),
+	)
+	.await;
+	assert!(routed.is_some(), "the join did not verify the route");
+	assert_eq!(state_of(&observer, NodeId(121)), Some(MemberState::Alive));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_addrs_propagates_and_routes_follow_the_advertised_list() {
+	if !dual_stack() {
+		return;
+	}
+	let nodes = cluster_with(130..133, |cfg| {
+		cfg.bind = "[::]:0".parse().unwrap();
+		cfg.advertise = vec!["[::1]:0".parse().unwrap()];
+	})
+	.await;
+	let mover = &nodes[2];
+	let id = id_of(mover);
+	let (v6, v4) = (mover.local_addr(), v4_of(mover));
+	let before = nodes[0].member(id).unwrap().incarnation;
+	let mut rx = nodes[0].subscribe();
+	mover
+		.set_addrs(vec!["[::1]:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()])
+		.unwrap();
+	let peers = &nodes[..2];
+	assert!(
+		eventually(Duration::from_secs(2), || peers.iter().all(|g| {
+			g.member(id)
+				.is_some_and(|m| m.addrs == [v6, v4] && m.addr == v6 && m.incarnation > before)
+		}))
+		.await,
+		"new addresses did not propagate"
+	);
+	let updated = wait_event(
+		&mut rx,
+		Duration::from_secs(1),
+		|e| matches!(e, MemberEvent::Updated(m) if m.id == id),
+	)
+	.await;
+	assert!(updated.is_some());
+	// Dropping the route moves peers to the address still advertised.
+	mover.set_addrs(vec![v4]).unwrap();
+	assert_eq!(mover.local_addr(), v4);
+	assert!(
+		eventually(Duration::from_secs(2), || peers.iter().all(|g| g
+			.member(id)
+			.is_some_and(|m| m.addrs == [v4] && m.addr == v4)))
+		.await,
+		"route did not follow the advertised addresses"
+	);
+	let incarnation = mover.member(id).unwrap().incarnation;
+	mover
+		.set_addrs(vec!["127.0.0.1:0".parse().unwrap()])
+		.unwrap();
+	assert_eq!(mover.member(id).unwrap().incarnation, incarnation, "unchanged list is a no-op");
+	assert!(mover.set_addrs(Vec::new()).is_err());
+	assert!(mover.set_addrs(vec!["0.0.0.0:0".parse().unwrap()]).is_err());
+	let too_many = (1..=17)
+		.map(|i| SocketAddr::from(([10, 0, 0, i], 1)))
+		.collect();
+	assert!(mover.set_addrs(too_many).is_err());
+	tokio::time::sleep(SUSPICION).await;
+	assert!(all_alive(&nodes));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ping_req_helper_also_tries_its_own_route() {
+	if !dual_stack() {
+		return;
+	}
+	let nodes = cluster_with(140..143, dual).await;
+	let (prober, helper, target) = (&nodes[0], &nodes[1], &nodes[2]);
+	let id = id_of(target);
+	let (v6, v4) = (target.local_addr(), v4_of(target));
+	// The helper reaches the target only at its second address…
+	helper.inner.blocked.lock().insert(v6);
+	assert!(
+		eventually(Duration::from_secs(2), || helper.member(id).is_some_and(|m| m.addr == v4)).await
+	);
+	// …and the prober not at all: its probes ask the helper to ping [::1],
+	// which only works because the helper also pings its own route.
+	let before = prober.member(id).unwrap().incarnation;
+	let mut rx = prober.subscribe();
+	prober.inner.blocked.lock().extend([v6, v4]);
+	tokio::time::sleep(SUSPICION * 3).await;
+	let doubted = wait_event(&mut rx, Duration::from_millis(1), |e| {
+		e.member().id == id && e.member().state != MemberState::Alive
+	})
+	.await;
+	assert_eq!(doubted, None, "indirect probes failed");
+	let m = prober.member(id).unwrap();
+	assert_eq!((m.state, m.incarnation, m.addr), (MemberState::Alive, before, v6));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_traffic_is_dropped_without_disrupting_the_member() {
 	let nodes = cluster(90..92).await;
 	let target = nodes[0].local_addr();
@@ -376,7 +565,7 @@ async fn malformed_traffic_is_dropped_without_disrupting_the_member() {
 		if round % 2 == 0 {
 			// Authenticated garbage exercises the decoder, not just the MAC check.
 			if round % 4 == 0 {
-				noise.splice(0..0, *b"VG1");
+				noise.splice(0..0, *b"VG2");
 			}
 			auth.seal(&mut noise);
 		}
@@ -386,7 +575,7 @@ async fn malformed_traffic_is_dropped_without_disrupting_the_member() {
 		}
 	}
 	for frame in [vec![0xff; 4], vec![0, 0, 0, 40, 1, 2, 3], {
-		let mut body = b"VG1\x10garbage".to_vec();
+		let mut body = b"VG2\x10garbage".to_vec();
 		auth.seal(&mut body);
 		let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
 		frame.extend(body);

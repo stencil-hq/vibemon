@@ -4,9 +4,11 @@
 //! [`MemberMeta`] so nodes and drivers can discover each other's roles,
 //! internal URLs, capacity, and raft state (see ARCHITECTURE.md §5.1).
 
-use std::{fmt, str::FromStr};
+use std::{fmt, net::SocketAddr, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::gossip::Member;
 
 /// Upper bound for encoded metadata so it always fits a gossip packet.
 pub const MAX_META_BYTES: usize = 4096;
@@ -68,8 +70,11 @@ pub struct Roles {
 #[serde(rename_all = "camelCase")]
 pub struct MemberMeta {
 	pub roles:         Roles,
-	/// Internal HTTP base URL (`http://host:7947`), serving `/cluster/v1` and `/node/v1`.
-	pub cluster_url:   String,
+	/// Host name of the machine, shown instead of the id.
+	pub hostname:      String,
+	/// Port of the internal HTTP listener (`/cluster/v1`, `/node/v1`) on every
+	/// gossip address; see [`MemberMeta::cluster_url`].
+	pub cluster_port:  u16,
 	/// Public base URL of a driver's API/ingress listener.
 	pub public_url:    Option<String>,
 	/// vmon version string.
@@ -91,6 +96,8 @@ pub struct NodeCapacity {
 	pub backend:        String,
 	/// Host OS: `linux`, `macos`, or `windows`.
 	pub os:             String,
+	/// Host CPU model name (e.g. `Intel(R) Xeon(R) Gold 6438N`); display only.
+	pub cpu_model:      String,
 	/// Snapshot compatibility key (`vmon vmm --print-cpu-baseline`).
 	pub cpu_baseline:   String,
 	pub cpus:           u32,
@@ -121,6 +128,12 @@ pub struct RaftStatus {
 }
 
 impl MemberMeta {
+	/// Internal HTTP base URL of `member` through the address this process
+	/// currently reaches it at ([`Member::addr`]).
+	pub fn cluster_url(&self, member: &Member) -> String {
+		format!("http://{}", SocketAddr::new(member.addr.ip(), self.cluster_port))
+	}
+
 	/// Encodes to JSON, dropping `cached_builds` entries until it fits
 	/// [`MAX_META_BYTES`].
 	pub fn encode(&self) -> Vec<u8> {

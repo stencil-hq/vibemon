@@ -269,7 +269,7 @@ async fn poll_once(
 		.into_iter()
 		.find(|(member, meta)| member.id == node_id && meta.roles.node);
 	let url = match member {
-		Some((member, meta)) if member.state == MemberState::Alive => meta.cluster_url,
+		Some((member, meta)) if member.state == MemberState::Alive => meta.cluster_url(&member),
 		Some((member, _)) if member.state == MemberState::Suspect => return Ok(Progress::Running),
 		_ => {
 			let message = format!("builder node {node_id} is no longer available");

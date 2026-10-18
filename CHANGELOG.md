@@ -4,6 +4,28 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+### Added (multi-address membership)
+
+- Every member advertises all of its reachable IPs (every up interface address except loopback, link-local, and container/VM bridges such as `docker0`, `veth*`, `vmon*`; default-route IP first), re-advertised when interfaces change, plus its host name
+- Each process ranks a peer's addresses LAN-first (own subnet, then other private space, then overlays such as Tailscale/CGNAT, then public) and reaches it through the best one that answers: probes fail over to another advertised address instead of suspecting the member, and move back once the better address answers again. Driver→node calls, node→node artifact and file transfers (the fetching node resolves sources itself), KV forwarding, and raft RPCs all use the local route
+- Dashboard: nodes are titled by host name (id kept as secondary text), the Host card shows the CPU model and every address with the current route marked, and the CPU baseline is no longer shown; E2B `machineInfo.cpuModel`/`cpuModelName` carry the CPU model instead of the baseline
+
+### Added (NVIDIA GPU guest driver)
+
+- Guest kernel: loadable module support (unsigned, no usermode `modprobe`, everything else still built in) plus what NVIDIA's open kernel modules need (MSI/MSI-X, firmware loading, MMU notifiers, dma-buf, DMI, PAT)
+- `just gpu-driver` / `kernel/build.sh --nvidia`: builds the NVIDIA GPU driver bundle `target/kernel/vmon-nvidia-<arch>/` (driver 615.71.09, sha256-pinned installer): open kernel modules built against the vmon kernel, GSP firmware, CUDA driver libraries, and `nvidia-smi`
+- vmon-agent loads the bundle in guests with an NVIDIA GPU before envd serves (virtio-fs tag `vmon_gpu` at `/run/vmon/gpu`, `finit_module`, `/dev/nvidia*`, `ldconfig`, tools in `/usr/bin`), and GC4 `gpu_release` (also run on `poweroff`) unloads it so the GPU's GSP firmware stops before the VM is torn down
+
+### Added (GPU sandboxes)
+
+- Sandboxes request NVIDIA GPUs with `metadata["vmon.gpus"] = "<0-8>"` (stock E2B SDKs), which overrides the template default from its environment variable `VMON_GPUS`; placement only picks nodes with enough free assignable GPUs (`sandbox_no_compatible_node` when no node has that many, `sandbox_capacity_unavailable` while they are held), and the count is stored per sandbox and sent to the node on create and resume
+- GPU sandboxes always cold-boot; pauses (API and `autoPause`) and snapshots of a GPU sandbox are filesystem-only, resumes boot the disk again with GPUs re-reserved, and migration refuses them
+- Nodes discover host NVIDIA GPUs (whole GPUs on `vfio-pci` and SR-IOV vGPU VFs with a profile) every 5 s and publish each with its model, holder, and the reason it cannot be assigned (not on `vfio-pci`, IOMMU group, VFIO cdev, `/dev/iommu`, missing or mismatched guest driver bundle, unsupported host); `vmon serve --gpu-driver` / `VMON_GPU_DRIVER` points at the guest driver bundle (default `vmon-nvidia-<arch>/` next to `vmon`, else `target/kernel/` in a dev tree)
+- Nodes reserve GPUs all-or-nothing per create/resume (`busy` when too few are free), pass them to the VMM with a stable per-sandbox VM UUID, re-reserve them for VMMs adopted after a node restart, and answer `gpu_memory_snapshot` to memory pauses and snapshots of GPU sandboxes. Before a GPU VM stops the node has the guest unload its driver; a GPU whose VM exited without that is quarantined ("needs host reboot") until the host reboots, persisted across node restarts
+- Cold boots (GPU sandboxes, volume mounts, filesystem-only resumes, templates without a usable snapshot) now run the template's start command and wait for its ready command after envd `/init`, as the template snapshot does
+- Dashboard: GPU column on Nodes (free / total), a GPUs card on each node (model, PCI address, free / in use by a sandbox / problem), and the GPU count on sandbox pages; `GET /admin/cluster` lists `node.gpus` and `GET /admin/sandboxes` adds `gpus`
+- `cuda` default template (`nvidia/cuda:13.0.3-runtime-ubuntu24.04`, python3 + pip, `VMON_GPUS=1`, `vmon-gpu-check`) and an operator guide for GPU hosts (docs: Operate → GPUs)
+
 ### Added (admin dashboard)
 
 - Admin dashboard at `/dashboard/` on the driver's public listeners (`/` redirects there), signed in with `--admin-token`: fleet capacity and activity charts, cluster members, every team's sandboxes with an in-browser terminal (PTY login shell over envd), file browser (preview, upload, download, rename, delete), metrics, and logs, plus create, pause, resume, kill, timeouts, node draining, and team-wide kills; built from `ui/` with `just ui` and embedded in the binary
@@ -17,6 +39,9 @@ All notable changes to this project are recorded here.
 
 ### Breaking Changes
 
+- `vmon serve --cluster-advertise` and `--gossip-advertise` are replaced by `--advertise <IP>[,<IP>…]` (`VMON_ADVERTISE`); by default every eligible interface IP is advertised, or the listeners' IP when they bind a specific one
+- Gossip packets are now `VG2` (a member update carries all of its addresses): members of earlier releases cannot gossip with this one, so every process of a cluster must be upgraded together. `MemberMeta.cluster_url` is replaced by `hostname` + `cluster_port`, and node API source lists (`artifactSources`, `fileSources`, parent build sources) carry node ids instead of URLs
+- Whole-GPU hosts must load `vfio-pci` with `disable_idle_d3=1`; nodes report whole GPUs as unassignable otherwise (on an RTX 5070, reopening a GPU that idled in D3hot after a sandbox hung the host)
 - Replaced the `vmond` server, its gRPC/WebSocket API, the Python/TypeScript/Go SDKs, the web UI, the mesh/orchestration layer, and the deployment stacks with an E2B-compatible platform; the official E2B SDKs and `e2b` CLI are now the clients
 - Removed the `vmon run/snapshot/restore/fork/…` user CLI; `vmon` now has `serve`, `admin`, and `vmm`
 - Snapshot format version is 4 (HVF vCPU state records the frozen guest counter); v3 snapshots are rejected with recapture required, so existing templates must be rebuilt

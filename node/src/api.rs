@@ -32,9 +32,10 @@ pub struct CreateSandbox {
 	pub team_id:          String,
 	pub template_id:      String,
 	pub build_id:         String,
-	/// Cluster URLs of nodes that hold the build's artifacts, best first.
-	/// Empty when the build is expected to be local.
-	pub artifact_sources: Vec<String>,
+	/// Nodes that hold the build's artifacts, best first; the receiving node
+	/// resolves each to its own route (`Cluster::cluster_url`). Empty when the
+	/// build is expected to be local.
+	pub artifact_sources: Vec<NodeId>,
 	pub vcpus:            u32,
 	pub memory_mb:        u64,
 	pub disk_mb:          u64,
@@ -260,10 +261,14 @@ pub struct ResumeSandbox {
 	/// Authoritative sandbox metadata for adopting a pause from another node.
 	#[serde(default)]
 	pub meta:             Option<crate::sandbox::SandboxMeta>,
-	/// Peers holding the template build (cold-boot fallback, template RAM
+	/// Nodes holding the template build (cold-boot fallback, template RAM
 	/// base of delta snapshots).
 	#[serde(default)]
-	pub artifact_sources: Vec<String>,
+	pub artifact_sources: Vec<NodeId>,
+	/// GPUs to reserve again (as [`CreateSandbox::gpus`]); the resume then
+	/// cold-boots the paused filesystem.
+	#[serde(default)]
+	pub gpus:             u32,
 }
 
 /// `POST /sandboxes/{id}/deadline`.
@@ -337,8 +342,8 @@ pub struct StartBuild {
 	pub vcpus:            u32,
 	pub memory_mb:        u64,
 	pub disk_mb:          u64,
-	/// Cluster URLs of nodes holding uploaded file contexts (`/node/v1/files`).
-	pub file_sources:     Vec<String>,
+	/// Nodes holding uploaded file contexts (`/node/v1/files`).
+	pub file_sources:     Vec<NodeId>,
 	/// Ignore every cached step.
 	pub force:            bool,
 	/// Builder semantics derived from the client's SDK version.
@@ -368,9 +373,9 @@ pub enum BuildBase {
 	/// OCI image reference (`ubuntu:22.04`, `ghcr.io/org/img@sha256:…`).
 	#[serde(rename_all = "camelCase")]
 	Image { image: String, registry: Option<RegistryAuth> },
-	/// Another build's rootfs (`fromTemplate`).
+	/// Another build's rootfs (`fromTemplate`), held by `sources`.
 	#[serde(rename_all = "camelCase")]
-	Build { build_id: String, sources: Vec<String> },
+	Build { build_id: String, sources: Vec<NodeId> },
 }
 
 /// Registry credentials (`fromImageRegistry`).

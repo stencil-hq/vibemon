@@ -18,6 +18,7 @@ futures.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+libc.workspace = true
 openraft.workspace = true
 parking_lot.workspace = true
 rand.workspace = true

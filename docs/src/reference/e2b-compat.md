@@ -76,13 +76,14 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | DELETE | `/templates/tags` | SDK | Remove tags. |
 | GET | `/templates/{id}/tags` | SDK | List tags. |
 | GET | `/templates/aliases/{alias}` | SDK | 200 owner / 403 other team / 404. |
-| GET | `/nodes` | Admin | Gossip members with `roles.node` + capacity. |
+| GET | `/nodes` | Admin | Gossip members with `roles.node` + capacity. `machineInfo`: `cpuFamily` = hypervisor backend, `cpuModel` and `cpuModelName` = host CPU model name, `cpuArchitecture` = guest arch. |
 | GET | `/nodes/{nodeID}` | Admin | Member detail + sandboxes + cached builds. |
 | POST | `/nodes/{nodeID}` | Admin | `ready` / `draining` / `unhealthy` via KV `node/<id>/status`. |
 | POST | `/admin/teams/{teamID}/sandboxes/kill` | Admin | Kill every team sandbox. |
 | GET | `/admin/sandboxes/running-counts` | Admin | Counts from KV catalog. |
 | GET | `/admin/sandboxes/{id}` | Admin | Team + state. |
-| GET | `/admin/cluster` | Admin | vmon extension (dashboard): gossip members with roles, raft view, node capacity/status/create counters, plus 1 h of 5 s fleet samples. |
+| POST | `/admin/sandboxes/{id}/migrate` | Admin | vmon extension: offline migration of a running or node-local paused sandbox to `{"nodeID"}` (optional; else placed on a compatible node) → `{"sandboxID", "nodeID", "state"}`. |
+| GET | `/admin/cluster` | Admin | vmon extension (dashboard): gossip members with host name, advertised IPs, roles, raft view, node capacity/CPU model/status/create counters/GPUs, plus 1 h of 5 s fleet samples. |
 | GET | `/admin/teams` | Admin | vmon extension (dashboard): every team with limits and stored running/paused counts, by name. |
 | GET | `/admin/sandboxes` | Admin | vmon extension (dashboard): every team's running/paused sandboxes (`ListedSandbox` + `teamID`, `teamName`, `nodeID`), newest first; `state`, `team`, `limit` ≤ 1000 (default 500), `nextToken`/`X-Next-Token`; `id` returns just that sandbox (`[]` when killed/unknown). |
 | POST | `/admin/teams/{teamID}/builds/cancel` | Admin | Cancel team builds. |

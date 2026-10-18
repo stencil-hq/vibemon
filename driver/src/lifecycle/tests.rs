@@ -324,22 +324,21 @@ struct Harness {
 async fn harness() -> Harness {
 	let dir = tempfile::tempdir().unwrap();
 
-	// One process serving both roles; its cluster URL also hosts the fake node
-	// API.
+	// One process serving both roles; its cluster listener also hosts the fake
+	// node API.
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let cluster_url = format!("http://{}", listener.local_addr().unwrap());
 	let cluster = Cluster::start(
 		ClusterConfig {
-			id: NODE,
-			data_dir: dir.path().join("cluster"),
-			roles: Roles { node: true, driver: true },
-			gossip_bind: "127.0.0.1:0".parse().unwrap(),
-			gossip_advertise: "127.0.0.1:0".parse().unwrap(),
-			cluster_url,
-			join: vec![],
-			secret: SECRET.as_bytes().to_vec(),
+			id:               NODE,
+			data_dir:         dir.path().join("cluster"),
+			roles:            Roles { node: true, driver: true },
+			gossip_bind:      "127.0.0.1:0".parse().unwrap(),
+			advertise:        None,
+			cluster_port:     listener.local_addr().unwrap().port(),
+			join:             vec![],
+			secret:           SECRET.as_bytes().to_vec(),
 			bootstrap_expect: 1,
-			raft_reap_after: Duration::from_mins(10),
+			raft_reap_after:  Duration::from_mins(10),
 		},
 		MemberMeta {
 			version: "test".into(),

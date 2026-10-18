@@ -29,12 +29,9 @@ All processes need the same `--cluster-secret`. All drivers should share `--doma
 
 Every process joins gossip on `--gossip-listen` (default `0.0.0.0:7946`, UDP and TCP). Pass the seeds with `--join host:port,host:port`. Seed host names are resolved through DNS, and the process's own address is skipped, so you can pass the same seed list to every process. Listing all drivers is a good choice. If no seed answers at startup, the process logs a warning and retries every 2 s until one does.
 
-Peers reach a process at its advertised addresses:
+Peers reach a process at its advertised IPs, on the `--gossip-listen` port for gossip and the `--cluster-listen` port for cluster HTTP. With the default wildcard listeners, a process advertises every IP of its interfaces (LAN, VPN such as Tailscale, public), leaving out loopback, link-local, and container or VM bridges. A listener bound to a specific IP advertises only that IP, and `--advertise ip,ip,…` sets the list explicitly, for example behind NAT (details in [Advertise addresses](../reference/serve.md#cluster-and-gossip)).
 
-- `--gossip-advertise` (`ip:port`), defaulting to the detected IP with the `--gossip-listen` port.
-- `--cluster-advertise` (a URL), defaulting to `http://<detected-ip>:<cluster-listen port>`.
-
-The detected IP is the `--cluster-listen` IP when it is specific, or else the host's outbound IPv4 address. Set both advertise flags on multi-homed hosts, in containers, and behind NAT.
+Each process picks its own route to every peer from that peer's list: a shared subnet (LAN) first, then other private addresses, then overlay networks, then public addresses. When that address stops answering, it falls back to another one, so a peer is lost only when none of its addresses works. Transfers between nodes (template artifacts, build file contexts) follow the fetching node's route, so two nodes on the same LAN copy over the LAN even when the driver reaches them over a VPN. Every member also publishes its host name, which the dashboard shows next to the node ID.
 
 Failure detection: each member probes one peer per second. An unanswered probe (500 ms timeout, then 3 indirect probes) marks the peer `Suspect`, and it becomes `Dead` after `5 × max(1, ⌈log10(n+1)⌉)` seconds. A process that shuts down cleanly announces `Left` instead. Every 30 s, members exchange full state with a random peer (and with a random dead one), which heals partitions. Packets are authenticated with an HMAC keyed from the cluster secret, and unauthenticated ones are dropped.
 
@@ -147,7 +144,7 @@ vmon serve --role node \
   --vmm-user 64000:64000
 ```
 
-Binding the internal listeners to the host's private IP also makes it the advertised address. Put the drivers' public listeners behind DNS or a load balancer for `api.sbx.example.com` and `*.sbx.example.com` (see [Domains, TLS, and ingress](ingress.md)). Then check that `GET /nodes` on any driver lists every node as `ready`:
+Binding the internal listeners to the host's private IP also makes it the only advertised address; with the default `0.0.0.0` listeners, the node advertises all its interface IPs instead. Put the drivers' public listeners behind DNS or a load balancer for `api.sbx.example.com` and `*.sbx.example.com` (see [Domains, TLS, and ingress](ingress.md)). Then check that `GET /nodes` on any driver lists every node as `ready`:
 
 ```sh
 curl -s https://api.sbx.example.com/nodes -H "X-Admin-Token: $VMON_ADMIN_TOKEN"

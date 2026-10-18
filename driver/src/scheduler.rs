@@ -119,9 +119,8 @@ pub struct PlacementRequest {
 /// An eligible node with its score.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-	pub node_id:     NodeId,
-	pub cluster_url: String,
-	pub score:       f64,
+	pub node_id: NodeId,
+	pub score:   f64,
 }
 
 /// Why no node was eligible; maps to the E2B placement `error_code`s.
@@ -331,8 +330,8 @@ pub fn eligible<S: BuildHasher>(
 				score += SNAPSHOT_BONUS;
 			}
 		}
-		score = f64::from(inflight(*id)).mul_add(-INFLIGHT_PENALTY, score);
-		out.push(Candidate { node_id: *id, cluster_url: meta.cluster_url.clone(), score });
+		score = f64::from(counters.inflight).mul_add(-INFLIGHT_PENALTY, score);
+		out.push(Candidate { node_id: *id, score });
 	}
 	if out.is_empty() {
 		return Err(if compatible {
@@ -389,7 +388,6 @@ mod tests {
 		f(&mut cap);
 		let meta = MemberMeta {
 			roles: Roles { node: true, driver: false },
-			cluster_url: format!("http://n{id}:7947"),
 			node: Some(cap),
 			..MemberMeta::default()
 		};
@@ -593,11 +591,7 @@ mod tests {
 	#[test]
 	fn power_of_two_never_picks_from_bottom_half() {
 		let cands: Vec<Candidate> = (0..6)
-			.map(|i| Candidate {
-				node_id:     NodeId(i),
-				cluster_url: String::new(),
-				score:       10.0 - f64::from(i as u8),
-			})
+			.map(|i| Candidate { node_id: NodeId(i), score: 10.0 - f64::from(i as u8) })
 			.collect();
 		let mut rng = rand::rng();
 		let mut seen = HashSet::new();

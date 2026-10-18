@@ -12,11 +12,20 @@ import {
   Stat,
   Status,
 } from "../components.tsx";
-import { fmt, shortId } from "../format.ts";
+import { fmt, memberName, shortId } from "../format.ts";
 import { useNow, usePoll } from "../hooks.ts";
 import { Icon } from "../icons.tsx";
 import { Link } from "../router.tsx";
-import { NODE_TONE, nodeActions } from "./Nodes.tsx";
+import { gpuAvailable, NODE_TONE, nodeActions } from "./Nodes.tsx";
+
+/** Host of a URL without IPv6 brackets ("" when unparsable). */
+function urlHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return "";
+  }
+}
 
 export function NodeDetailPage({ id }: { id: string }) {
   const cluster = useCluster();
@@ -24,6 +33,7 @@ export function NodeDetailPage({ id }: { id: string }) {
   const detail = usePoll(`node|${id}`, (signal) => api.node(id, signal), 5000);
   const now = useNow(5000);
   const n = member?.node;
+  const route = member ? urlHost(member.clusterURL) : "";
   const sandboxes = [...(detail.data?.sandboxes ?? [])].sort(
     (a, b) => b.startedAtMs - a.startedAtMs,
   );
@@ -36,12 +46,22 @@ export function NodeDetailPage({ id }: { id: string }) {
             <Link to="/nodes">Nodes</Link>
             <Icon name="chevron" size={12} />
           </div>
-          <h1 className="page__title mono truncate">{shortId(id)}</h1>
+          <h1 className={`page__title truncate${member ? "" : " mono"}`}>
+            {member ? memberName(member) : shortId(id)}
+          </h1>
           <p className="page__lede">
             {n ? (
               <Status tone={NODE_TONE[n.status]}>{n.status.replace("_", " ")}</Status>
             ) : (
               "Unknown node"
+            )}
+            {member && (
+              <>
+                <span className="faint"> · </span>
+                <span className="mono" title={id}>
+                  {shortId(id)}
+                </span>
+              </>
             )}
             {member && (
               <>
@@ -119,8 +139,25 @@ export function NodeDetailPage({ id }: { id: string }) {
                 {n.os}/{n.arch}
               </Detail>
               <Detail label="Hypervisor">{n.backend}</Detail>
-              <Detail label="CPU baseline">
-                <span className="mono truncate">{n.cpuBaseline || "—"}</span>
+              <Detail label="CPU">{n.cpuModel || "—"}</Detail>
+              <Detail label="Addresses">
+                <span className="chips">
+                  {member.addrs.length
+                    ? member.addrs.map((addr) =>
+                        addr === route ? (
+                          <span key={addr} title={`Current route: ${member.clusterURL}`}>
+                            <Badge tone="info">
+                              <span className="mono">{addr}</span> route
+                            </Badge>
+                          </span>
+                        ) : (
+                          <Badge key={addr}>
+                            <span className="mono">{addr}</span>
+                          </Badge>
+                        ),
+                      )
+                    : "—"}
+                </span>
               </Detail>
               <Detail label="Up">{fmt.duration(now - new Date(member.startedAt).getTime())}</Detail>
               <Detail label="Roles">

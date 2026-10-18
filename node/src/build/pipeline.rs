@@ -26,7 +26,7 @@ use tokio::io::AsyncWriteExt;
 use vmon_agent::proto::Op;
 
 use super::{
-	BuildFailure, Builder,
+	BuildFailure, Builder, Sources,
 	cache::{self, CopyPolicy, LayerDef},
 	log::{BuildLog, LineSplitter},
 	provision,
@@ -84,6 +84,7 @@ const FINALIZE: &str = "finalize";
 pub(super) struct Job {
 	builder: Builder,
 	req:     StartBuild,
+	sources: Sources,
 	log:     BuildLog,
 }
 
@@ -169,12 +170,17 @@ fn fail(step: &str) -> impl FnOnce(anyhow::Error) -> BuildFailure + '_ {
 }
 
 impl Job {
-	pub(super) const fn new(builder: Builder, req: StartBuild, log: BuildLog) -> Self {
-		Self { builder, req, log }
+	pub(super) const fn new(
+		builder: Builder,
+		req: StartBuild,
+		sources: Sources,
+		log: BuildLog,
+	) -> Self {
+		Self { builder, req, sources, log }
 	}
 
 	pub(super) async fn run(self) -> Result<ArtifactInfo, BuildFailure> {
-		let Self { builder, req, log } = self;
+		let Self { builder, req, sources, log } = self;
 		let inner = &builder.inner;
 		let store = &inner.store;
 		let cfg = &inner.config;
@@ -208,8 +214,8 @@ impl Job {
 					format!("[base] FROM {image}"),
 				)
 			},
-			BuildBase::Build { build_id, sources } => {
-				let meta = parent_meta(store, build_id, sources)
+			BuildBase::Build { build_id, .. } => {
+				let meta = parent_meta(store, build_id, &sources.parent)
 					.await
 					.map_err(fail(BASE))?;
 				(
@@ -365,7 +371,7 @@ impl Job {
 				.join("context")
 				.join(&req.template_id);
 			for hash in &copy_hashes {
-				ensure_file_context(&builder, &req, &context_dir, hash)
+				ensure_file_context(&builder, &req, &sources.files, &context_dir, hash)
 					.await
 					.map_err(|e| {
 						let label = to_run
@@ -923,6 +929,7 @@ async fn run_logged(
 async fn ensure_file_context(
 	builder: &Builder,
 	req: &StartBuild,
+	file_sources: &[String],
 	context_dir: &Path,
 	hash: &str,
 ) -> Result<()> {
@@ -935,7 +942,7 @@ async fn ensure_file_context(
 	let archive = context_dir.join(format!(".{hash}.{:08x}.tar", rand::random::<u32>()));
 	let mut errors = Vec::new();
 	let mut fetched = false;
-	for source in &req.file_sources {
+	for source in file_sources {
 		let attempt = async {
 			let client = NodeClient::new(source, &cfg.secret, cfg.http.clone())?;
 			let response = client.get_file(&req.template_id, hash).await?;

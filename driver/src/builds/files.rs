@@ -61,12 +61,12 @@ pub async fn file_present(state: &AppState, template_id: &str, hash: &str) -> Ap
 	Ok(file_location(state, template_id, hash).await?.is_some())
 }
 
-/// Cluster URL of the alive node storing an archive.
+/// The alive node storing an archive.
 pub(super) async fn file_location(
 	state: &AppState,
 	template_id: &str,
 	hash: &str,
-) -> ApiResult<Option<String>> {
+) -> ApiResult<Option<NodeId>> {
 	let Some(entry) = state.cluster.kv.get(&file_key(template_id, hash)).await? else {
 		return Ok(None);
 	};
@@ -75,9 +75,9 @@ pub(super) async fn file_location(
 	};
 	Ok(state
 		.node_members()
-		.into_iter()
-		.find(|(id, _)| *id == record.node)
-		.map(|(_, meta)| meta.cluster_url))
+		.iter()
+		.any(|(id, _)| *id == record.node)
+		.then_some(record.node))
 }
 
 /// Classifies an archive from its first bytes; `complete` says the whole
@@ -147,13 +147,13 @@ pub async fn store_upload(
 
 /// Alive, non-draining node with the most free disk.
 fn storage_node(state: &AppState) -> ApiResult<(NodeId, vmon_node::client::NodeClient)> {
-	let (id, meta) = state
+	let (id, _) = state
 		.node_members()
 		.into_iter()
 		.filter(|(_, meta)| meta.node.as_ref().is_some_and(|cap| !cap.draining))
 		.max_by_key(|(_, meta)| meta.node.as_ref().map_or(0, |cap| cap.disk_free_mb))
 		.ok_or_else(|| ApiError::unavailable("no node is available to store build files"))?;
-	Ok((id, state.node_at(&meta.cluster_url)?))
+	Ok((id, state.node(id)?))
 }
 
 #[cfg(test)]

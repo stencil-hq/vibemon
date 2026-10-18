@@ -3427,6 +3427,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "openraft",
  "parking_lot",
  "rand 0.10.2",

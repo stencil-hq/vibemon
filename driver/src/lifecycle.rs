@@ -380,7 +380,7 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 		team_id:          plan.team.id.clone(),
 		template_id:      plan.template_id.clone(),
 		build_id:         plan.build_id.clone(),
-		artifact_sources: plan.sources.iter().map(|s| s.cluster_url.clone()).collect(),
+		artifact_sources: plan.sources.iter().map(|s| s.node_id).collect(),
 		vcpus:            plan.artifact.vcpus,
 		memory_mb:        plan.artifact.memory_mb,
 		disk_mb:          plan.artifact.disk_mb,
@@ -401,7 +401,6 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 	let mut admitted = false;
 	let mut last_error: Option<NodeError> = None;
 	let mut started = None;
-	let mut placed_url = String::new();
 	for _ in 0..scheduler::MAX_ATTEMPTS {
 		let statuses = scheduler::load_statuses(kv).await?;
 		let candidate = match state
@@ -422,7 +421,7 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 			routes::admit(kv, id, &route, plan.team.limits.max_concurrent_sandboxes).await?;
 			admitted = true;
 		}
-		let client = match state.node_at(&candidate.cluster_url) {
+		let client = match state.node(candidate.node_id) {
 			Ok(client) => client,
 			Err(error) => {
 				remove_route(kv, id, &plan.team.id).await.ok();
@@ -434,7 +433,6 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 			Ok(info) => {
 				guard.finish(CreateOutcome::Success);
 				started = Some((client, info));
-				placed_url = candidate.cluster_url;
 				break;
 			},
 			Err(error) if retryable(&error) => {
@@ -465,9 +463,7 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 		// create path: its first manifest request hashes the files.
 		let (state, node, build_id) = (state.clone(), route.node_id, plan.build_id.clone());
 		tokio::spawn(async move {
-			if let Err(error) =
-				crate::builds::record_holder(&state, node, &placed_url, &build_id).await
-			{
+			if let Err(error) = crate::builds::record_holder(&state, node, &build_id).await {
 				tracing::warn!(error = %error.message, %node, build = %build_id, "recording a new artifact holder failed");
 			}
 		});
@@ -1178,7 +1174,7 @@ async fn resume_paused(
 			.scheduler
 			.place_paused(&state.node_members(), &statuses, &placement, owner, remote, cold_boot)
 			.map_err(unplaceable)?;
-		(candidate.node_id, state.node_at(&candidate.cluster_url)?, cold_boot)
+		(candidate.node_id, state.node(candidate.node_id)?, cold_boot)
 	} else {
 		// A node-local pause needs its holder (not fresh-create capacity).
 		let Ok(client) = state.node(owner) else {
@@ -1218,7 +1214,7 @@ async fn resume_paused(
 		builds::artifact_sources(state, &row.build_id)
 			.await?
 			.into_iter()
-			.map(|source| source.cluster_url)
+			.map(|source| source.node_id)
 			.collect()
 	} else {
 		Vec::new()
@@ -1603,11 +1599,7 @@ async fn launch_forks(
 		.node_members()
 		.into_iter()
 		.find(|(node, _)| *node == route.node_id)
-		.map(|(node, meta)| ArtifactSource {
-			node_id:     node,
-			cluster_url: meta.cluster_url,
-			info:        artifact.clone(),
-		})
+		.map(|(node, _)| ArtifactSource { node_id: node, info: artifact.clone() })
 		.ok_or_else(|| ApiError::unavailable("the source sandbox's node left the cluster"))?;
 	let env_vars = decrypt_env(state, row)?;
 	let policy = decrypt_policy(state, row)?;

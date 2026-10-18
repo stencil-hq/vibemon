@@ -1,6 +1,7 @@
 //! Vibemon cluster layer: SWIM-style gossip memberlist plus a raft-replicated
 //! KV store, combined behind the [`Cluster`] facade (ARCHITECTURE.md §5).
 
+pub mod addrs;
 pub mod gossip;
 pub mod kv;
 pub mod meta;
@@ -8,7 +9,7 @@ pub mod meta;
 use std::{
 	convert::Infallible,
 	future::Future,
-	net::SocketAddr,
+	net::{IpAddr, SocketAddr},
 	path::PathBuf,
 	sync::Arc,
 	time::{Duration, Instant},
@@ -53,9 +54,13 @@ pub struct ClusterConfig {
 	pub data_dir:         PathBuf,
 	pub roles:            Roles,
 	pub gossip_bind:      SocketAddr,
-	pub gossip_advertise: SocketAddr,
-	/// Internal HTTP base URL where this process serves [`Cluster::router`].
-	pub cluster_url:      String,
+	/// IPs peers may reach this process at, gossip and cluster listener alike,
+	/// in preference order (at most 16). `None`: the gossip bind IP when
+	/// specific, else every [`addrs::advertisable`] address, re-read every
+	/// 30 s and re-advertised when it changes.
+	pub advertise:        Option<Vec<IpAddr>>,
+	/// Port of the internal HTTP listener serving [`Cluster::router`].
+	pub cluster_port:     u16,
 	/// Gossip seeds (`host:port`).
 	pub join:             Vec<String>,
 	/// Shared cluster secret (HTTP bearer, gossip HMAC key material).
@@ -93,11 +98,17 @@ impl Cluster {
 		let secret: Arc<[u8]> = cfg.secret.clone().into();
 		let auth = Arc::new(bearer(&secret)?);
 		meta.roles = cfg.roles;
-		meta.cluster_url.clone_from(&cfg.cluster_url);
+		meta.cluster_port = cfg.cluster_port;
 		meta.raft = cfg.roles.driver.then(RaftStatus::default);
 
-		let gossip_cfg =
-			GossipConfig::new(cfg.id, cfg.gossip_bind, cfg.gossip_advertise, cfg.secret.clone());
+		// Empty: gossip derives the list from the bind address / interfaces.
+		let advertise = cfg
+			.advertise
+			.iter()
+			.flatten()
+			.map(|ip| SocketAddr::new(*ip, 0))
+			.collect();
+		let gossip_cfg = GossipConfig::new(cfg.id, cfg.gossip_bind, advertise, cfg.secret.clone());
 		let gossip = Gossip::start(gossip_cfg, meta.encode())
 			.await
 			.context("starting gossip")?;
@@ -148,7 +159,7 @@ impl Cluster {
 				meta.clone(),
 				cfg.bootstrap_expect,
 				cfg.raft_reap_after,
-				cfg.cluster_url.clone(),
+				format!("http://{}", SocketAddr::new(gossip.local_addr().ip(), cfg.cluster_port)),
 			);
 			tasks.push(tokio::spawn(reconciler.run(stop_rx)));
 		}
@@ -199,6 +210,13 @@ impl Cluster {
 			.into_iter()
 			.filter_map(|m| MemberMeta::decode(&m.meta).map(|meta| (m, meta)))
 			.collect()
+	}
+
+	/// Cluster listener URL of member `id` through the address this process
+	/// currently reaches it at; `None` when gossip does not know the member or
+	/// its metadata. Liveness is the caller's concern.
+	pub fn cluster_url(&self, id: NodeId) -> Option<String> {
+		kv::member_url(&self.gossip, id)
 	}
 
 	/// Current raft leader as seen locally (always `None` on node-only

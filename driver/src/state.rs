@@ -129,7 +129,7 @@ impl AppState {
 
 	/// Client for a node by id; fails when the node is not an alive member.
 	pub fn node(&self, id: NodeId) -> Result<NodeClient, ApiError> {
-		let (_, meta) = self
+		let (member, meta) = self
 			.cluster
 			.members()
 			.into_iter()
@@ -137,7 +137,7 @@ impl AppState {
 				member.id == id && member.state != MemberState::Dead && meta.roles.node
 			})
 			.ok_or_else(|| ApiError::unavailable(format!("node {id} is not available")))?;
-		self.node_at(&meta.cluster_url)
+		self.node_at(&meta.cluster_url(&member))
 	}
 
 	/// Client for a node by cluster URL.

@@ -170,7 +170,7 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 		.members()
 		.into_iter()
 		.filter(|(_, meta)| meta.roles.node)
-		.map(|(member, meta)| (member.id, (member.state, meta.cluster_url)))
+		.map(|(member, meta)| (member.id, (member.state, meta.cluster_url(&member))))
 		.collect();
 	let now_instant = Instant::now();
 	departures.observe(

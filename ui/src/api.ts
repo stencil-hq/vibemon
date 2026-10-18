@@ -97,7 +97,7 @@ export interface NodeInfo {
   arch: string;
   os: string;
   backend: string;
-  cpuBaseline: string;
+  cpuModel: string;
   cpus: number;
   vcpusUsed: number;
   memoryMB: number;
@@ -110,6 +110,18 @@ export interface NodeInfo {
   createSuccesses: number;
   createFails: number;
   inflight: number;
+  gpus: GpuInfo[];
+}
+
+/** One host GPU (or vGPU VF) a node publishes. */
+export interface GpuInfo {
+  /** PCI address, e.g. `0000:52:00.0`. */
+  address: string;
+  model: string;
+  /** Sandbox holding it; null when free. */
+  sandbox: string | null;
+  /** Why sandboxes cannot use it; empty when assignable. */
+  problem: string;
 }
 
 export interface RaftInfo {
@@ -121,11 +133,15 @@ export interface RaftInfo {
 
 export interface ClusterMember {
   id: string;
+  hostname: string;
   state: MemberState;
   roles: { node: boolean; driver: boolean };
   version: string;
   startedAt: string;
+  /** Admin URL through the address the serving driver currently routes to. */
   clusterURL: string;
+  /** Every advertised IP, in the order the serving driver holds them. */
+  addrs: string[];
   publicURL: string | null;
   raft: RaftInfo | null;
   node: NodeInfo | null;

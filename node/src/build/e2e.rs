@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vmon_cluster::NodeId;
 
-use super::{BuildConfig, Builder};
+use super::{BuildConfig, Builder, Sources};
 use crate::{
 	api::{ArtifactInfo, BuildBase, BuildState, BuildStep, GuestInit, StartBuild, TemplateVersion},
 	envd::{ENVD_PORT, EnvdClient},
@@ -177,23 +177,23 @@ async fn build(
 ) -> (ArtifactInfo, String) {
 	let build_id = uuid::Uuid::new_v4().to_string();
 	let started = Instant::now();
-	env.builder
-		.start(StartBuild {
-			build_id: build_id.clone(),
-			template_id: format!("e2e{name}"),
-			team_id: "team".into(),
-			from,
-			steps,
-			start_cmd: start.map(str::to_owned),
-			ready_cmd: ready.map(str::to_owned),
-			vcpus: 2,
-			memory_mb: 1024,
-			disk_mb: 4096,
-			file_sources: vec![env.file_source.clone()],
-			force: false,
-			template_version: TemplateVersion::V2_1,
-		})
-		.unwrap();
+	let req = StartBuild {
+		build_id: build_id.clone(),
+		template_id: format!("e2e{name}"),
+		team_id: "team".into(),
+		from,
+		steps,
+		start_cmd: start.map(str::to_owned),
+		ready_cmd: ready.map(str::to_owned),
+		vcpus: 2,
+		memory_mb: 1024,
+		disk_mb: 4096,
+		file_sources: Vec::new(),
+		force: false,
+		template_version: TemplateVersion::V2_1,
+	};
+	let sources = Sources { files: vec![env.file_source.clone()], parent: Vec::new() };
+	env.builder.start(req, sources).unwrap();
 	let mut offset = 0;
 	loop {
 		let status = env.builder.status(&build_id, offset).unwrap();
@@ -558,7 +558,8 @@ async fn templates_build_snapshot_and_fork() {
 
 		// A second node with a different CPU baseline fetches the build from
 		// this node's artifact routes and regenerates the snapshot locally.
-		let app = Router::new().nest("/node/v1", super::routes(env.builder.clone()));
+		let app = Router::new()
+			.nest("/node/v1", super::routes(env.builder.clone(), crate::server::Peers::default()));
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let source = format!("http://{}", listener.local_addr().unwrap());
 		tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

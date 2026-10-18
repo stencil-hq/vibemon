@@ -150,7 +150,7 @@ async fn portable_resume_relocates_from_a_dead_owner() {
 	let meta = request.meta.unwrap();
 	assert_eq!(meta.envd_access_token, h.state.keys.envd_token(&id));
 	assert!(meta.pid.is_none() && meta.tap.is_none());
-	assert!(!request.artifact_sources.is_empty(), "the template holder is offered");
+	assert_eq!(request.artifact_sources, [NODE], "the template holder is offered by id");
 	let owner = h
 		.cluster
 		.kv

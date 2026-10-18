@@ -31,14 +31,15 @@ struct Proc {
 impl Proc {
 	async fn start(id: u64, dir: &Path, roles: Roles, seeds: &[&Self], expect: usize) -> Self {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let url = format!("http://{}", listener.local_addr().unwrap());
+		let addr = listener.local_addr().unwrap();
+		let url = format!("http://{addr}");
 		let cfg = ClusterConfig {
 			id: NodeId(id),
 			data_dir: dir.join(format!("{id:x}")),
 			roles,
 			gossip_bind: "127.0.0.1:0".parse().unwrap(),
-			gossip_advertise: "127.0.0.1:0".parse().unwrap(),
-			cluster_url: url.clone(),
+			advertise: None,
+			cluster_port: addr.port(),
 			join: seeds
 				.iter()
 				.map(|p| p.cluster.gossip.local_addr().to_string())

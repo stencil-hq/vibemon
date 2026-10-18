@@ -4,7 +4,7 @@
 use axum::{
 	Json, Router,
 	body::Body,
-	extract::{Path, Query, State},
+	extract::{FromRef, Path, Query, State},
 	http::{HeaderMap, StatusCode, header},
 	response::{IntoResponse, Response},
 	routing::{get, post},
@@ -12,20 +12,44 @@ use axum::{
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-use super::{Builder, StartError};
-use crate::api::{ErrorBody, StartBuild};
+use super::{Builder, Sources, StartError};
+use crate::{
+	api::{BuildBase, ErrorBody, StartBuild},
+	server::Peers,
+};
 
-/// Router for `POST /builds`, `GET|DELETE /builds/{id}`,
-/// `GET /artifacts/{id}/manifest`, `GET /artifacts/{id}/files/{*path}`, and
-/// `DELETE /artifacts/{id}`; the node server nests it under `/node/v1`.
-pub fn routes(builder: Builder) -> Router {
+/// State of the build routes.
+#[derive(Clone)]
+struct BuildApi {
+	builder: Builder,
+	peers:   Peers,
+}
+
+impl FromRef<BuildApi> for Builder {
+	fn from_ref(api: &BuildApi) -> Self {
+		api.builder.clone()
+	}
+}
+
+impl FromRef<BuildApi> for Peers {
+	fn from_ref(api: &BuildApi) -> Self {
+		api.peers.clone()
+	}
+}
+
+/// Build and artifact routes; the node server nests them under `/node/v1`.
+///
+/// `POST /builds`, `GET|DELETE /builds/{id}`, `GET /artifacts/{id}/manifest`,
+/// `GET /artifacts/{id}/files/{*path}`, and `DELETE /artifacts/{id}`. `peers`
+/// resolves the sources of build requests.
+pub fn routes(builder: Builder, peers: Peers) -> Router {
 	Router::new()
 		.route("/builds", post(start_build))
 		.route("/builds/{id}", get(build_status).delete(cancel_build))
 		.route("/artifacts/{id}", axum::routing::delete(delete_artifact))
 		.route("/artifacts/{id}/manifest", get(artifact_manifest))
 		.route("/artifacts/{id}/files/{*path}", get(artifact_file))
-		.with_state(builder)
+		.with_state(BuildApi { builder, peers })
 }
 
 fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -44,8 +68,17 @@ fn error_response_for(error: &anyhow::Error) -> Response {
 	self::error(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
 }
 
-async fn start_build(State(builder): State<Builder>, Json(req): Json<StartBuild>) -> Response {
-	match builder.start(req) {
+async fn start_build(
+	State(builder): State<Builder>,
+	State(peers): State<Peers>,
+	Json(req): Json<StartBuild>,
+) -> Response {
+	let parent = match &req.from {
+		BuildBase::Build { sources, .. } => peers.urls(sources),
+		BuildBase::Image { .. } => Vec::new(),
+	};
+	let sources = Sources { files: peers.urls(&req.file_sources), parent };
+	match builder.start(req, sources) {
 		Ok(()) => StatusCode::ACCEPTED.into_response(),
 		Err(StartError::Invalid(message)) => error(StatusCode::BAD_REQUEST, "invalid", message),
 		Err(StartError::Internal(e)) => internal(&e),

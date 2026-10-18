@@ -1,3 +1,4 @@
+import { useNodeName } from "../App.tsx";
 import { api, type SandboxDetail } from "../api.ts";
 import {
   Badge,
@@ -12,7 +13,7 @@ import {
   Tabs,
 } from "../components.tsx";
 import type { EnvdTarget } from "../envd.ts";
-import { fmt, shortId } from "../format.ts";
+import { fmt } from "../format.ts";
 import { useNow, usePoll } from "../hooks.ts";
 import { Icon } from "../icons.tsx";
 import { Link, navigate, useRoute } from "../router.tsx";
@@ -58,6 +59,7 @@ export function SandboxDetailPage({ id }: { id: string }) {
   const tab: TabId = TABS.some((t) => t.id === tabParam) ? (tabParam as TabId) : "terminal";
   const sandbox = usePoll(`sandbox|${id}`, (signal) => loadSandbox(id, signal), 5000);
   const now = useNow(1000);
+  const nodeName = useNodeName();
   const data = sandbox.data;
 
   if (!data) {
@@ -172,8 +174,8 @@ export function SandboxDetailPage({ id }: { id: string }) {
           </Detail>
           <Detail label="Node">
             {data.nodeID ? (
-              <Link to={`/nodes/${data.nodeID}`} className="mono row-link">
-                {shortId(data.nodeID)}
+              <Link to={`/nodes/${data.nodeID}`} className="row-link" title={data.nodeID}>
+                {nodeName(data.nodeID)}
               </Link>
             ) : (
               "—"

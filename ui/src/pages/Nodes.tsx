@@ -1,5 +1,5 @@
 import { useCluster } from "../App.tsx";
-import { api, type ClusterMember, type NodeStatus } from "../api.ts";
+import { api, type ClusterMember, type GpuInfo, type NodeStatus } from "../api.ts";
 import {
   Card,
   confirmAction,
@@ -11,7 +11,7 @@ import {
   Status,
   type Tone,
 } from "../components.tsx";
-import { fmt, shortId } from "../format.ts";
+import { fmt, memberName } from "../format.ts";
 import { attempt } from "../hooks.ts";
 import { Link } from "../router.tsx";
 
@@ -23,6 +23,11 @@ export const NODE_TONE: Record<NodeStatus, Tone> = {
   shutting_down: "muted",
 };
 
+/** Free and assignable (no holder, no problem). */
+export function gpuAvailable(gpu: GpuInfo): boolean {
+  return gpu.sandbox === null && gpu.problem === "";
+}
+
 /** Operator status changes (`POST /nodes/{id}`), confirming the disruptive ones. */
 export function nodeActions(member: ClusterMember, onChanged: () => void): MenuItem[] {
   const status = member.node?.status;
@@ -32,7 +37,7 @@ export function nodeActions(member: ClusterMember, onChanged: () => void): MenuI
         title: next === "draining" ? "Drain node?" : "Mark node unhealthy?",
         body: (
           <p>
-            <span className="mono">{shortId(member.id)}</span>{" "}
+            <strong>{memberName(member)}</strong>{" "}
             {next === "draining"
               ? "stops receiving new sandboxes and builds. Running sandboxes keep running."
               : "is excluded from placement until marked ready again."}
@@ -44,7 +49,7 @@ export function nodeActions(member: ClusterMember, onChanged: () => void): MenuI
       if (!ok) return;
     }
     if (
-      await attempt(`${shortId(member.id)} is now ${next}`, () =>
+      await attempt(`${memberName(member)} is now ${next}`, () =>
         api.setNodeStatus(member.id, next),
       )
     )
@@ -74,7 +79,8 @@ export function NodesPage() {
   const cluster = useCluster();
   const nodes = (cluster.data?.members ?? [])
     .filter((m) => m.node)
-    .sort((a, b) => a.id.localeCompare(b.id));
+    .sort((a, b) => memberName(a).localeCompare(memberName(b)) || a.id.localeCompare(b.id));
+  const showGpus = nodes.some((m) => (m.node?.gpus.length ?? 0) > 0);
 
   return (
     <div className="page">
@@ -115,8 +121,8 @@ export function NodesPage() {
                   return (
                     <tr key={m.id}>
                       <td>
-                        <Link to={`/nodes/${m.id}`} className="row-link mono">
-                          {shortId(m.id)}
+                        <Link to={`/nodes/${m.id}`} className="row-link" title={m.id}>
+                          {memberName(m)}
                         </Link>
                         <div className="cell-sub mono">{m.clusterURL}</div>
                       </td>
@@ -154,7 +160,7 @@ export function NodesPage() {
                       </td>
                       <td className="shrink">
                         <Menu
-                          label={`Actions for node ${shortId(m.id)}`}
+                          label={`Actions for node ${memberName(m)}`}
                           items={nodeActions(m, cluster.refresh)}
                         />
                       </td>

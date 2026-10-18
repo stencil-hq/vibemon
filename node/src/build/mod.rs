@@ -101,6 +101,17 @@ struct Inner {
 	initramfs:    OnceCell<PathBuf>,
 }
 
+/// Peers a build fetches from, as cluster URLs: the API handler resolves the
+/// request's node ids (`StartBuild::file_sources`, `BuildBase::Build::sources`)
+/// through this node's view of the cluster.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sources {
+	/// Holders of the uploaded file contexts.
+	pub files:  Vec<String>,
+	/// Holders of the `fromTemplate` parent build.
+	pub parent: Vec<String>,
+}
+
 /// One build known to this process.
 struct BuildHandle {
 	state:    Mutex<HandleState>,
@@ -189,9 +200,9 @@ impl Builder {
 		self.inner.running.load(Ordering::Relaxed)
 	}
 
-	/// Accepts a build and runs it in the background (`POST /builds`).
-	/// Re-posting a known build ID is idempotent.
-	pub fn start(&self, req: StartBuild) -> Result<(), StartError> {
+	/// Accepts a build and runs it in the background (`POST /builds`),
+	/// fetching from `sources`. Re-posting a known build ID is idempotent.
+	pub fn start(&self, req: StartBuild, sources: Sources) -> Result<(), StartError> {
 		validate(&req).map_err(|e| StartError::Invalid(format!("{e:#}")))?;
 		let dir = self
 			.inner
@@ -218,11 +229,11 @@ impl Builder {
 			handle
 		};
 		let builder = self.clone();
-		tokio::spawn(async move { builder.run(req, handle).await });
+		tokio::spawn(async move { builder.run(req, sources, handle).await });
 		Ok(())
 	}
 
-	async fn run(self, req: StartBuild, handle: Arc<BuildHandle>) {
+	async fn run(self, req: StartBuild, sources: Sources, handle: Arc<BuildHandle>) {
 		let _finished = handle.finished.clone().drop_guard();
 		let inner = &self.inner;
 		let started = Instant::now();
@@ -235,7 +246,7 @@ impl Builder {
 			Some(_permit) => {
 				handle.state.lock().status = BuildState::Building;
 				inner.running.fetch_add(1, Ordering::Relaxed);
-				let job = pipeline::Job::new(self.clone(), req.clone(), handle.log.clone());
+				let job = pipeline::Job::new(self.clone(), req.clone(), sources, handle.log.clone());
 				let result = tokio::select! {
 					result = job.run() => result.map_err(Some),
 					() = handle.cancel.cancelled() => Err(None),
@@ -483,16 +494,13 @@ mod tests {
 		.unwrap()
 	}
 
-	/// A `fromTemplate` build whose parent is fetched from `source`.
-	fn request(build_id: &str, source: &str) -> StartBuild {
+	/// A `fromTemplate` build (its parent fetched from [`parent_at`]).
+	fn request(build_id: &str) -> StartBuild {
 		StartBuild {
 			build_id:         build_id.into(),
 			template_id:      "t".into(),
 			team_id:          "team".into(),
-			from:             BuildBase::Build {
-				build_id: "parent".into(),
-				sources:  vec![source.into()],
-			},
+			from:             BuildBase::Build { build_id: "parent".into(), sources: Vec::new() },
 			steps:            Vec::new(),
 			start_cmd:        None,
 			ready_cmd:        None,
@@ -505,6 +513,11 @@ mod tests {
 		}
 	}
 
+	/// Sources that fetch the parent build from `url`.
+	fn parent_at(url: &str) -> Sources {
+		Sources { files: Vec::new(), parent: vec![url.into()] }
+	}
+
 	#[tokio::test]
 	async fn deleting_artifacts_stops_the_build_first_and_forgets_it() {
 		let dir = tempfile::tempdir().unwrap();
@@ -513,8 +526,12 @@ mod tests {
 		let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let source = format!("http://{}", peer.local_addr().unwrap());
 		let builder = builder(dir.path());
-		builder.start(request("running", &source)).unwrap();
-		builder.start(request("queued", &source)).unwrap();
+		builder
+			.start(request("running"), parent_at(&source))
+			.unwrap();
+		builder
+			.start(request("queued"), parent_at(&source))
+			.unwrap();
 		while builder.running() == 0 {
 			tokio::time::sleep(Duration::from_millis(10)).await;
 		}

@@ -58,8 +58,8 @@ pub struct NodeClient {
 }
 
 impl NodeClient {
-	/// `cluster_url` is the member's `MemberMeta::cluster_url`; `http` is a
-	/// shared connection pool.
+	/// `cluster_url` is the member's route (`MemberMeta::cluster_url`,
+	/// `Cluster::cluster_url`); `http` is a shared connection pool.
 	pub fn new(cluster_url: &str, secret: &str, http: reqwest::Client) -> Result<Self, NodeError> {
 		let base = Url::parse(cluster_url)
 			.map_err(|e| NodeError::Unreachable(format!("bad node url {cluster_url}: {e}")))?;

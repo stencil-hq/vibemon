@@ -9,6 +9,12 @@
 //! demand to fetch metadata too large to inline in a UDP packet. Every packet
 //! and frame carries an HMAC-SHA256 tag keyed by `HKDF(secret, "vmon-gossip")`;
 //! anything else is dropped and counted ([`Gossip::dropped_packets`]).
+//!
+//! Members advertise every address they are reachable at. Each process ranks a
+//! peer's addresses for itself ([`crate::addrs::rank`]: LAN first) and reaches
+//! it through one of them, its route ([`Member::addr`]); probes fail over to
+//! another address when the route stops answering and move back to a
+//! better-ranked one once it answers again.
 
 mod table;
 #[cfg(test)]
@@ -18,7 +24,7 @@ mod wire;
 use std::{
 	collections::{HashMap, HashSet},
 	fmt, io,
-	net::SocketAddr,
+	net::{IpAddr, SocketAddr},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -31,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpListener, TcpStream, UdpSocket},
-	sync::{broadcast, oneshot},
+	sync::{broadcast, mpsc},
 	task::JoinHandle,
 	time::{Interval, MissedTickBehavior},
 };
@@ -41,7 +47,7 @@ use self::{
 	table::{Origin, Table},
 	wire::{Message, PushPull, Update},
 };
-use crate::meta::NodeId;
+use crate::{addrs, meta::NodeId};
 
 /// Capacity of the [`Gossip::subscribe`] channel; slow subscribers lag.
 const EVENT_CAPACITY: usize = 1024;
@@ -54,9 +60,11 @@ pub struct GossipConfig {
 	pub id:                 NodeId,
 	/// UDP + TCP listen address. Port 0 binds an ephemeral port (same for both).
 	pub bind:               SocketAddr,
-	/// Address peers use to reach us. Port 0 → the bound port; an unspecified
-	/// IP → the bind IP (which then must be specified).
-	pub advertise:          SocketAddr,
+	/// Addresses peers may reach us at, in preference order (at most 16,
+	/// duplicates dropped). Port 0 → the bound port. Empty → the bind address
+	/// when its IP is specified, else every [`addrs::advertisable`] address of
+	/// the bind family, re-read every `refresh_interval`.
+	pub advertise:          Vec<SocketAddr>,
 	/// Shared cluster secret; the packet key is `HKDF(secret, "vmon-gossip")`.
 	pub secret:             Vec<u8>,
 	/// Period between failure-detector probes (one member per period).
@@ -82,13 +90,22 @@ pub struct GossipConfig {
 	pub tcp_timeout:        Duration,
 	/// `Dead`/`Left` members are removed from the table after this long.
 	pub reap_after:         Duration,
+	/// Period of re-reading this host's interfaces: peers' addresses are
+	/// re-ranked, and an automatic `advertise` list is re-advertised when it
+	/// changed.
+	pub refresh_interval:   Duration,
 }
 
 impl GossipConfig {
 	/// Builds a config with production timings (probe 1 s, ack 500 ms, k=3,
 	/// suspicion ×5, retransmit ×4, gossip 200 ms × 3, push-pull 30 s, TCP
-	/// 10 s, reap 1 h).
-	pub const fn new(id: NodeId, bind: SocketAddr, advertise: SocketAddr, secret: Vec<u8>) -> Self {
+	/// 10 s, reap 1 h, interface refresh 30 s).
+	pub const fn new(
+		id: NodeId,
+		bind: SocketAddr,
+		advertise: Vec<SocketAddr>,
+		secret: Vec<u8>,
+	) -> Self {
 		Self {
 			id,
 			bind,
@@ -104,6 +121,7 @@ impl GossipConfig {
 			push_pull_interval: Duration::from_secs(30),
 			tcp_timeout: Duration::from_secs(10),
 			reap_after: Duration::from_hours(1),
+			refresh_interval: Duration::from_secs(30),
 		}
 	}
 }
@@ -125,6 +143,7 @@ impl fmt::Debug for GossipConfig {
 			.field("push_pull_interval", &self.push_pull_interval)
 			.field("tcp_timeout", &self.tcp_timeout)
 			.field("reap_after", &self.reap_after)
+			.field("refresh_interval", &self.refresh_interval)
 			.finish()
 	}
 }
@@ -148,8 +167,14 @@ pub enum MemberState {
 pub struct Member {
 	/// Stable process identity.
 	pub id:           NodeId,
-	/// Advertised gossip address (UDP + TCP).
+	/// Address this process currently reaches the member at (UDP + TCP), its
+	/// route: one of `addrs`, picked by the local failure detector. For the
+	/// local member, its first advertised address.
 	pub addr:         SocketAddr,
+	/// Every address the member advertises, best-ranked first for this host
+	/// ([`addrs::rank`]; equal ranks keep the member's order). The local
+	/// member lists its own in advertised order.
+	pub addrs:        Vec<SocketAddr>,
 	/// Local view of liveness.
 	pub state:        MemberState,
 	/// SWIM incarnation; bumped by the member to refute suspicion or to leave.
@@ -165,8 +190,9 @@ pub struct Member {
 pub enum MemberEvent {
 	/// A new member appeared, or a `Dead`/`Left` member came back.
 	Joined(Member),
-	/// Metadata, address, or `Alive`↔`Suspect` state changed (also emitted for
-	/// the local member on [`Gossip::set_meta`]).
+	/// Metadata, advertised addresses, route, or `Alive`↔`Suspect` state
+	/// changed (also emitted for the local member on [`Gossip::set_meta`] and
+	/// [`Gossip::set_addrs`]).
 	Updated(Member),
 	/// A member was declared `Dead`.
 	Failed(Member),
@@ -196,7 +222,7 @@ impl fmt::Debug for Gossip {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Gossip")
 			.field("id", &self.inner.cfg.id)
-			.field("addr", &self.inner.cfg.advertise)
+			.field("addrs", &self.inner.table.lock().local().addrs)
 			.finish_non_exhaustive()
 	}
 }
@@ -208,16 +234,25 @@ impl Gossip {
 	pub async fn start(cfg: GossipConfig, meta: Vec<u8>) -> io::Result<Self> {
 		let (udp, listener) = bind_pair(cfg.bind).await?;
 		let bound = udp.local_addr()?;
-		let advertise = resolve_advertise(cfg.advertise, bound)?;
-		let cfg = GossipConfig { bind: bound, advertise, ..cfg };
+		let cfg = GossipConfig { bind: bound, ..cfg };
+		let auto_advertise = cfg.advertise.is_empty() && bound.ip().is_unspecified();
+		let advertise = if auto_advertise {
+			advertisable(bound)
+		} else if cfg.advertise.is_empty() {
+			vec![bound]
+		} else {
+			resolve_advertise(&cfg.advertise, bound)?
+		};
 		// Wall-clock start values make a restarted member (same id) outrank its
 		// previous life immediately; refutation covers clock regressions.
 		let epoch_ms = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.map_or(1, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+		debug!(id = %cfg.id, bind = %bound, ?advertise, "gossip starting");
 		let local = Member {
 			id: cfg.id,
-			addr: advertise,
+			addr: advertise[0],
+			addrs: advertise,
 			state: MemberState::Alive,
 			incarnation: epoch_ms,
 			meta_version: epoch_ms,
@@ -225,14 +260,16 @@ impl Gossip {
 		};
 		let inner = Arc::new(Inner {
 			auth: wire::Auth::new(&cfg.secret),
-			table: Mutex::new(Table::new(local, Instant::now())),
+			table: Mutex::new(Table::new(local, addrs::interfaces(), Instant::now())),
 			cfg,
+			auto_advertise,
 			udp,
 			waiters: Mutex::new(HashMap::new()),
 			seq: AtomicU32::new(rand::random()),
 			events: broadcast::channel(EVENT_CAPACITY).0,
 			dropped: AtomicU64::new(0),
 			fetching: Mutex::new(HashSet::new()),
+			verifying: Mutex::new(HashSet::new()),
 			stopped: AtomicBool::new(false),
 			#[cfg(test)]
 			blocked: Mutex::new(HashSet::new()),
@@ -243,8 +280,8 @@ impl Gossip {
 			tokio::spawn(Arc::clone(&inner).probe_loop()),
 			tokio::spawn(Arc::clone(&inner).gossip_loop()),
 			tokio::spawn(Arc::clone(&inner).push_pull_loop()),
+			tokio::spawn(Arc::clone(&inner).refresh_loop()),
 		];
-		debug!(id = %inner.cfg.id, bind = %bound, advertise = %advertise, "gossip started");
 		Ok(Self { inner, tasks: Arc::new(Tasks(Mutex::new(handles))) })
 	}
 
@@ -273,9 +310,9 @@ impl Gossip {
 		}
 	}
 
-	/// Advertised address of this instance (what peers and seeds lists use).
+	/// First advertised address of this instance (what seeds lists use).
 	pub fn local_addr(&self) -> SocketAddr {
-		self.inner.cfg.advertise
+		self.inner.table.lock().local().addr
 	}
 
 	/// All known members, including the local one and not-yet-reaped
@@ -294,6 +331,17 @@ impl Gossip {
 	pub fn set_meta(&self, meta: Vec<u8>) {
 		let member = self.inner.table.lock().set_local_meta(meta);
 		self.inner.publish(MemberEvent::Updated(member));
+	}
+
+	/// Advertises `addrs` from now on (preference order, at most 16, port 0 →
+	/// the bound port) with a bumped incarnation and disseminates them; peers
+	/// keep their route to this member while it is still advertised. No-op when
+	/// unchanged. With an automatic advertise list (wildcard bind, empty
+	/// `advertise`), the next interface refresh replaces a differing list.
+	pub fn set_addrs(&self, addrs: Vec<SocketAddr>) -> io::Result<()> {
+		let addrs = resolve_advertise(&addrs, self.inner.cfg.bind)?;
+		self.inner.set_local_addrs(addrs);
+		Ok(())
 	}
 
 	/// Subscribes to membership events from now on.
@@ -350,8 +398,14 @@ impl Drop for Tasks {
 
 /// Pending acknowledgement for a sequence number.
 enum Waiter {
-	/// Our own probe; signalled by `Ack` or `IndirectAck`.
-	Probe { tx: oneshot::Sender<()>, deadline: Instant },
+	/// One of our own pings, signalled by `Ack` or `IndirectAck`: reports
+	/// `addr` on `tx`, the address pinged directly (`None`: the `PingReq`s of
+	/// a probe round).
+	Probe {
+		tx:       mpsc::UnboundedSender<Option<SocketAddr>>,
+		addr:     Option<SocketAddr>,
+		deadline: Instant,
+	},
 	/// A probe we run for `requester`'s `PingReq{seq}`.
 	Relay { requester: SocketAddr, seq: u32, deadline: Instant },
 }
@@ -364,22 +418,67 @@ impl Waiter {
 	}
 }
 
+/// Acknowledgements gathered by one probe (or route verification) of a
+/// member.
+struct ProbeRound {
+	tx:       mpsc::UnboundedSender<Option<SocketAddr>>,
+	rx:       mpsc::UnboundedReceiver<Option<SocketAddr>>,
+	/// The member's addresses, best-ranked first.
+	addrs:    Vec<SocketAddr>,
+	/// Sequence numbers of the round's pings (dropped from the waiters at the
+	/// end).
+	seqs:     Vec<u32>,
+	/// Index in `addrs` of the best-ranked address that acked directly.
+	best:     Option<usize>,
+	/// A `PingReq` helper reached the member.
+	indirect: bool,
+}
+
+impl ProbeRound {
+	fn new(addrs: Vec<SocketAddr>) -> Self {
+		let (tx, rx) = mpsc::unbounded_channel();
+		Self { tx, rx, addrs, seqs: Vec::new(), best: None, indirect: false }
+	}
+
+	/// Records acks until `done` holds or `within` elapses.
+	async fn wait(&mut self, within: Duration, done: fn(&Self) -> bool) {
+		let deadline = tokio::time::Instant::now() + within;
+		while !done(self) {
+			let Ok(Some(ack)) = tokio::time::timeout_at(deadline, self.rx.recv()).await else {
+				return;
+			};
+			match ack {
+				Some(addr) => {
+					if let Some(index) = self.addrs.iter().position(|a| *a == addr) {
+						self.best = Some(self.best.map_or(index, |best| best.min(index)));
+					}
+				},
+				None => self.indirect = true,
+			}
+		}
+	}
+}
+
 struct Inner {
-	cfg:      GossipConfig,
-	auth:     wire::Auth,
-	udp:      UdpSocket,
-	table:    Mutex<Table>,
-	waiters:  Mutex<HashMap<u32, Waiter>>,
-	seq:      AtomicU32,
-	events:   broadcast::Sender<MemberEvent>,
-	dropped:  AtomicU64,
-	/// Addresses with an in-flight metadata fetch (deduplicates fetches).
-	fetching: Mutex<HashSet<SocketAddr>>,
-	/// Set by `leave`; blocks joins and new fetches.
-	stopped:  AtomicBool,
+	cfg:            GossipConfig,
+	/// `advertise` follows the interfaces (wildcard bind, no configured list).
+	auto_advertise: bool,
+	auth:           wire::Auth,
+	udp:            UdpSocket,
+	table:          Mutex<Table>,
+	waiters:        Mutex<HashMap<u32, Waiter>>,
+	seq:            AtomicU32,
+	events:         broadcast::Sender<MemberEvent>,
+	dropped:        AtomicU64,
+	/// Members with an in-flight metadata fetch (deduplicates fetches).
+	fetching:       Mutex<HashSet<NodeId>>,
+	/// Members with an in-flight route verification.
+	verifying:      Mutex<HashSet<NodeId>>,
+	/// Set by `leave`; blocks joins, new fetches, and route verifications.
+	stopped:        AtomicBool,
 	/// Test-only partition: destinations we refuse to send to or connect to.
 	#[cfg(test)]
-	blocked:  Mutex<HashSet<SocketAddr>>,
+	blocked:        Mutex<HashSet<SocketAddr>>,
 }
 
 impl Inner {
@@ -400,20 +499,37 @@ impl Inner {
 
 	/// Sends `msg` to `to`, piggybacking as many pending updates as fit.
 	fn send(&self, msg: Message, to: SocketAddr) {
+		self.send_packet(msg, to, true);
+	}
+
+	/// Sends `msg` to `to`, with pending updates only if `piggyback`: extra
+	/// probe pings must not spend the updates' retransmit budget.
+	fn send_packet(&self, msg: Message, to: SocketAddr, piggyback: bool) {
 		if self.is_blocked(to) {
 			return;
 		}
 		let mut buf = wire::encode_message(msg);
-		let budget = wire::MAX_PACKET.saturating_sub(buf.len() + 1 + wire::TAG_LEN);
-		let (count, updates) = {
-			let mut table = self.table.lock();
-			let limit = table.log_scale(self.cfg.retransmit_mult);
-			table.take_broadcasts(budget, limit)
-		};
-		buf.push(count);
-		buf.extend_from_slice(&updates);
+		if piggyback {
+			let budget = wire::MAX_PACKET.saturating_sub(buf.len() + 1 + wire::TAG_LEN);
+			let (count, updates) = {
+				let mut table = self.table.lock();
+				let limit = table.log_scale(self.cfg.retransmit_mult);
+				table.take_broadcasts(budget, limit)
+			};
+			buf.push(count);
+			buf.extend_from_slice(&updates);
+		} else {
+			buf.push(0);
+		}
 		self.auth.seal(&mut buf);
-		if let Err(err) = self.udp.try_send_to(&buf, to) {
+		// A dual-stack socket reaches IPv4 peers at their v4-mapped address.
+		let dest = match to {
+			SocketAddr::V4(v4) if self.cfg.bind.is_ipv6() => {
+				SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+			},
+			_ => to,
+		};
+		if let Err(err) = self.udp.try_send_to(&buf, dest) {
 			trace!(%to, %err, "gossip send failed");
 		}
 	}
@@ -425,37 +541,85 @@ impl Inner {
 		let _ = self.events.send(event);
 	}
 
-	/// Applies updates and publishes resulting events / metadata fetches.
+	/// Advertises `addrs` for the local member and publishes the change.
+	fn set_local_addrs(&self, addrs: Vec<SocketAddr>) {
+		let member = self.table.lock().set_local_addrs(addrs);
+		if let Some(member) = member {
+			self.publish(MemberEvent::Updated(member));
+		}
+	}
+
+	/// Routes traffic for `id` through `addr` and publishes a change.
+	fn set_route(&self, id: NodeId, addr: SocketAddr) {
+		let event = self.table.lock().set_route(id, addr);
+		if let Some(event) = event {
+			self.publish(event);
+		}
+	}
+
+	/// Applies updates and publishes resulting events, metadata fetches, and
+	/// route verifications.
 	fn merge(self: &Arc<Self>, updates: Vec<Update>, origin: Origin) {
 		let now = Instant::now();
 		let outcomes: Vec<_> = {
 			let mut table = self.table.lock();
 			updates
 				.into_iter()
-				.map(|update| table.apply(update, origin, now))
+				.map(|update| (update.id, table.apply(update, origin, now)))
 				.collect()
 		};
-		for outcome in outcomes {
+		for (id, outcome) in outcomes {
 			if let Some(event) = outcome.event {
 				self.publish(event);
 			}
-			if let Some(addr) = outcome.fetch_meta {
-				self.fetch_meta(addr);
+			if outcome.verify_route {
+				self.verify_route(id);
+			}
+			if outcome.fetch_meta {
+				self.fetch_meta(id);
 			}
 		}
 	}
 
 	/// Pulls metadata that was too large to inline via push-pull with its owner.
-	fn fetch_meta(self: &Arc<Self>, addr: SocketAddr) {
-		if self.stopped.load(Ordering::SeqCst) || !self.fetching.lock().insert(addr) {
+	fn fetch_meta(self: &Arc<Self>, id: NodeId) {
+		if self.stopped.load(Ordering::SeqCst) || !self.fetching.lock().insert(id) {
 			return;
 		}
 		let inner = Arc::clone(self);
 		tokio::spawn(async move {
-			if let Err(err) = inner.push_pull(addr).await {
-				debug!(%addr, %err, "gossip metadata fetch failed");
+			if let Err(err) = inner.push_pull_member(id).await {
+				debug!(%id, %err, "gossip metadata fetch failed");
 			}
-			inner.fetching.lock().remove(&addr);
+			inner.fetching.lock().remove(&id);
+		});
+	}
+
+	/// Pings every address of a member whose route is unverified (new, back,
+	/// or re-addressed) and routes through the best-ranked one answering
+	/// within `ack_timeout`. Until then, and when nothing answers, the route
+	/// stays the best-ranked address; probes take over from there.
+	fn verify_route(self: &Arc<Self>, id: NodeId) {
+		if self.stopped.load(Ordering::SeqCst) || !self.verifying.lock().insert(id) {
+			return;
+		}
+		let inner = Arc::clone(self);
+		tokio::spawn(async move {
+			let target = inner.table.lock().target(id);
+			if let Some(target) = target {
+				let mut round = ProbeRound::new(target.addrs);
+				for index in 0..round.addrs.len() {
+					inner.ping(&mut round, id, index, false);
+				}
+				round
+					.wait(inner.cfg.ack_timeout, |round| round.best == Some(0))
+					.await;
+				inner.finish(&round);
+				if let Some(best) = round.best {
+					inner.set_route(id, round.addrs[best]);
+				}
+			}
+			inner.verifying.lock().remove(&id);
 		});
 	}
 
@@ -474,23 +638,40 @@ impl Inner {
 			},
 			Message::Ack { seq } | Message::IndirectAck { seq } => self.resolve(seq),
 			Message::PingReq { seq, target, addr } => {
-				let relay_seq = self.next_seq();
-				let deadline = Instant::now() + self.cfg.probe_interval;
-				self
-					.waiters
-					.lock()
-					.insert(relay_seq, Waiter::Relay { requester: from, seq, deadline });
-				self.send(Message::Ping { seq: relay_seq, target }, addr);
+				// The requester's route failed; ours may differ and work.
+				let route = self.table.lock().route(target);
+				self.relay(from, seq, target, addr, true);
+				if let Some(route) = route.filter(|route| *route != addr) {
+					self.relay(from, seq, target, route, false);
+				}
 			},
 			Message::Gossip => {},
 		}
 	}
 
+	/// Pings `target` at `addr` on behalf of `requester`'s `PingReq{seq}`.
+	fn relay(
+		&self,
+		requester: SocketAddr,
+		seq: u32,
+		target: NodeId,
+		addr: SocketAddr,
+		piggyback: bool,
+	) {
+		let relay_seq = self.next_seq();
+		let deadline = Instant::now() + self.cfg.probe_interval;
+		self
+			.waiters
+			.lock()
+			.insert(relay_seq, Waiter::Relay { requester, seq, deadline });
+		self.send_packet(Message::Ping { seq: relay_seq, target }, addr, piggyback);
+	}
+
 	fn resolve(&self, seq: u32) {
 		let waiter = self.waiters.lock().remove(&seq);
 		match waiter {
-			Some(Waiter::Probe { tx, .. }) => {
-				let _ = tx.send(());
+			Some(Waiter::Probe { tx, addr, .. }) => {
+				let _ = tx.send(addr);
 			},
 			Some(Waiter::Relay { requester, seq, .. }) => {
 				self.send(Message::IndirectAck { seq }, requester);
@@ -499,47 +680,97 @@ impl Inner {
 		}
 	}
 
-	/// One SWIM probe round: direct ping, then `k` indirect probes, then
-	/// suspicion of exactly the probed incarnation.
+	/// Pings `target` at its address `round.addrs[index]` as part of `round`
+	/// (`piggyback`: only the route ping carries updates).
+	fn ping(&self, round: &mut ProbeRound, target: NodeId, index: usize, piggyback: bool) {
+		let addr = round.addrs[index];
+		let seq = self.next_seq();
+		round.seqs.push(seq);
+		let deadline = self.probe_deadline();
+		let waiter = Waiter::Probe { tx: round.tx.clone(), addr: Some(addr), deadline };
+		self.waiters.lock().insert(seq, waiter);
+		self.send_packet(Message::Ping { seq, target }, addr, piggyback);
+	}
+
+	/// Forgets the pending acks of a finished round.
+	fn finish(&self, round: &ProbeRound) {
+		let mut waiters = self.waiters.lock();
+		for seq in &round.seqs {
+			waiters.remove(seq);
+		}
+	}
+
+	/// Waiter expiry for probe pings (backstop for `finish`).
+	fn probe_deadline(&self) -> Instant {
+		Instant::now() + self.cfg.probe_interval + self.cfg.ack_timeout * 2
+	}
+
+	/// One SWIM probe round of the next member (ARCHITECTURE.md §5.2):
+	/// 1. ping its route (piggybacking updates) and every better-ranked address,
+	///    and wait up to `ack_timeout`;
+	/// 2. without a direct ack, ping its remaining addresses and ask `k` helpers
+	///    to probe the route, and wait the rest of the probe interval for a
+	///    direct ack.
+	///
+	/// A direct ack moves the route to the best-ranked address that answered;
+	/// an indirect ack only confirms liveness; silence suspects exactly the
+	/// probed incarnation.
 	async fn probe(self: &Arc<Self>) {
-		let Some((target, addr, incarnation)) = self.table.lock().next_probe_target() else {
+		let Some(target) = self.table.lock().next_probe_target() else {
 			return;
 		};
-		let seq = self.next_seq();
-		let (tx, mut rx) = oneshot::channel();
-		let deadline = Instant::now() + self.cfg.probe_interval + self.cfg.ack_timeout * 2;
-		self
-			.waiters
-			.lock()
-			.insert(seq, Waiter::Probe { tx, deadline });
-		self.send(Message::Ping { seq, target }, addr);
-		if matches!(tokio::time::timeout(self.cfg.ack_timeout, &mut rx).await, Ok(Ok(()))) {
-			return;
+		let route = target
+			.addrs
+			.iter()
+			.position(|addr| *addr == target.route)
+			.unwrap_or(0);
+		let mut round = ProbeRound::new(target.addrs);
+		self.ping(&mut round, target.id, route, true);
+		for index in 0..route {
+			self.ping(&mut round, target.id, index, false);
 		}
-		let helpers = self.table.lock().random_peers(
-			&[MemberState::Alive],
-			Some(target),
-			self.cfg.indirect_probes,
-		);
-		for (_, helper) in helpers {
-			self.send(Message::PingReq { seq, target, addr }, helper);
+		round
+			.wait(self.cfg.ack_timeout, |round| round.best == Some(0))
+			.await;
+		if round.best.is_none() {
+			for index in route + 1..round.addrs.len() {
+				self.ping(&mut round, target.id, index, false);
+			}
+			let helpers = self.table.lock().random_peers(
+				&[MemberState::Alive],
+				Some(target.id),
+				self.cfg.indirect_probes,
+			);
+			if !helpers.is_empty() {
+				let seq = self.next_seq();
+				round.seqs.push(seq);
+				let deadline = self.probe_deadline();
+				let waiter = Waiter::Probe { tx: round.tx.clone(), addr: None, deadline };
+				self.waiters.lock().insert(seq, waiter);
+				let msg = Message::PingReq { seq, target: target.id, addr: target.route };
+				for (_, helper) in helpers {
+					self.send(msg, helper);
+				}
+			}
+			let rest = self
+				.cfg
+				.probe_interval
+				.saturating_sub(self.cfg.ack_timeout)
+				.max(self.cfg.ack_timeout);
+			round.wait(rest, |round| round.best.is_some()).await;
 		}
-		let rest = self
-			.cfg
-			.probe_interval
-			.saturating_sub(self.cfg.ack_timeout)
-			.max(self.cfg.ack_timeout);
-		if matches!(tokio::time::timeout(rest, &mut rx).await, Ok(Ok(()))) {
-			return;
-		}
-		self.waiters.lock().remove(&seq);
-		debug!(%target, %addr, "gossip probe failed");
-		let outcome = self
-			.table
-			.lock()
-			.suspect(target, incarnation, Instant::now());
-		if let Some(event) = outcome.event {
-			self.publish(event);
+		self.finish(&round);
+		if let Some(best) = round.best {
+			self.set_route(target.id, round.addrs[best]);
+		} else if !round.indirect {
+			debug!(id = %target.id, route = %target.route, "gossip probe failed");
+			let outcome = self
+				.table
+				.lock()
+				.suspect(target.id, target.incarnation, Instant::now());
+			if let Some(event) = outcome.event {
+				self.publish(event);
+			}
 		}
 	}
 
@@ -584,15 +815,16 @@ impl Inner {
 	/// Resolves one seed and push-pulls with its first reachable foreign
 	/// address. `Ok(false)` when it only resolves to this instance.
 	async fn join_seed(self: &Arc<Self>, seed: &str) -> io::Result<bool> {
+		let own = self.table.lock().local().addrs.clone();
 		let addrs: Vec<SocketAddr> = tokio::net::lookup_host(seed)
 			.await
 			.map_err(|err| io::Error::new(err.kind(), format!("gossip seed {seed}: {err}")))?
-			.filter(|addr| *addr != self.cfg.advertise && *addr != self.cfg.bind)
+			.filter(|addr| !own.contains(addr) && *addr != self.cfg.bind)
 			.collect();
 		let mut last_err = None;
 		for addr in addrs {
 			match self.push_pull(addr).await {
-				Ok(()) => return Ok(true),
+				Ok(_) => return Ok(true),
 				Err(err) => {
 					last_err =
 						Some(io::Error::new(err.kind(), format!("gossip seed {seed} ({addr}): {err}")));
@@ -602,8 +834,9 @@ impl Inner {
 		last_err.map_or(Ok(false), Err)
 	}
 
-	/// Client side of a full-state exchange with `addr`.
-	async fn push_pull(self: &Arc<Self>, addr: SocketAddr) -> io::Result<()> {
+	/// Client side of a full-state exchange with `addr`; returns the id of the
+	/// member that answered.
+	async fn push_pull(self: &Arc<Self>, addr: SocketAddr) -> io::Result<NodeId> {
 		if self.is_blocked(addr) {
 			return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "blocked by test partition"));
 		}
@@ -614,11 +847,30 @@ impl Inner {
 			let remote = self.read_state(&mut stream).await?;
 			trace!(from = %remote.from, members = remote.members.len(), "gossip push-pull reply");
 			self.merge(remote.members, Origin::PushPull);
-			Ok(())
+			Ok(remote.from)
 		};
 		tokio::time::timeout(self.cfg.tcp_timeout, exchange)
 			.await
 			.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "gossip push-pull timed out"))?
+	}
+
+	/// Push-pull with member `id`, dialing its addresses in
+	/// [`Table::dial_order`]; the first one that answers as `id` becomes its
+	/// route.
+	async fn push_pull_member(self: &Arc<Self>, id: NodeId) -> io::Result<()> {
+		let addrs = self.table.lock().dial_order(id);
+		let mut last_err = None;
+		for addr in addrs {
+			match self.push_pull(addr).await {
+				Ok(from) if from == id => {
+					self.set_route(id, addr);
+					return Ok(());
+				},
+				Ok(from) => last_err = Some(io::Error::other(format!("{addr} answered as {from}"))),
+				Err(err) => last_err = Some(io::Error::new(err.kind(), format!("{addr}: {err}"))),
+			}
+		}
+		Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown member")))
 	}
 
 	/// Server side: merge the peer's state first (so refutations are already
@@ -719,22 +971,47 @@ impl Inner {
 		}
 	}
 
-	/// Anti-entropy with a random alive member plus a reconnect attempt with a
-	/// random dead one (heals partitions once the network does).
+	/// Anti-entropy with a random alive member (through its route) plus a
+	/// reconnect attempt with a random dead one through each of its addresses
+	/// (heals partitions once the network does).
 	async fn push_pull_loop(self: Arc<Self>) {
 		let mut tick = ticker(self.cfg.push_pull_interval);
 		loop {
 			tick.tick().await;
-			let targets = {
+			let (alive, dead) = {
 				let table = self.table.lock();
-				let mut targets = table.random_peers(&[MemberState::Alive], None, 1);
-				targets.extend(table.random_peers(&[MemberState::Dead], None, 1));
-				targets
+				(
+					table.random_peers(&[MemberState::Alive], None, 1),
+					table.random_peers(&[MemberState::Dead], None, 1),
+				)
 			};
-			for (id, addr) in targets {
+			for (id, addr) in alive {
 				if let Err(err) = self.push_pull(addr).await {
 					debug!(%id, %addr, %err, "gossip push-pull failed");
 				}
+			}
+			for (id, _) in dead {
+				if let Err(err) = self.push_pull_member(id).await {
+					debug!(%id, %err, "gossip push-pull with dead member failed");
+				}
+			}
+		}
+	}
+
+	/// Re-reads this host's interfaces every `refresh_interval`: re-ranks
+	/// peers' addresses and re-advertises an automatic address list that
+	/// changed.
+	async fn refresh_loop(self: Arc<Self>) {
+		let mut tick = ticker(self.cfg.refresh_interval);
+		loop {
+			tick.tick().await;
+			let interfaces = addrs::interfaces();
+			let events = self.table.lock().set_interfaces(interfaces);
+			for event in events {
+				self.publish(event);
+			}
+			if self.auto_advertise {
+				self.set_local_addrs(advertisable(self.cfg.bind));
 			}
 		}
 	}
@@ -764,23 +1041,41 @@ async fn bind_pair(bind: SocketAddr) -> io::Result<(UdpSocket, TcpListener)> {
 	Err(io::Error::new(io::ErrorKind::AddrInUse, "no port free for both gossip UDP and TCP"))
 }
 
-/// Fills a zero advertise port / unspecified advertise IP from the bound
-/// address.
-fn resolve_advertise(advertise: SocketAddr, bound: SocketAddr) -> io::Result<SocketAddr> {
-	let port = if advertise.port() == 0 {
-		bound.port()
-	} else {
-		advertise.port()
-	};
-	let ip = if !advertise.ip().is_unspecified() {
-		advertise.ip()
-	} else if !bound.ip().is_unspecified() {
-		bound.ip()
-	} else {
-		return Err(io::Error::new(
-			io::ErrorKind::InvalidInput,
-			"gossip advertise address must have a routable IP when binding a wildcard address",
-		));
-	};
-	Ok(SocketAddr::new(ip, port))
+/// The first [`wire::MAX_ADDRS`] [`addrs::advertisable`] IPs of a wildcard
+/// `bound` address, at its port.
+fn advertisable(bound: SocketAddr) -> Vec<SocketAddr> {
+	addrs::advertisable(bound.ip())
+		.into_iter()
+		.take(wire::MAX_ADDRS)
+		.map(|ip| SocketAddr::new(ip, bound.port()))
+		.collect()
+}
+
+/// Validates an explicit advertise list: fills zero ports from the bound
+/// address and drops duplicates.
+fn resolve_advertise(advertise: &[SocketAddr], bound: SocketAddr) -> io::Result<Vec<SocketAddr>> {
+	let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
+	let mut out = Vec::with_capacity(advertise.len());
+	for addr in advertise {
+		if addr.ip().is_unspecified() {
+			return Err(invalid(format!("gossip advertise address {addr} has no routable IP")));
+		}
+		let port = if addr.port() == 0 {
+			bound.port()
+		} else {
+			addr.port()
+		};
+		let addr = SocketAddr::new(addr.ip(), port);
+		if !out.contains(&addr) {
+			out.push(addr);
+		}
+	}
+	if !(1..=wire::MAX_ADDRS).contains(&out.len()) {
+		return Err(invalid(format!(
+			"gossip advertises 1 to {} addresses, not {}",
+			wire::MAX_ADDRS,
+			out.len()
+		)));
+	}
+	Ok(out)
 }

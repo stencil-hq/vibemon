@@ -233,7 +233,7 @@ pub async fn start_build(
 			};
 			let base = BuildBase::Build {
 				build_id: parent.id.clone(),
-				sources:  sources.into_iter().map(|s| s.cluster_url).collect(),
+				sources:  sources.into_iter().map(|s| s.node_id).collect(),
 			};
 			(base, arch, start_cmd, ready_cmd)
 		},
@@ -284,7 +284,7 @@ pub async fn start_build(
 	};
 	let mut last_error = None;
 	for (node_id, meta) in candidates.into_iter().take(MAX_START_ATTEMPTS) {
-		let client = state.node_at(&meta.cluster_url)?;
+		let client = state.node(node_id)?;
 		match client.start_build(&start).await {
 			Ok(()) => {
 				let arch = meta
@@ -408,14 +408,14 @@ async fn parent_build(state: &AppState, team: &Team, reference: &str) -> ApiResu
 		.ok_or_else(|| ApiError::bad_request(format!("template '{reference}' has no ready build")))
 }
 
-/// Cluster URLs of the nodes holding every `COPY` archive; 400 when one was
-/// never uploaded (or its node is gone — the client re-uploads).
+/// The nodes holding every `COPY` archive; 400 when one was never uploaded
+/// (or its node is gone — the client re-uploads).
 async fn file_sources(
 	state: &AppState,
 	template_id: &str,
 	steps: &[BuildStep],
-) -> ApiResult<Vec<String>> {
-	let mut urls = BTreeSet::new();
+) -> ApiResult<Vec<NodeId>> {
+	let mut nodes = BTreeSet::new();
 	for (index, step) in steps.iter().enumerate() {
 		let Some(hash) = &step.files_hash else {
 			continue;
@@ -423,7 +423,7 @@ async fn file_sources(
 		if step.kind != "COPY" {
 			continue;
 		}
-		let url = file_location(state, template_id, hash)
+		let node = file_location(state, template_id, hash)
 			.await?
 			.ok_or_else(|| {
 				ApiError::bad_request(format!(
@@ -431,9 +431,9 @@ async fn file_sources(
 					index + 1
 				))
 			})?;
-		urls.insert(url);
+		nodes.insert(node);
 	}
-	Ok(urls.into_iter().collect())
+	Ok(nodes.into_iter().collect())
 }
 
 /// Admin node status overrides (`node/<id>/status`).
@@ -539,6 +539,7 @@ mod tests {
 			arch: arch.into(),
 			backend: "kvm".into(),
 			os: "linux".into(),
+			cpu_model: String::new(),
 			cpu_baseline: "x".into(),
 			cpus: 8,
 			memory_mb: 16384,
@@ -553,7 +554,8 @@ mod tests {
 		};
 		let meta = MemberMeta {
 			roles:         Roles { node: true, driver: false },
-			cluster_url:   format!("http://n{id}:7947"),
+			hostname:      format!("n{id}"),
+			cluster_port:  7947,
 			public_url:    None,
 			version:       "t".into(),
 			started_at_ms: 0,

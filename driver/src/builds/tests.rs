@@ -129,6 +129,7 @@ fn capacity() -> NodeCapacity {
 		arch:           "x86_64".into(),
 		backend:        "kvm".into(),
 		os:             "linux".into(),
+		cpu_model:      "Test CPU".into(),
 		cpu_baseline:   "x86-64-v3".into(),
 		cpus:           8,
 		memory_mb:      16384,
@@ -155,8 +156,8 @@ async fn start_cluster(
 		data_dir: dir.join(id.to_string()),
 		roles,
 		gossip_bind: "127.0.0.1:0".parse().unwrap(),
-		gossip_advertise: "127.0.0.1:0".parse().unwrap(),
-		cluster_url: format!("http://{}", listener.local_addr().unwrap()),
+		advertise: None,
+		cluster_port: listener.local_addr().unwrap().port(),
 		join,
 		secret: SECRET.as_bytes().to_vec(),
 		bootstrap_expect: 1,
@@ -548,9 +549,16 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 	let store = Store::new(driver.kv.clone());
 	let driver_router = driver.router();
 	tokio::spawn(async move { axum::serve(driver_listener, driver_router).await.unwrap() });
-	// The fake node serves the manifest of its peer-fetched copy.
+	// The fake node serves the manifest of its peer-fetched copy (describing
+	// NODE_ID); a second member reached at the same port claims to hold it too.
 	let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let node_url = format!("http://{}", node_listener.local_addr().unwrap());
+	let seeds = vec![driver.gossip.local_addr().to_string()];
+	let node_roles = Roles { node: true, driver: false };
+	let mut nodes = Vec::new();
+	for node_id in [NODE_ID, NodeId(0xbad)] {
+		let node = start_cluster(node_id, dir.path(), node_roles, &node_listener, seeds.clone());
+		nodes.push(node.await);
+	}
 	let node_router = Router::new().route(
 		"/node/v1/artifacts/{id}/manifest",
 		get(|UrlPath(id): UrlPath<String>| async move {
@@ -571,9 +579,15 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 	let state =
 		AppState::new(config, store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
 	eventually("raft leadership", || async { driver.is_leader() }).await;
+	eventually("both nodes in gossip", || async {
+		[NODE_ID, NodeId(0xbad)]
+			.iter()
+			.all(|id| state.node(*id).is_ok())
+	})
+	.await;
 
 	let build_id = uuid::Uuid::new_v4().to_string();
-	super::record_holder(&state, NODE_ID, &node_url, &build_id)
+	super::record_holder(&state, NODE_ID, &build_id)
 		.await
 		.unwrap();
 	let record = driver
@@ -585,7 +599,7 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 	assert_eq!(serde_json::from_slice::<ArtifactInfo>(&record.value).unwrap(), artifact(&build_id));
 	// A manifest describing another node is not recorded under this one.
 	assert!(
-		super::record_holder(&state, NodeId(0xbad), &node_url, &build_id)
+		super::record_holder(&state, NodeId(0xbad), &build_id)
 			.await
 			.is_err()
 	);
@@ -598,5 +612,8 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 			.is_none()
 	);
 
+	for node in nodes {
+		node.shutdown().await;
+	}
 	driver.shutdown().await;
 }

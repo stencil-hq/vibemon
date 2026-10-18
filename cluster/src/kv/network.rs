@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::raft::{RaftPeer, Snapshot, SnapshotMeta, TypeConfig, Vote};
 use crate::{
 	gossip::{Gossip, MemberState},
-	meta::NodeId,
+	meta::{MemberMeta, NodeId},
 };
 
 /// Retry delay after an unreachable error while gossip still sees the peer.
@@ -58,7 +58,9 @@ impl SnapshotHeader {
 	}
 }
 
-/// Raft URL of every peer this process sends RPCs to.
+/// Raft URL recorded in raft membership for every peer this process sends
+/// RPCs to; used when gossip cannot resolve the peer (see
+/// `PeerClient::base_url`).
 ///
 /// openraft keeps a peer's replication stream, and so its client, across
 /// membership changes; a peer re-addressed by the reconciler is reached
@@ -76,12 +78,9 @@ impl PeerUrls {
 		}
 	}
 
-	/// `{base of id}/cluster/v1/raft/{path}`.
-	fn rpc_url(&self, id: NodeId, path: &str) -> Option<String> {
-		let urls = self.0.read();
-		urls
-			.get(&id)
-			.map(|base| format!("{base}/cluster/v1/raft/{path}"))
+	/// Recorded base URL of `id`.
+	fn base(&self, id: NodeId) -> Option<String> {
+		self.0.read().get(&id).cloned()
 	}
 }
 
@@ -119,6 +118,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
 			gossip: self.gossip.clone(),
 			urls: self.urls.clone(),
 			target,
+			meta: None,
 		}
 	}
 }
@@ -130,14 +130,38 @@ pub struct PeerClient {
 	gossip: Gossip,
 	urls:   PeerUrls,
 	target: NodeId,
+	/// `(meta_version, meta)` of the target's last decoded gossip metadata.
+	meta:   Option<(u64, MemberMeta)>,
 }
 
 impl PeerClient {
+	/// Base URL of the target: its cluster listener at this process's gossip
+	/// route to it (LAN first, failed over by probes), so every driver dials
+	/// peers its own way; else the URL raft membership recorded.
+	fn base_url(&mut self) -> Option<String> {
+		self.gossip_url().or_else(|| self.urls.base(self.target))
+	}
+
+	fn gossip_url(&mut self) -> Option<String> {
+		let member = self.gossip.member(self.target)?;
+		if self
+			.meta
+			.as_ref()
+			.is_none_or(|(version, _)| *version != member.meta_version)
+		{
+			self.meta = Some((member.meta_version, MemberMeta::decode(&member.meta)?));
+		}
+		self
+			.meta
+			.as_ref()
+			.map(|(_, meta)| meta.cluster_url(&member))
+	}
+
 	/// Posts `body` of `content_type` to `/cluster/v1/raft/{path}` and decodes
 	/// the peer's `Result<Resp, E>`; a remote error counts as unreachable (the
 	/// peer's raft is stopping).
 	async fn post<Resp, E>(
-		&self,
+		&mut self,
 		path: &str,
 		body: reqwest::Body,
 		content_type: &'static str,
@@ -147,7 +171,7 @@ impl PeerClient {
 		Resp: DeserializeOwned,
 		E: Error + DeserializeOwned,
 	{
-		let Some(url) = self.urls.rpc_url(self.target, path) else {
+		let Some(base) = self.base_url() else {
 			return Err(RPCError::Unreachable(Unreachable::from_string(format!(
 				"raft rpc {path} to {}: no known address",
 				self.target
@@ -155,7 +179,7 @@ impl PeerClient {
 		};
 		let response = self
 			.http
-			.post(url)
+			.post(format!("{base}/cluster/v1/raft/{path}"))
 			.header(reqwest::header::AUTHORIZATION, (*self.auth).clone())
 			.header(reqwest::header::CONTENT_TYPE, content_type)
 			.timeout(option.hard_ttl())
@@ -185,7 +209,7 @@ impl PeerClient {
 	}
 
 	async fn post_json<Req, Resp>(
-		&self,
+		&mut self,
 		path: &str,
 		req: &Req,
 		option: &RPCOption,

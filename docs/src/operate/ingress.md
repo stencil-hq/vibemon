@@ -55,7 +55,7 @@ To terminate TLS on an external load balancer instead, forward both `api.<domain
 - signed template file upload URLs (`GET /templates/{id}/files/{hash}` returns a `PUT …/upload?expires=…&signature=…` URL, valid for 30 minutes and authenticated by its signature alone);
 - `tokenEndpoint` and `revokeEndpoint` of `e2b auth login`.
 
-The default is `https://api.<domain>` with `--tls-listen`, and `http://<advertise-ip>:<listen port>` otherwise. Set it explicitly when clients reach the driver through another host, a port other than 443, or a load balancer. Otherwise template builds that upload files fail from outside. In a cluster, each driver advertises its own public URL.
+The default is `https://api.<domain>` with `--tls-listen`, and `http://<first advertised IP>:<listen port>` otherwise (see `--advertise` in [vmon serve](../reference/serve.md#cluster-and-gossip)). Set it explicitly when clients reach the driver through another host, a port other than 443, or a load balancer. Otherwise template builds that upload files fail from outside. In a cluster, each driver advertises its own public URL.
 
 ## DNS
 

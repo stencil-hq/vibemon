@@ -133,9 +133,11 @@ mod tests {
 	use super::*;
 
 	fn member(id: u64, state: MemberState) -> Member {
+		let addr = SocketAddr::from(([127, 0, 0, 1], 7946));
 		Member {
 			id: NodeId(id),
-			addr: SocketAddr::from(([127, 0, 0, 1], 7946)),
+			addr,
+			addrs: vec![addr],
 			state,
 			incarnation: 0,
 			meta_version: 0,

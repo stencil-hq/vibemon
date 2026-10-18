@@ -1,4 +1,5 @@
 import { type FormEvent, useMemo, useState } from "react";
+import { useNodeName } from "../App.tsx";
 import { api, type SandboxRow, type SandboxState, type TeamView } from "../api.ts";
 import {
   Badge,
@@ -11,7 +12,7 @@ import {
   Segmented,
   Status,
 } from "../components.tsx";
-import { fmt, shortId } from "../format.ts";
+import { fmt } from "../format.ts";
 import { attempt, useNow, usePoll } from "../hooks.ts";
 import { Icon } from "../icons.tsx";
 import { Link, navigate, setQuery, useRoute } from "../router.tsx";
@@ -20,7 +21,7 @@ import { killSandbox, pauseSandbox, resumeSandbox } from "./actions.tsx";
 type StateFilter = "all" | SandboxState;
 
 /** Every row a filter can match on, lowercased once per row. */
-function haystack(row: SandboxRow): string {
+function haystack(row: SandboxRow, nodeName: string): string {
   const meta = Object.entries(row.metadata ?? {}).map(([k, v]) => `${k}=${v}`);
   return [
     row.sandboxID,
@@ -29,6 +30,7 @@ function haystack(row: SandboxRow): string {
     row.teamName,
     row.teamID,
     row.nodeID,
+    nodeName,
     ...meta,
   ]
     .join(" ")
@@ -44,6 +46,7 @@ export function SandboxesPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [creating, setCreating] = useState(false);
   const now = useNow(1000);
+  const nodeName = useNodeName();
 
   const filterKey = `${state}|${team}`;
   const list = usePoll(
@@ -60,8 +63,8 @@ export function SandboxesPage() {
   const rows = useMemo(() => {
     const all = [...(list.data?.rows ?? []), ...(extra?.rows ?? [])];
     const needle = search.trim().toLowerCase();
-    return needle ? all.filter((row) => haystack(row).includes(needle)) : all;
-  }, [list.data, extra, search]);
+    return needle ? all.filter((row) => haystack(row, nodeName(row.nodeID)).includes(needle)) : all;
+  }, [list.data, extra, search, nodeName]);
   const next = extra ? extra.next : (list.data?.next ?? null);
 
   const loadMore = async () => {
@@ -110,7 +113,7 @@ export function SandboxesPage() {
               name="q"
               autoComplete="off"
               spellCheck={false}
-              placeholder="Filter by ID, template, team, metadata…"
+              placeholder="Filter by ID, template, team, node, metadata…"
               value={search}
               onChange={(event) => {
                 setSearch(event.currentTarget.value);
@@ -180,7 +183,13 @@ export function SandboxesPage() {
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <SandboxRowView key={row.sandboxID} row={row} now={now} onChanged={refresh} />
+                  <SandboxRowView
+                    key={row.sandboxID}
+                    row={row}
+                    node={nodeName(row.nodeID)}
+                    now={now}
+                    onChanged={refresh}
+                  />
                 ))}
               </tbody>
             </table>
@@ -207,10 +216,12 @@ export function SandboxesPage() {
 
 function SandboxRowView({
   row,
+  node,
   now,
   onChanged,
 }: {
   row: SandboxRow;
+  node: string;
   now: number;
   onChanged: () => void;
 }) {
@@ -236,8 +247,8 @@ function SandboxRowView({
         {running ? <Status tone="live">running</Status> : <Status tone="muted">paused</Status>}
       </td>
       <td>
-        <Link to={`/nodes/${row.nodeID}`} className="mono muted">
-          {shortId(row.nodeID)}
+        <Link to={`/nodes/${row.nodeID}`} className="muted" title={row.nodeID}>
+          {node}
         </Link>
       </td>
       <td className="right num muted">

@@ -908,8 +908,13 @@ impl SandboxManager {
 		});
 	}
 
-	/// `POST /sandboxes`.
-	pub async fn create(self: &Arc<Self>, req: CreateSandbox) -> Result<SandboxInfo, ApiError> {
+	/// `POST /sandboxes`; `sources` are the cluster URLs of
+	/// `req.artifact_sources`.
+	pub async fn create(
+		self: &Arc<Self>,
+		req: CreateSandbox,
+		sources: &[String],
+	) -> Result<SandboxInfo, ApiError> {
 		validate_id(&req.sandbox_id)?;
 		let id = req.sandbox_id.clone();
 		if self.sandboxes.lock().contains_key(&id) || !self.pending.lock().insert(id.clone()) {
@@ -918,7 +923,7 @@ impl SandboxManager {
 		let _pending = Pending { manager: self, id: id.clone() };
 		let artifact = self
 			.builder
-			.ensure(&req.build_id, &req.artifact_sources)
+			.ensure(&req.build_id, sources)
 			.await
 			.map_err(|e| {
 				ApiError::busy(format!("build {} is not available on this node: {e:#}", req.build_id))
@@ -1231,6 +1236,7 @@ impl SandboxManager {
 		id: &str,
 		remote: &Remote,
 		req: &ResumeSandbox,
+		sources: &[String],
 		paths: &SandboxPaths,
 		allow_lazy: bool,
 	) -> Result<Option<LazyResume>, ApiError> {
@@ -1244,7 +1250,7 @@ impl SandboxManager {
 		private_dir(&paths.dir).map_err(ApiError::internal)?;
 		let cold = req.cold_boot;
 		if self.config.lazy_resume && allow_lazy {
-			match self.fetch_lazy(&store, remote, req, paths).await {
+			match self.fetch_lazy(&store, remote, cold, sources, paths).await {
 				Ok(Some(lazy)) => {
 					tracing::info!(
 						sandbox = id,
@@ -1274,7 +1280,7 @@ impl SandboxManager {
 			.await
 			.map_err(|error| ApiError::busy(format!("fetching paused state of {id}: {error:#}")))?;
 		if !cold {
-			self.link_ram_base(&manifest, req, paths).await?;
+			self.link_ram_base(&manifest, sources, paths).await?;
 		}
 		let committed = paths.clone();
 		tokio::task::spawn_blocking(move || commit_paused(&committed))
@@ -1297,7 +1303,8 @@ impl SandboxManager {
 		&self,
 		store: &Store,
 		remote: &Remote,
-		req: &ResumeSandbox,
+		cold: bool,
+		sources: &[String],
 		paths: &SandboxPaths,
 	) -> anyhow::Result<Option<LazyResume>> {
 		let manifest = store.manifest(remote).await?;
@@ -1309,7 +1316,6 @@ impl SandboxManager {
 			return Ok(None);
 		}
 		remove_path(&paths.paused);
-		let cold = req.cold_boot;
 		let manifest = store
 			.fetch(remote, &paths.paused, |path| {
 				lazy_resume::fetch_filter(path)
@@ -1318,7 +1324,7 @@ impl SandboxManager {
 			.await?;
 		if !cold {
 			self
-				.link_ram_base(&manifest, req, paths)
+				.link_ram_base(&manifest, sources, paths)
 				.await
 				.map_err(|error| anyhow!("{}", error.message))?;
 		}
@@ -1351,7 +1357,7 @@ impl SandboxManager {
 	async fn link_ram_base(
 		&self,
 		manifest: &paused_store::PausedManifest,
-		req: &ResumeSandbox,
+		sources: &[String],
 		paths: &SandboxPaths,
 	) -> Result<(), ApiError> {
 		let Some(build) = &manifest.ram_base_build else {
@@ -1359,7 +1365,7 @@ impl SandboxManager {
 		};
 		self
 			.builder
-			.ensure(build, &req.artifact_sources)
+			.ensure(build, sources)
 			.await
 			.map_err(|error| ApiError::busy(format!("template RAM base {build}: {error:#}")))?;
 		let template = self
@@ -1373,11 +1379,13 @@ impl SandboxManager {
 
 	/// `POST /sandboxes/{id}/resume`: fork the paused memory snapshot (or
 	/// cold-boot the paused rootfs) and re-run envd `/init`. Paused state
-	/// this node does not hold is fetched from `req.remote` first.
+	/// this node does not hold is fetched from `req.remote` first; `sources`
+	/// are the cluster URLs of `req.artifact_sources`.
 	pub async fn resume(
 		self: &Arc<Self>,
 		id: &str,
-		req: ResumeSandbox,
+		mut req: ResumeSandbox,
+		sources: &[String],
 	) -> Result<SandboxInfo, ApiError> {
 		validate_id(id)?;
 		if let Some(remote) = &req.remote {
@@ -1397,7 +1405,7 @@ impl SandboxManager {
 		// inference of the axum handler.
 		let resumed: std::pin::Pin<
 			Box<dyn Future<Output = Result<SandboxInfo, ApiError>> + Send + '_>,
-		> = Box::pin(self.resume_locked(id, &entry, &req));
+		> = Box::pin(self.resume_locked(id, &entry, &req, sources));
 		let result = resumed.await;
 		if result.is_err() && adopted {
 			// Nothing of the adopted sandbox stays behind on a failed resume.
@@ -1419,6 +1427,7 @@ impl SandboxManager {
 		id: &str,
 		entry: &Arc<Entry>,
 		req: &ResumeSandbox,
+		sources: &[String],
 	) -> Result<SandboxInfo, ApiError> {
 		Self::join_upload(entry).await;
 		let (build_id, vcpus, memory_mb) = {
@@ -1436,7 +1445,11 @@ impl SandboxManager {
 				.remote
 				.as_ref()
 				.ok_or_else(|| ApiError::internal(format!("paused state of {id} is missing")))?;
-			self.fetch_remote(id, remote, req, &paths, true).await?
+			// A failed boot may quarantine GPUs, so GPU sandboxes skip the lazy
+			// attempt and its retry.
+			self
+				.fetch_remote(id, remote, req, sources, &paths, req.gpus == 0)
+				.await?
 		};
 		let lazily = lazy.is_some();
 		let booted = match self
@@ -1457,9 +1470,11 @@ impl SandboxManager {
 					.remote
 					.as_ref()
 					.ok_or_else(|| ApiError::internal(format!("paused state of {id} is missing")))?;
-				self.fetch_remote(id, remote, req, &paths, false).await?;
 				self
-					.boot_paused(id, &paths, req, &build_id, vcpus, memory_mb, None)
+					.fetch_remote(id, remote, req, sources, &paths, false)
+					.await?;
+				self
+					.boot_paused(id, &paths, req, &build_id, vcpus, memory_mb, None, &gpus.gpus)
 					.await?
 			},
 			result => result?,

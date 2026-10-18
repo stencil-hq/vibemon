@@ -75,9 +75,18 @@ The `vmm` crate stays synchronous.
 |---|---|---|---|
 | `--listen` | `0.0.0.0:3000` | public HTTP/1.1 + h2c | driver: E2B API + sandbox ingress |
 | `--tls-listen` + `--tls-cert/--tls-key` | off | public HTTPS (h2/http1.1 ALPN) | same router as `--listen` |
-| `--cluster-listen` / `--cluster-advertise` | `0.0.0.0:7947` / derived | internal HTTP | `/cluster/v1/*` (raft, kv), `/node/v1/*` (node API, tunnels) |
-| `--gossip-listen` / `--gossip-advertise` | `0.0.0.0:7946` / derived | UDP (probes) + TCP (push-pull) | gossip |
+| `--cluster-listen` | `0.0.0.0:7947` | internal HTTP | `/cluster/v1/*` (raft, kv), `/node/v1/*` (node API, tunnels) |
+| `--gossip-listen` | `0.0.0.0:7946` | UDP (probes) + TCP (push-pull) | gossip |
 | `--kv-resp-listen` | off | Redis protocol (RESP2) | cluster KV for `redis-cli`/`redis-benchmark` (§5.3) |
+
+`--advertise <ip>[,<ip>…]` (`VMON_ADVERTISE`) lists the IPs peers reach a
+process at, gossip and cluster listener alike, in preference order. Unset:
+the IP `--cluster-listen`/`--gossip-listen` bind when it is specific (the two
+must agree, else startup fails), or, when both bind a wildcard, every eligible
+interface IP (`addrs::advertisable`). Peers dial the gossip port on the
+member's current route (§5.2) and the cluster listener at
+`http://<that ip>:<cluster_port>` (`MemberMeta::cluster_url`); the default
+plain-HTTP `--public-url` uses the first advertised IP.
 
 Cluster HTTP and gossip are authenticated with the shared `--cluster-secret`
 (`VMON_CLUSTER_SECRET`): HTTP uses `Authorization: Bearer <secret>`
@@ -126,7 +135,8 @@ pub struct NodeId(pub u64);                 // Display = 16 hex; serde as string
 bitflags-like: pub struct Roles { pub node: bool, pub driver: bool }
 pub struct MemberMeta {
     pub roles: Roles,
-    pub cluster_url: String,                // http://host:7947 (internal HTTP base)
+    pub hostname: String,                   // machine host name (display)
+    pub cluster_port: u16,                  // internal HTTP port on every advertised IP
     pub public_url: Option<String>,         // drivers: public base URL
     pub version: String,                    // vmon version
     pub started_at_ms: u64,
@@ -137,7 +147,8 @@ pub struct NodeCapacity {
     pub arch: String,                       // "x86_64" | "aarch64"
     pub backend: String,                    // "kvm" | "hvf" | "whp"
     pub os: String,                         // "linux" | "macos" | "windows"
-    pub cpu_baseline: String,               // snapshot-compatibility key (`vmon vmm --print-cpu-baseline`)
+    pub cpu_model: String,                  // host CPU model name (display only)
+    pub cpu_baseline: String,               // snapshot-compatibility key (`vmon vmm --print-cpu-baseline`), never displayed
     pub cpus: u32, pub memory_mb: u64, pub disk_free_mb: u64,
     pub vcpus_used: u32, pub memory_used_mb: u64, pub sandboxes: u32,
     pub builds: u32,
@@ -146,43 +157,87 @@ pub struct NodeCapacity {
     pub cached_builds: Vec<String>,         // build IDs with local artifacts (bounded, most recent first)
 }
 pub struct RaftStatus { pub cluster_id: Option<String>, pub leader: Option<NodeId>, pub voter: bool, pub term: u64 }
+impl MemberMeta { pub fn cluster_url(&self, member: &Member) -> String }  // http://{member.addr.ip()}:{cluster_port}
 ```
 
 Encoded as JSON bytes inside gossip (≤ 4 KiB; `cached_builds` is truncated to fit).
+No member publishes its internal HTTP URL: each process derives it from
+`cluster_port` and its own route to the member (§5.2), so HTTP to a peer
+(raft RPCs, KV forwards, node API) takes the same LAN-first path as its gossip
+probes. `hostname` and `cpu_model` are for display only.
 
 ### 5.2 Gossip (`cluster::gossip`)
 
 SWIM-style, implemented in-house (no external memberlist crate):
 
-- UDP: `Ping{seq}`, `Ack{seq}`, `PingReq{seq, target}`, `IndirectAck`, plus
-  `Gossip` (updates only, sent every 200 ms to 3 random live peers while
-  updates are pending); every packet (≤ 1400 B) piggybacks the
-  least-transmitted member updates (`Alive|Suspect|Dead|Left` with
-  incarnation, plus `Meta{version, bytes}`), each retransmitted
-  `4 × ⌈log10(n+1)⌉` times. Metadata > 1100 B is announced by version only;
-  receivers fetch it with a push-pull to its owner.
-- Probe every `probe_interval` (1 s) to a round-robin shuffled member; ack
-  timeout 500 ms; then `k=3` indirect probes; unanswered → `Suspect`;
-  suspicion timeout `5 × max(1, ⌈log10(n+1)⌉) × probe_interval` → `Dead`.
-  Refutation by incarnation bump (incarnation and `meta_version` start at the
+- Wire format `VG2` (magic + version prefix of every body). A member update
+  carries every advertised address, so `VG1` (one address per member) and
+  `VG2` processes drop each other's packets: upgrade every member together;
+  there is no rolling upgrade from `VG1`.
+- UDP: `Ping{seq, target}`, `Ack{seq}`, `PingReq{seq, target, addr}`,
+  `IndirectAck{seq}`, plus `Gossip` (updates only, sent every 200 ms to 3
+  random live peers while updates are pending); every packet (≤ 1400 B)
+  piggybacks the least-transmitted member updates (`Alive|Suspect|Dead|Left`
+  with incarnation, 1–16 advertised addresses, plus `Meta{version, bytes}`),
+  each retransmitted `4 × ⌈log10(n+1)⌉` times. Metadata > 997 B (what fits a
+  packet next to an update with 16 IPv6 addresses) is announced by version
+  only; receivers fetch it with a push-pull to its owner.
+- Addresses: a member advertises every IP it is reachable at (≤ 16):
+  `GossipConfig::advertise` (`--advertise`); else the bind IP when specific;
+  else every `addrs::advertisable` interface IP of the bind family (no
+  loopback, link-local, or container/VM bridges; default-route IP first). The
+  interfaces are re-read every 30 s; an automatic list that changed is
+  re-advertised with an incarnation bump (`Gossip::set_addrs`). Each process
+  orders a peer's addresses by `addrs::rank` against its own interfaces
+  (re-read on the same period): 0 own IP or attached subnet (LAN), 1 other
+  private, 2 overlay (CGNAT `100.64.0.0/10`, Tailscale `fd7a:115c:a1e0::/48`),
+  3 public; equal ranks keep the advertiser's order. `Member::addrs` holds
+  this order; relayed updates keep the advertiser's.
+- Routes: `Member::addr` is the address this process currently reaches the
+  member at (UDP, push-pull, and `MemberMeta::cluster_url`); routes are local
+  choices and never gossiped, and every change publishes
+  `MemberEvent::Updated`. A member that is new, comes back from
+  `Dead`/`Left`, or advertises a new list (newer `Alive` incarnation) starts
+  at its best-ranked address, or keeps its route while still advertised. All
+  its addresses are pinged at once and the best-ranked one answering within
+  the ack timeout becomes the route; until then consumers see the unverified
+  best-ranked address (`Joined` carries it, the switch is an `Updated`).
+- Probe every `probe_interval` (1 s) to a round-robin shuffled member: ping its
+  route (the only ping that piggybacks updates) and every better-ranked
+  address, then wait up to the ack timeout (500 ms) for the best-ranked one.
+  Without a direct ack, ping its remaining addresses and send `PingReq` for
+  the route to `k=3` helpers (a helper pings the requested address and, when
+  its own route to the target differs, that one too), then wait the rest of
+  the probe interval. A direct ack moves the route to the best-ranked address
+  that answered: failover when the route stops answering, and back once a
+  better-ranked address answers again. An indirect ack only confirms
+  liveness. Nothing answered → `Suspect`: a member is suspected only when none
+  of its addresses answered the prober and no helper reached it. Suspicion timeout
+  `5 × max(1, ⌈log10(n+1)⌉) × probe_interval` → `Dead`. Refutation by
+  incarnation bump, also against an `Alive` claim at the current incarnation
+  listing other addresses (incarnation and `meta_version` start at the
   wall-clock ms, so a restarted member outranks its previous life).
   `Dead`/`Left` members are reaped from the table after 1 h.
 - TCP push-pull: full-state exchange on join and every 30 s with a random
-  alive member (anti-entropy) plus a random dead member (reconnect). A `Dead`
-  received via push-pull is merged as `Suspect`, so the member refutes — this
-  is what heals partitions.
+  alive member through its route (anti-entropy) plus a random dead member
+  (reconnect), dialing its addresses in rank order until one answers as that
+  member, which becomes its route. Metadata fetches dial the route first, then
+  the other addresses in rank order. A `Dead` received via push-pull is merged
+  as `Suspect`, so the member refutes — this is what heals partitions.
 - Metadata: `set_meta` bumps a per-member `meta_version`; newer version wins.
   Metadata updates are rate-limited (≥ 1 s apart) by the caller.
 
 ```rust
-pub struct GossipConfig { pub id: NodeId, pub bind: SocketAddr, pub advertise: SocketAddr,
-                          pub secret: Vec<u8>, pub probe_interval: Duration, /* timeouts… */ }
+pub struct GossipConfig { pub id: NodeId, pub bind: SocketAddr, pub advertise: Vec<SocketAddr>,
+                          pub secret: Vec<u8>, pub probe_interval: Duration,
+                          /* timeouts…, */ pub refresh_interval: Duration }
 pub struct Gossip;  // Clone (Arc inside)
 impl Gossip {
     pub async fn start(cfg: GossipConfig, meta: Vec<u8>) -> io::Result<Gossip>;
     pub async fn join(&self, seeds: &[String]) -> io::Result<usize>; // host:port; DNS resolved; returns contacted
                                                                       // (self skipped; Err if foreign seeds given and none reached)
-    pub fn local_addr(&self) -> SocketAddr;                           // advertise addr (port 0 → bound port)
+    pub fn local_addr(&self) -> SocketAddr;                           // first advertised addr (port 0 → bound port)
+    pub fn set_addrs(&self, addrs: Vec<SocketAddr>) -> io::Result<()>; // re-advertise (incarnation bump; no-op if unchanged)
     pub fn dropped_packets(&self) -> u64;                             // unauthenticated/malformed packets+frames
     pub fn members(&self) -> Vec<Member>;                             // includes self
     pub fn member(&self, id: NodeId) -> Option<Member>;
@@ -190,12 +245,15 @@ impl Gossip {
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<MemberEvent>;
     pub async fn leave(&self, timeout: Duration);
 }
-pub struct Member { pub id: NodeId, pub addr: SocketAddr, pub state: MemberState,
-                    pub incarnation: u64, pub meta_version: u64, pub meta: Vec<u8> }
+pub struct Member { pub id: NodeId,
+                    pub addr: SocketAddr,        // route: how this process reaches the member
+                    pub addrs: Vec<SocketAddr>,  // every advertised address, best-ranked first
+                    pub state: MemberState, pub incarnation: u64, pub meta_version: u64, pub meta: Vec<u8> }
 pub enum MemberState { Alive, Suspect, Dead, Left }
 pub enum MemberEvent { Joined(Member), Updated(Member), Failed(Member), Left(Member) }
 // GossipConfig::new(id, bind, advertise, secret) fills production timings; all timings are pub fields.
-// Joined: new member or Dead/Left → Alive. Updated: meta/addr change, Alive↔Suspect, own set_meta.
+// Joined: new member or Dead/Left → Alive. Updated: meta/addresses/route change, Alive↔Suspect,
+// own set_meta/set_addrs.
 // Dropping the last Gossip handle stops its tasks without announcing Left.
 ```
 
@@ -367,7 +425,9 @@ in-memory map.
 
 ```rust
 pub struct ClusterConfig { pub id: NodeId, pub data_dir: PathBuf, pub roles: Roles,
-    pub gossip_bind: SocketAddr, pub gossip_advertise: SocketAddr, pub cluster_url: String,
+    pub gossip_bind: SocketAddr,
+    pub advertise: Option<Vec<IpAddr>>,  // None: gossip bind IP when specific, else addrs::advertisable(bind ip)
+    pub cluster_port: u16,               // cluster listener port on every advertised IP
     pub join: Vec<String>, pub secret: Vec<u8>, pub bootstrap_expect: usize, pub raft_reap_after: Duration }
 pub struct Cluster { pub gossip: Gossip, pub kv: Kv }
 impl Cluster {
@@ -376,6 +436,7 @@ impl Cluster {
     pub fn local_id(&self) -> NodeId;
     pub fn update_meta(&self, f: impl FnOnce(&mut MemberMeta));
     pub fn members(&self) -> Vec<(Member, MemberMeta)>;   // decoded; undecodable skipped
+    pub fn cluster_url(&self, id: NodeId) -> Option<String>; // via the member's current route; None if unknown
     pub fn leader(&self) -> tokio::sync::watch::Receiver<Option<NodeId>>; // raft leader (None on node-only)
     pub fn is_leader(&self) -> bool;
     pub async fn shutdown(&self);
@@ -383,9 +444,10 @@ impl Cluster {
 pub fn require_secret(secret: Arc<[u8]>) -> impl tower::Layer<Route> + Clone; // `router.layer(require_secret(s))`, 401 on mismatch
 ```
 
-`start` overwrites `meta.roles`, `meta.cluster_url`, and `meta.raft` from the
-config; the caller must serve `router()` at `cluster_url` (raft peers and KV
-clients reach drivers there). `router()` is empty on node-only processes.
+`start` overwrites `meta.roles`, `meta.cluster_port`, and `meta.raft` from the
+config; the caller must serve `router()` on `cluster_port` of every advertised
+IP (raft peers and KV clients reach drivers there). `router()` is empty on
+node-only processes.
 `leader()`/`is_leader()` (and the gossiped `RaftStatus.leader`) report this
 node only once its leadership is confirmed: committed vote, an applied entry
 of its current term, and a quorum ack within 1.5 s. A restarted former leader
@@ -395,7 +457,12 @@ Dead/Left backs off up to 30 s, so openraft logs at most one failure per
 ~30 s for that peer. When the peer comes back (or restarts on a new address),
 the leader points its running replication stream at the gossiped address,
 records it in raft membership, and resets the peer's replication backoff
-(openraft keeps replication streams across membership changes).
+(openraft keeps replication streams across membership changes). Raft RPCs
+and KV forwards dial each peer through this process's gossip route
+(`meta.cluster_url(&member)`), falling back to the URL recorded in raft
+membership only when gossip cannot resolve the peer; the leader rewrites a
+recorded URL only when the peer stops advertising it (restart, new
+addresses) or revives, not when a route switches.
 
 ## 6. KV keyspace
 
@@ -924,7 +991,7 @@ also deletes `builds/<buildID>/`.
 
 ```rust
 pub struct CreateSandbox { pub sandbox_id: String, pub team_id: String, pub template_id: String,
-    pub build_id: String, pub artifact_sources: Vec<String>, // cluster URLs of nodes holding the build
+    pub build_id: String, pub artifact_sources: Vec<NodeId>, // nodes holding the build, best first
     pub vcpus: u32, pub memory_mb: u64, pub disk_mb: u64, pub end_at_ms: u64,
     pub env_vars: BTreeMap<String, String>, pub envd_access_token: String,
     pub default_user: Option<String>, pub default_workdir: Option<String>,
@@ -934,22 +1001,29 @@ pub struct ResumeSandbox { pub end_at_ms: u64, pub init: GuestInit, pub network:
     pub volume_mounts: Vec<VolumeMount>, pub cold_boot: bool,
     pub remote: Option<paused_store::Remote>,   // published generation (object store)
     pub meta: Option<SandboxMeta>,              // authoritative metadata for adoption
-    pub artifact_sources: Vec<String> }         // template holders (cold boot, RAM base)
+    pub artifact_sources: Vec<NodeId>,          // template holders (cold boot, RAM base)
+    pub gpus: u32 }                             // as CreateSandbox::gpus
 pub struct NetworkPolicy { pub allow_out: Vec<String>, pub deny_out: Vec<String>,
     pub egress_proxy: Option<EgressProxy>, pub rules: BTreeMap<String, Vec<NetworkRule>> }
 pub struct SandboxInfo { pub sandbox_id: String, pub state: String /* running|paused */,
     pub build_id: String, pub vcpus: u32, pub memory_mb: u64, pub disk_mb: u64,
     pub started_at_ms: u64, pub end_at_ms: u64, pub envd_version: String }
 pub struct StartBuild { pub build_id: String, pub template_id: String, pub team_id: String,
-    pub from: BuildBase /* Image{image, registry: Option<RegistryAuth>} | Build{build_id, sources} */,
+    pub from: BuildBase /* Image{image, registry: Option<RegistryAuth>} | Build{build_id, sources: Vec<NodeId>} */,
     pub steps: Vec<BuildStep>, pub start_cmd: Option<String>, pub ready_cmd: Option<String>,
-    pub vcpus: u32, pub memory_mb: u64, pub disk_mb: u64, pub file_sources: Vec<String>,
+    pub vcpus: u32, pub memory_mb: u64, pub disk_mb: u64, pub file_sources: Vec<NodeId>,
     pub force: bool }
 pub struct BuildStep { pub kind: String, pub args: Vec<String>, pub files_hash: Option<String>, pub force: bool }
 pub struct ArtifactInfo { pub build_id: String, pub node_id: NodeId, pub arch: String, pub backend: String,
     pub cpu_baseline: String, pub has_snapshot: bool, pub bytes: u64, pub envd_version: String,
     pub default_user: String, pub default_workdir: Option<String>, pub env: BTreeMap<String,String> }
 ```
+
+Peer sources (`artifact_sources`, `file_sources`, `BuildBase::Build.sources`)
+are node ids: the driver picks the holders, and the fetching node resolves
+each id at the API boundary (`server::Peers`, `Cluster::cluster_url`) to the
+route it reaches that peer at, so transfers prefer its LAN path; ids unknown
+to its gossip are skipped.
 
 ### 8.6 Template build pipeline (node)
 
@@ -1106,9 +1180,12 @@ Admin dashboard API (vmon extensions, `X-Admin-Token`; the static panel is
 served at `/dashboard/` on the public listeners):
 
 - `GET /admin/cluster`: `clusterID`, `localID`, every gossip member sorted by
-  id (`state`, `roles`, `version`, `startedAt`, `clusterURL`, `publicURL`,
-  `raft` for drivers, `node` for nodes: `GET /nodes` status precedence,
-  capacity, `cachedBuilds` count, this driver's create counters), and
+  id (`hostname`, `addrs` (every advertised IP, in the order this driver
+  holds them), `state`, `roles`, `version`, `startedAt`, `clusterURL` (via
+  this driver's current route), `publicURL`, `raft` for drivers, `node` for
+  nodes: `GET /nodes` status precedence, capacity, `cpuModel`, `cachedBuilds`
+  count, this driver's create counters, `gpus: [{address, model, sandbox,
+  problem}]`), and
   `history`: the driver's in-memory fleet samples (every 5 s, newest 720,
   oldest first; `nodes` and capacity sums over alive node members, `starts` =
   `sandbox.lifecycle.created|resumed` events since the previous sample via an

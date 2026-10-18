@@ -28,7 +28,7 @@ The node role runs on Linux with KVM (x86_64 and aarch64 guests) and on macOS 15
 | `--gossip-listen` | `0.0.0.0:7946` | every process | Every other process, on both UDP and TCP. |
 | `--kv-resp-listen` | off | any process | Operator tools speaking the Redis protocol (`redis-cli`, `redis-benchmark`) that inspect or load-test the cluster KV. Clients `AUTH` with the cluster secret. |
 
-Peers dial the advertised addresses (`--cluster-advertise`, `--gossip-advertise`), not the bind addresses. When unset, both are derived from the IP of `--cluster-listen`, or from the host's outbound IPv4 address when it binds `0.0.0.0` (details in [Cluster and gossip](../reference/serve.md#cluster-and-gossip)).
+Peers dial the advertised IPs (`--advertise`) on the two internal listener ports, not the bind addresses. When `--advertise` is unset, a listener bound to a specific IP advertises that IP, and the default `0.0.0.0` listeners advertise every interface IP except loopback, link-local, and container or VM bridges. Each peer prefers an address on its own LAN and falls back to the others (details in [Cluster and gossip](../reference/serve.md#cluster-and-gossip)).
 
 Cluster HTTP requires `Authorization: Bearer <cluster secret>`. Gossip packets carry an HMAC tag keyed from the same secret, and unauthenticated packets are dropped. Even so, keep both internal listeners on a private network, because the node API controls every VM.
 

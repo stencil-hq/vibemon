@@ -53,13 +53,12 @@ pub const BUILD_TIMEOUT: Duration = Duration::from_hours(1);
 pub const BUILD_TIMEOUT_MESSAGE: &str =
 	"build status polling timed out. Maximum build time is 1h0m0s.";
 
-/// A node holding a build's artifacts, with the URL to fetch them from.
+/// An alive node holding a build's artifacts. Fetching nodes resolve the id
+/// to a route of their own (`Cluster::cluster_url`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactSource {
-	pub node_id:     NodeId,
-	/// The node's cluster URL (`MemberMeta::cluster_url`).
-	pub cluster_url: String,
-	pub info:        ArtifactInfo,
+	pub node_id: NodeId,
+	pub info:    ArtifactInfo,
 }
 
 /// A template reference resolved to a concrete ready build.

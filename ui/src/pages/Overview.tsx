@@ -13,7 +13,7 @@ import {
   Status,
   type Tone,
 } from "../components.tsx";
-import { fmt, shortId } from "../format.ts";
+import { fmt, memberName } from "../format.ts";
 import { useNow } from "../hooks.ts";
 import { Link } from "../router.tsx";
 
@@ -62,7 +62,10 @@ export function OverviewPage() {
   const domain: [number, number] = [now - RANGE_MS[range], now];
   const starts = startsPerMinute(history);
   const members = [...(view?.members ?? [])].sort(
-    (a, b) => Number(b.roles.driver) - Number(a.roles.driver) || a.id.localeCompare(b.id),
+    (a, b) =>
+      Number(b.roles.driver) - Number(a.roles.driver) ||
+      memberName(a).localeCompare(memberName(b)) ||
+      a.id.localeCompare(b.id),
   );
 
   return (
@@ -220,11 +223,11 @@ export function OverviewPage() {
                     <tr key={m.id}>
                       <td>
                         {m.node ? (
-                          <Link to={`/nodes/${m.id}`} className="row-link mono">
-                            {shortId(m.id)}
+                          <Link to={`/nodes/${m.id}`} className="row-link" title={m.id}>
+                            {memberName(m)}
                           </Link>
                         ) : (
-                          <span className="mono">{shortId(m.id)}</span>
+                          <span title={m.id}>{memberName(m)}</span>
                         )}
                         {m.id === view?.localID && (
                           <>

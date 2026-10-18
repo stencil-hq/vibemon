@@ -1,7 +1,7 @@
-import { createContext, type FormEvent, useContext, useEffect, useState } from "react";
+import { createContext, type FormEvent, useContext, useEffect, useMemo, useState } from "react";
 import { adminToken, api, type ClusterView, onAuthChange, signIn, signOut } from "./api.ts";
 import { Button, DialogHost, StatusDot, Toaster } from "./components.tsx";
-import { shortId } from "./format.ts";
+import { memberName, shortId } from "./format.ts";
 import { type Poll, usePoll } from "./hooks.ts";
 import { Icon, type IconName } from "./icons.tsx";
 import { NodeDetailPage } from "./pages/NodeDetail.tsx";
@@ -19,6 +19,18 @@ export function useCluster(): Poll<ClusterView> {
   const poll = useContext(ClusterContext);
   if (!poll) throw new Error("useCluster outside <App>");
   return poll;
+}
+
+/** Labels a node ID by its member's hostname (short ID while unknown to the cluster view). */
+export function useNodeName(): (id: string) => string {
+  const members = useCluster().data?.members;
+  return useMemo(() => {
+    const byId = new Map(members?.map((m) => [m.id, m]));
+    return (id: string) => {
+      const member = byId.get(id);
+      return member ? memberName(member) : shortId(id);
+    };
+  }, [members]);
 }
 
 export function App() {
@@ -248,7 +260,7 @@ function Console() {
           </Link>
         ))}
         <div className="sidebar__foot">
-          Served by driver <span className="mono">{local ? shortId(local.id) : "…"}</span>
+          Served by driver <span title={local?.id}>{local ? memberName(local) : "…"}</span>
           <br />
           Charts keep this driver's last hour.
         </div>

@@ -3,7 +3,7 @@
 
 use std::{
 	fs,
-	net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+	net::{IpAddr, SocketAddr},
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -72,33 +72,32 @@ pub struct ServeArgs {
 
 	/// Shared cluster secret; generated and stored in the data dir when unset.
 	#[arg(long, env = "VMON_CLUSTER_SECRET", hide_env_values = true)]
-	cluster_secret:    Option<String>,
+	cluster_secret:   Option<String>,
 	/// Internal HTTP listener (raft, KV, node API, tunnels).
 	#[arg(long, env = "VMON_CLUSTER_LISTEN", default_value = "0.0.0.0:7947")]
-	cluster_listen:    SocketAddr,
-	/// URL peers use to reach `--cluster-listen` (default: http://<detected-ip>:<port>).
-	#[arg(long, env = "VMON_CLUSTER_ADVERTISE")]
-	cluster_advertise: Option<String>,
+	cluster_listen:   SocketAddr,
 	/// Redis-protocol (RESP2) listener for the cluster KV; clients `AUTH` with
 	/// the cluster secret (off when unset).
 	#[arg(long, env = "VMON_KV_RESP_LISTEN")]
-	kv_resp_listen:    Option<SocketAddr>,
+	kv_resp_listen:   Option<SocketAddr>,
 	/// Gossip listener (UDP probes + TCP push-pull).
 	#[arg(long, env = "VMON_GOSSIP_LISTEN", default_value = "0.0.0.0:7946")]
-	gossip_listen:     SocketAddr,
-	/// Address peers use to reach `--gossip-listen`.
-	#[arg(long, env = "VMON_GOSSIP_ADVERTISE")]
-	gossip_advertise:  Option<SocketAddr>,
+	gossip_listen:    SocketAddr,
+	/// IPs peers reach this process at (gossip and cluster listener), in
+	/// preference order, comma separated (default: the listeners' IP when
+	/// specific, else every eligible interface IP).
+	#[arg(long, env = "VMON_ADVERTISE", value_delimiter = ',')]
+	advertise:        Vec<IpAddr>,
 	/// Gossip seeds (`host:port`, comma separated).
 	#[arg(long, env = "VMON_JOIN", value_delimiter = ',')]
-	join:              Vec<String>,
+	join:             Vec<String>,
 	/// Number of drivers that must be visible before the raft cluster
 	/// bootstraps.
 	#[arg(long, env = "VMON_BOOTSTRAP_EXPECT", default_value_t = 1)]
-	bootstrap_expect:  usize,
+	bootstrap_expect: usize,
 	/// How long a dead driver stays a raft voter before removal (seconds).
 	#[arg(long, env = "VMON_RAFT_REAP_AFTER", default_value_t = 600)]
-	raft_reap_after:   u64,
+	raft_reap_after:  u64,
 
 	/// Public API + sandbox ingress listener (driver).
 	#[arg(long, env = "VMON_LISTEN", default_value = "0.0.0.0:3000")]
@@ -217,24 +216,21 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 		None => load_or_create_secret(&data_dir)?,
 	};
 
-	let advertise_ip = advertise_ip(args.cluster_listen.ip());
-	let cluster_url = args.cluster_advertise.clone().unwrap_or_else(|| {
-		format!("http://{}", SocketAddr::new(advertise_ip, args.cluster_listen.port()))
+	let advertise = advertise(&args)?;
+	let public_url = args.public_url.clone().unwrap_or_else(|| {
+		if args.tls_listen.is_some() {
+			return format!("https://api.{}", args.domain);
+		}
+		let ip = advertise
+			.as_ref()
+			.map_or_else(|| vmon_cluster::addrs::advertisable(args.listen.ip())[0], |ips| ips[0]);
+		format!("http://{}", SocketAddr::new(ip, args.listen.port()))
 	});
-	let gossip_advertise = args
-		.gossip_advertise
-		.unwrap_or_else(|| SocketAddr::new(advertise_ip, args.gossip_listen.port()));
-	let public_url = args
-		.public_url
-		.clone()
-		.unwrap_or_else(|| match args.tls_listen {
-			Some(_) => format!("https://api.{}", args.domain),
-			None => format!("http://{}", SocketAddr::new(advertise_ip, args.listen.port())),
-		});
 
 	let meta = MemberMeta {
 		roles,
-		cluster_url: cluster_url.clone(),
+		hostname: hostname(),
+		cluster_port: args.cluster_listen.port(),
 		public_url: roles.driver.then(|| public_url.clone()),
 		version: env!("CARGO_PKG_VERSION").to_owned(),
 		started_at_ms: now_ms(),
@@ -247,8 +243,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			data_dir: data_dir.clone(),
 			roles,
 			gossip_bind: args.gossip_listen,
-			gossip_advertise,
-			cluster_url: cluster_url.clone(),
+			advertise,
+			cluster_port: args.cluster_listen.port(),
 			join: args.join.clone(),
 			secret: secret.as_bytes().to_vec(),
 			bootstrap_expect: args.bootstrap_expect,
@@ -258,7 +254,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 	)
 	.await
 	.context("starting cluster layer")?;
-	tracing::info!(%id, %cluster_url, gossip = %gossip_advertise, ?roles, "cluster layer started");
+	let advertised: Vec<IpAddr> = cluster
+		.gossip
+		.member(id)
+		.map(|member| member.addrs.iter().map(SocketAddr::ip).collect())
+		.unwrap_or_default();
+	tracing::info!(%id, ?advertised, ?roles, "cluster layer started");
 
 	let object_store = match args
 		.object_store
@@ -527,18 +528,34 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
 	Ok(())
 }
 
-/// The bind IP when specific, else the host's outbound IPv4 (loopback when
-/// offline).
-fn advertise_ip(bind: IpAddr) -> IpAddr {
-	if !bind.is_unspecified() {
-		return bind;
+/// `--advertise`, else the listeners' IP when they bind a specific one; `None`
+/// lets the cluster layer advertise every eligible interface IP.
+fn advertise(args: &ServeArgs) -> anyhow::Result<Option<Vec<IpAddr>>> {
+	if !args.advertise.is_empty() {
+		return Ok(Some(args.advertise.clone()));
 	}
-	UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-		.and_then(|socket| {
-			socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-			socket.local_addr()
-		})
-		.map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |addr| addr.ip())
+	let specific = |addr: SocketAddr| Some(addr.ip()).filter(|ip| !ip.is_unspecified());
+	match (specific(args.cluster_listen), specific(args.gossip_listen)) {
+		(Some(cluster), Some(gossip)) if cluster != gossip => bail!(
+			"--cluster-listen ({cluster}) and --gossip-listen ({gossip}) bind different IPs; set \
+			 --advertise"
+		),
+		(Some(ip), _) | (None, Some(ip)) => Ok(Some(vec![ip])),
+		(None, None) => Ok(None),
+	}
+}
+
+/// This machine's host name; empty when unavailable.
+fn hostname() -> String {
+	let mut buf = [0u8; 256];
+	// SAFETY: `buf` is writable for `buf.len()` bytes; gethostname writes at
+	// most that many and does not retain the pointer.
+	let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+	if rc != 0 {
+		return String::new();
+	}
+	let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+	String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 fn now_ms() -> u64 {
