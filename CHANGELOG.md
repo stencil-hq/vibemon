@@ -28,6 +28,7 @@ All notable changes to this project are recorded here.
 
 ### Added
 
+- Added automated journal gap-filling to restore missing event records after snapshot installations
 - `vmon serve --kv-resp-listen` serves the cluster KV over the Redis protocol (RESP2: `AUTH` with the cluster secret, `PING`, `QUIT`, `GET`, `SET` with `NX`/`XX`/`EX`/`PX`, `DEL`, `EXISTS`), so `redis-cli` and `redis-benchmark` work against it; consecutive pipelined writes commit as one raft entry
 - `Kv::txns` commits several transactions as one raft entry, in order, all or none (`DEL` of several keys and pipelined RESP writes use it)
 - Lazy cross-node resume (`vmon serve --lazy-resume`, default on): a node

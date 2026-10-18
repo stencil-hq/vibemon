@@ -15,7 +15,6 @@ use std::{
 };
 
 use anyhow::Context;
-use openraft::async_runtime::WatchReceiver;
 use axum::{
 	Router,
 	extract::Request,
@@ -25,6 +24,7 @@ use axum::{
 	routing::Route,
 };
 pub use meta::{MemberMeta, NodeCapacity, NodeId, RaftStatus, Roles};
+use openraft::async_runtime::WatchReceiver;
 use parking_lot::Mutex;
 use tokio::{
 	net::TcpListener,
@@ -140,6 +140,7 @@ impl Cluster {
 
 		if let Some(local) = local {
 			tasks.push(tokio::spawn(track_leader(local.clone(), leader_tx.clone(), stop_rx.clone())));
+			tasks.push(tokio::spawn(kv::maintain_journal(local.clone(), stop_rx.clone())));
 			let reconciler = Reconciler::new(
 				cfg.id,
 				local,

@@ -15,7 +15,7 @@ use tokio::{
 	task::JoinHandle,
 };
 
-use super::{Compare, Kv, KvError, Op, Range, Txn, WatchEvent};
+use super::{Compare, Kv, KvError, Op, Range, Scan, Txn, WatchEvent};
 use crate::{Cluster, ClusterConfig, MemberMeta, NodeId, Roles};
 
 const DRIVER: Roles = Roles { node: false, driver: true };
@@ -220,11 +220,18 @@ async fn kv_driver_restart_recovers_committed_data() {
 			.put(&format!("k/{i}"), vec![i], None)
 			.await
 			.unwrap();
+		let txn = Txn { success: vec![append("j", u64::from(i))], ..Txn::default() };
+		a.cluster.kv.txn(txn).await.unwrap();
 	}
 	a.cluster.kv.delete("k/3").await.unwrap();
 	a.snapshot_and_purge().await;
 	a.cluster.kv.put("k/tail", Vec::new(), None).await.unwrap();
 	a.cluster.kv.delete("k/tail").await.unwrap();
+	// Journal records after the snapshot are replayed on restart.
+	for i in 20..25 {
+		let txn = Txn { success: vec![append("j", i)], ..Txn::default() };
+		a.cluster.kv.txn(txn).await.unwrap();
+	}
 	let cluster_id = eventually("cluster id", || async { a.cluster_id() }).await;
 	a.kill().await;
 
@@ -240,7 +247,92 @@ async fn kv_driver_restart_recovers_committed_data() {
 	assert_eq!(a.cluster_id(), Some(cluster_id), "restart must not re-bootstrap");
 	let rev = a.cluster.kv.put("k/new", Vec::new(), None).await.unwrap();
 	assert!(rev > a.cluster.kv.get("k/19").await.unwrap().unwrap().mod_rev);
+	// The journal kept every record once, and numbering continues.
+	let txn = Txn { success: vec![append("j", 25)], ..Txn::default() };
+	a.cluster.kv.txn(txn).await.unwrap();
+	let expected: Vec<(u64, Vec<u8>)> = (0..26u64)
+		.map(|i| (i + 1, i.to_be_bytes().to_vec()))
+		.collect();
+	assert_eq!(journal(&a, "j").await, expected);
 	a.kill().await;
+}
+
+/// Seqs and values of journal stream `stream` as `p` reads it.
+async fn journal(p: &Proc, stream: &str) -> Vec<(u64, Vec<u8>)> {
+	let scan = Scan { stream: stream.into(), ..Scan::default() };
+	let records = p.cluster.kv.scan(&scan).await.unwrap();
+	records.into_iter().map(|r| (r.seq, r.value)).collect()
+}
+
+fn append(stream: &str, i: u64) -> Op {
+	Op::Append { streams: vec!["all".into(), stream.into()], value: i.to_be_bytes().to_vec() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn kv_journal_replicates_and_a_late_driver_backfills_what_its_snapshot_skipped() {
+	let (_tmp, dir) = dir();
+	let a = Proc::start(0x50, &dir, DRIVER, &[], 2).await;
+	let b = Proc::start(0x51, &dir, DRIVER, &[&a], 2).await;
+	let leader = leader_of(&[&a, &b]).await;
+
+	// Appends through both drivers; a failed compare appends nothing.
+	for i in 0..40u64 {
+		let p = if i % 2 == 0 { &a } else { &b };
+		let txn = Txn { success: vec![append(&format!("t/{}", i % 3), i)], ..Txn::default() };
+		p.cluster.kv.txn(txn).await.unwrap();
+	}
+	let refused = Txn {
+		compare: vec![Compare::Exists("absent".into())],
+		success: vec![append("t/0", 99)],
+		failure: Vec::new(),
+	};
+	assert!(!a.cluster.kv.txn(refused).await.unwrap().succeeded);
+	let expected: Vec<(u64, Vec<u8>)> = (0..40u64)
+		.map(|i| (i + 1, i.to_be_bytes().to_vec()))
+		.collect();
+	for p in [&a, &b] {
+		p.cluster.kv.sync().await.unwrap();
+		assert_eq!(journal(p, "all").await, expected);
+		assert_eq!(journal(p, "t/1").await.len(), 13);
+	}
+
+	// A late driver installs a snapshot (the log behind it is purged) and
+	// copies the journal records it skipped from a peer.
+	let (lead, other) = if a.id() == leader { (&a, &b) } else { (&b, &a) };
+	lead.snapshot_and_purge().await;
+	other.snapshot_and_purge().await;
+	let c = Proc::start(0x52, &dir, DRIVER, &[&a], 2).await;
+	eventually("c backfilled its journal", || async {
+		let state = c.cluster.kv.local()?.state();
+		(c.cluster_id().is_some() && state.journal_complete()).then_some(())
+	})
+	.await;
+	let local = c.cluster.kv.local().unwrap().state();
+	let all = local
+		.scan(&Scan { stream: "all".into(), ..Scan::default() })
+		.await
+		.unwrap();
+	assert_eq!(all.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=40).collect::<Vec<_>>());
+
+	// Node-only processes read the journal through a driver.
+	let n = Proc::start(0x53, &dir, NODE, &[&a], 2).await;
+	eventually("node-only scan", || async {
+		let scan = Scan { stream: "t/2".into(), after: Some(30), ..Scan::default() };
+		let records = n.cluster.kv.scan(&scan).await.ok()?;
+		(records.iter().map(|r| r.seq).collect::<Vec<_>>() == [33, 36, 39]).then_some(())
+	})
+	.await;
+
+	// New records reach the late driver through the log.
+	let txn = Txn { success: vec![append("t/0", 40)], ..Txn::default() };
+	b.cluster.kv.txn(txn).await.unwrap();
+	let mut expected = expected;
+	expected.push((41, 40u64.to_be_bytes().to_vec()));
+	c.cluster.kv.sync().await.unwrap();
+	assert_eq!(journal(&c, "all").await, expected);
+	for p in [a, b, c, n] {
+		p.kill().await;
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

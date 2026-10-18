@@ -1,8 +1,11 @@
-//! Deterministic KV state: ordered map, global revision, TTL index.
+//! Deterministic KV state: ordered map, global revision, TTL index, and the
+//! journal position.
 //!
 //! Every [`Command`] carries the leader-stamped `now_ms`; applying it first
 //! advances the applied clock (monotonically) and expires due keys, so every
-//! replica reaches the same state from the same log.
+//! replica reaches the same state from the same log. [`Op::Append`] records
+//! leave as [`Appended`] for the on-disk journal, numbered from the
+//! replicated position.
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -12,7 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{Compare, Entry, Op, Range, Txn, TxnResult, WatchEvent, stamp};
+use super::{Compare, Entry, Op, Range, Txn, TxnResult, WatchEvent, journal::Appended, stamp};
 
 /// Raft log payload (openraft `D`), proposed by the leader.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ pub struct KvState {
 	revision:   u64,
 	applied_ms: u64,
 	cluster_id: Option<String>,
+	/// Seq of the last journal record (0 before the first).
+	#[serde(default)]
+	journal:    u64,
 	/// `(expires_at_ms, key)` for every entry with a TTL; rebuilt on load.
 	#[serde(skip)]
 	ttl:        BTreeSet<(u64, String)>,
@@ -92,6 +98,12 @@ impl KvState {
 	/// Revision of the last applied change.
 	pub const fn revision(&self) -> u64 {
 		self.revision
+	}
+
+	/// Seq the next journal record gets; every record below it was appended
+	/// (records are numbered from 1).
+	pub const fn journal_next(&self) -> u64 {
+		self.journal + 1
 	}
 
 	/// Cluster UUID recorded at bootstrap.
@@ -152,14 +164,23 @@ impl KvState {
 		}
 	}
 
-	/// Applies one command; appends resulting changes to `events`. Returns one
-	/// result per transaction of [`Command::Txns`], else a single result.
-	pub fn apply(&mut self, command: &Command, events: &mut Vec<WatchEvent>) -> Vec<TxnResult> {
+	/// Applies one command; appends resulting changes to `events` and journal
+	/// records to `journal`. Returns one result per transaction of
+	/// [`Command::Txns`], else a single result.
+	pub fn apply(
+		&mut self,
+		command: &Command,
+		events: &mut Vec<WatchEvent>,
+		journal: &mut Vec<Appended>,
+	) -> Vec<TxnResult> {
 		self.applied_ms = self.applied_ms.max(command.now_ms());
 		self.expire(events);
 		match command {
-			Command::Txns { txns, .. } => txns.iter().map(|txn| self.apply_txn(txn, events)).collect(),
-			Command::Txn { txn, .. } => vec![self.apply_txn(txn, events)],
+			Command::Txns { txns, .. } => txns
+				.iter()
+				.map(|txn| self.apply_txn(txn, events, journal))
+				.collect(),
+			Command::Txn { txn, .. } => vec![self.apply_txn(txn, events, journal)],
 			Command::Expire { .. } => vec![TxnResult { succeeded: true, revision: self.revision }],
 			Command::SetClusterId { cluster_id, .. } => {
 				let id = self.cluster_id.get_or_insert_with(|| cluster_id.clone());
@@ -170,7 +191,12 @@ impl KvState {
 
 	/// Evaluates `txn`'s compares and runs the chosen branch; the revision
 	/// advances only if that changed something.
-	fn apply_txn(&mut self, txn: &Txn, events: &mut Vec<WatchEvent>) -> TxnResult {
+	fn apply_txn(
+		&mut self,
+		txn: &Txn,
+		events: &mut Vec<WatchEvent>,
+		journal: &mut Vec<Appended>,
+	) -> TxnResult {
 		let succeeded = txn.compare.iter().all(|c| self.check(c));
 		let ops = if succeeded {
 			&txn.success
@@ -180,7 +206,7 @@ impl KvState {
 		let rev = self.revision + 1;
 		let mut changed = false;
 		for op in ops {
-			changed |= self.apply_op(op, rev, events);
+			changed |= self.apply_op(op, rev, events, journal);
 		}
 		if changed {
 			self.revision = rev;
@@ -252,8 +278,24 @@ impl KvState {
 	}
 
 	/// Applies one op at revision `rev`; returns whether anything changed.
-	fn apply_op(&mut self, op: &Op, rev: u64, events: &mut Vec<WatchEvent>) -> bool {
+	fn apply_op(
+		&mut self,
+		op: &Op,
+		rev: u64,
+		events: &mut Vec<WatchEvent>,
+		journal: &mut Vec<Appended>,
+	) -> bool {
 		match op {
+			Op::Append { streams, value } => {
+				self.journal += 1;
+				journal.push(Appended {
+					seq:     self.journal,
+					ts_ms:   self.applied_ms,
+					streams: streams.clone(),
+					value:   value.clone(),
+				});
+				true
+			},
 			Op::Put { key, value, ttl_ms } => {
 				self.put(key.clone(), value, *ttl_ms, rev, events);
 				true
@@ -337,7 +379,7 @@ mod tests {
 
 	fn txn(state: &mut KvState, now_ms: u64, compare: Vec<Compare>, success: Vec<Op>) -> TxnResult {
 		let command = Command::Txn { now_ms, txn: Txn { compare, success, failure: Vec::new() } };
-		state.apply(&command, &mut Vec::new())[0]
+		state.apply(&command, &mut Vec::new(), &mut Vec::new())[0]
 	}
 
 	#[test]
@@ -355,7 +397,7 @@ mod tests {
 			guarded(Compare::Value { key: "a".into(), value: b"1".to_vec() }, put("b", "1", None)),
 			guarded(Compare::Exists("b".into()), Op::Delete { key: "a".into() }),
 		];
-		let results = s.apply(&Command::Txns { now_ms: 1, txns }, &mut Vec::new());
+		let results = s.apply(&Command::Txns { now_ms: 1, txns }, &mut Vec::new(), &mut Vec::new());
 		let outcome: Vec<(bool, u64)> = results.iter().map(|r| (r.succeeded, r.revision)).collect();
 		assert_eq!(outcome, [(true, 1), (false, 1), (true, 2), (true, 3)]);
 		assert_eq!(s.get("a"), None);
@@ -429,6 +471,30 @@ mod tests {
 	}
 
 	#[test]
+	fn appends_number_journal_records_densely_in_the_chosen_branch_only() {
+		let mut s = KvState::default();
+		let append =
+			|stream: &str| Op::Append { streams: vec![stream.into()], value: b"v".to_vec() };
+		let missing = || vec![Compare::Exists("nope".into())];
+		let txns = vec![
+			Txn { success: vec![append("a"), append("b")], ..Txn::default() },
+			Txn { compare: missing(), success: vec![append("lost")], failure: Vec::new() },
+			Txn { compare: missing(), success: Vec::new(), failure: vec![append("c")] },
+		];
+		let mut journal = Vec::new();
+		let results = s.apply(&Command::Txns { now_ms: 7, txns }, &mut Vec::new(), &mut journal);
+		let records: Vec<(u64, &str, u64)> = journal
+			.iter()
+			.map(|r| (r.seq, r.streams[0].as_str(), r.ts_ms))
+			.collect();
+		assert_eq!(records, [(1, "a", 7), (2, "b", 7), (3, "c", 7)]);
+		assert_eq!(results.iter().map(|r| r.revision).collect::<Vec<_>>(), [1, 1, 2]);
+		assert_eq!(s.list(""), Vec::new(), "journal records stay out of the map");
+		let restored = KvState::from_snapshot(&s.to_snapshot()).unwrap();
+		assert_eq!(restored.journal_next(), 4);
+	}
+
+	#[test]
 	fn compares_choose_branch() {
 		let mut s = KvState::default();
 		txn(&mut s, 1, vec![], vec![put("k", "v", None)]);
@@ -455,7 +521,11 @@ mod tests {
 				},
 			};
 			let mut events = Vec::new();
-			assert_eq!(s.apply(&command, &mut events)[0].succeeded, expected, "{compare:?}");
+			assert_eq!(
+				s.apply(&command, &mut events, &mut Vec::new())[0].succeeded,
+				expected,
+				"{compare:?}"
+			);
 			assert_eq!(
 				events.is_empty(),
 				expected,
@@ -493,10 +563,10 @@ mod tests {
 		txn(&mut s, 1400, vec![], vec![put("lock", "x", Some(500))]);
 		assert_eq!(s.next_expiry_ms(), Some(1900));
 		let mut events = Vec::new();
-		s.apply(&Command::Expire { now_ms: 1899 }, &mut events);
+		s.apply(&Command::Expire { now_ms: 1899 }, &mut events, &mut Vec::new());
 		assert!(events.is_empty(), "unexpected events: {events:?}");
 		let before = s.revision;
-		s.apply(&Command::Expire { now_ms: 1900 }, &mut events);
+		s.apply(&Command::Expire { now_ms: 1900 }, &mut events, &mut Vec::new());
 		assert_eq!(events, vec![WatchEvent::Delete {
 			key:      "lock".into(),
 			revision: before + 1,
@@ -512,7 +582,7 @@ mod tests {
 		txn(&mut s, 2000, vec![], vec![put("lease", "a", Some(100))]);
 		// A new leader with a lagging clock must not resurrect or extend
 		// anything.
-		s.apply(&Command::Expire { now_ms: 2100 }, &mut Vec::new());
+		s.apply(&Command::Expire { now_ms: 2100 }, &mut Vec::new(), &mut Vec::new());
 		let r = txn(&mut s, 1500, vec![Compare::Missing("lease".into())], vec![put(
 			"lease",
 			"b",
@@ -535,15 +605,22 @@ mod tests {
 			now_ms: 2,
 			txn:    Txn { success: vec![Op::DeletePrefix { prefix: "p/".into() }], ..Txn::default() },
 		};
-		s.apply(&command, &mut events);
+		s.apply(&command, &mut events, &mut Vec::new());
 		assert_eq!(events.len(), 2);
 		assert_eq!(s.list(""), vec![s.get("q").unwrap()]);
 		assert_eq!(s.next_expiry_ms(), None);
 
 		txn(&mut s, 3, vec![], vec![put("t", "", Some(5))]);
-		s.apply(&Command::SetClusterId { now_ms: 4, cluster_id: "c1".into() }, &mut Vec::new());
-		let second =
-			s.apply(&Command::SetClusterId { now_ms: 4, cluster_id: "c2".into() }, &mut Vec::new());
+		s.apply(
+			&Command::SetClusterId { now_ms: 4, cluster_id: "c1".into() },
+			&mut Vec::new(),
+			&mut Vec::new(),
+		);
+		let second = s.apply(
+			&Command::SetClusterId { now_ms: 4, cluster_id: "c2".into() },
+			&mut Vec::new(),
+			&mut Vec::new(),
+		);
 		assert!(!second[0].succeeded);
 		let restored = KvState::from_snapshot(&s.to_snapshot()).unwrap();
 		assert_eq!(restored, s);

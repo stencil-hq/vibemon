@@ -4,9 +4,11 @@
 //! Applied state lives in memory; durability comes from the snapshot file
 //! (`<data>/raft/snapshot.bin`: one JSON line of [`SnapshotMeta`], then the
 //! serialized [`KvState`]) plus log replay up to the persisted committed id.
+//! Journal records go to `<data>/raft/journal/` ([`Journal`]), made durable
+//! up to the snapshot's journal position before a snapshot is persisted.
 
 use std::{
-	fs, io,
+	fs, io, ops,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::Duration,
@@ -21,13 +23,15 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-	Entry, KvError, Range, WATCH_CAPACITY, WatchEvent,
+	Entry, KvError, Range, Record, Scan, WATCH_CAPACITY, WatchEvent,
+	journal::{Copied, Journal},
 	log_store::replace_file,
 	machine::KvState,
 	raft::{LogId, Snapshot, SnapshotMeta as Meta, StoredMembership as Membership, TypeConfig},
 };
 
 const SNAPSHOT_FILE: &str = "snapshot.bin";
+const JOURNAL_DIR: &str = "journal";
 
 /// Shared state machine handle: openraft drives it, [`super::Kv`] reads it.
 #[derive(Clone)]
@@ -42,6 +46,8 @@ struct Shared {
 	watchers: Mutex<Vec<(String, mpsc::Sender<WatchEvent>)>>,
 	/// Applied KV revision, for [`StateMachineStore::wait_revision`].
 	revision: watch::Sender<u64>,
+	/// Locked after `state` when both are held.
+	journal:  Mutex<Journal>,
 }
 
 struct AppliedState {
@@ -70,14 +76,90 @@ impl StateMachineStore {
 			Err(error) if error.kind() == io::ErrorKind::NotFound => None,
 			Err(error) => return Err(error),
 		};
+		let mut journal = Journal::open(&dir.join(JOURNAL_DIR))?;
+		journal.advance(applied.kv.journal_next())?;
 		let shared = Shared {
 			dir:      dir.to_owned(),
 			revision: watch::Sender::new(applied.kv.revision()),
 			state:    RwLock::new(applied),
 			snapshot: Mutex::new(snapshot),
 			watchers: Mutex::new(Vec::new()),
+			journal:  Mutex::new(journal),
 		};
 		Ok(Self { shared: Arc::new(shared) })
+	}
+
+	/// Records of one journal stream from the local journal.
+	///
+	/// # Errors
+	///
+	/// [`KvError::Io`] when reading the journal fails.
+	pub async fn scan(&self, scan: &Scan) -> Result<Vec<Record>, KvError> {
+		let plan = self.shared.journal.lock().plan(scan);
+		tokio::task::spawn_blocking(move || plan.run())
+			.await
+			.map_err(|error| KvError::Io(error.to_string()))?
+			.map_err(|error| KvError::Io(format!("journal: {error}")))
+	}
+
+	/// Whether the local journal holds every record (no holes left by an
+	/// installed snapshot).
+	pub fn journal_complete(&self) -> bool {
+		self.shared.journal.lock().complete()
+	}
+
+	/// Seq ranges the local journal misses and a peer may hold.
+	pub fn journal_holes(&self) -> Vec<ops::Range<u64>> {
+		self.shared.journal.lock().holes().to_vec()
+	}
+
+	/// Makes every appended journal record durable (fsync, index files), doing
+	/// the file work outside the journal lock.
+	///
+	/// # Errors
+	///
+	/// I/O errors syncing or writing index files.
+	pub async fn flush_journal(&self) -> io::Result<()> {
+		let plan = self.shared.journal.lock().flush_plan();
+		let plan = tokio::task::spawn_blocking(move || plan.run().map(|()| plan))
+			.await
+			.map_err(io::Error::other)??;
+		self.shared.journal.lock().flushed(&plan)
+	}
+
+	/// Deletes journal segments older than `cutoff_ms`; returns how many.
+	///
+	/// # Errors
+	///
+	/// I/O errors removing files.
+	pub fn prune_journal(&self, cutoff_ms: u64) -> io::Result<usize> {
+		self.shared.journal.lock().prune(cutoff_ms)
+	}
+
+	/// Inserts records a peer copied into the journal hole `hole`.
+	///
+	/// # Errors
+	///
+	/// I/O errors, or records that do not fit the hole.
+	pub fn fill_journal(&self, hole: ops::Range<u64>, copied: &Copied) -> io::Result<()> {
+		self.shared.journal.lock().fill(hole, copied)
+	}
+
+	/// Journal records of `range` for a peer filling a hole (about
+	/// `max_bytes` of values at most).
+	///
+	/// # Errors
+	///
+	/// I/O errors reading segments.
+	pub async fn copy_journal(
+		&self,
+		range: ops::Range<u64>,
+		max_bytes: usize,
+	) -> io::Result<Copied> {
+		let plan = self.shared.journal.lock().copy_plan(range);
+		tokio::task::spawn_blocking(move || plan.run(max_bytes))
+			.await
+			.map_err(io::Error::other)?
 	}
 
 	/// Whether any log entry or snapshot has been applied (this replica holds
@@ -191,6 +273,9 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
 			};
 			(meta, applied.kv.clone())
 		};
+		// Every journal record below the snapshot's position must survive a
+		// crash: log replay after the snapshot does not rewrite them.
+		self.flush_journal().await?;
 		let this = self.clone();
 		let meta2 = meta.clone();
 		let data = tokio::task::spawn_blocking(move || {
@@ -225,6 +310,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 	{
 		let entries: Vec<EntryResponder<TypeConfig>> = entries.try_collect().await?;
 		let mut events = Vec::new();
+		let mut journal = Vec::new();
 		let mut replies = Vec::with_capacity(entries.len());
 		let revision = {
 			let mut applied = self.shared.state.write();
@@ -232,7 +318,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 				applied.last_applied = Some(entry.log_id);
 				let reply = match entry.payload {
 					EntryPayload::Blank => Vec::new(),
-					EntryPayload::Normal(command) => applied.kv.apply(&command, &mut events),
+					EntryPayload::Normal(command) => {
+						applied.kv.apply(&command, &mut events, &mut journal)
+					},
 					EntryPayload::Membership(membership) => {
 						applied.membership = Membership::new(Some(entry.log_id), membership);
 						Vec::new()
@@ -242,6 +330,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 					replies.push((responder, reply));
 				}
 			}
+			self.shared.journal.lock().append(&journal)?;
 			applied.kv.revision()
 		};
 		self.shared.revision.send_replace(revision);
@@ -275,6 +364,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 			applied.kv = kv;
 			applied.last_applied = meta.last_log_id;
 			applied.membership = meta.last_membership.clone();
+			self
+				.shared
+				.journal
+				.lock()
+				.advance(applied.kv.journal_next())?;
 			(events, applied.kv.revision())
 		};
 		*self.shared.snapshot.lock() = Some((meta.clone(), data));
