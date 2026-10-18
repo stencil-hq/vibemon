@@ -1316,6 +1316,7 @@ at the requested path. The volume-content API is proxied by the driver to
 | driver role | yes | yes | no |
 | networking | TAP + NAT + egress proxy | user-net + packet filter | — |
 | CoW rootfs | block overlay + hard-linked base (any fs; overlay clones reflink on XFS/btrfs) | block overlay (clones via `fclonefileat`) | full copy (`--disk-overlay-of`) |
+| GPU passthrough (`vmon vmm --vfio-gpu`) | x86_64: whole NVIDIA GPU on `vfio-pci` or SR-IOV vGPU VF, direct boot, cold boot only (no pause/snapshot/fork) | — | — |
 
 ## 12. Verification
 

@@ -18,7 +18,8 @@ const DEFAULT_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 pub const MAX_COUNT: u32 = 32;
 pub const MAX_CPUS: u8 = 64;
 pub const MAX_MEM_MIB: usize = 64 * 1024;
-/// Maximum NVIDIA vGPU virtual functions assignable to one guest.
+/// Maximum NVIDIA GPU functions (whole GPUs or vGPU VFs) assignable to one
+/// guest.
 pub const MAX_VFIO_GPUS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -137,7 +138,8 @@ pub struct Config {
 	pub mac: [u8; 6],
 	/// virtio transport (`mmio` everywhere, `pci` on `x86_64` only).
 	pub transport: Transport,
-	/// Pre-created NVIDIA SR-IOV vGPU virtual functions assigned through VFIO.
+	/// NVIDIA GPU functions assigned through VFIO: whole GPUs bound to vfio-pci
+	/// or SR-IOV vGPU virtual functions with a pre-created profile.
 	#[cfg_attr(
 		not(all(target_os = "linux", target_arch = "x86_64")),
 		allow(dead_code, reason = "VFIO assignment exists only on x86_64 Linux")
@@ -359,11 +361,12 @@ struct CliArgs {
 	#[arg(long, value_name = "KIND", value_parser = parse_transport, default_value = "mmio")]
 	transport: Transport,
 
-	/// Pre-created NVIDIA SR-IOV vGPU VF sysfs path; repeatable
+	/// NVIDIA GPU sysfs path (/sys/bus/pci/devices/DDDD:BB:DD.F): a whole GPU
+	/// bound to vfio-pci or an SR-IOV vGPU VF with a profile; repeatable
 	#[arg(long = "vfio-gpu", value_name = "SYSFS")]
 	vfio_gpus: Vec<PathBuf>,
 
-	/// Stable VM UUID required by NVIDIA vGPU guests
+	/// Stable VM UUID (SMBIOS system UUID); required with --vfio-gpu
 	#[arg(long, value_name = "UUID", value_parser = parse_uuid)]
 	vm_uuid: Option<[u8; 16]>,
 
@@ -877,7 +880,8 @@ impl Config {
 			for path in &cli.vfio_gpus {
 				if !path.is_absolute() || !path.starts_with("/sys/bus/pci/devices") {
 					bail!(
-						"--vfio-gpu must name an absolute SR-IOV VF under /sys/bus/pci/devices (got {})",
+						"--vfio-gpu must name an absolute PCI function under /sys/bus/pci/devices (got \
+						 {})",
 						path.display()
 					);
 				}

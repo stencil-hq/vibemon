@@ -1,4 +1,5 @@
-//! Minimal SMBIOS identity table used by NVIDIA vGPU guests.
+//! Minimal SMBIOS identity table carrying the stable VM UUID for assigned
+//! NVIDIA GPUs.
 
 use vm_memory::{Bytes, GuestAddress};
 

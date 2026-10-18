@@ -1376,7 +1376,7 @@ fn machine_info(vmm: &Vmm) -> MachineInfo {
 				.iter()
 				.map(|device| device_kind_name(device.kind))
 				.collect::<Vec<_>>();
-			devices.extend(std::iter::repeat_n("nvidia-vgpu", vmm.vfio_devices.len()));
+			devices.extend(std::iter::repeat_n("nvidia-gpu", vmm.vfio_devices.len()));
 			devices
 		}
 		#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -2319,7 +2319,7 @@ impl Vmm {
 			let assigned = attach_gpu_devices(preopened, vm.clone(), &mut resources)?;
 			for gpu in &assigned {
 				if pci_slot >= 32 {
-					return Err(err("NVIDIA vGPU exhausted guest PCI slots"));
+					return Err(err("VFIO GPUs exhausted guest PCI slots"));
 				}
 				let function: Arc<dyn PciFunction> = gpu.clone();
 				pci_root
@@ -3270,7 +3270,7 @@ impl Vmm {
 		}
 		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		if !self.vfio_devices.is_empty() {
-			return Err(err("pause is not supported while an NVIDIA vGPU is attached"));
+			return Err(err("pause is not supported while a VFIO GPU is attached"));
 		}
 
 		// Reset the parked counter BEFORE publishing Paused: a vCPU only bumps
@@ -3645,7 +3645,7 @@ impl Vmm {
 	fn snapshot(&self, dir: &Path, name: &str, base: Option<&str>, track: bool) -> Result<()> {
 		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		if !self.vfio_devices.is_empty() {
-			return Err(err("full VM snapshots are not supported while an NVIDIA vGPU is attached"));
+			return Err(err("full VM snapshots are not supported while a VFIO GPU is attached"));
 		}
 		match self.gate.state() {
 			RunState::Stopping => return Err(err("snapshot failed: VM is stopping")),
@@ -3849,7 +3849,7 @@ impl Vmm {
 		#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 		for gpu in &self.vfio_devices {
 			if gpu.stop_interrupts().is_err() && join_error.is_none() {
-				join_error = Some("NVIDIA vGPU interrupt shutdown failed");
+				join_error = Some("VFIO GPU interrupt shutdown failed");
 			}
 		}
 		let _ = self.worker_kill_evt.write(1);
