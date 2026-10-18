@@ -468,7 +468,7 @@ addresses) or revives, not when a route switches.
 
 | Key | Value (JSON) | Writer | Purpose |
 |---|---|---|---|
-| `sbx/<sandboxID>` | `SandboxRoute` | driver | Live catalog: node, team, state, endAt, ingress settings. Present for `running`, `pausing`, `resuming`, `snapshotting` (`killing` only in routes left by older drivers; the reconciler finishes those kills). Absent when paused/killed. |
+| `sbx/<sandboxID>` | `SandboxRoute` | driver | Live catalog: node, team, state, endAt, ingress settings. Present for `running`, `pausing`, `resuming`, `snapshotting`, `migrating` (`killing` only in routes left by older drivers; the reconciler finishes those kills). Absent when paused/killed. |
 | `team/<teamID>/sbx/<sandboxID>` | `""` | driver | Admission index (`CountBelow`) for concurrent-sandbox limits. |
 | `lock/<name>` | holder (NodeId, `lock/sbx/*`: `<NodeId>/<uuid>` per operation) | driver | TTL leases (`Missing` + `Put{ttl}`, released with `Value` compare): per-sandbox ops (`lock/sbx/<id>`, 60 s, renewed every 20 s), build supervision (`lock/build/<id>`). A TTL runs from the leader's clock at proposal, so renewals are scheduled from the previous write's proposal (not its reply), and a renewal that finds its lease expired re-takes it if no other holder has (a lapse under slow commits is not a takeover). |
 | `art/<buildID>/<nodeID>` | `ArtifactInfo` | driver (from node reports) | Which nodes hold a build's artifacts (rootfs, snapshot, cpu baseline). |
@@ -487,7 +487,7 @@ pub struct SandboxRoute { pub team_id: String, pub node_id: NodeId, pub template
     pub auto_pause: bool, pub auto_resume: bool, pub allow_public_traffic: bool,
     pub traffic_token: Option<String>, pub mask_request_host: Option<String>,
     pub https_ports: Vec<u16>, pub vcpus: u32, pub memory_mb: u64, pub envd_version: String }
-pub enum RouteState { Running, Pausing, Resuming, Killing, Snapshotting }
+pub enum RouteState { Running, Pausing, Resuming, Killing, Snapshotting, Migrating }
 ```
 
 `SandboxRoute` and `ArtifactInfo` are defined in `node::api` (shared DTO module).
@@ -659,6 +659,7 @@ paused/<sandboxID>/           snapshot/ (+ base/ when it is a delta) + rootfs.im
 paused/<sandboxID>.upload/    staging of a running object-store upload (meta.json, boot-init.json, rootfs.blk, rootfs.blk.json)
                               (a lazily resumed sandbox's dir holds instead: rootfs.img (remote sector overlay), rootfs.cache,
                               rootfs.blk.json, rootfs.remote.json, pages/ (Linux page caches))
+paused/<sandboxID>.adopt/     staging of a running handover adoption (paused/…, console.log, metrics.jsonl; swept at node start)
 volumes/<volumeID>/           volume contents (or --volumes-dir on shared storage)
 gpu-quarantine.json           GPUs that need a host reboot ({bootId, gpus: {address: sandbox}}; ignored after a host reboot)
 ```
@@ -796,6 +797,40 @@ under the 104-byte macOS `sun_path` limit.
   I/O errors); a node restart orphans a Linux page server (the adopted VM
   dies on its next remote page fault); block fetches stall the VM's shared
   device worker for their duration.
+- Handover (`node::sandbox::handover`; offline migration, the driver's
+  drain): the source pauses with `PauseSandbox.handover` — a normal pause
+  that never starts the object-store upload — and serves the committed state:
+  `GET /sandboxes/{id}/handover` (waits for the commit under the operation
+  lock; 409 unless paused and committed) lists every regular file under
+  `paused/<id>/` except `committed` and dot/`*.tmp` files, as `paused/…`, plus
+  `console.log` and `metrics.jsonl`, each as an `ArtifactFile` (extents +
+  extent digest). A file that is the same inode as a file of the sandbox's
+  build (the template RAM base under `base/`, the raw disk base
+  `rootfs.img.base`) takes the build manifest's entry and names it as
+  `build_file`; the rest is hashed. The manifest is cached on the sandbox
+  until the next pause or until a listed file changes (device, inode, size,
+  mtime). `GET /sandboxes/{id}/handover/{path}` streams a listed file's
+  extents. The target (`POST /sandboxes/{id}/adopt`, `AdoptSandbox{meta,
+  source, artifact_sources}`; 409 if it knows the sandbox; runs to completion
+  like resume) pulls the manifest from `source`, makes sure it holds the
+  build (fetched from `artifact_sources`; on failure everything comes from
+  the source), and stages every file in `paused/<id>.adopt/`: a `build_file`
+  whose local copy holds the same content is hard-linked from
+  `builds/<buildID>/` (an identical manifest entry, else
+  `sparse::matches`: the local file read at the source's extents hashes to
+  its digest and is zero elsewhere — nodes' copies of a build differ in
+  holes, and a regenerated snapshot differs in content), everything else
+  fetched sparse and
+  digest-verified (paths outside `paused/…` and the two logs are rejected
+  before anything is written). It then replaces `sandboxes/<id>/` with the
+  driver's `meta` and the logs, moves the state to `paused/<id>/`, and
+  commits it (`committed` last). It never uploads to the object store; any
+  failure removes the staging, sandbox and paused dirs (peer failures answer
+  502 `unreachable`, digest mismatches 500 `internal`). A plain resume then
+  boots the local state. Once the driver moved route and record,
+  `DELETE /sandboxes/{id}/paused` on the source deletes only its paused copy
+  (paused dir, upload staging, lazy files; console/metrics stay as after a
+  kill) and forgets the sandbox, leaving KV records and objects alone.
 - Snapshot-as-template (E2B `POST /sandboxes/{id}/snapshots`) = pause +
   snapshot + resume of the source, then the snapshot dir and a frozen rootfs
   overlay clone (with its base link) become `builds/<newBuildID>/`.
@@ -1012,8 +1047,12 @@ DTOs in `node::api` (serde, camelCase). Client: `node::client::NodeClient`.
 | GET | `/sandboxes` | → `Vec<SandboxInfo>` |
 | GET | `/sandboxes/{id}` | → `SandboxInfo` |
 | DELETE | `/sandboxes/{id}` | kill + delete paused state (teardown continues after the reply) → 204 |
-| POST | `/sandboxes/{id}/pause` | `PauseSandbox{memory}` → `SandboxInfo` |
+| POST | `/sandboxes/{id}/pause` | `PauseSandbox{memory, handover?}` → `SandboxInfo` (`handover`: no object-store upload; a peer adopts the state) |
 | POST | `/sandboxes/{id}/resume` | `ResumeSandbox` → `SandboxInfo` |
+| POST | `/sandboxes/{id}/adopt` | `AdoptSandbox{meta, source, artifactSources}` → `SandboxInfo` (paused); pulls `source`'s paused state (§8.2 Handover); 409 if known, 502 `unreachable` (source failed) |
+| GET | `/sandboxes/{id}/handover` | → `HandoverManifest{buildId, files:[{path,size,sha256,extents,buildFile?}]}`; 409 unless paused and committed |
+| GET | `/sandboxes/{id}/handover/{path}` | stream a manifest file's extents, concatenated; 404 for unlisted paths |
+| DELETE | `/sandboxes/{id}/paused` | drop this node's paused copy and forget the sandbox (no KV/object-store changes) → 204; 409 if running |
 | POST | `/sandboxes/{id}/deadline` | `{endAtMs}` → 204 |
 | PUT | `/sandboxes/{id}/network` | `NetworkPolicy` → 204 |
 | POST | `/sandboxes/{id}/snapshot` | `SnapshotSandbox{buildId}` → `ArtifactInfo` |
@@ -1284,7 +1323,9 @@ served at `/dashboard/` on the public listeners):
 
 Candidates: gossip members with `roles.node`, `Alive`, not draining/unhealthy,
 matching required features (egress features, volume locality), `arch`
-matching the build artifact when a snapshot must be reused. Score: free
+matching the build artifact when a snapshot must be reused, and `backend` +
+`cpu_baseline` when a running guest's memory must restore (migration;
+`PlacementRequest` fields, empty = any). Score: free
 vCPU/memory headroom, +bonus when the node already has the build's artifacts
 (`art/<build>/*` in KV), −inflight creates. Power-of-two-choices among the
 top candidates; on `busy`/failure retry the next (max 3).
@@ -1317,7 +1358,57 @@ stateDiagram-v2
   Paused --> [*]: kill (node kill, store state=killed)
   Running --> Snapshotting: snapshots / fork
   Snapshotting --> Running
+  Running --> Migrating: admin migrate / evacuator (draining node)
+  Migrating --> Running: target resumed (route + node_id moved) or rolled back to the source
+  Migrating --> Paused: rollback resume failed (stays paused on the source)
+  Paused --> Paused: migrate node-local pause (node_id moved)
 ```
+
+**Migration** (`lifecycle::migrate`, offline, snapshot-based; `POST
+/admin/sandboxes/{id}/migrate` with optional `{"nodeID"}`, and the
+evacuator): under the sandbox lock the target is the requested node or a
+placed one — excluding the source, with the source's `arch`, `backend`, and
+`cpu_baseline`, the egress features, the node-local volume pin (a volume
+pinned to the source makes it unplaceable), and the route's vCPUs/memory;
+the build's holders give the artifact bonus. The route goes `migrating`
+(still the source), `paused/<id>/owner` is deleted (a restarted source must
+not publish), the source pauses with `PauseSandbox{memory, handover}`
+(node-local, no upload), the target `POST /sandboxes/{id}/adopt`s it
+(`SandboxMeta` with the route's `endAt` and the envd token, `source`,
+build holders as `artifact_sources`: §8.5) and resumes it with the same
+deadline. One KV transaction guarded by the lock value
+(`SandboxLock::fence`) then writes the route `running` on the target and
+the row's `node_id` (state still `running`; same execution, no event);
+deadline changes all take the lock, so the route's `endAt` cannot move
+meanwhile. Only then does the source `DELETE /sandboxes/{id}/paused` (a
+failure is logged; the reconciler kills the stale copy). A failed adopt or
+resume drops the target's copy and resumes the source from its handover
+pause (route back to `running`); if that fails too the sandbox stays paused
+on the source (row paused, route removed, `paused` event). A paused row
+whose alive holder has no published `paused/<id>/remote` (published → 409)
+moves the same way without a resume: adopt, then one fenced txn sets
+`node_id` and deletes `paused/<id>/owner`, then the old holder drops its
+copy. Same ID, guest processes, and memory survive; ingress waits on
+`migrating` like `resuming`, in-flight connections (GC4 tunnels on the
+source) drop. An unlocked `migrating` route (its driver died) is never
+killed as abandoned: the reaper and the reconciler first ask its node —
+running → route `running`; paused → resumed there (else left paused);
+`not_found` → orphan-killed; unreachable → retried — and the target's
+stray copy is killed by the listed-VM pass.
+
+**GPU sandboxes** (`SandboxRow.gpus > 0`) cannot snapshot memory (the VMM
+refuses `--vfio-gpu` with restore/fork; the node answers
+`gpu_memory_snapshot` to a memory pause or snapshot, which the driver never
+sends). `limits::captures_memory` turns every pause (API, reaper
+`autoPause`, the reconciler's re-pause) and every snapshot (named, fork)
+into a filesystem-only one, leaving the stored `autoPauseMemory` /
+`autoResume` flags as requested. Creates and resumes set `cold_boot` and
+carry `gpus`; a resume boots the paused disk on its holder (or, with a
+published generation, on a node placed with the GPU filter) and
+re-reserves GPUs there — 503 `sandbox_capacity_unavailable` while they are
+held. Fork children cold-boot from the filesystem-only fork build on the
+source's node with the source's GPU count. Migration refuses GPU sandboxes
+(400), so the evacuator leaves them on a draining node.
 
 Resume of a paused sandbox prefers its holder while it is alive (the
 holder still gets `paused/<id>/remote`, in case it lost its local copy).
@@ -1342,7 +1433,12 @@ so a client timeout never strands an admission slot, a transitional route,
 or a hidden fork template. The raft-leader driver runs:
 the **reaper** (every 1 s: routes past `endAtMs` → pause or kill; a route
 still in a transitional state with its lock free was abandoned by a dead
-driver → kill), the
+driver → kill, except `migrating`, which is recovered first), the
+**evacuator** (every 5 s: on alive nodes that are draining — admin status
+or gossip flag — migrates unlocked running routes with more than 60 s
+left and, on nodes without the `object-store` feature, node-local paused
+sandboxes; at most 2 concurrent migrations per node, 60 s in-memory backoff
+per sandbox after a failure), the
 **reconciler** (every 10 s, in its own task so a pass stalled on the store never
 delays the reaper; a sandbox whose repair fails is logged and retried next
 pass: compare node `GET /sandboxes` with KV routes; routes
@@ -1353,7 +1449,9 @@ does not list counts as lost too (younger ones may still be booting even if
 their create lock lapsed); running rows without a route, unlocked and
 started over 2 min ago, are marked killed; VMMs a node reports without a route on that node are killed, except
 a running VM whose row is paused on that node — a resume whose reply was
-lost — which is paused again; a failed resume call itself first asks the
+lost — which is paused again, and a paused VM whose route still names that
+node (an interrupted migration's source pause); an unlocked `migrating`
+route on an alive node is recovered as in **Migration**; a failed resume call itself first asks the
 node whether the sandbox runs and then keeps it), and
 **housekeeping** (every 60 s: snapshot builds stuck in `building` and fork
 templates not retired for 30 min — their driver died — are failed/retired;
@@ -1404,7 +1502,10 @@ no data, no error until the sandbox runs again, is killed, or 620 s pass), so
 the SDKs' health probe after a failed stream does not auto-resume the
 sandbox right after a pause; dial retry (5 × 100–400 ms);
 502 bodies `The sandbox was not found` / `The sandbox is running but port is
-not open`; CORS.
+not open`; CORS. A `migrating` route is waited out like `resuming` (up to
+60 s, then the transitioning error) and holds broken responses; a
+migration ends the source's GC4 tunnels, so in-flight connections drop and
+new ones reach the target.
 
 ### 9.6 Volumes
 

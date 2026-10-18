@@ -11,7 +11,7 @@ use axum::{
 	extract::{FromRef, Path, Query, Request, State},
 	http::{StatusCode, header},
 	response::{IntoResponse, Response},
-	routing::{get, post, put},
+	routing::{delete, get, post, put},
 };
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
@@ -19,9 +19,11 @@ use vmon_cluster::{Cluster, NodeId};
 
 use crate::{
 	api::{
-		ArtifactInfo, CreateSandbox, Deadline, ErrorBody, LogEntry, LogQuery, MetricSample,
-		NetworkPolicy, PauseSandbox, ResumeSandbox, SandboxInfo, SnapshotSandbox, TUNNEL_UPGRADE,
+		AdoptSandbox, ArtifactInfo, CreateSandbox, Deadline, ErrorBody, HandoverManifest, LogEntry,
+		LogQuery, MetricSample, NetworkPolicy, PauseSandbox, ResumeSandbox, SandboxInfo,
+		SnapshotSandbox, TUNNEL_UPGRADE,
 	},
+	artifacts::sparse,
 	gc4::{ConnectError, DATA_CHUNK},
 	sandbox::SandboxManager,
 };
@@ -68,6 +70,11 @@ impl ApiError {
 	/// 503 `busy` (no capacity; the driver retries another node).
 	pub fn busy(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message)
+	}
+
+	/// 502 `unreachable` (a peer node or the guest agent failed).
+	pub fn unreachable(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::BAD_GATEWAY, "unreachable", message)
 	}
 
 	/// 500 `internal` from any error (full context chain in the message).
@@ -159,6 +166,10 @@ pub fn sandbox_routes(manager: Arc<SandboxManager>, peers: Peers) -> Router {
 		.route("/sandboxes/{id}", get(get_one).delete(kill))
 		.route("/sandboxes/{id}/pause", post(pause))
 		.route("/sandboxes/{id}/resume", post(resume))
+		.route("/sandboxes/{id}/adopt", post(adopt))
+		.route("/sandboxes/{id}/paused", delete(drop_paused))
+		.route("/sandboxes/{id}/handover", get(handover_manifest))
+		.route("/sandboxes/{id}/handover/{*path}", get(handover_file))
 		.route("/sandboxes/{id}/deadline", post(deadline))
 		.route("/sandboxes/{id}/network", put(network))
 		.route("/sandboxes/{id}/snapshot", post(snapshot))
@@ -211,7 +222,7 @@ async fn pause(
 	Path(id): Path<String>,
 	Json(req): Json<PauseSandbox>,
 ) -> Result<Json<SandboxInfo>, ApiError> {
-	Ok(Json(manager.pause(&id, req.memory).await?))
+	Ok(Json(manager.pause(&id, &req).await?))
 }
 
 async fn resume(
@@ -220,7 +231,52 @@ async fn resume(
 	Path(id): Path<String>,
 	Json(req): Json<ResumeSandbox>,
 ) -> Result<Json<SandboxInfo>, ApiError> {
-	Ok(Json(detached(async move { manager.resume(&id, req).await }).await?))
+	let sources = peers.urls(&req.artifact_sources);
+	Ok(Json(detached(async move { manager.resume(&id, req, &sources).await }).await?))
+}
+
+async fn adopt(
+	State(manager): Manager,
+	State(peers): State<Peers>,
+	Path(id): Path<String>,
+	Json(req): Json<AdoptSandbox>,
+) -> Result<Json<SandboxInfo>, ApiError> {
+	let source = peers.urls(&[req.source]).pop().ok_or_else(|| {
+		ApiError::unreachable(format!("source node {} is unknown to gossip", req.source))
+	})?;
+	let sources = peers.urls(&req.artifact_sources);
+	let adopted =
+		detached(async move { manager.adopt_paused(&id, req.meta, &source, &sources).await });
+	Ok(Json(adopted.await?))
+}
+
+async fn drop_paused(
+	State(manager): Manager,
+	Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+	manager.drop_paused(&id).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+async fn handover_manifest(
+	State(manager): Manager,
+	Path(id): Path<String>,
+) -> Result<Json<HandoverManifest>, ApiError> {
+	Ok(Json(HandoverManifest::clone(&*manager.handover_manifest(&id).await?)))
+}
+
+/// Streams exactly the manifest entry's data extents, in order.
+async fn handover_file(
+	State(manager): Manager,
+	Path((id, path)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+	let (file, extents) = manager.handover_file(&id, &path).await?;
+	let len: u64 = extents.iter().map(|extent| extent[1]).sum();
+	Response::builder()
+		.header(header::CONTENT_TYPE, "application/octet-stream")
+		.header(header::CONTENT_LENGTH, len)
+		.body(axum::body::Body::from_stream(sparse::read_extents(file, extents)))
+		.map_err(ApiError::internal)
 }
 
 async fn deadline(
@@ -299,9 +355,7 @@ async fn tunnel(
 			"port_closed",
 			format!("port {port} is not open in sandbox {id}"),
 		),
-		ConnectError::Failed(message) => {
-			ApiError::new(StatusCode::BAD_GATEWAY, "unreachable", message)
-		},
+		ConnectError::Failed(message) => ApiError::unreachable(message),
 	})?;
 	let upgrade = hyper::upgrade::on(&mut request);
 	tokio::spawn(async move {

@@ -1,17 +1,18 @@
 //! Driver-side sandbox lifecycle (ARCHITECTURE.md §9.4).
 //!
 //! Create (admission, placement, node create), kill, pause, resume/connect,
-//! timeouts, network updates, snapshots, and forks. Every transition of an
-//! existing sandbox runs under `lock/sbx/<id>`.
+//! timeouts, network updates, snapshots, forks, and migrations. Every
+//! transition of an existing sandbox runs under `lock/sbx/<id>`.
 //!
 //! Live sandboxes have a KV route (`sbx/<id>`); paused sandboxes have a
 //! store record (`state='paused'`, `node_id` = holder of the paused state) and,
 //! with an object store, a portable generation at `paused/<id>/remote` that
-//! lets another node resume them. The raft leader runs the reaper and
-//! reconciler ([`spawn_background`]).
+//! lets another node resume them. The raft leader runs the reaper,
+//! reconciler, and evacuator ([`spawn_background`]).
 
 mod background;
 pub mod limits;
+mod migrate;
 pub mod network;
 pub mod routes;
 pub mod s3mounts;
@@ -38,7 +39,10 @@ use vmon_node::{
 	sandbox::SandboxMeta,
 };
 
-pub use self::background::spawn_background;
+pub use self::{
+	background::spawn_background,
+	migrate::{Migrated, migrate},
+};
 use self::{
 	limits::{LifecycleFlags, clamp_end, extend_end, max_length_ms, timeout_end},
 	network::{Ingress, NetworkConfig, NetworkUpdate, egress_policy, required_features},
@@ -786,6 +790,7 @@ const fn route_state_name(state: RouteState) -> &'static str {
 		RouteState::Resuming => "resuming",
 		RouteState::Killing => "killing",
 		RouteState::Snapshotting => "snapshotting",
+		RouteState::Migrating => "migrating",
 	}
 }
 
@@ -794,6 +799,7 @@ fn transition_conflict(id: &str, state: RouteState) -> ApiError {
 		RouteState::Killing => format!("Sandbox \"{id}\" is being killed"),
 		RouteState::Pausing => format!("Sandbox \"{id}\" is being paused"),
 		RouteState::Snapshotting => format!("Sandbox \"{id}\" is being snapshotted"),
+		RouteState::Migrating => format!("Sandbox \"{id}\" is being migrated"),
 		other => format!("Sandbox \"{id}\" is in {} state", route_state_name(other)),
 	};
 	ApiError::conflict(message)
@@ -1014,7 +1020,10 @@ async fn pause_locked(state: &AppState, id: &str, current: Current, memory: bool
 	let mut pausing = route.clone();
 	pausing.state = RouteState::Pausing;
 	put_route(kv, id, &pausing).await?;
-	if let Err(error) = client.pause_sandbox(id, &PauseSandbox { memory }).await {
+	if let Err(error) = client
+		.pause_sandbox(id, &PauseSandbox { memory, handover: false })
+		.await
+	{
 		put_route(kv, id, &route).await?;
 		if error.code() == "busy" {
 			return Err(ApiError::unavailable(format!(
@@ -1762,11 +1771,25 @@ pub(crate) async fn expire(state: &AppState, id: &str) -> ApiResult<()> {
 		return Ok(());
 	};
 	let result = async {
-		let current = current(state, None, id).await?;
+		let mut current = current(state, None, id).await?;
+		if current
+			.route
+			.as_ref()
+			.is_some_and(|route| route.state == RouteState::Migrating && route.end_at_ms <= now_ms())
+		{
+			// A migration whose driver died: settle it where the state is first.
+			migrate::recover_locked(state, id).await?;
+			current = self::current(state, None, id).await?;
+		}
 		let Some(route) = current.route.as_ref() else {
 			return Ok(());
 		};
 		if route.end_at_ms > now_ms() {
+			return Ok(());
+		}
+		if route.state == RouteState::Migrating {
+			// Its node did not answer: recovery is retried, it is never killed as
+			// abandoned.
 			return Ok(());
 		}
 		if route.state != RouteState::Running {

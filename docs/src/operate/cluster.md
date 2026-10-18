@@ -69,7 +69,7 @@ Node status combines gossip liveness with an admin override stored in KV (`node/
 | Status | Meaning | New sandboxes and builds |
 |---|---|---|
 | `ready` | Alive, no override. | yes |
-| `draining` | Admin override. | no |
+| `draining` | Admin override (or announced by the node); the raft leader migrates its sandboxes to other nodes. | no |
 | `unhealthy` | Admin override, or gossip `Dead`. | no |
 | `connecting` | Gossip `Suspect`. | no (placement uses `Alive` members only) |
 | `shutting_down` | Gossip `Left`. | no |
@@ -82,7 +82,7 @@ curl -X POST "https://api.$DOMAIN/nodes/$NODE_ID" \
   -d '{"status": "draining"}'        # 204; "ready" removes the override
 ```
 
-Only `ready`, `draining`, and `unhealthy` can be set. Other values get 400, and an unknown node gets 404. A draining node keeps running its sandboxes. With an object store, resumes of sandboxes that were paused on it move to other nodes. Without one, a node-local pause can only resume on the node that holds it. For the operator workflow, see [Administration](admin.md).
+Only `ready`, `draining`, and `unhealthy` can be set. Other values get 400, and an unknown node gets 404. While a node is draining and alive, the raft leader evacuates it every 5 s: it migrates the node's running sandboxes that have more than a minute left (two at a time per node) to compatible ready nodes — same architecture, backend, and CPU baseline, enough capacity, the needed features, no volume pin to the draining node. The migration pauses the sandbox on the draining node, the target pulls the paused state directly from it over the cluster listener (only written disk extents and dirtied memory; template files the target already has are linked, not transferred), resumes it with the same ID, and the route moves; connections open during the move drop. A sandbox without a compatible node stays and is retried after a minute. Paused sandboxes held only on the draining node (no object store) are moved the same way and stay paused; with an object store, their background upload already lets any compatible node resume them. `unhealthy` stops placements without evacuating. For the operator workflow, see [Administration](admin.md#draining-a-node).
 
 ## Failure handling
 

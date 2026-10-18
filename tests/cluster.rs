@@ -8,15 +8,19 @@
 //! - a template builds on a node; sandboxes created through one driver are
 //!   reachable (envd exec + files over ingress) through the other two, and the
 //!   KV route reads the same on every driver;
-//! - draining the builder places the next sandbox on the other node (peer
-//!   artifact fetch);
+//! - draining the builder evacuates its sandbox to the other node and places
+//!   the next sandbox there (peer artifact fetch); an explicit migration moves
+//!   the sandbox back;
 //! - SIGKILL of the raft leader: a new leader is elected, the API keeps
 //!   answering on the survivors, and the new leader's reaper still enforces
 //!   timeouts; the restarted driver rejoins without a second bootstrap;
 //! - SIGKILL of a node: its sandboxes become killed (store + events), placement
 //!   avoids it, and its restart kills the orphaned VMM;
 //! - SIGTERM + restart of a node (gossip `Left`): its sandboxes survive and are
-//!   adopted.
+//!   adopted;
+//! - handover: `POST /admin/sandboxes/{id}/migrate` moves a running sandbox to
+//!   the other node with its guest processes, memory and files, and draining a
+//!   node evacuates its running and node-local paused sandboxes.
 //!
 //! Environment: `VMON_KERNEL`, `VMON_AGENT` (default
 //! `target/test-assets/{Image,vmon-agent}-<arch>`), `VMON_CLUSTER_NET` (`--net`
@@ -395,6 +399,77 @@ impl Cluster {
 			.cloned()
 	}
 
+	/// Starts a detached guest loop that rewrites `/tmp/<tag>-counter` every
+	/// second and returns its identity (pid and kernel start time), which only
+	/// a memory restore of the same guest preserves.
+	async fn start_counter(&self, via: &str, sandbox: &Sandbox, tag: &str) -> String {
+		let (identity, code) = self
+			.exec(
+				via,
+				sandbox,
+				&format!(
+					"nohup /bin/sh -c 'i=0; while :; do i=$((i+1)); printf \"%s\\n\" \"$i\" > \
+					 /tmp/{tag}-counter.next; mv /tmp/{tag}-counter.next /tmp/{tag}-counter; sleep 1; \
+					 done' {tag}-loop </dev/null >/tmp/{tag}.log 2>&1 & pid=$!; echo \"$pid\" > \
+					 /tmp/{tag}-pid; while [ ! -s /tmp/{tag}-counter ]; do sleep 0.1; done; kill -0 \
+					 \"$pid\" && printf '%s\\n' \"$pid\" && awk '{{print $22}}' /proc/$pid/stat"
+				),
+			)
+			.await;
+		assert_eq!(code, 0, "start {tag} loop: {identity:?}");
+		assert_eq!(identity.lines().count(), 2, "pid and kernel process start time");
+		identity
+	}
+
+	/// The identity of `start_counter`'s loop while it still runs.
+	async fn counter_identity(&self, via: &str, sandbox: &Sandbox, tag: &str) -> (String, i64) {
+		self
+			.exec(
+				via,
+				sandbox,
+				&format!(
+					"pid=$(cat /tmp/{tag}-pid); kill -0 \"$pid\" && printf '%s\\n' \"$pid\" && awk \
+					 '{{print $22}}' /proc/$pid/stat"
+				),
+			)
+			.await
+	}
+
+	/// Waits until `start_counter`'s loop counts past its current value.
+	async fn counter_advances(&self, via: &str, sandbox: &Sandbox, tag: &str) {
+		let read = format!("cat /tmp/{tag}-counter");
+		let (now, code) = self.exec(via, sandbox, &read).await;
+		assert_eq!(code, 0, "{tag} counter: {now:?}");
+		let now: u64 = now.trim().parse().unwrap();
+		self
+			.wait_for(&format!("{tag} loop makes progress"), Duration::from_secs(10), || async {
+				let (next, code) = self.exec(via, sandbox, &read).await;
+				code == 0 && next.trim().parse::<u64>().is_ok_and(|next| next > now)
+			})
+			.await;
+	}
+
+	/// Sets a node's operator status (`ready`, `draining`, `unhealthy`) via d1.
+	async fn set_node_status(&self, node: &str, status: &str) {
+		let (code, body) = self
+			.api(
+				"d1",
+				reqwest::Method::POST,
+				&format!("/nodes/{}", self.get(node).node_id()),
+				Some(json!({"status": status})),
+			)
+			.await;
+		assert_eq!(code, 204, "{node} -> {status}: {body}");
+	}
+
+	/// `GET /admin/sandboxes?id=` item of a running or paused sandbox.
+	async fn listed(&self, via: &str, sandbox: &str) -> Option<Value> {
+		let (_, list) = self
+			.api(via, reqwest::Method::GET, &format!("/admin/sandboxes?id={sandbox}"), None)
+			.await;
+		list.as_array()?.first().cloned()
+	}
+
 	/// Sandbox IDs the node's own API reports (`None` while unreachable).
 	async fn node_inventory(&self, node: &str) -> Option<Vec<String>> {
 		let resp = self
@@ -634,17 +709,16 @@ async fn distributed_topology_survives_driver_and_node_failures() {
 	eprintln!("[ingress] {} on {builder}: exec/files via d1,d2,d3 ok; KV route identical", s1.id);
 
 	// Drain the builder: the next sandbox lands on the other node (artifact
-	// fetched from the builder), then the builder is ready again.
-	let builder_id = c.get(&builder).node_id();
-	let (status, _) = c
-		.api(
-			"d3",
-			reqwest::Method::POST,
-			&format!("/nodes/{builder_id}"),
-			Some(json!({"status": "draining"})),
-		)
-		.await;
-	assert_eq!(status, 204);
+	// fetched from the builder), then the builder is ready again. Draining
+	// also evacuates s1, so wait for the node to be empty first.
+	c.set_node_status(&builder, "draining").await;
+	c.wait_for("builder evacuated", Duration::from_mins(5), || async {
+		c.node_inventory(&builder)
+			.await
+			.is_some_and(|ids| ids.is_empty())
+	})
+	.await;
+	assert_eq!(c.node_of("d2", &s1).await, other, "draining evacuates running sandboxes");
 	let started = Instant::now();
 	let s2 = c.create("d3", 600).await;
 	assert_eq!(c.node_of("d3", &s2).await, other, "draining node is skipped");
@@ -653,16 +727,22 @@ async fn distributed_topology_survives_driver_and_node_failures() {
 		s2.id,
 		started.elapsed()
 	);
-	let (status, _) = c
+	c.set_node_status(&builder, "ready").await;
+	assert_eq!(c.exec("d1", &s2, "echo hi").await, ("hi\n".to_owned(), 0));
+
+	// The failure cases below need s1 on the builder again.
+	let (status, moved) = c
 		.api(
-			"d3",
+			"d2",
 			reqwest::Method::POST,
-			&format!("/nodes/{builder_id}"),
-			Some(json!({"status": "ready"})),
+			&format!("/admin/sandboxes/{}/migrate", s1.id),
+			Some(json!({"nodeID": c.get(&builder).node_id()})),
 		)
 		.await;
-	assert_eq!(status, 204);
-	assert_eq!(c.exec("d1", &s2, "echo hi").await, ("hi\n".to_owned(), 0));
+	assert_eq!(status, 200, "migrate back: {moved}");
+	assert_eq!(c.node_of("d1", &s1).await, builder);
+	assert_eq!(c.exec("d3", &s1, "cat /tmp/hello.txt").await, ("written via d2".to_owned(), 0));
+	let reference = c.route("d1", &s1.id, true).await.unwrap().unwrap();
 
 	// Leader failover: kill the raft leader; the survivors elect a new one,
 	// keep serving, and the new leader's reaper enforces a short timeout.
@@ -889,20 +969,7 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 	// A real, detached guest process keeps a counter in shell memory. Neither
 	// the command nor its counter is part of template initialization: a cold
 	// boot cannot satisfy the process identity and post-resume progress checks.
-	let (identity, code) = c
-		.exec(
-			"d3",
-			&sandbox,
-			"nohup /bin/sh -c 'i=0; while :; do i=$((i+1)); printf \"%s\\n\" \"$i\" > \
-			 /tmp/portable-pause-counter.next; mv /tmp/portable-pause-counter.next \
-			 /tmp/portable-pause-counter; sleep 1; done' portable-pause-loop </dev/null \
-			 >/tmp/portable-pause.log 2>&1 & pid=$!; echo \"$pid\" > /tmp/portable-pause-pid; while \
-			 [ ! -s /tmp/portable-pause-counter ]; do sleep 0.1; done; kill -0 \"$pid\" && printf \
-			 '%s\\n' \"$pid\" && awk '{print $22}' /proc/$pid/stat",
-		)
-		.await;
-	assert_eq!(code, 0, "start persistent process: {identity:?}");
-	assert_eq!(identity.lines().count(), 2, "pid and kernel process start time");
+	let identity = c.start_counter("d3", &sandbox, "portable-pause").await;
 
 	let (status, body) = c
 		.api(
@@ -1011,13 +1078,7 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 	};
 	assert_eq!(c.node_of("d2", &resumed).await, other, "resume lands on the surviving node");
 	assert_eq!(
-		c.exec(
-			"d1",
-			&resumed,
-			"pid=$(cat /tmp/portable-pause-pid); kill -0 \"$pid\" && printf '%s\\n' \"$pid\" && awk \
-			 '{print $22}' /proc/$pid/stat",
-		)
-		.await,
+		c.counter_identity("d1", &resumed, "portable-pause").await,
 		(identity, 0),
 		"same running guest process survives memory restore"
 	);
@@ -1028,18 +1089,7 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 		.unwrap();
 	assert!(got.status().is_success(), "read restored file: {}", got.status());
 	assert_eq!(got.text().await.unwrap(), file);
-	let (counter, code) = c
-		.exec("d1", &resumed, "cat /tmp/portable-pause-counter")
-		.await;
-	assert_eq!(code, 0);
-	let counter: u64 = counter.trim().parse().unwrap();
-	c.wait_for("restored process makes progress", Duration::from_secs(10), || async {
-		let (next, code) = c
-			.exec("d2", &resumed, "cat /tmp/portable-pause-counter")
-			.await;
-		code == 0 && next.trim().parse::<u64>().is_ok_and(|next| next > counter)
-	})
-	.await;
+	c.counter_advances("d2", &resumed, "portable-pause").await;
 
 	let (status, body) = c
 		.api("d1", reqwest::Method::DELETE, &format!("/sandboxes/{}", resumed.id), None)
@@ -1079,5 +1129,126 @@ async fn portable_pause_survives_holder_loss_and_removes_remote_state_on_kill() 
 			.is_some_and(|ids| !ids.contains(&resumed.id))
 	})
 	.await;
+	cleanup(c);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handover_moves_sandboxes_and_draining_evacuates_a_node() {
+	if !enabled() {
+		eprintln!("skipping: set VMON_CLUSTER_E2E=1 on a host with KVM/HVF");
+		return;
+	}
+	let c = topology("_handover", None).await;
+	build_template(&c).await;
+
+	// Explicit migration of a running sandbox: files, processes and their
+	// memory survive; the source keeps nothing.
+	let s = c.create("d1", 600).await;
+	let first = c.node_of("d1", &s).await;
+	let second = if first == "n1" { "n2" } else { "n1" };
+	let file = "written before the handover\n";
+	let resp = c
+		.envd("d2", &s, reqwest::Method::POST, "/files?path=/tmp/handover.txt")
+		.header("content-type", "application/octet-stream")
+		.body(file)
+		.send()
+		.await
+		.unwrap();
+	assert!(resp.status().is_success(), "write file: {}", resp.status());
+	let identity = c.start_counter("d3", &s, "handover").await;
+	let started = Instant::now();
+	let (status, moved) = c
+		.api("d2", reqwest::Method::POST, &format!("/admin/sandboxes/{}/migrate", s.id), None)
+		.await;
+	assert_eq!(status, 200, "migrate: {moved}");
+	eprintln!("[handover] {} moved {first} -> {second} in {:?}", s.id, started.elapsed());
+	assert_eq!(moved["nodeID"], c.get(second).node_id());
+	assert_eq!(moved["state"], "running");
+	assert_eq!(c.node_of("d3", &s).await, second);
+	assert_eq!(
+		c.counter_identity("d1", &s, "handover").await,
+		(identity.clone(), 0),
+		"the same guest process runs on the target"
+	);
+	let got = c
+		.envd("d3", &s, reqwest::Method::GET, "/files?path=/tmp/handover.txt")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(got.text().await.unwrap(), file);
+	c.counter_advances("d2", &s, "handover").await;
+	c.wait_for("source dropped its copy", Duration::from_secs(30), || async {
+		c.node_inventory(&first)
+			.await
+			.is_some_and(|ids| !ids.contains(&s.id))
+	})
+	.await;
+
+	// A node-local paused sandbox next to it on the same node.
+	c.set_node_status(&first, "draining").await;
+	let p = c.create("d1", 600).await;
+	assert_eq!(c.node_of("d1", &p).await, second, "placement skips the draining node");
+	c.set_node_status(&first, "ready").await;
+	let resp = c
+		.envd("d1", &p, reqwest::Method::POST, "/files?path=/tmp/paused.txt")
+		.header("content-type", "application/octet-stream")
+		.body("paused on the drained node")
+		.send()
+		.await
+		.unwrap();
+	assert!(resp.status().is_success(), "write file: {}", resp.status());
+	let (status, body) = c
+		.api("d2", reqwest::Method::POST, &format!("/sandboxes/{}/pause", p.id), None)
+		.await;
+	assert_eq!(status, 204, "pause: {body}");
+
+	// Draining the node evacuates both.
+	let first_id = c.get(&first).node_id();
+	let started = Instant::now();
+	c.set_node_status(second, "draining").await;
+	c.wait_for("draining node evacuated", Duration::from_mins(5), || async {
+		let running = c
+			.route("d2", &s.id, true)
+			.await
+			.ok()
+			.flatten()
+			.is_some_and(|r| r["nodeId"] == first_id.as_str() && r["state"] == "running");
+		let paused = c
+			.listed("d3", &p.id)
+			.await
+			.is_some_and(|l| l["nodeID"] == first_id.as_str() && l["state"] == "paused");
+		running
+			&& paused
+			&& c
+				.node_inventory(second)
+				.await
+				.is_some_and(|ids| ids.is_empty())
+	})
+	.await;
+	eprintln!("[evacuation] {second} drained to {first} in {:?}", started.elapsed());
+	assert_eq!(c.counter_identity("d3", &s, "handover").await, (identity, 0));
+	c.counter_advances("d1", &s, "handover").await;
+	let (status, connected) = c
+		.api(
+			"d1",
+			reqwest::Method::POST,
+			&format!("/v2/sandboxes/{}/connect", p.id),
+			Some(json!({"timeout": 600})),
+		)
+		.await;
+	assert_eq!(status, 201, "resume moved paused sandbox: {connected}");
+	assert_eq!(c.node_of("d2", &p).await, first, "it resumes where its state moved");
+	assert_eq!(
+		c.exec("d3", &p, "cat /tmp/paused.txt").await,
+		("paused on the drained node".to_owned(), 0)
+	);
+	c.set_node_status(second, "ready").await;
+
+	for id in [&s.id, &p.id] {
+		let (status, _) = c
+			.api("d1", reqwest::Method::DELETE, &format!("/sandboxes/{id}"), None)
+			.await;
+		assert_eq!(status, 204);
+	}
 	cleanup(c);
 }

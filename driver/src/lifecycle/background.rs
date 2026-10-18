@@ -1,7 +1,8 @@
 //! Leader-only supervision (ARCHITECTURE.md §9.4).
 //!
 //! The reaper expires sandboxes past `endAt` every second; the reconciler
-//! compares node inventories with KV routes and the store every ten seconds.
+//! compares node inventories with KV routes and the store every ten seconds;
+//! the evacuator migrates sandboxes off draining nodes every five seconds.
 //! They run as separate tasks, so a reconciliation pass stalled on the store
 //! does not hold up expiries, and one sandbox whose repair fails does not
 //! end the pass for the others.
@@ -86,6 +87,7 @@ fn node_lost(state: Option<MemberState>, left_for: Duration) -> bool {
 /// raft leader. Called once by [`crate::Driver::start`].
 pub fn spawn_background(state: AppState) {
 	tokio::spawn(run_reaper(state.clone()));
+	tokio::spawn(run_evacuator(state.clone()));
 	tokio::spawn(run_reconciler(state));
 }
 
@@ -120,6 +122,16 @@ async fn run_reaper(state: AppState) {
 	while let Some(is_leader) = ticks.tick().await {
 		if is_leader {
 			reap(&state, &inflight).await;
+		}
+	}
+}
+
+async fn run_evacuator(state: AppState) {
+	let evacuations = super::migrate::Evacuations::default();
+	let mut ticks = LeaderTicks::new(&state, super::migrate::EVACUATE_INTERVAL);
+	while let Some(is_leader) = ticks.tick().await {
+		if is_leader && let Err(error) = super::migrate::evacuate(&state, &evacuations).await {
+			tracing::warn!(error = %error.message, "evacuating draining nodes failed");
 		}
 	}
 }
@@ -209,6 +221,12 @@ pub async fn reconcile(state: &AppState, departures: &mut Departures) -> ApiResu
 			if is_locked(kv, id).await? {
 				return Ok(());
 			}
+			if route.state == RouteState::Migrating
+				&& matches!(members.get(&route.node_id), Some((MemberState::Alive, _)))
+			{
+				// A migration whose driver died: settle it where the state is.
+				return super::migrate::recover_migration(state, id).await;
+			}
 			let gone = match members.get(&route.node_id) {
 				// An unlocked `killing` route is a kill whose driver died (kills no
 				// longer write that state): finish it.
@@ -289,11 +307,16 @@ async fn reconcile_listed(
 	let id = info.sandbox_id.as_str();
 	// A VM is only legitimate on the node its route names: a create
 	// retried elsewhere after a timeout may have left a copy behind.
+	// A paused copy is also legitimate while its route names this node: the
+	// source pause of an interrupted migration, which recovery resumes.
 	let legit = match info.state {
 		NodeSandboxState::Running => routed.get(id) == Some(&node),
-		NodeSandboxState::Paused => rows.get(id).is_some_and(|(row_state, row_node)| {
-			*row_state == SandboxState::Paused && *row_node == node.to_string()
-		}),
+		NodeSandboxState::Paused => {
+			routed.get(id) == Some(&node)
+				|| rows.get(id).is_some_and(|(row_state, row_node)| {
+					*row_state == SandboxState::Paused && *row_node == node.to_string()
+				})
+		},
 	};
 	if legit || is_locked(kv, id).await? {
 		return Ok(());
@@ -321,7 +344,7 @@ async fn reconcile_listed(
 		let gpus = state.store.sandbox(id).await?.map_or(0, |row| row.gpus);
 		let memory = super::limits::captures_memory(true, gpus);
 		if let Err(error) = client
-			.pause_sandbox(id, &PauseSandbox { memory: true })
+			.pause_sandbox(id, &PauseSandbox { memory, handover: false })
 			.await
 		{
 			tracing::warn!(%error, sandbox = id, "re-pausing failed");
@@ -368,7 +391,7 @@ async fn reconcile_routeless_row(
 	mark_orphan_killed(state, id).await
 }
 
-async fn mark_orphan_killed(state: &AppState, id: &str) -> ApiResult<()> {
+pub(super) async fn mark_orphan_killed(state: &AppState, id: &str) -> ApiResult<()> {
 	if let Some(row) = state.store.sandbox(id).await? {
 		let killed =
 			super::EventSubject::from_row(&row).event(event_types::KILLED, Some(KillReason::Orphaned));

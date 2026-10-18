@@ -150,12 +150,15 @@ curl -s -X DELETE -H "$AUTH" "$API/admin/teams/$TEAM/api-keys/<keyID>"
 |---|---|---|
 | `GET` | `/admin/sandboxes/running-counts` | `{"<teamID>": <count>, …}` from the cluster's admission index |
 | `GET` | `/admin/sandboxes/{sandboxID}` | `{"sandboxID", "teamID", "state"}` with `state` `running`, `paused`, or `killed` |
+| `POST` | `/admin/sandboxes/{sandboxID}/migrate` | vmon extension. Moves a running sandbox, or a paused one whose state is only on its node, to another node with the same ID, processes, memory, and disk. Optional body `{"nodeID": "<16 hex>"}`; without it the scheduler picks a compatible node. 200 `{"sandboxID", "nodeID", "state"}` (`state` stays `running` or `paused`); 404 unknown or killed; 409 while another operation runs or when the paused state is already in the object store; 503 `sandbox_no_compatible_node` / `sandbox_capacity_unavailable` without a target |
 | `POST` | `/admin/teams/{teamID}/sandboxes/kill` | Kills every sandbox of the team: `{"killedCount", "failedCount"}` |
 | `POST` | `/admin/teams/{teamID}/builds/cancel` | Cancels the team's unfinished template builds: `{"cancelledCount", "failedCount"}` |
 
 ```sh
 curl -s -H "$AUTH" "$API/admin/sandboxes/running-counts"
 curl -s -X POST -H "$AUTH" "$API/admin/teams/$TEAM/sandboxes/kill"
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"nodeID": "<nodeID>"}' "$API/admin/sandboxes/<sandboxID>/migrate"
 ```
 
 The five `/clusters/{clusterID}/rigs…` operations (upstream's autoscaled node pools) check the admin token and then answer `501 Not implemented by this deployment`, the spec's response for deployments without rigs.
@@ -180,7 +183,7 @@ curl -s -H "$AUTH" "$API/admin/sandboxes?state=running&limit=50"
 |---|---|---|
 | `GET` | `/nodes` | Every gossip member with the node role, sorted by ID: version, `clusterID`, machine info (`cpuModel` and `cpuModelName` are the host CPU model), `status`, sandbox counts, capacity metrics, create successes/failures |
 | `GET` | `/nodes/{nodeID}` | The same plus the node's sandboxes (when the node is alive) and `cachedBuilds` |
-| `POST` | `/nodes/{nodeID}` | Body `{"status": "ready" \| "draining" \| "unhealthy"}`; 204 |
+| `POST` | `/nodes/{nodeID}` | Body `{"status": "ready" \| "draining" \| "unhealthy"}`; 204. `draining` also migrates the node's sandboxes to other nodes ([Draining a node](#draining-a-node)) |
 
 Node IDs are 16 lowercase hex characters. The reported `status` is derived in this order:
 
@@ -193,15 +196,17 @@ Node IDs are 16 lowercase hex characters. The reported `status` is derived in th
 ## Draining a node
 
 1. Find the node: `curl -s -H "$AUTH" "$API/nodes"`.
-2. Stop new placements on it:
+2. Mark it draining:
 
    ```sh
    curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
      -d '{"status": "draining"}' "$API/nodes/<nodeID>"
    ```
 
-   The scheduler places new sandboxes and builds only on `ready` nodes. Sandboxes already on the node keep running.
-3. Watch `sandboxCount` in `GET /nodes/<nodeID>` fall as sandboxes end.
+   The scheduler places new sandboxes and builds only on `ready` nodes, and the driver starts evacuating the node: every few seconds it migrates the node's running sandboxes with more than a minute left, two at a time, plus its paused sandboxes when the node keeps paused state only locally (without an object store). A migrated sandbox keeps its ID, processes, memory, and disk; the move pauses it, transfers its written disk and dirtied memory to the target, and resumes it there, so the blackout grows with that amount. Connections open during the move drop; clients reconnect to the same sandbox on the new node.
+
+   Each sandbox needs a compatible `ready` node: same architecture, hypervisor backend, and CPU baseline, enough capacity, the features its network settings need, and no volume on node-local storage pinning it to the draining node. Sandboxes without one stay where they are and are retried every minute (the driver logs why). Sandboxes with less than a minute left expire in place. One sandbox can be moved by hand with `POST /admin/sandboxes/{sandboxID}/migrate`.
+3. Watch `sandboxCount` in `GET /nodes/<nodeID>` fall as sandboxes move or end.
 4. Return it to service with `{"status": "ready"}`, which deletes the stored override.
 
-`unhealthy` has the same placement effect. What happens to paused sandboxes, failover, and node shutdown is covered in [Clusters](cluster.md#node-status).
+`unhealthy` has the same placement effect but does not evacuate. What happens to paused sandboxes, failover, and node shutdown is covered in [Clusters](cluster.md#node-status).

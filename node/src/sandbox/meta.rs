@@ -71,6 +71,9 @@ impl SandboxMeta {
 /// root and in `paused/<id>/`.
 pub const RAM_BASE: &str = "base";
 
+/// Commit marker of `paused/<id>/` ([`SandboxPaths::paused_committed`]).
+pub const COMMITTED: &str = "committed";
+
 /// Paths of one sandbox's node state.
 #[derive(Clone, Debug)]
 pub struct SandboxPaths {
@@ -138,7 +141,7 @@ impl SandboxPaths {
 	/// is durable: without it a crash may have left memory and disk out of
 	/// step, so the state must not be resumed.
 	pub fn paused_committed(&self) -> PathBuf {
-		self.paused.join("committed")
+		self.paused.join(COMMITTED)
 	}
 
 	/// Whether `paused/<id>/` holds a complete, durable pause.

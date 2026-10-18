@@ -39,7 +39,7 @@ export function nodeActions(member: ClusterMember, onChanged: () => void): MenuI
           <p>
             <strong>{memberName(member)}</strong>{" "}
             {next === "draining"
-              ? "stops receiving new sandboxes and builds. Running sandboxes keep running."
+              ? "stops receiving new sandboxes and builds. Its sandboxes move to other compatible nodes, keeping their processes and files."
               : "is excluded from placement until marked ready again."}
           </p>
         ),

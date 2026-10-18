@@ -5,6 +5,7 @@
 //! snapshot-as-build, metric scraping, VMM-exit cleanup, and restart
 //! recovery. Serves the `/node/v1/sandboxes` routes through `crate::server`.
 
+mod handover;
 mod meta;
 
 use std::{
@@ -31,7 +32,8 @@ pub use self::meta::{SandboxMeta, SandboxPaths};
 use crate::{
 	api::{
 		ArtifactInfo, CreateSandbox, GuestInit, LogEntry, LogQuery, MetricSample, NetworkPolicy,
-		ResumeSandbox, S3Mount, SandboxInfo, SandboxState, SnapshotSandbox, VolumeMount,
+		PauseSandbox, ResumeSandbox, S3Mount, SandboxInfo, SandboxState, SnapshotSandbox,
+		VolumeMount,
 	},
 	artifacts::{
 		self,
@@ -159,12 +161,14 @@ struct Upload {
 
 /// One sandbox known to the node (running or paused).
 struct Entry {
-	paths:  SandboxPaths,
+	paths:    SandboxPaths,
 	/// Serializes lifecycle operations on this sandbox (shared so a kill can
 	/// keep holding it while its teardown finishes in the background).
-	ops:    Arc<tokio::sync::Mutex<()>>,
-	state:  Mutex<EntryState>,
-	upload: Mutex<Option<Upload>>,
+	ops:      Arc<tokio::sync::Mutex<()>>,
+	state:    Mutex<EntryState>,
+	upload:   Mutex<Option<Upload>>,
+	/// Handover manifest of the paused state (`handover`); pauses drop it.
+	handover: Mutex<Option<handover::CachedManifest>>,
 }
 
 /// Root disk of a [`BootPlan`].
@@ -410,6 +414,7 @@ impl SandboxManager {
 		for dir in ["sandboxes", "paused"] {
 			fs::create_dir_all(config.data_dir.join(dir))?;
 		}
+		handover::sweep_staging(&config.data_dir.join("paused"));
 		let mut s3fs_config = S3FsConfig::new(config.run_dir.clone(), config.object_store.clone());
 		s3fs_config.allow_private = config.s3_mounts_allow_private;
 		let s3fs = S3Fs::new(s3fs_config);
@@ -1031,6 +1036,12 @@ impl SandboxManager {
 	/// console/metrics for retention, forgets it. Blocking file I/O.
 	fn finish(&self, id: &str, entry: &Entry) {
 		lazy_resume::release(self.config.object_store.as_ref(), &entry.paths.dir);
+		self.finish_local(id, entry);
+	}
+
+	/// [`Self::finish`] without ending a lazily resumed disk's object-store
+	/// generation.
+	fn finish_local(&self, id: &str, entry: &Entry) {
 		s3fs::forget_mounts(&entry.paths.dir);
 		drop_disk(&entry.paths.rootfs());
 		remove_path(&entry.paths.snapshot_root());
@@ -1187,6 +1198,7 @@ impl SandboxManager {
 			ops: Arc::default(),
 			state: Mutex::new(EntryState { meta, live: None }),
 			upload: Mutex::default(),
+			handover: Mutex::default(),
 		});
 		self.install_live(&id, &entry, booted);
 		gpus.keep();
@@ -1222,8 +1234,14 @@ impl SandboxManager {
 	/// delta against its hard-linked RAM base, which moves along to
 	/// `paused/<id>/base`. The VMM is reaped and its network torn down after
 	/// the reply. With an object store the committed pause then uploads in
-	/// the background ([`paused_store`]).
-	pub async fn pause(self: &Arc<Self>, id: &str, memory: bool) -> Result<SandboxInfo, ApiError> {
+	/// the background ([`paused_store`]), unless it is the source pause of a
+	/// handover (`req.handover`), which a peer pulls from this node instead.
+	pub async fn pause(
+		self: &Arc<Self>,
+		id: &str,
+		req: &PauseSandbox,
+	) -> Result<SandboxInfo, ApiError> {
+		let PauseSandbox { memory, handover } = *req;
 		let entry = self.entry(id)?;
 		let holds_gpus = !entry.state.lock().meta.gpus.is_empty();
 		if memory && holds_gpus {
@@ -1232,6 +1250,7 @@ impl SandboxManager {
 		// Held until the paused state is durable (see `commit_paused`), so a
 		// resume or kill waits for it instead of racing it.
 		let ops = Arc::clone(&entry.ops).lock_owned().await;
+		entry.handover.lock().take();
 		// A previous generation must be gone before this pause can publish.
 		Self::join_upload(&entry).await;
 		// A lazily resumed disk still reads its generation's objects.
@@ -1371,11 +1390,13 @@ impl SandboxManager {
 		let info = state.meta.info();
 		drop(state);
 		// Guest flushes do not fsync sandbox overlays: make the pause durable
-		// off the request path, then commit it and start its upload.
+		// off the request path, then commit it and start its upload (a
+		// handover's target pulls it instead).
 		let (paths, id) = (paths.clone(), id.to_owned());
 		let (manager, entry) = (Arc::clone(self), Arc::clone(&entry));
 		tokio::task::spawn_blocking(move || {
 			match commit_paused(&paths) {
+				Ok(()) if handover => {},
 				Ok(()) => manager.start_upload(&id, &entry),
 				Err(error) => tracing::warn!(
 					sandbox = id,
@@ -1417,10 +1438,11 @@ impl SandboxManager {
 			return Err(ApiError::conflict(format!("sandbox {id} is being created")));
 		}
 		let entry = Arc::new(Entry {
-			paths:  self.paths(id),
-			ops:    Arc::default(),
-			state:  Mutex::new(EntryState { meta, live: None }),
-			upload: Mutex::default(),
+			paths:    self.paths(id),
+			ops:      Arc::default(),
+			state:    Mutex::new(EntryState { meta, live: None }),
+			upload:   Mutex::default(),
+			handover: Mutex::default(),
 		});
 		sandboxes.insert(id.to_owned(), Arc::clone(&entry));
 		Ok((entry, true))
@@ -2047,10 +2069,11 @@ impl SandboxManager {
 				continue;
 			}
 			let entry = Arc::new(Entry {
-				paths:  paths.clone(),
-				ops:    Arc::default(),
-				state:  Mutex::new(EntryState { meta: meta.clone(), live: None }),
-				upload: Mutex::default(),
+				paths:    paths.clone(),
+				ops:      Arc::default(),
+				state:    Mutex::new(EntryState { meta: meta.clone(), live: None }),
+				upload:   Mutex::default(),
+				handover: Mutex::default(),
 			});
 			match meta.state {
 				SandboxState::Paused if paths.paused_resumable() => {

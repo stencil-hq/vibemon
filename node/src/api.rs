@@ -247,7 +247,55 @@ pub enum SandboxState {
 #[serde(rename_all = "camelCase")]
 pub struct PauseSandbox {
 	/// `false` = filesystem-only pause (fsfreeze + stop; resume cold-boots).
-	pub memory: bool,
+	pub memory:   bool,
+	/// Source pause of a handover: the state stays node-local for the target
+	/// to pull (`AdoptSandbox`), so no object-store upload starts.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub handover: bool,
+}
+
+/// `POST /sandboxes/{id}/adopt`: pull another node's paused sandbox
+/// (`GET /sandboxes/{id}/handover` on `source`) and hold it paused here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptSandbox {
+	/// Authoritative sandbox metadata, state `paused` (as
+	/// `ResumeSandbox::meta`).
+	pub meta:             crate::sandbox::SandboxMeta,
+	/// Node holding the paused state.
+	pub source:           NodeId,
+	/// Peers holding the template build, whose files the state may link
+	/// instead of transferring them.
+	#[serde(default)]
+	pub artifact_sources: Vec<NodeId>,
+}
+
+/// `GET /sandboxes/{id}/handover`: a committed paused sandbox as a peer pulls
+/// it (`AdoptSandbox`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoverManifest {
+	/// Template build that `HandoverFile::build_file` entries refer to.
+	pub build_id: String,
+	pub files:    Vec<HandoverFile>,
+}
+
+/// One file of a `HandoverManifest`; `GET /sandboxes/{id}/handover/{path}`
+/// streams its data extents in order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoverFile {
+	/// `path` is relative to the sandbox: `paused/…` (the paused state:
+	/// snapshot, RAM base, rootfs overlay and its base) or `console.log` /
+	/// `metrics.jsonl` (history the logs and metrics routes serve).
+	#[serde(flatten)]
+	pub file:       ArtifactFile,
+	/// Build-relative path of the same file in `HandoverManifest::build_id`
+	/// (a hard link on the source, e.g. the template's RAM base or raw
+	/// rootfs): a target whose copy of the build has an identical entry links
+	/// it instead of fetching.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub build_file: Option<String>,
 }
 
 /// `POST /sandboxes/{id}/resume`.
@@ -533,6 +581,10 @@ pub enum RouteState {
 	Resuming,
 	Killing,
 	Snapshotting,
+	/// Moving to another node (driver `lifecycle::migrate`): `node_id` holds
+	/// the sandbox, paused once the move is under way, until the target runs
+	/// it and the route names the target.
+	Migrating,
 }
 
 #[cfg(test)]

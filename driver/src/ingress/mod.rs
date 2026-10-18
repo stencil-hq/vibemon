@@ -104,8 +104,8 @@ async fn ingress(state: &AppState, target: Target, req: Request) -> Response {
 	response
 }
 
-/// Finds the live route of a sandbox: local KV read, waiting out `resuming`,
-/// and auto-resuming paused sandboxes that opted in.
+/// Finds the live route of a sandbox: local KV read, waiting out `resuming`
+/// and `migrating`, and auto-resuming paused sandboxes that opted in.
 async fn resolve(state: &AppState, target: &Target, path: &str) -> Result<SandboxRoute, Resolve> {
 	let sandbox_id = target.sandbox_id.as_str();
 	let key = format!("sbx/{sandbox_id}");
@@ -128,10 +128,10 @@ async fn resolve(state: &AppState, target: &Target, path: &str) -> Result<Sandbo
 			RouteState::Killing | RouteState::Pausing => {
 				return Err(Resolve::Proxy(ProxyError::not_found(sandbox_id)));
 			},
-			RouteState::Resuming if Instant::now() >= deadline => {
+			RouteState::Resuming | RouteState::Migrating if Instant::now() >= deadline => {
 				return Err(Resolve::Proxy(ProxyError::transitioning(sandbox_id)));
 			},
-			RouteState::Resuming => tokio::time::sleep(RESUMING_POLL).await,
+			RouteState::Resuming | RouteState::Migrating => tokio::time::sleep(RESUMING_POLL).await,
 		}
 	}
 }

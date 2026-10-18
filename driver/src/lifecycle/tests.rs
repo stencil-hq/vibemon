@@ -23,6 +23,8 @@ use vmon_node::api::{
 	SandboxInfo, SandboxState as NodeState, SnapshotSandbox,
 };
 
+mod gpus;
+mod migrate;
 mod portable;
 mod s3;
 mod spawns;
@@ -68,6 +70,8 @@ struct FakeNode {
 	create_delay:      Duration,
 	/// The next resume completes but answers 500 (as if the reply was lost).
 	resume_then_fail:  bool,
+	/// Handover calls and peers (`tests/migrate.rs`).
+	migration:         migrate::FakeMigration,
 }
 
 /// The node's 500 for a VM that could not start or be captured.
@@ -158,6 +162,9 @@ async fn fake_pause(
 ) -> Result<Json<SandboxInfo>, StatusCode> {
 	let mut node = node.lock();
 	node.pauses.push((id.clone(), req.memory));
+	if req.handover {
+		node.migration.handovers.push(id.clone());
+	}
 	let info = node.sandboxes.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
 	info.state = NodeState::Paused;
 	Ok(Json(info.clone()))
@@ -225,6 +232,8 @@ fn fake_routes(node: Shared) -> Router {
 		.route("/node/v1/sandboxes/{id}/resume", post(fake_resume))
 		.route("/node/v1/sandboxes/{id}/deadline", post(fake_deadline))
 		.route("/node/v1/sandboxes/{id}/snapshot", post(fake_snapshot))
+		.route("/node/v1/sandboxes/{id}/adopt", post(migrate::fake_adopt))
+		.route("/node/v1/sandboxes/{id}/paused", axum::routing::delete(migrate::fake_drop_paused))
 		.route("/node/v1/artifacts/{id}", axum::routing::delete(fake_delete_artifact))
 		.with_state(node)
 }

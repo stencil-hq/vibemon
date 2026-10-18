@@ -13,13 +13,16 @@
 //! Guards: [`Store::insert_sandbox`] requires the record to be absent; every
 //! state transition is a guarded read of the record checking its current
 //! state (the old `WHERE state = …`), and commits the record change together
-//! with its event ([`super::events`]) in one transaction.
+//! with its event ([`super::events`]) in one transaction. A migration
+//! ([`Store::move_sandbox`]) also requires the mover's sandbox lock and
+//! commits the live route with the record.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
-use vmon_node::api::VolumeMount;
+use vmon_cluster::kv::Compare;
+use vmon_node::api::{SandboxRoute, VolumeMount};
 
 use super::{
 	KILLED_SANDBOX_TTL, NewSandboxEvent, Read, Result, Store, Tx, events::stage_event, key,
@@ -273,6 +276,40 @@ pub struct ResumedExecution<'a> {
 	pub end_at:       DateTime<Utc>,
 }
 
+/// A KV entry that must still hold `value` when a transaction commits (the
+/// committing operation's sandbox lock, `SandboxLock::fence`).
+#[derive(Clone, Copy, Debug)]
+pub struct Fence<'a> {
+	pub key:   &'a str,
+	pub value: &'a [u8],
+}
+
+/// Input of [`Store::move_sandbox`]: the commit of a migration.
+#[derive(Clone, Debug)]
+pub struct SandboxMove<'a> {
+	pub id:      &'a str,
+	/// State the row must still be in (it keeps it).
+	pub from:    SandboxState,
+	/// Node now holding the sandbox.
+	pub node_id: &'a str,
+	pub fence:   Fence<'a>,
+	/// Live route written with the row, at its KV key.
+	pub route:   Option<(String, &'a SandboxRoute)>,
+	/// KV keys deleted with the row.
+	pub delete:  Vec<String>,
+}
+
+/// Outcome of [`Store::move_sandbox`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveOutcome {
+	/// Row, route, and deletions committed together.
+	Moved,
+	/// The row is missing or no longer in `from`; nothing was written.
+	Stale,
+	/// The fence no longer holds; nothing was written.
+	Fenced,
+}
+
 /// Keyset position: rows strictly after `(started_at, id)` in the list order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListAfter {
@@ -425,6 +462,43 @@ impl Store {
 			stage_event(&mut tx, event);
 			if tx.commit().await? {
 				return Ok(true);
+			}
+		}
+	}
+
+	/// Points the row of a sandbox in state `from` at another node together
+	/// with the move's KV writes, in one transaction guarded by the fence. A
+	/// migration keeps the execution and records no event.
+	pub async fn move_sandbox(&self, change: &SandboxMove<'_>) -> Result<MoveOutcome> {
+		let key = sandbox_key(change.id);
+		let mut tx = self.tx().await?;
+		loop {
+			let fence = change.fence;
+			if self
+				.kv
+				.get(fence.key)
+				.await?
+				.is_none_or(|entry| entry.value != fence.value)
+			{
+				return Ok(MoveOutcome::Fenced);
+			}
+			let Some(mut row) = tx.get::<SandboxRow>(&key).await? else {
+				return Ok(MoveOutcome::Stale);
+			};
+			if row.state() != change.from {
+				return Ok(MoveOutcome::Stale);
+			}
+			change.node_id.clone_into(&mut row.node_id);
+			stage_row(&mut tx, &mut row);
+			tx.require(Compare::Value { key: fence.key.to_owned(), value: fence.value.to_vec() });
+			if let Some((route_key, route)) = &change.route {
+				tx.put(route_key.as_str(), *route);
+			}
+			for deleted in &change.delete {
+				tx.delete(deleted.as_str());
+			}
+			if tx.commit().await? {
+				return Ok(MoveOutcome::Moved);
 			}
 		}
 	}

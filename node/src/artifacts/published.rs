@@ -18,7 +18,7 @@ use super::{ArtifactMeta, ArtifactStore, MANIFEST, safe_relative, sparse};
 use crate::api::ArtifactManifest;
 
 /// Bytes of one fetched artifact file.
-pub(super) type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+pub(crate) type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
 
 /// Largest accepted published manifest.
 const MANIFEST_LIMIT: usize = 8 << 20;

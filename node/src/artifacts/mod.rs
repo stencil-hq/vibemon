@@ -452,8 +452,14 @@ impl ArtifactStore {
 		Err(anyhow!("fetching artifacts of {build_id} failed: {}", errors.join("; ")))
 	}
 
+	/// Node API client for the peer at `cluster_url`, authenticated and
+	/// pooled like artifact fetches.
+	pub(crate) fn peer(&self, cluster_url: &str) -> Result<NodeClient, crate::client::NodeError> {
+		NodeClient::new(cluster_url, &self.inner.secret, self.inner.http.clone())
+	}
+
 	async fn fetch_from(&self, build_id: &str, source: &str) -> Result<ArtifactMeta> {
-		let client = NodeClient::new(source, &self.inner.secret, self.inner.http.clone())?;
+		let client = self.peer(source)?;
 		let manifest = client.artifact_manifest(build_id).await?;
 		self
 			.install_fetched(build_id, &manifest, |path| {

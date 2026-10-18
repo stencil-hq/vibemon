@@ -106,16 +106,20 @@ pub struct ArtifactLocation {
 /// What a sandbox needs from a node.
 #[derive(Clone, Debug, Default)]
 pub struct PlacementRequest {
-	pub vcpus:     u32,
-	pub memory_mb: u64,
+	pub vcpus:        u32,
+	pub memory_mb:    u64,
 	/// Guest architecture of the build (`x86_64`/`aarch64`); empty = any.
-	pub arch:      String,
+	pub arch:         String,
+	/// Hypervisor backend (`kvm`/`hvf`) a memory snapshot needs; empty = any.
+	pub backend:      String,
+	/// CPU baseline a memory snapshot needs; empty = any.
+	pub cpu_baseline: String,
 	/// Node features that must all be present (`egress-proxy`, …).
-	pub features:  Vec<&'static str>,
+	pub features:     Vec<&'static str>,
 	/// Hard pin (volume locality, fork, paused-state resume).
-	pub pinned:    Option<NodeId>,
+	pub pinned:       Option<NodeId>,
 	/// Nodes holding the build's artifacts.
-	pub artifacts: Vec<ArtifactLocation>,
+	pub artifacts:    Vec<ArtifactLocation>,
 	/// Nodes already tried for this create.
 	pub excluded:     Vec<NodeId>,
 	/// Whole GPUs (or vGPU VFs) passed through; such sandboxes always cold
@@ -319,7 +323,10 @@ pub fn eligible<S: BuildHasher>(
 		if cap.draining || statuses.get(id).copied().unwrap_or_default() != NodeStatus::Ready {
 			continue;
 		}
-		if !req.arch.is_empty() && cap.arch != req.arch {
+		if (!req.arch.is_empty() && cap.arch != req.arch)
+			|| (!req.backend.is_empty() && cap.backend != req.backend)
+			|| (!req.cpu_baseline.is_empty() && cap.cpu_baseline != req.cpu_baseline)
+		{
 			continue;
 		}
 		if !req

@@ -78,7 +78,7 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | GET | `/templates/aliases/{alias}` | SDK | 200 owner / 403 other team / 404. |
 | GET | `/nodes` | Admin | Gossip members with `roles.node` + capacity. `machineInfo`: `cpuFamily` = hypervisor backend, `cpuModel` and `cpuModelName` = host CPU model name, `cpuArchitecture` = guest arch. |
 | GET | `/nodes/{nodeID}` | Admin | Member detail + sandboxes + cached builds. |
-| POST | `/nodes/{nodeID}` | Admin | `ready` / `draining` / `unhealthy` via KV `node/<id>/status`. |
+| POST | `/nodes/{nodeID}` | Admin | `ready` / `draining` / `unhealthy` via KV `node/<id>/status`; `draining` also evacuates the node (§5). |
 | POST | `/admin/teams/{teamID}/sandboxes/kill` | Admin | Kill every team sandbox. |
 | GET | `/admin/sandboxes/running-counts` | Admin | Counts from KV catalog. |
 | GET | `/admin/sandboxes/{id}` | Admin | Team + state. |
@@ -225,6 +225,17 @@ Details and the fixes made are listed in [`e2e/README.md`](https://github.com/st
 - **Admin dashboard.** `/dashboard/` on the public listener and its
   `GET /admin/cluster`, `GET /admin/teams`, `GET /admin/sandboxes` endpoints
   (`X-Admin-Token`) are vmon extensions with no upstream counterpart.
+
+- **Draining a node evacuates it.** Upstream's `draining` only stops new
+  placements. In vmon the raft leader also migrates the node's running
+  sandboxes (more than 60 s left) and node-local paused sandboxes to
+  compatible ready nodes (same architecture, backend, CPU baseline;
+  capacity, features, node-local volume pins): pause, transfer of the
+  written disk and dirtied memory, resume. The sandbox ID, guest processes,
+  and memory survive; connections open during the move drop. Sandboxes
+  without a compatible node, and GPU sandboxes, stay. `POST
+  /admin/sandboxes/{id}/migrate` moves one sandbox on demand (vmon
+  extension).
 
 - **Sandbox log fields are strings.** `SandboxLogEntry.fields` is
   `map<string,string>`, so non-string envd fields (`pid`, `process_result`)

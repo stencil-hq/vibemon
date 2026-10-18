@@ -12,6 +12,7 @@ use vmon_node::api::SandboxRoute;
 use crate::{
 	error::{ApiError, ApiResult},
 	state::AppState,
+	store::sandboxes::Fence,
 };
 
 /// TTL of `lock/sbx/<id>` (§9.4); renewed while the holder works.
@@ -272,6 +273,12 @@ impl SandboxLock {
 			}
 			tokio::time::sleep(LOCK_POLL).await;
 		}
+	}
+
+	/// This holder's lock entry: a commit guarded by it fails once the lock
+	/// lapsed and another operation took it.
+	pub fn fence(&self) -> Fence<'_> {
+		Fence { key: &self.key, value: &self.holder }
 	}
 
 	/// Releases the lock if this holder still owns it.

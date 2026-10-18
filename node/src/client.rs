@@ -13,9 +13,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 
 use crate::api::{
-	ArtifactInfo, ArtifactManifest, BuildStatus, CreateSandbox, Deadline, ErrorBody, LogEntry,
-	LogQuery, MetricSample, NetworkPolicy, PREFIX, PauseSandbox, ResumeSandbox, SandboxInfo,
-	SnapshotSandbox, StartBuild, TUNNEL_UPGRADE,
+	AdoptSandbox, ArtifactInfo, ArtifactManifest, BuildStatus, CreateSandbox, Deadline, ErrorBody,
+	HandoverManifest, LogEntry, LogQuery, MetricSample, NetworkPolicy, PREFIX, PauseSandbox,
+	ResumeSandbox, SandboxInfo, SnapshotSandbox, StartBuild, TUNNEL_UPGRADE,
 };
 
 /// Default timeout for control calls; long operations (create, pause,
@@ -23,6 +23,9 @@ use crate::api::{
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound for lifecycle operations that snapshot or boot VMs.
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_mins(5);
+/// Upper bound for an adoption, which transfers a sandbox's written disk and
+/// guest RAM between nodes.
+const HANDOVER_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Failure talking to a node.
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +117,51 @@ impl NodeClient {
 		self
 			.json(Method::POST, &format!("/sandboxes/{id}/resume"), Some(req), LIFECYCLE_TIMEOUT)
 			.await
+	}
+
+	/// Pulls the paused sandbox `req.source` holds and keeps it paused here.
+	pub async fn adopt_sandbox(
+		&self,
+		id: &str,
+		req: &AdoptSandbox,
+	) -> Result<SandboxInfo, NodeError> {
+		self
+			.json(Method::POST, &format!("/sandboxes/{id}/adopt"), Some(req), HANDOVER_TIMEOUT)
+			.await
+	}
+
+	/// Deletes this node's paused copy and forgets the sandbox, leaving the
+	/// KV and the object store alone (a handover source after the target took
+	/// over, or a target whose adoption is rolled back).
+	pub async fn drop_paused(&self, id: &str) -> Result<(), NodeError> {
+		self
+			.empty::<()>(Method::DELETE, &format!("/sandboxes/{id}/paused"), None, LIFECYCLE_TIMEOUT)
+			.await
+	}
+
+	/// Describes a committed paused sandbox for a peer's adoption.
+	pub async fn handover_manifest(&self, id: &str) -> Result<HandoverManifest, NodeError> {
+		self
+			.json::<(), _>(Method::GET, &format!("/sandboxes/{id}/handover"), None, LIFECYCLE_TIMEOUT)
+			.await
+	}
+
+	/// Streams the data extents of one handover file (in manifest order); the
+	/// caller consumes `bytes_stream()`.
+	pub async fn handover_extents(
+		&self,
+		id: &str,
+		path: &str,
+	) -> Result<reqwest::Response, NodeError> {
+		let url = self.url(&format!("/sandboxes/{id}/handover/{path}"))?;
+		let response = self
+			.http
+			.get(url)
+			.bearer_auth(&self.secret)
+			.send()
+			.await
+			.map_err(transport)?;
+		ensure_ok(response).await
 	}
 
 	pub async fn set_deadline(&self, id: &str, end_at_ms: u64) -> Result<(), NodeError> {

@@ -126,18 +126,89 @@ pub fn describe(dir: &Path, rel: &str) -> Result<ArtifactFile> {
 	let mut buf = vec![0u8; CHUNK];
 	for &[offset, len] in &extents {
 		hasher.extent([offset, len]);
-		file.seek(SeekFrom::Start(offset))?;
-		let mut left = len;
-		while left > 0 {
-			let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
-			file
-				.read_exact(&mut buf[..want])
-				.with_context(|| format!("reading {}", path.display()))?;
-			hasher.update(&buf[..want]);
-			left -= want as u64;
-		}
+		read_range(&mut file, [offset, len], &mut buf, |chunk| {
+			hasher.update(chunk);
+			true
+		})
+		.with_context(|| format!("reading {}", path.display()))?;
 	}
 	Ok(ArtifactFile { path: rel.to_owned(), size, sha256: hasher.finish(size), extents })
+}
+
+/// Whether `path` holds exactly the content `file` describes, whatever its
+/// own hole layout (blocking).
+///
+/// Equal size, `file`'s extents hash to its digest, and every other byte
+/// reads as zero. Two nodes' copies of one build differ in holes (a fetch
+/// keeps zero blocks sparse), so their manifest digests are not comparable
+/// directly.
+pub fn matches(path: &Path, file: &ArtifactFile) -> Result<bool> {
+	validate(file)?;
+	let mut local = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+	let size = local.metadata()?.len();
+	if size != file.size {
+		return Ok(false);
+	}
+	let mut buf = vec![0u8; CHUNK];
+	let mut hasher = ExtentHasher::default();
+	for &extent in &file.extents {
+		hasher.extent(extent);
+		read_range(&mut local, extent, &mut buf, |chunk| {
+			hasher.update(chunk);
+			true
+		})?;
+	}
+	if hasher.finish(size) != file.sha256 {
+		return Ok(false);
+	}
+	// Local data outside `file`'s (sorted, disjoint) extents must be zeros.
+	let theirs = &file.extents;
+	let mut next = 0;
+	for [start, len] in data_extents(&local, size)? {
+		let (mut pos, end) = (start, start + len);
+		while pos < end {
+			while theirs.get(next).is_some_and(|&[o, l]| o + l <= pos) {
+				next += 1;
+			}
+			let gap_end = match theirs.get(next) {
+				Some(&[o, l]) if o <= pos => {
+					pos = (o + l).min(end);
+					continue;
+				},
+				Some(&[o, _]) => o.min(end),
+				None => end,
+			};
+			if !read_range(&mut local, [pos, gap_end - pos], &mut buf, |chunk| {
+				chunk.iter().all(|&byte| byte == 0)
+			})? {
+				return Ok(false);
+			}
+			pos = gap_end;
+		}
+	}
+	Ok(true)
+}
+
+/// Reads `[offset, len]` of `file` in `buf`-sized chunks, handing each to
+/// `chunk` until it returns `false`; returns whether every chunk was
+/// accepted.
+fn read_range(
+	file: &mut File,
+	[offset, len]: [u64; 2],
+	buf: &mut [u8],
+	mut chunk: impl FnMut(&[u8]) -> bool,
+) -> io::Result<bool> {
+	file.seek(SeekFrom::Start(offset))?;
+	let mut left = len;
+	while left > 0 {
+		let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+		file.read_exact(&mut buf[..want])?;
+		if !chunk(&buf[..want]) {
+			return Ok(false);
+		}
+		left -= want as u64;
+	}
+	Ok(true)
 }
 
 /// Rejects extent lists that are empty-length, unsorted, overlapping, or
@@ -303,6 +374,50 @@ mod tests {
 		assert_eq!(described.size, 64 * MIB);
 		assert_eq!(described.extents, extents);
 		validate(&described).unwrap();
+	}
+
+	/// Content equality ignores where holes are, but not data hidden in one
+	/// side's holes, a changed byte, or a different length.
+	#[test]
+	fn matches_compares_content_not_hole_layout() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = sparse_file(dir.path());
+		let described = describe(dir.path(), "rootfs.ext4").unwrap();
+		assert!(matches(&path, &described).unwrap());
+
+		// A peer copy with an allocated zero block at 16 MiB describes it as
+		// data: same content, different extents and digest.
+		let bytes = std::fs::read(&path).unwrap();
+		let mut theirs = described.clone();
+		theirs.extents.push([16 * MIB, 4096]);
+		theirs.extents.sort_unstable();
+		let mut hasher = ExtentHasher::default();
+		for &[offset, len] in &theirs.extents {
+			hasher.extent([offset, len]);
+			let start = usize::try_from(offset).unwrap();
+			hasher.update(&bytes[start..start + usize::try_from(len).unwrap()]);
+		}
+		theirs.sha256 = hasher.finish(64 * MIB);
+		assert_ne!(theirs.sha256, described.sha256);
+		assert!(matches(&path, &theirs).unwrap(), "holes vs allocated zeros");
+
+		// Local data where the description has a hole.
+		let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+		file.seek(SeekFrom::Start(48 * MIB)).unwrap();
+		file.write_all(&[1]).unwrap();
+		assert!(!matches(&path, &described).unwrap(), "data in a described hole");
+		file.seek(SeekFrom::Start(48 * MIB)).unwrap();
+		file.write_all(&[0]).unwrap();
+		assert!(matches(&path, &described).unwrap());
+
+		// A changed byte inside an extent; a different length.
+		file.seek(SeekFrom::Start(100)).unwrap();
+		file.write_all(&[0xab]).unwrap();
+		assert!(!matches(&path, &described).unwrap(), "changed data");
+		file.seek(SeekFrom::Start(100)).unwrap();
+		file.write_all(&[0xaa]).unwrap();
+		file.set_len(65 * MIB).unwrap();
+		assert!(!matches(&path, &described).unwrap(), "different size");
 	}
 
 	#[test]

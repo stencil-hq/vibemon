@@ -390,7 +390,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 
 	let pause = Instant::now();
 	let paused = client
-		.pause_sandbox(&id, &PauseSandbox { memory: true })
+		.pause_sandbox(&id, &PauseSandbox { memory: true, handover: false })
 		.await
 		.expect("pause");
 	let pause_latency = pause.elapsed();
@@ -438,7 +438,7 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 		.await
 		.unwrap();
 	client
-		.pause_sandbox(&id, &PauseSandbox { memory: true })
+		.pause_sandbox(&id, &PauseSandbox { memory: true, handover: false })
 		.await
 		.expect("second pause");
 	client

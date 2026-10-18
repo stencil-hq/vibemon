@@ -357,6 +357,24 @@ pub struct AdminKillDto {
 	pub failed_count: u64,
 }
 
+/// Body of `POST /admin/sandboxes/{id}/migrate` (vmon extension).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MigrateBody {
+	/// Target node; absent = placement picks one.
+	#[serde(rename = "nodeID")]
+	pub node_id: Option<String>,
+}
+
+/// Result of `POST /admin/sandboxes/{id}/migrate` (vmon extension).
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminMigratedDto {
+	#[serde(rename = "sandboxID")]
+	pub sandbox_id: String,
+	#[serde(rename = "nodeID")]
+	pub node_id:    String,
+	pub state:      &'static str,
+}
+
 /// `AdminSandbox`.
 #[derive(Clone, Debug, Serialize)]
 pub struct AdminSandboxDto {

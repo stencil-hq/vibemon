@@ -31,7 +31,7 @@ const HOLD_POLL: Duration = Duration::from_millis(250);
 /// What a broken response waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
-	/// Pausing or paused: keep the response open.
+	/// Pausing, paused, resuming, or migrating: keep the response open.
 	Wait,
 	/// Running, killed, or unknown: report the failure now.
 	Release,
@@ -40,7 +40,7 @@ pub enum Hold {
 /// Decides from the sandbox's live route and, without one, its durable state.
 pub fn decide(route: Option<&SandboxRoute>, durable: Option<SandboxState>) -> Hold {
 	match route.map(|route| route.state) {
-		Some(RouteState::Pausing | RouteState::Resuming) => Hold::Wait,
+		Some(RouteState::Pausing | RouteState::Resuming | RouteState::Migrating) => Hold::Wait,
 		Some(RouteState::Running | RouteState::Snapshotting | RouteState::Killing) => Hold::Release,
 		None if durable == Some(SandboxState::Paused) => Hold::Wait,
 		None => Hold::Release,
@@ -161,6 +161,7 @@ mod tests {
 	fn holds_only_while_pausing_or_paused() {
 		assert_eq!(decide(Some(&route(RouteState::Pausing)), None), Hold::Wait);
 		assert_eq!(decide(Some(&route(RouteState::Resuming)), None), Hold::Wait);
+		assert_eq!(decide(Some(&route(RouteState::Migrating)), None), Hold::Wait);
 		assert_eq!(decide(None, Some(SandboxState::Paused)), Hold::Wait);
 		assert_eq!(decide(Some(&route(RouteState::Running)), None), Hold::Release, "guest closed it");
 		assert_eq!(decide(Some(&route(RouteState::Killing)), None), Hold::Release);

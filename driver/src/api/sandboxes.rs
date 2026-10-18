@@ -26,10 +26,10 @@ use vmon_cluster::kv::{Compare, Op, Txn};
 use vmon_node::api::{LogQuery, MetricSample, RouteState, SandboxRoute};
 
 use self::dto::{
-	AdminKillDto, AdminListedSandboxDto, AdminSandboxDto, ConnectBody, ErrorDto, ForkBody,
-	ForkResultDto, LifecycleDto, ListedSandboxDto, LogEntryDto, LogLineDto, LogsV1Dto, LogsV2Dto,
-	MetricDto, MountDto, NewSandboxBody, PauseBody, RefreshBody, ResumeBody, SandboxDetailDto,
-	SandboxDto, SandboxesWithMetricsDto, SnapshotBody, TimeoutBody, rfc3339,
+	AdminKillDto, AdminListedSandboxDto, AdminMigratedDto, AdminSandboxDto, ConnectBody, ErrorDto,
+	ForkBody, ForkResultDto, LifecycleDto, ListedSandboxDto, LogEntryDto, LogLineDto, LogsV1Dto,
+	LogsV2Dto, MetricDto, MigrateBody, MountDto, NewSandboxBody, PauseBody, RefreshBody, ResumeBody,
+	SandboxDetailDto, SandboxDto, SandboxesWithMetricsDto, SnapshotBody, TimeoutBody, rfc3339,
 };
 use crate::{
 	auth::{AdminAuth, TeamAuth},
@@ -85,6 +85,7 @@ pub fn routes() -> Router<AppState> {
 		.route("/admin/sandboxes", get(admin_list))
 		.route("/admin/sandboxes/running-counts", get(admin_running_counts))
 		.route("/admin/sandboxes/{sandbox_id}", get(admin_sandbox))
+		.route("/admin/sandboxes/{sandbox_id}/migrate", post(admin_migrate))
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1083,12 +1084,40 @@ async fn admin_sandbox(
 		(Some(route), _) => (route.team_id.clone(), match route.state {
 			RouteState::Killing => "killed",
 			RouteState::Pausing => "paused",
-			RouteState::Running | RouteState::Resuming | RouteState::Snapshotting => "running",
+			RouteState::Running
+			| RouteState::Resuming
+			| RouteState::Snapshotting
+			| RouteState::Migrating => "running",
 		}),
 		(None, Some(row)) => (row.team_id.clone(), row.state().as_str()),
 		(None, None) => return Err(ApiError::sandbox_not_found(&id)),
 	};
 	Ok(Json(AdminSandboxDto { sandbox_id: id, team_id, state: state_name }))
+}
+
+/// `POST /admin/sandboxes/{sandboxID}/migrate` (vmon extension): moves a
+/// running or node-local paused sandbox to `nodeID` or a placed node.
+async fn admin_migrate(
+	State(state): State<AppState>,
+	_admin: AdminAuth,
+	Path(raw_id): Path<String>,
+	body: Bytes,
+) -> ApiResult<Json<AdminMigratedDto>> {
+	let id = normalize_sandbox_id(&raw_id)?;
+	let body: MigrateBody = parse_optional_json(&body)?;
+	let target = body
+		.node_id
+		.map(|raw| {
+			raw.parse::<vmon_cluster::NodeId>()
+				.map_err(|_| ApiError::bad_request(format!("invalid nodeID {raw:?}")))
+		})
+		.transpose()?;
+	let migrated = lifecycle::migrate(&state, &id, target).await?;
+	Ok(Json(AdminMigratedDto {
+		sandbox_id: migrated.sandbox_id,
+		node_id:    migrated.node_id.to_string(),
+		state:      migrated.state.as_str(),
+	}))
 }
 
 #[cfg(test)]
