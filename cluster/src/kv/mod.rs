@@ -1,7 +1,8 @@
 //! Raft-replicated KV store on openraft (ARCHITECTURE.md §5.3).
 //!
 //! Drivers run a raft voter ([`raft`]) whose state machine ([`machine`]) is an
-//! ordered map with revisions and deterministic TTLs. Node-only processes get a
+//! ordered map with revisions and deterministic TTLs, plus an on-disk journal
+//! of append-only history ([`journal`]). Node-only processes get a
 //! [`Kv`] that forwards every call to a live driver found through gossip;
 //! [`Kv::connect`] gives tools outside the cluster (`vmon admin`) the same
 //! forwarding handle over fixed driver URLs.
@@ -9,6 +10,7 @@
 #[cfg(test)]
 mod compat_tests;
 mod http;
+mod journal;
 mod log_store;
 mod machine;
 mod membership;
@@ -26,10 +28,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use self::http::{GetRequest, ListRequest};
+pub use self::journal::RETENTION as JOURNAL_RETENTION;
 pub(crate) use self::{
 	http::{KvClient, routes},
 	membership::Reconciler,
-	raft::RaftKv,
+	raft::{RaftKv, maintain_journal},
 	resp::serve_resp,
 };
 use crate::{gossip::Gossip, meta::NodeId};
@@ -94,6 +97,42 @@ pub enum Op {
 		value:  Vec<u8>,
 		ttl_ms: Option<u64>,
 	},
+	/// Appends `value` to the journal under each of `streams` ([`Kv::scan`]):
+	/// on disk on every driver, not in the map. The record's seq is the next
+	/// journal position (dense, in commit order) and its timestamp the
+	/// leader-stamped command time. Transactions cannot compare journal
+	/// contents; records expire after [`JOURNAL_RETENTION`].
+	Append {
+		streams: Vec<String>,
+		#[serde(with = "hex_bytes")]
+		value:   Vec<u8>,
+	},
+}
+
+/// Ordered read of one journal stream for [`Kv::scan`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scan {
+	pub stream:  String,
+	/// Records after this seq (before it when `reverse`).
+	#[serde(default)]
+	pub after:   Option<u64>,
+	/// At most this many records; `None` returns every match.
+	#[serde(default)]
+	pub limit:   Option<usize>,
+	/// Newest first.
+	#[serde(default)]
+	pub reverse: bool,
+}
+
+/// One journal record returned by [`Kv::scan`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+	/// Journal position: dense across all streams, in commit order.
+	pub seq:   u64,
+	/// Leader-stamped commit time (unix ms); never decreases with `seq`.
+	pub ts_ms: u64,
+	#[serde(with = "hex_bytes")]
+	pub value: Vec<u8>,
 }
 
 /// Key fragment [`Op::PutStamped`] substitutes for `revision`: zero-padded so
@@ -141,6 +180,9 @@ impl Txn {
 				},
 				Op::Delete { key } => key.len(),
 				Op::DeletePrefix { prefix } => prefix.len(),
+				Op::Append { streams, value } => {
+					streams.iter().map(String::len).sum::<usize>() + value.len()
+				},
 			})
 			.sum()
 	}
@@ -248,6 +290,16 @@ impl Kv {
 		match self.ready_local() {
 			Some(local) => Ok(local.range_local(range)),
 			None => self.inner.remote.range(range).await,
+		}
+	}
+
+	/// Records of one journal stream in seq order (newest first with
+	/// `reverse`), from local applied state; a driver whose journal still has
+	/// holes (it installed a raft snapshot) asks the leader.
+	pub async fn scan(&self, scan: &Scan) -> Result<Vec<Record>, KvError> {
+		match self.ready_local() {
+			Some(local) => local.scan(scan, false).await,
+			None => self.inner.remote.scan(scan).await,
 		}
 	}
 
@@ -395,6 +447,10 @@ impl Remote {
 
 	async fn range(&self, range: &Range) -> Result<Vec<Entry>, KvError> {
 		self.call("range", range).await
+	}
+
+	async fn scan(&self, scan: &Scan) -> Result<Vec<Record>, KvError> {
+		self.call("scan", scan).await
 	}
 
 	async fn txns(&self, txns: &[Txn]) -> Result<Vec<TxnResult>, KvError> {

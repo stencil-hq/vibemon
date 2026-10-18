@@ -18,7 +18,8 @@ use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
-	Entry, KvError, Range, Txn, TxnResult,
+	Entry, KvError, Range, Record, Scan, Txn, TxnResult,
+	journal::Copied,
 	network::SnapshotHeader,
 	raft::{RaftKv, Snapshot, TypeConfig},
 };
@@ -42,6 +43,14 @@ pub struct GetRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListRequest {
 	pub prefix: String,
+}
+
+/// Body of `POST /cluster/v1/kv/journal`: journal records `[from, to)` a peer
+/// copies to fill a hole.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CopyRequest {
+	pub from: u64,
+	pub to:   u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +97,8 @@ pub fn routes(kv: Arc<RaftKv>) -> Router {
 		.route("/cluster/v1/kv/get", post(kv_get))
 		.route("/cluster/v1/kv/list", post(kv_list))
 		.route("/cluster/v1/kv/range", post(kv_range))
+		.route("/cluster/v1/kv/scan", post(kv_scan))
+		.route("/cluster/v1/kv/journal", post(kv_journal))
 		.route("/cluster/v1/kv/sync", post(kv_sync))
 		.route("/cluster/v1/kv/txns", post(kv_txns))
 		.layer(DefaultBodyLimit::max(RAFT_BODY_LIMIT))
@@ -137,6 +148,23 @@ async fn kv_list(
 	Json(req): Json<ListRequest>,
 ) -> Json<Reply<Vec<Entry>>> {
 	Json(kv.list_served(&req.prefix).await.into())
+}
+
+async fn kv_scan(
+	State(kv): State<Arc<RaftKv>>,
+	headers: HeaderMap,
+	Json(scan): Json<Scan>,
+) -> Json<Reply<Vec<Record>>> {
+	let hop = Hop::from_headers(&headers);
+	Json(kv.scan_served(&scan, hop == Hop::Forwarded).await.into())
+}
+
+/// Local journal records for a peer filling a hole (never forwarded).
+async fn kv_journal(
+	State(kv): State<Arc<RaftKv>>,
+	Json(req): Json<CopyRequest>,
+) -> Json<Reply<Copied>> {
+	Json(kv.copy_journal(req.from..req.to).await.into())
 }
 
 async fn kv_range(

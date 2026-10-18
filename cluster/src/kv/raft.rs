@@ -3,6 +3,7 @@
 
 use std::{
 	future::Future,
+	ops,
 	path::Path,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -16,11 +17,12 @@ use openraft::{
 };
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::{
-	Entry, KvError, Range, Txn, TxnResult, WatchEvent,
-	http::{CallError, GetRequest, Hop, KvClient, ListRequest},
+	Entry, KvError, Range, Record, Scan, Txn, TxnResult, WatchEvent,
+	http::{CallError, CopyRequest, GetRequest, Hop, KvClient, ListRequest},
+	journal::{self, Copied},
 	log_store::LogStore,
 	machine::Command,
 	membership,
@@ -67,6 +69,12 @@ pub type RaftMetrics = openraft::RaftMetrics<TypeConfig>;
 /// The openraft handle of a driver.
 pub type KvRaft = Raft<TypeConfig, StateMachineStore>;
 
+/// Period of [`maintain_journal`].
+const JOURNAL_TICK: Duration = Duration::from_secs(10);
+/// Ticks between journal retention passes.
+const JOURNAL_PRUNE_TICKS: u32 = 6;
+/// Values per journal copy reply (hex doubles them on the wire).
+const JOURNAL_COPY_BYTES: usize = 4 << 20;
 /// How long a KV call waits for a reachable leader before failing with
 /// [`KvError::NoLeader`].
 const LEADER_WAIT: Duration = Duration::from_secs(8);
@@ -245,22 +253,109 @@ impl RaftKv {
 		self
 			.via_leader("sync", &(), hop, || async {
 				if self.is_leader() {
-					return Attempt::Done(Ok(self.sm.revision()));
-				}
-				let metrics = self.raft.metrics().borrow_watched().clone();
-				match metrics.current_leader.filter(|leader| *leader != self.id) {
-					Some(leader) => Attempt::Forward(
-						metrics
-							.membership_config
-							.membership()
-							.get_node(&leader)
-							.map(|peer| peer.cluster_url.clone()),
-					),
-					// Leadership not confirmed yet (election, fresh term).
-					None => Attempt::Retry,
+					Attempt::Done(Ok(self.sm.revision()))
+				} else {
+					self.to_leader()
 				}
 			})
 			.await
+	}
+
+	/// Forward to the current raft leader, or retry while there is none (or
+	/// it is this node, not yet confirmed).
+	fn to_leader<T>(&self) -> Attempt<T> {
+		let metrics = self.raft.metrics().borrow_watched().clone();
+		match metrics.current_leader.filter(|leader| *leader != self.id) {
+			Some(leader) => Attempt::Forward(
+				metrics
+					.membership_config
+					.membership()
+					.get_node(&leader)
+					.map(|peer| peer.cluster_url.clone()),
+			),
+			None => Attempt::Retry,
+		}
+	}
+
+	/// Journal scan ([`super::Kv::scan`]) of local state; a follower whose
+	/// journal has holes (it installed a raft snapshot and is still copying
+	/// the records it skipped) asks the leader, which serves what it holds.
+	pub async fn scan(&self, scan: &Scan, forwarded: bool) -> Result<Vec<Record>, KvError> {
+		if forwarded || self.sm.journal_complete() || self.is_leader() {
+			return self.sm.scan(scan).await;
+		}
+		self
+			.via_leader("scan", scan, Hop::Entry, || async {
+				if self.is_leader() {
+					Attempt::Done(self.sm.scan(scan).await)
+				} else {
+					self.to_leader()
+				}
+			})
+			.await
+	}
+
+	/// Journal scan served to a remote client (after a read barrier); a
+	/// driver without state asks the leader.
+	pub async fn scan_served(&self, scan: &Scan, forwarded: bool) -> Result<Vec<Record>, KvError> {
+		if forwarded {
+			return self.sm.scan(scan).await;
+		}
+		if self.has_state() {
+			self.sync().await?;
+			return self.scan(scan, false).await;
+		}
+		self
+			.via_leader("scan", scan, Hop::Entry, || async { Attempt::Forward(None) })
+			.await
+	}
+
+	/// This replica's journal records of `range` for a peer filling a hole.
+	pub async fn copy_journal(&self, range: ops::Range<u64>) -> Result<Copied, KvError> {
+		self
+			.sm
+			.copy_journal(range, JOURNAL_COPY_BYTES)
+			.await
+			.map_err(|error| KvError::Io(format!("journal: {error}")))
+	}
+
+	/// Copies the records of every journal hole from peers (believed leader
+	/// first), staying with a peer while it makes progress.
+	async fn backfill_journal(&self) {
+		'holes: for hole in self.sm.journal_holes() {
+			for url in membership::driver_urls(&self.gossip, self.id) {
+				let mut missing = hole.clone();
+				loop {
+					let req = CopyRequest { from: missing.start, to: missing.end };
+					let copied: Copied = match self
+						.client
+						.call(&url, "journal", &req, Hop::Forwarded)
+						.await
+					{
+						Ok(copied) => copied,
+						Err(error) => {
+							tracing::debug!(%url, ?error, "journal copy failed");
+							break;
+						},
+					};
+					if let Err(error) = self.sm.fill_journal(missing.clone(), &copied) {
+						tracing::warn!(%url, %error, "journal copy rejected");
+						break;
+					}
+					let rest = self
+						.sm
+						.journal_holes()
+						.into_iter()
+						.find(|rest| rest.start < hole.end && hole.start < rest.end);
+					match rest {
+						None => continue 'holes,
+						Some(rest) if rest.start > missing.start => missing = rest,
+						// No progress from this peer: try the next one.
+						Some(_) => break,
+					}
+				}
+			}
+		}
 	}
 
 	/// Follower read served to a remote client (after a read barrier); a driver
@@ -421,6 +516,36 @@ impl RaftKv {
 				return Err(KvError::NoLeader);
 			}
 			tokio::time::sleep(RETRY_DELAY).await;
+		}
+	}
+}
+
+/// Background upkeep of a driver's journal until `stop`: makes appended
+/// records durable every [`JOURNAL_TICK`], drops records older than
+/// [`journal::RETENTION`], and copies holes from peers.
+pub async fn maintain_journal(kv: Arc<RaftKv>, mut stop: watch::Receiver<bool>) {
+	let mut tick = tokio::time::interval(JOURNAL_TICK);
+	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	let mut ticks = 0u32;
+	loop {
+		tokio::select! {
+			_ = tick.tick() => {},
+			_ = stop.changed() => return,
+		}
+		if let Err(error) = kv.sm.flush_journal().await {
+			tracing::warn!(%error, "journal flush failed");
+		}
+		ticks = ticks.wrapping_add(1);
+		if ticks.is_multiple_of(JOURNAL_PRUNE_TICKS) {
+			let retention = u64::try_from(journal::RETENTION.as_millis()).unwrap_or(u64::MAX);
+			match kv.sm.prune_journal(now_ms().saturating_sub(retention)) {
+				Ok(0) => {},
+				Ok(pruned) => tracing::debug!(pruned, "journal segments expired"),
+				Err(error) => tracing::warn!(%error, "journal prune failed"),
+			}
+		}
+		if !kv.sm.journal_complete() {
+			kv.backfill_journal().await;
 		}
 	}
 }
