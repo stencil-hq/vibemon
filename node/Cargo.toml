@@ -1,6 +1,6 @@
 [package]
 name = "vmon-node"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 description = "Vibemon node role: microVM runtime, template builds, artifacts, guest tunnels"
 license.workspace = true

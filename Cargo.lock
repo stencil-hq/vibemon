@@ -3288,7 +3288,7 @@ checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
 
 [[package]]
 name = "vmm"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "applevisor",
  "applevisor-sys",
@@ -3344,7 +3344,7 @@ dependencies = [
 
 [[package]]
 name = "vmon"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "vmon-agent"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "vmon-cloud"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bytes",
@@ -3418,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "vmon-cluster"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "vmon-driver"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "vmon-node"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",

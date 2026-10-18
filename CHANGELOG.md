@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here.
 
-## Unreleased
+## 0.4.0
 
 ### Added (multi-address membership)
 
