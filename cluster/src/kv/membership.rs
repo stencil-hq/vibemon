@@ -7,7 +7,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use openraft::{ChangeMembers, ServerState};
+use openraft::{ChangeMembers, ServerState, async_runtime::WatchReceiver};
 use rand::seq::SliceRandom;
 use tokio::sync::watch;
 
@@ -151,7 +151,7 @@ impl Reconciler {
 	}
 
 	fn status(&self) -> RaftStatus {
-		let metrics = self.kv.raft().metrics().borrow().clone();
+		let metrics = self.kv.raft().metrics().borrow_watched().clone();
 		RaftStatus {
 			cluster_id: self
 				.kv
@@ -238,7 +238,7 @@ impl Reconciler {
 
 	/// Adds alive drivers as learners → voters and reaps long-dead voters.
 	async fn reconcile_membership(&mut self) {
-		let metrics = self.kv.raft().metrics().borrow().clone();
+		let metrics = self.kv.raft().metrics().borrow_watched().clone();
 		if metrics.state != ServerState::Leader {
 			return;
 		}
@@ -256,9 +256,9 @@ impl Reconciler {
 		let raft = self.kv.raft();
 
 		// Peers that restarted on a new address, or came back after being seen
-		// down: re-setting their address appends a membership entry, which
-		// rebuilds the replication streams and so ends the long unreachable
-		// backoff of the revived peer (see `network::PeerClient::backoff`).
+		// down: their running replication streams switch to the address, which
+		// a membership entry records for later leaders, and the long unreachable
+		// backoff of a revived peer ends (see `network::PeerClient::backoff`).
 		let refresh: BTreeMap<NodeId, RaftPeer> = membership
 			.nodes()
 			.filter_map(|(id, node)| {
@@ -270,10 +270,15 @@ impl Reconciler {
 			.collect();
 		if !refresh.is_empty() {
 			tracing::info!(nodes = ?refresh.keys().collect::<Vec<_>>(), "refreshing raft peer addresses");
-			for id in refresh.keys() {
+			for (id, peer) in &refresh {
 				self.down_since.remove(id);
+				self.kv.set_peer_url(*id, &peer.cluster_url);
 			}
+			let ids: Vec<NodeId> = refresh.keys().copied().collect();
 			change(raft.change_membership(ChangeMembers::SetNodes(refresh), true)).await;
+			if let Err(error) = raft.trigger().reset_backoff(ids).await {
+				tracing::warn!(%error, "raft replication backoff reset failed");
+			}
 			return;
 		}
 

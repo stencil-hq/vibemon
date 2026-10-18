@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::Context;
+use openraft::async_runtime::WatchReceiver;
 use axum::{
 	Router,
 	extract::Request,

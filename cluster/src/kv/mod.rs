@@ -127,6 +127,25 @@ pub struct Txn {
 	pub failure: Vec<Op>,
 }
 
+impl Txn {
+	/// Key and value bytes carried by the ops (bounds RESP write groups).
+	pub(crate) fn payload_len(&self) -> usize {
+		self
+			.success
+			.iter()
+			.chain(&self.failure)
+			.map(|op| match op {
+				Op::Put { key, value, .. } => key.len() + value.len(),
+				Op::PutStamped { prefix, suffix, value, .. } => {
+					prefix.len() + suffix.len() + value.len()
+				},
+				Op::Delete { key } => key.len(),
+				Op::DeletePrefix { prefix } => prefix.len(),
+			})
+			.sum()
+	}
+}
+
 /// Outcome of a [`Txn`]: which branch ran and the store revision after it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxnResult {
@@ -252,12 +271,27 @@ impl Kv {
 		}
 	}
 
-	/// Runs a transaction on the leader.
-	pub async fn txn(&self, txn: Txn) -> Result<TxnResult, KvError> {
-		match &self.inner.local {
-			Some(local) => local.txn(txn, false).await,
-			None => self.inner.remote.txn(&txn).await,
+	/// Commits `txns` on the leader as one raft entry, in order: each sees the
+	/// effects of the ones before it, and all commit or none does. Entries of
+	/// concurrent callers share one log append (group commit).
+	pub async fn txns(&self, txns: Vec<Txn>) -> Result<Vec<TxnResult>, KvError> {
+		if txns.is_empty() {
+			return Ok(Vec::new());
 		}
+		let expected = txns.len();
+		let results = match &self.inner.local {
+			Some(local) => local.txns(txns, false).await,
+			None => self.inner.remote.txns(&txns).await,
+		}?;
+		if results.len() != expected {
+			return Err(KvError::Io(format!("{} results for {expected} txns", results.len())));
+		}
+		Ok(results)
+	}
+
+	/// Runs one transaction on the leader ([`Kv::txns`]).
+	pub async fn txn(&self, txn: Txn) -> Result<TxnResult, KvError> {
+		Ok(self.txns(vec![txn]).await?[0])
 	}
 
 	/// Writes a key unconditionally; returns its new `mod_rev`.
@@ -363,8 +397,8 @@ impl Remote {
 		self.call("range", range).await
 	}
 
-	async fn txn(&self, txn: &Txn) -> Result<TxnResult, KvError> {
-		self.call("txn", txn).await
+	async fn txns(&self, txns: &[Txn]) -> Result<Vec<TxnResult>, KvError> {
+		self.call("txns", &txns).await
 	}
 
 	/// Sends to live drivers (believed leader first), moving on only when a

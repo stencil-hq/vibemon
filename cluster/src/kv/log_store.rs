@@ -35,14 +35,13 @@ use std::{
 };
 
 use openraft::{
-	ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, StorageError, Vote,
-	storage::{LogFlushed, RaftLogStorage},
+	LogState, RaftLogReader,
+	storage::{IOFlushed, RaftLogStorage},
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use super::raft::{LogEntry, TypeConfig};
-use crate::meta::NodeId;
+use super::raft::{LogEntry, LogId, TypeConfig, Vote};
 
 const SLOT_FILES: [&str; 2] = ["log.0", "log.1"];
 /// The single append-only log of earlier versions (migrated on open).
@@ -62,16 +61,27 @@ const BODY: u64 = 4096;
 const SLOT_GROWTH: u64 = 8 << 20;
 /// Size of `committed.bin`: one framed record, zero-padded.
 const COMMITTED_LEN: usize = 256;
+/// Capacity the reused encode buffer keeps between writes.
+const ENCODE_BUF_KEEP: usize = 1 << 20;
 static ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 
-/// One record of the log.
-#[derive(Serialize, Deserialize)]
+/// One record of the log, as decoded on replay.
+#[derive(Debug, PartialEq, Deserialize)]
 pub(super) enum Record {
 	Entry(LogEntry),
 	/// Remove entries with index >= this.
 	Truncate(u64),
 	/// Remove entries up to and including this id.
-	Purge(LogId<NodeId>),
+	Purge(LogId),
+}
+
+/// A [`Record`] to write, borrowing its entry; encodes to the same bytes.
+#[derive(Serialize)]
+#[serde(rename = "Record")]
+pub(super) enum RecordRef<'a> {
+	Entry(&'a LogEntry),
+	Truncate(u64),
+	Purge(&'a LogId),
 }
 
 /// openraft log storage; clones share the same state (used as the log reader
@@ -88,11 +98,13 @@ struct Inner {
 	/// Records in the active slot (drives compaction).
 	records:        usize,
 	entries:        BTreeMap<u64, LogEntry>,
-	last_purged:    Option<LogId<NodeId>>,
+	last_purged:    Option<LogId>,
 	dir:            PathBuf,
-	vote:           Option<Vote<NodeId>>,
-	committed:      Option<LogId<NodeId>>,
+	vote:           Option<Vote>,
+	committed:      Option<LogId>,
 	committed_file: File,
+	/// Encode buffer reused across writes.
+	buf:            Vec<u8>,
 }
 
 /// One preallocated log file.
@@ -111,7 +123,7 @@ struct Slot {
 #[derive(Default)]
 struct Replayed {
 	entries:     BTreeMap<u64, LogEntry>,
-	last_purged: Option<LogId<NodeId>>,
+	last_purged: Option<LogId>,
 	records:     usize,
 	/// Bytes of decodable records.
 	len:         usize,
@@ -230,8 +242,8 @@ impl LogStore {
 /// What [`Inner`] keeps beside the log.
 struct Saved {
 	dir:            PathBuf,
-	vote:           Option<Vote<NodeId>>,
-	committed:      Option<LogId<NodeId>>,
+	vote:           Option<Vote>,
+	committed:      Option<LogId>,
 	committed_file: File,
 }
 
@@ -247,22 +259,38 @@ impl Inner {
 			vote: saved.vote,
 			committed: saved.committed,
 			committed_file: saved.committed_file,
+			buf: Vec::new(),
 		}
 	}
 
 	/// Appends `records` to the active slot and fdatasyncs them.
-	fn write_records(&mut self, records: &[Record]) -> io::Result<()> {
-		let mut buf = Vec::new();
+	fn write_records<'a>(
+		&mut self,
+		records: impl IntoIterator<Item = RecordRef<'a>>,
+	) -> io::Result<()> {
+		let mut buf = std::mem::take(&mut self.buf);
+		let mut count = 0;
 		for record in records {
-			encode_record(record, &mut buf);
+			encode_record(&record, &mut buf);
+			count += 1;
 		}
+		let result = self.write_active(&buf);
+		buf.clear();
+		buf.shrink_to(ENCODE_BUF_KEEP);
+		self.buf = buf;
+		result?;
+		self.records += count;
+		Ok(())
+	}
+
+	/// Appends encoded records to the active slot and fdatasyncs them.
+	fn write_active(&mut self, bytes: &[u8]) -> io::Result<()> {
 		let slot = &mut self.slots[self.active];
-		let end = slot.end + buf.len() as u64;
+		let end = slot.end + bytes.len() as u64;
 		slot.reserve(end)?;
-		slot.write_at(slot.end, &buf)?;
+		slot.write_at(slot.end, bytes)?;
 		slot.file.sync_data()?;
 		slot.end = end;
-		self.records += records.len();
 		Ok(())
 	}
 
@@ -277,22 +305,32 @@ impl Inner {
 	/// Writes the live state into the other slot, then seals it with the next
 	/// epoch, which makes it the slot replayed on open.
 	fn rewrite(&mut self) -> io::Result<()> {
-		let mut buf = Vec::new();
+		let mut buf = std::mem::take(&mut self.buf);
 		let mut records = 0;
-		if let Some(purged) = self.last_purged {
-			encode_record(&Record::Purge(purged), &mut buf);
+		if let Some(purged) = &self.last_purged {
+			encode_record(&RecordRef::Purge(purged), &mut buf);
 			records += 1;
 		}
 		for entry in self.entries.values() {
-			encode_record(&Record::Entry(entry.clone()), &mut buf);
+			encode_record(&RecordRef::Entry(entry), &mut buf);
 			records += 1;
 		}
+		let result = self.write_rewrite(&buf, records);
+		buf.clear();
+		buf.shrink_to(ENCODE_BUF_KEEP);
+		self.buf = buf;
+		result
+	}
+
+	/// Writes `buf` (`records` encoded records) into the inactive slot and
+	/// seals it as the new active slot.
+	fn write_rewrite(&mut self, buf: &[u8], records: usize) -> io::Result<()> {
 		let epoch = self.slots[self.active].epoch.unwrap_or(0) + 1;
 		let target = 1 - self.active;
 		let slot = &mut self.slots[target];
 		let end = BODY + buf.len() as u64;
 		slot.reserve(end)?;
-		slot.write_at(BODY, &buf)?;
+		slot.write_at(BODY, buf)?;
 		if slot.end > end {
 			slot.zero(end, slot.end)?;
 		}
@@ -305,19 +343,24 @@ impl Inner {
 	}
 
 	/// Overwrites `committed.bin` in place (no fsync).
-	fn write_committed(&mut self, committed: Option<LogId<NodeId>>) -> io::Result<()> {
-		let payload = serde_json::to_vec(&committed).map_err(io::Error::other)?;
-		let mut buf = Vec::with_capacity(COMMITTED_LEN);
-		frame(&payload, &mut buf);
-		if buf.len() > COMMITTED_LEN {
-			return Err(io::Error::other("raft committed id record too large"));
-		}
-		buf.resize(COMMITTED_LEN, 0);
-		self.committed_file.seek(SeekFrom::Start(0))?;
-		self.committed_file.write_all(&buf)
+	fn write_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
+		let mut buf = std::mem::take(&mut self.buf);
+		encode_framed(&committed, &mut buf);
+		let result = if buf.len() > COMMITTED_LEN {
+			Err(io::Error::other("raft committed id record too large"))
+		} else {
+			buf.resize(COMMITTED_LEN, 0);
+			self
+				.committed_file
+				.seek(SeekFrom::Start(0))
+				.and_then(|_| self.committed_file.write_all(&buf))
+		};
+		buf.clear();
+		self.buf = buf;
+		result
 	}
 
-	fn last_log_id(&self) -> Option<LogId<NodeId>> {
+	fn last_log_id(&self) -> Option<LogId> {
 		self
 			.entries
 			.values()
@@ -448,12 +491,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 	})
 }
 
-/// Appends `payload` with its length and checksum to `buf`.
-fn frame(payload: &[u8], buf: &mut Vec<u8>) {
+/// Appends the JSON of `value` to `buf`, framed with its length and checksum.
+fn encode_framed<T: Serialize + ?Sized>(value: &T, buf: &mut Vec<u8>) {
+	let start = buf.len();
+	buf.extend_from_slice(&[0; HEADER]);
+	serde_json::to_writer(&mut *buf, value).expect("raft log record serializes");
+	let payload = &buf[start + HEADER..];
 	let len = u32::try_from(payload.len()).expect("raft log record below 4 GiB");
-	buf.extend_from_slice(&len.to_le_bytes());
-	buf.extend_from_slice(&fnv1a64(payload).to_le_bytes());
-	buf.extend_from_slice(payload);
+	let hash = fnv1a64(payload);
+	buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+	buf[start + 4..start + HEADER].copy_from_slice(&hash.to_le_bytes());
 }
 
 /// The framed payload at the start of `bytes` and the framed length; `None`
@@ -467,8 +514,8 @@ fn unframe(bytes: &[u8]) -> Option<(&[u8], usize)> {
 	(fnv1a64(payload) == hash).then_some((payload, HEADER + len))
 }
 
-fn encode_record(record: &Record, buf: &mut Vec<u8>) {
-	frame(&serde_json::to_vec(record).expect("raft log record serializes"), buf);
+fn encode_record(record: &RecordRef<'_>, buf: &mut Vec<u8>) {
+	encode_framed(record, buf);
 }
 
 /// Decodes the record at the start of `bytes`; `None` on end of data or a
@@ -481,7 +528,7 @@ fn decode_record(bytes: &[u8]) -> Option<(Record, usize)> {
 /// The committed id (`committed.bin` exists); unknown, and re-learned, when
 /// unreadable. A never written `committed.bin` falls back to the
 /// `committed.json` of earlier versions.
-fn read_committed(dir: &Path) -> io::Result<Option<LogId<NodeId>>> {
+fn read_committed(dir: &Path) -> io::Result<Option<LogId>> {
 	let bytes = fs::read(dir.join(COMMITTED_FILE))?;
 	let committed = if bytes.is_empty() {
 		read_json(&dir.join(LEGACY_COMMITTED_FILE)).map(Option::flatten)
@@ -530,12 +577,6 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
 		.map(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other))
 		.transpose()
 }
-fn io_err(
-	subject: ErrorSubject<NodeId>,
-	verb: ErrorVerb,
-) -> impl FnOnce(io::Error) -> StorageError<NodeId> {
-	move |error| StorageError::from_io_error(subject, verb, error)
-}
 
 impl RaftLogReader<TypeConfig> for LogStore {
 	#[expect(
@@ -545,7 +586,7 @@ impl RaftLogReader<TypeConfig> for LogStore {
 	async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
 		&mut self,
 		range: RB,
-	) -> Result<Vec<LogEntry>, StorageError<NodeId>> {
+	) -> io::Result<Vec<LogEntry>> {
 		Ok(self
 			.inner
 			.lock()
@@ -553,6 +594,14 @@ impl RaftLogReader<TypeConfig> for LogStore {
 			.range(range)
 			.map(|(_, entry)| entry.clone())
 			.collect())
+	}
+
+	#[expect(
+		clippy::unused_async_trait_impl,
+		reason = "signature fixed by openraft's RaftLogReader"
+	)]
+	async fn read_vote(&mut self) -> io::Result<Option<Vote>> {
+		Ok(self.inner.lock().vote)
 	}
 }
 
@@ -563,7 +612,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 		clippy::unused_async_trait_impl,
 		reason = "signature fixed by openraft's RaftLogStorage"
 	)]
-	async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+	async fn get_log_state(&mut self) -> io::Result<LogState<TypeConfig>> {
 		let inner = self.inner.lock();
 		Ok(LogState {
 			last_purged_log_id: inner.last_purged,
@@ -579,7 +628,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 		self.clone()
 	}
 
-	async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+	async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
 		let vote = *vote;
 		self
 			.blocking(move |inner| {
@@ -591,15 +640,6 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 				Ok(())
 			})
 			.await
-			.map_err(io_err(ErrorSubject::Vote, ErrorVerb::Write))
-	}
-
-	#[expect(
-		clippy::unused_async_trait_impl,
-		reason = "signature fixed by openraft's RaftLogStorage"
-	)]
-	async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-		Ok(self.inner.lock().vote)
 	}
 
 	/// Persists the committed id in place without fsync: openraft only uses
@@ -608,10 +648,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 	/// runs ahead of the durable log, which is fsync'd before commit. Saves two
 	/// fsyncs per KV write, and the overwrite in place creates, renames, and
 	/// allocates nothing.
-	async fn save_committed(
-		&mut self,
-		committed: Option<LogId<NodeId>>,
-	) -> Result<(), StorageError<NodeId>> {
+	async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
 		self
 			.blocking(move |inner| {
 				if inner.committed == committed {
@@ -622,22 +659,20 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 				Ok(())
 			})
 			.await
-			.map_err(io_err(ErrorSubject::Store, ErrorVerb::Write))
 	}
 
 	#[expect(
 		clippy::unused_async_trait_impl,
 		reason = "signature fixed by openraft's RaftLogStorage"
 	)]
-	async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+	async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
 		Ok(self.inner.lock().committed)
 	}
 
-	async fn append<I>(
-		&mut self,
-		entries: I,
-		callback: LogFlushed<TypeConfig>,
-	) -> Result<(), StorageError<NodeId>>
+	/// Writes and fdatasyncs every entry openraft hands over in one call (it
+	/// merges queued appends, so concurrent writes share one sync), then
+	/// reports them flushed.
+	async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> io::Result<()>
 	where
 		I: IntoIterator<Item = LogEntry> + Send,
 		I::IntoIter: Send,
@@ -645,8 +680,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 		let entries: Vec<LogEntry> = entries.into_iter().collect();
 		let result = self
 			.blocking(move |inner| {
-				let records: Vec<Record> = entries.iter().cloned().map(Record::Entry).collect();
-				inner.write_records(&records)?;
+				inner.write_records(entries.iter().map(RecordRef::Entry))?;
 				for entry in entries {
 					inner.entries.insert(entry.log_id.index, entry);
 				}
@@ -657,44 +691,46 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 			Ok(()) => Ok(()),
 			Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
 		};
-		callback.log_io_completed(reply);
-		result.map_err(io_err(ErrorSubject::Logs, ErrorVerb::Write))
+		callback.io_completed(reply);
+		result
 	}
 
-	async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+	async fn truncate_after(&mut self, last_log_id: Option<LogId>) -> io::Result<()> {
+		let since = last_log_id.map_or(0, |log_id| log_id.index + 1);
 		self
 			.blocking(move |inner| {
-				inner.write_records(&[Record::Truncate(log_id.index)])?;
-				inner.entries.split_off(&log_id.index);
+				inner.write_records([RecordRef::Truncate(since)])?;
+				inner.entries.split_off(&since);
 				Ok(())
 			})
 			.await
-			.map_err(io_err(ErrorSubject::Logs, ErrorVerb::Delete))
 	}
 
-	async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+	async fn purge(&mut self, log_id: LogId) -> io::Result<()> {
 		self
 			.blocking(move |inner| {
-				inner.write_records(&[Record::Purge(log_id)])?;
+				inner.write_records([RecordRef::Purge(&log_id)])?;
 				inner.entries = inner.entries.split_off(&(log_id.index + 1));
 				inner.last_purged = Some(log_id);
 				inner.maybe_compact()
 			})
 			.await
-			.map_err(io_err(ErrorSubject::Logs, ErrorVerb::Delete))
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use openraft::{CommittedLeaderId, EntryPayload};
+	use openraft::EntryPayload;
 
 	use super::*;
-	use crate::kv::machine::Command;
+	use crate::{
+		kv::{machine::Command, raft::LeaderId},
+		meta::NodeId,
+	};
 
 	fn entry(term: u64, index: u64) -> LogEntry {
 		LogEntry {
-			log_id:  LogId::new(CommittedLeaderId::new(term, NodeId(1)), index),
+			log_id:  LogId::new(LeaderId { term, node_id: NodeId(1) }, index),
 			payload: EntryPayload::Blank,
 		}
 	}
@@ -716,8 +752,9 @@ mod tests {
 
 	fn append_sync(store: &LogStore, entries: Vec<LogEntry>) {
 		let mut inner = store.inner.lock();
-		let records: Vec<Record> = entries.iter().cloned().map(Record::Entry).collect();
-		inner.write_records(&records).unwrap();
+		inner
+			.write_records(entries.iter().map(RecordRef::Entry))
+			.unwrap();
 		for e in entries {
 			inner.entries.insert(e.log_id.index, e);
 		}
@@ -742,7 +779,10 @@ mod tests {
 		{
 			let mut store = LogStore::open(dir.path()).unwrap();
 			append_sync(&store, (1..=10).map(|i| entry(1, i)).collect());
-			store.truncate(entry(1, 8).log_id).await.unwrap();
+			store
+				.truncate_after(Some(entry(1, 7).log_id))
+				.await
+				.unwrap();
 			append_sync(&store, vec![entry(2, 8)]);
 			store.purge(entry(1, 3).log_id).await.unwrap();
 			store.save_vote(&Vote::new(2, NodeId(7))).await.unwrap();
@@ -959,10 +999,10 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let mut legacy = Vec::new();
 		for i in 1..=5 {
-			encode_record(&Record::Entry(entry(1, i)), &mut legacy);
+			encode_record(&RecordRef::Entry(&entry(1, i)), &mut legacy);
 		}
-		encode_record(&Record::Purge(entry(1, 1).log_id), &mut legacy);
-		encode_record(&Record::Truncate(5), &mut legacy);
+		encode_record(&RecordRef::Purge(&entry(1, 1).log_id), &mut legacy);
+		encode_record(&RecordRef::Truncate(5), &mut legacy);
 		legacy.extend_from_slice(b"torn");
 		fs::write(dir.path().join(LEGACY_LOG_FILE), &legacy).unwrap();
 		let committed = Some(entry(1, 4).log_id);

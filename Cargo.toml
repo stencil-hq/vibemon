@@ -43,7 +43,7 @@ hyper = { version = "1.12", features = ["full"] }
 hyper-util = { version = "0.1.21", features = ["full"] }
 jsonwebtoken = "9"
 libc = "0.2"
-openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+openraft = { version = "=0.10.0-alpha.37", default-features = false, features = ["serde", "tokio-rt"] }
 parking_lot = "0.12.5"
 percent-encoding = "2"
 rand = "0.10"

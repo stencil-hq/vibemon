@@ -8,6 +8,7 @@ use std::{
 	time::Duration,
 };
 
+use openraft::async_runtime::WatchReceiver;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	net::{TcpListener, TcpStream},
@@ -77,7 +78,7 @@ impl Proc {
 
 	fn voters(&self) -> BTreeSet<NodeId> {
 		let local = self.cluster.kv.local().unwrap();
-		let metrics = local.raft().metrics().borrow().clone();
+		let metrics = local.raft().metrics().borrow_watched().clone();
 		metrics.membership_config.membership().voter_ids().collect()
 	}
 
@@ -85,12 +86,12 @@ impl Proc {
 	/// must use the snapshot.
 	async fn snapshot_and_purge(&self) {
 		let raft = self.cluster.kv.local().unwrap().raft().clone();
-		let applied = raft.metrics().borrow().last_applied.unwrap().index;
+		let applied = raft.metrics().borrow_watched().last_applied.unwrap().index;
 		raft.trigger().snapshot().await.unwrap();
 		eventually("snapshot", || async {
 			raft
 				.metrics()
-				.borrow()
+				.borrow_watched()
 				.snapshot
 				.is_some_and(|s| s.index >= applied)
 				.then_some(())
@@ -100,7 +101,7 @@ impl Proc {
 		eventually("purge", || async {
 			raft
 				.metrics()
-				.borrow()
+				.borrow_watched()
 				.purged
 				.is_some_and(|p| p.index >= applied)
 				.then_some(())
@@ -536,6 +537,54 @@ async fn kv_restarted_former_leader_never_claims_leadership_while_another_leads(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_concurrent_txns_each_get_their_own_result() {
+	let (_tmp, dir) = dir();
+	let a = Proc::start(0x60, &dir, DRIVER, &[], 1).await;
+	leader_of(&[&a]).await;
+	a.cluster
+		.kv
+		.put("taken", b"x".to_vec(), None)
+		.await
+		.unwrap();
+
+	// Even callers claim fresh keys; odd ones a taken key, so their compare
+	// fails. Batched log appends mix both; every caller gets its own outcome.
+	let calls: Vec<_> = (0..200_u32)
+		.map(|i| {
+			let kv = a.cluster.kv.clone();
+			tokio::spawn(async move {
+				let key = if i % 2 == 0 {
+					format!("q/{i}")
+				} else {
+					"taken".to_owned()
+				};
+				let txn = Txn {
+					compare: vec![Compare::Missing(key.clone())],
+					success: vec![Op::Put {
+						key:    key.clone(),
+						value:  i.to_be_bytes().to_vec(),
+						ttl_ms: None,
+					}],
+					failure: Vec::new(),
+				};
+				(i, key, kv.txn(txn).await.unwrap())
+			})
+		})
+		.collect();
+	let mut revisions = BTreeSet::new();
+	for call in calls {
+		let (i, key, result) = call.await.unwrap();
+		assert_eq!(result.succeeded, i % 2 == 0, "{key}");
+		if result.succeeded {
+			let entry = a.cluster.kv.get(&key).await.unwrap().unwrap();
+			assert_eq!((entry.mod_rev, entry.value), (result.revision, i.to_be_bytes().to_vec()));
+			assert!(revisions.insert(result.revision), "revision {} reported twice", result.revision);
+		}
+	}
+	a.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kv_resp_requires_auth_and_maps_set_get_del_exists_onto_the_kv() {
 	let (_tmp, dir) = dir();
 	let a = Proc::start(0x50, &dir, DRIVER, &[], 1).await;
@@ -568,7 +617,11 @@ async fn kv_resp_requires_auth_and_maps_set_get_del_exists_onto_the_kv() {
 		(b"QUIT\r\n", "+OK\r\n"),
 	];
 	let mut stream = TcpStream::connect(addr).await.unwrap();
-	let pipeline: Vec<u8> = requests.iter().flat_map(|(request, _)| *request).copied().collect();
+	let pipeline: Vec<u8> = requests
+		.iter()
+		.flat_map(|(request, _)| *request)
+		.copied()
+		.collect();
 	stream.write_all(&pipeline).await.unwrap();
 	let mut replies = String::new();
 	stream.read_to_string(&mut replies).await.unwrap();

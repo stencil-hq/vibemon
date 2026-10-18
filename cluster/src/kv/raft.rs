@@ -3,15 +3,16 @@
 
 use std::{
 	future::Future,
-	io::Cursor,
 	path::Path,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use openraft::{
-	Config, Raft, RaftMetrics, ServerState, SnapshotPolicy,
-	error::{CheckIsLeaderError, ClientWriteError, RaftError},
+	Config, EntryPayload, Raft, ReadPolicy, ServerState, SnapshotPolicy,
+	async_runtime::WatchReceiver,
+	error::{ClientWriteError, LinearizableReadError, RaftError},
+	impls::leader_id_adv,
 };
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -23,7 +24,7 @@ use super::{
 	log_store::LogStore,
 	machine::Command,
 	membership,
-	network::Network,
+	network::{Network, PeerUrls},
 	state_machine::StateMachineStore,
 };
 use crate::{gossip::Gossip, meta::NodeId};
@@ -39,14 +40,32 @@ openraft::declare_raft_types!(
 	/// openraft type configuration for the cluster KV.
 	pub TypeConfig:
 		D = Command,
-		R = TxnResult,
+		R = Vec<TxnResult>,
 		NodeId = NodeId,
 		Node = RaftPeer,
-		SnapshotData = Cursor<Vec<u8>>,
+		LeaderId = LeaderId,
 );
 
+/// Leader identity `(term, node)` carried by votes and log ids (openraft's
+/// default `leader_adv` mode, the shape stored by every release).
+pub type LeaderId = leader_id_adv::LeaderId<u64, NodeId>;
+/// Raft log id.
+pub type LogId = openraft::LogId<LeaderId>;
+/// Raft vote.
+pub type Vote = openraft::Vote<LeaderId>;
 /// Raft log entry type.
-pub type LogEntry = openraft::Entry<TypeConfig>;
+pub type LogEntry = openraft::Entry<LeaderId, EntryPayload<Command, NodeId, RaftPeer>>;
+/// Membership with the id of the log entry that holds it.
+pub type StoredMembership = openraft::StoredMembership<LeaderId, NodeId, RaftPeer>;
+/// Metadata of a state machine snapshot.
+pub type SnapshotMeta = openraft::SnapshotMeta<LeaderId, NodeId, RaftPeer>;
+/// State machine snapshot: metadata plus serialized
+/// [`super::machine::KvState`].
+pub type Snapshot = openraft::Snapshot<LeaderId, NodeId, RaftPeer, Vec<u8>>;
+/// openraft metrics of this type configuration.
+pub type RaftMetrics = openraft::RaftMetrics<TypeConfig>;
+/// The openraft handle of a driver.
+pub type KvRaft = Raft<TypeConfig, StateMachineStore>;
 
 /// How long a KV call waits for a reachable leader before failing with
 /// [`KvError::NoLeader`].
@@ -60,7 +79,7 @@ const LEADER_ACK_MAX_MS: u64 = 1500;
 /// node counts as leader only once its leadership is confirmed for the current
 /// term (see [`leadership_confirmed`]); used by the facade's leader watch and
 /// the gossip `RaftStatus`.
-pub fn reported_leader(id: NodeId, metrics: &RaftMetrics<NodeId, RaftPeer>) -> Option<NodeId> {
+pub fn reported_leader(id: NodeId, metrics: &RaftMetrics) -> Option<NodeId> {
 	match metrics.current_leader {
 		Some(leader) if leader == id => leadership_confirmed(id, metrics).then_some(id),
 		other => other,
@@ -75,18 +94,29 @@ pub fn reported_leader(id: NodeId, metrics: &RaftMetrics<NodeId, RaftPeer>) -> O
 /// A former leader restarting with its persisted vote re-establishes itself
 /// as leader of its old term until it sees the higher term; neither quorum
 /// acknowledgement nor a current-term applied entry exists in that window.
-pub fn leadership_confirmed(id: NodeId, metrics: &RaftMetrics<NodeId, RaftPeer>) -> bool {
-	let vote = metrics.vote;
+pub fn leadership_confirmed(id: NodeId, metrics: &RaftMetrics) -> bool {
+	let vote = &metrics.vote;
 	let leader_id = vote.leader_id();
 	metrics.state == ServerState::Leader
 		&& metrics.current_leader == Some(id)
 		&& vote.is_committed()
-		&& leader_id.voted_for() == Some(id)
+		&& leader_id.node_id == id
 		&& metrics.last_applied.is_some_and(|applied| {
-			applied.leader_id.term == leader_id.get_term() && applied.leader_id.node_id == id
-		}) && metrics
-		.millis_since_quorum_ack
-		.is_some_and(|ms| ms <= LEADER_ACK_MAX_MS)
+			applied.leader_id.term == leader_id.term && applied.leader_id.node_id == id
+		}) && millis_since_quorum_ack(metrics).is_some_and(|ms| ms <= LEADER_ACK_MAX_MS)
+}
+
+/// Milliseconds since a quorum last acknowledged this leader, as of the
+/// metrics report; `Some(0)` for a leader that is a quorum by itself.
+///
+/// Its replacement `last_quorum_acked` has no value for a single-voter leader
+/// (no follower ever acknowledges it), so it would never confirm one.
+#[expect(
+	deprecated,
+	reason = "the only metric that counts a single-voter leader as quorum-acknowledged"
+)]
+const fn millis_since_quorum_ack(metrics: &RaftMetrics) -> Option<u64> {
+	metrics.millis_since_quorum_ack
 }
 
 /// Leader-stamped wall clock in unix milliseconds.
@@ -108,10 +138,12 @@ enum Attempt<T> {
 /// A driver's raft participant plus everything needed to route KV calls.
 pub struct RaftKv {
 	id:     NodeId,
-	raft:   Raft<TypeConfig>,
+	raft:   KvRaft,
 	sm:     StateMachineStore,
 	client: KvClient,
 	gossip: Gossip,
+	/// Raft URLs the replication clients send to.
+	urls:   PeerUrls,
 }
 
 impl RaftKv {
@@ -129,22 +161,29 @@ impl RaftKv {
 			heartbeat_interval: 150,
 			election_timeout_min: 600,
 			election_timeout_max: 1200,
-			install_snapshot_timeout: 10_000,
+			// Bounds a whole snapshot transfer, sent as one request.
+			install_snapshot_timeout: 60_000,
 			snapshot_policy: SnapshotPolicy::LogsSinceLast(5000),
 			max_in_snapshot_log_to_keep: 500,
-			snapshot_max_chunk_size: 1 << 20,
 			..Config::default()
 		}
 		.validate()?;
 		let log = LogStore::open(dir)?;
 		let sm = StateMachineStore::open(dir)?;
-		let network = Network::new(http.clone(), auth.clone(), gossip.clone());
+		let urls = PeerUrls::default();
+		let network = Network::new(http.clone(), auth.clone(), gossip.clone(), urls.clone());
 		let raft = Raft::new(id, Arc::new(config), network, log, sm.clone()).await?;
-		Ok(Arc::new(Self { id, raft, sm, client: KvClient::new(http, auth), gossip }))
+		Ok(Arc::new(Self { id, raft, sm, client: KvClient::new(http, auth), gossip, urls }))
+	}
+
+	/// Sends this node's raft RPCs for `peer` to `url` from now on, including
+	/// on its running replication stream.
+	pub fn set_peer_url(&self, peer: NodeId, url: &str) {
+		self.urls.set(peer, url);
 	}
 
 	/// The openraft handle (RPC handlers, membership reconciler).
-	pub const fn raft(&self) -> &Raft<TypeConfig> {
+	pub const fn raft(&self) -> &KvRaft {
 		&self.raft
 	}
 
@@ -161,12 +200,12 @@ impl RaftKv {
 	/// Whether this process is the raft leader with confirmed authority
 	/// ([`leadership_confirmed`]); gates leader-only background work.
 	pub fn is_leader(&self) -> bool {
-		leadership_confirmed(self.id, &self.raft.metrics().borrow())
+		leadership_confirmed(self.id, &self.raft.metrics().borrow_watched())
 	}
 
 	/// Leader as reported to callers ([`reported_leader`]).
 	pub fn reported_leader(&self) -> Option<NodeId> {
-		reported_leader(self.id, &self.raft.metrics().borrow())
+		reported_leader(self.id, &self.raft.metrics().borrow_watched())
 	}
 
 	pub fn get_local(&self, key: &str) -> Option<Entry> {
@@ -208,7 +247,7 @@ impl RaftKv {
 				if self.is_leader() {
 					return Attempt::Done(Ok(self.sm.revision()));
 				}
-				let metrics = self.raft.metrics().borrow().clone();
+				let metrics = self.raft.metrics().borrow_watched().clone();
 				match metrics.current_leader.filter(|leader| *leader != self.id) {
 					Some(leader) => Attempt::Forward(
 						metrics
@@ -277,12 +316,14 @@ impl RaftKv {
 		};
 		self
 			.via_leader("get", &req, hop, || async {
-				match self.raft.ensure_linearizable().await {
+				match self.raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
 					Ok(_) => Attempt::Done(Ok(self.get_local(key))),
-					Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
+					Err(RaftError::APIError(LinearizableReadError::ForwardToLeader(f))) => {
 						Attempt::Forward(f.leader_node.map(|n| n.cluster_url))
 					},
-					Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_))) => Attempt::Retry,
+					Err(RaftError::APIError(LinearizableReadError::QuorumNotEnough(_))) => {
+						Attempt::Retry
+					},
 					Err(RaftError::Fatal(fatal)) => {
 						Attempt::Done(Err(KvError::Unavailable(fatal.to_string())))
 					},
@@ -291,26 +332,27 @@ impl RaftKv {
 			.await
 	}
 
-	/// Proposes a transaction (stamped with this leader's clock), forwarding to
-	/// the leader if needed.
+	/// Commits `txns` as one [`Command::Txns`] raft entry, in order (stamped
+	/// with this leader's clock), forwarding to the leader if needed.
+	/// Concurrent callers' entries share log appends: openraft's API queue
+	/// hands every write that arrived during the previous append to the next
+	/// one (one `fdatasync`).
 	///
 	/// A forward is retried only when the leader was unreachable or had stepped
 	/// down before proposing; an entry proposed by a leader that then lost
 	/// leadership can still commit, so non-idempotent transactions should guard
 	/// themselves with compares.
-	pub async fn txn(&self, txn: Txn, forwarded: bool) -> Result<TxnResult, KvError> {
+	pub async fn txns(&self, txns: Vec<Txn>, forwarded: bool) -> Result<Vec<TxnResult>, KvError> {
 		let hop = if forwarded {
 			Hop::Forwarded
 		} else {
 			Hop::Entry
 		};
 		self
-			.via_leader("txn", &txn, hop, || async {
-				match self
-					.propose(Command::Txn { now_ms: now_ms(), txn: txn.clone() })
-					.await
-				{
-					Ok(result) => Attempt::Done(Ok(result)),
+			.via_leader("txns", &txns, hop, || async {
+				let command = Command::Txns { now_ms: now_ms(), txns: txns.clone() };
+				match self.propose(command).await {
+					Ok(results) => Attempt::Done(Ok(results)),
 					Err(ProposeError::Forward(url)) => Attempt::Forward(url),
 					Err(ProposeError::Failed(error)) => Attempt::Done(Err(error)),
 				}
@@ -320,13 +362,19 @@ impl RaftKv {
 
 	/// Proposes `command` locally; fails with [`ProposeError::Forward`] on
 	/// followers.
-	pub async fn propose(&self, command: Command) -> Result<TxnResult, ProposeError> {
+	pub async fn propose(&self, command: Command) -> Result<Vec<TxnResult>, ProposeError> {
 		match self.raft.client_write(command).await {
 			Ok(response) => Ok(response.data),
-			Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
-				Err(ProposeError::Forward(f.leader_node.map(|n| n.cluster_url)))
-			},
+			// A discarded entry (truncated or purged after this node lost
+			// leadership) is forwarded like a refused proposal, as before
+			// openraft 0.10 split the two; see `txns` on duplicate commits.
+			Err(RaftError::APIError(
+				ClientWriteError::ForwardToLeader(f) | ClientWriteError::LogEntryDiscarded(f),
+			)) => Err(ProposeError::Forward(f.leader_node.map(|n| n.cluster_url))),
 			Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
+				Err(ProposeError::Failed(KvError::Rejected(e.to_string())))
+			},
+			Err(RaftError::APIError(ClientWriteError::PreconditionFailed(e))) => {
 				Err(ProposeError::Failed(KvError::Rejected(e.to_string())))
 			},
 			Err(RaftError::Fatal(fatal)) => {
@@ -386,23 +434,18 @@ pub enum ProposeError {
 
 #[cfg(test)]
 mod tests {
-	use openraft::{CommittedLeaderId, LogId, Vote};
-
 	use super::*;
 
 	const ME: NodeId = NodeId(1);
 
-	fn leader_metrics(
-		term: u64,
-		applied_term: u64,
-		ack_ms: Option<u64>,
-	) -> RaftMetrics<NodeId, RaftPeer> {
+	#[expect(deprecated, reason = "sets the metric `leadership_confirmed` reads")]
+	fn leader_metrics(term: u64, applied_term: u64, ack_ms: Option<u64>) -> RaftMetrics {
 		let mut metrics = RaftMetrics::new_initial(ME);
 		metrics.state = ServerState::Leader;
 		metrics.current_leader = Some(ME);
 		metrics.current_term = term;
 		metrics.vote = Vote::new_committed(term, ME);
-		metrics.last_applied = Some(LogId::new(CommittedLeaderId::new(applied_term, ME), 10));
+		metrics.last_applied = Some(LogId::new(LeaderId { term: applied_term, node_id: ME }, 10));
 		metrics.millis_since_quorum_ack = ack_ms;
 		metrics
 	}

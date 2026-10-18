@@ -66,8 +66,8 @@ processes discover each other through gossip seeds (`--join`).
 | `spec/e2b/` | — | Vendored upstream specs (OpenAPI, envd protos). |
 
 Runtime: tokio (multi-thread) in `serve`; axum 0.8 / hyper 1 for HTTP;
-reqwest (rustls) for outbound HTTP; openraft 0.9. The `vmm` crate stays
-synchronous.
+reqwest (rustls) for outbound HTTP; openraft 0.10 (`=0.10.0-alpha.37`).
+The `vmm` crate stays synchronous.
 
 ## 3. Listeners and addressing
 
@@ -201,9 +201,13 @@ pub enum MemberEvent { Joined(Member), Updated(Member), Failed(Member), Left(Mem
 
 ### 5.3 Raft KV (`cluster::kv`)
 
-openraft 0.9 (`storage-v2`). Voters: driver processes. Persistent log, vote,
-and snapshots under `<data>/raft/` (fsync'd). State machine: ordered map
-`String → Entry` plus TTL index.
+openraft 0.10 (`=0.10.0-alpha.37`, default `leader_adv` leader ids, network
+v2). Voters: driver processes. Persistent log, vote, and snapshots under
+`<data>/raft/` (fsync'd). State machine: ordered map `String → Entry` plus
+TTL index. openraft batches concurrent `client_write`s into one log append
+(one `fdatasync` for all entries handed to `RaftLogStorage::append`): every
+write that reaches the raft core during an append joins the next one (group
+commit).
 
 ```rust
 pub struct Entry { pub key: String, pub value: Vec<u8>, pub create_rev: u64, pub mod_rev: u64,
@@ -225,7 +229,8 @@ impl Kv {
     pub async fn list(&self, prefix: &str) -> Result<Vec<Entry>, KvError>;           // follower-local
     pub async fn range(&self, range: &Range) -> Result<Vec<Entry>, KvError>;         // follower-local, ordered page
     pub async fn sync(&self) -> Result<(), KvError>;                                 // read barrier for the local reads above
-    pub async fn txn(&self, txn: Txn) -> Result<TxnResult, KvError>;                 // forwarded to leader
+    pub async fn txns(&self, txns: Vec<Txn>) -> Result<Vec<TxnResult>, KvError>;     // one entry, in order, all or none; forwarded to leader
+    pub async fn txn(&self, txn: Txn) -> Result<TxnResult, KvError>;                 // txns(vec![txn])
     pub async fn put(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<u64, KvError>;
     pub async fn delete(&self, key: &str) -> Result<bool, KvError>;
     pub fn watch(&self, prefix: &str) -> tokio::sync::mpsc::Receiver<WatchEvent>;   // drivers only: applied-state events
@@ -241,8 +246,11 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   (`POST /cluster/v1/kv/{op}`), retrying the next driver on connection failure.
   `Kv::connect` builds the same client over fixed driver URLs for processes
   outside the cluster (`vmon admin`).
-- Drivers serve `/cluster/v1/raft/{append,vote,snapshot}` and
-  `/cluster/v1/kv/{get,list,range,sync,txn}` (replies are HTTP 200
+- Drivers serve `/cluster/v1/raft/{append,vote,snapshot}` (JSON
+  `AppendEntriesRequest`/`VoteRequest`; `snapshot` carries a whole snapshot:
+  one JSON line `{vote, meta}`, then the serialized map, without a body
+  limit) and
+  `/cluster/v1/kv/{get,list,range,sync,txns}` (replies are HTTP 200
   `{"ok": T}` / `{"err": KvError}`); followers forward writes, consistent
   reads, and `sync` to the leader once (`x-vmon-kv-forwarded`). A driver
   serves remote `get`/`list`/`range` after its own read barrier, so remote
@@ -253,6 +261,13 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
   machine has applied that revision; local reads after it observe every
   write acknowledged before the call. The driver store (§7) runs one before
   each read view and transaction attempt.
+- Writes: `Kv::txns` proposes one `Command::Txns { now_ms, txns }` entry; the
+  state machine applies its txns in order, each with its own result and
+  revision. Concurrent callers are not packed into shared entries by a
+  queue of ours: with a bounded number of such entries in flight, that
+  measured 30–50% fewer writes per second than letting openraft batch the
+  appends. Older
+  `Command::Txn { now_ms, txn }` entries still replay.
 - `range`: keys under `prefix`, ascending (descending with `reverse`),
   strictly after (before) `after`, at most `limit` live entries.
 - `PutStamped` writes `{prefix}{stamp}{suffix}` where `stamp` is the commit
@@ -262,10 +277,14 @@ pub enum KvError { NoLeader, Unavailable(String), Rejected(String), Io(String) }
 - `--kv-resp-listen` serves the same `Kv` handle over RESP2 (`kv::resp`):
   `AUTH [default] <cluster secret>` first, then `PING`, `QUIT`, `GET`
   (`get_consistent`), `SET key value [NX|XX] [EX s|PX ms]` (one txn,
-  `NX`/`XX` → `Missing`/`Exists` compare), `DEL`/`EXISTS key…` (one call per
-  key). Commands of a connection run in order (pipelines read their own
-  writes). Before `AUTH`, requests are capped at 10 arguments and 16 KiB bulk
-  strings; afterwards at 16 MiB bulk strings and 64 MiB of buffered input.
+  `NX`/`XX` → `Missing`/`Exists` compare), `DEL key…` (one `Exists`-guarded
+  delete txn per key; a non-UTF-8 key rejects the command before any
+  delete), `EXISTS key…`. Consecutive pipelined `SET`/`DEL` commands are
+  committed by one `Kv::txns` call (one entry, cut at 1024 txns or 4 MiB of
+  keys and values); any other command commits them first, so replies stay in
+  order and a pipeline reads its own writes. Before `AUTH`, requests are
+  capped at 10 arguments and 16 KiB bulk strings; afterwards at 16 MiB bulk
+  strings and 64 MiB of buffered input.
 - Semantics: expired keys count as missing; `ModRev{rev: 0}` matches a missing
   key; a txn whose chosen branch changes nothing does not bump the revision;
   `WatchEvent = Put(Entry) | Delete{key, revision}`; a watch channel (capacity
@@ -336,8 +355,10 @@ of its current term, and a quorum ack within 1.5 s. A restarted former leader
 that briefly re-establishes its old term is never reported, and a leader is
 dropped as soon as it steps down. Replication to a peer that gossip reports
 Dead/Left backs off up to 30 s, so openraft logs at most one failure per
-~30 s for that peer. When the peer comes back, the leader re-sets its address
-in raft membership, which rebuilds the replication streams immediately.
+~30 s for that peer. When the peer comes back (or restarts on a new address),
+the leader points its running replication stream at the gossiped address,
+records it in raft membership, and resets the peer's replication backoff
+(openraft keeps replication streams across membership changes).
 
 ## 6. KV keyspace
 

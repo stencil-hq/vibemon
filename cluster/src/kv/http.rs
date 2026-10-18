@@ -9,24 +9,26 @@ use std::sync::Arc;
 use axum::{
 	Json, Router,
 	extract::{DefaultBodyLimit, State},
-	http::HeaderMap,
+	http::{HeaderMap, StatusCode},
 	routing::post,
 };
-use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
+use bytes::Bytes;
+use openraft::raft::{AppendEntriesRequest, VoteRequest};
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
 	Entry, KvError, Range, Txn, TxnResult,
-	raft::{RaftKv, TypeConfig},
+	network::SnapshotHeader,
+	raft::{RaftKv, Snapshot, TypeConfig},
 };
-use crate::meta::NodeId;
 
 /// Marks a call already forwarded once by a driver; the receiver must not
 /// forward again.
 const FORWARDED_HEADER: &str = "x-vmon-kv-forwarded";
 
-/// Raft batches and snapshot chunks are far larger than axum's 2 MiB default.
+/// Raft batches are far larger than axum's 2 MiB default (snapshots, sent
+/// whole, are not limited).
 const RAFT_BODY_LIMIT: usize = 256 << 20;
 
 /// Body of `POST /cluster/v1/kv/get`.
@@ -82,12 +84,12 @@ pub fn routes(kv: Arc<RaftKv>) -> Router {
 	Router::new()
 		.route("/cluster/v1/raft/append", post(append))
 		.route("/cluster/v1/raft/vote", post(vote))
-		.route("/cluster/v1/raft/snapshot", post(snapshot))
+		.route("/cluster/v1/raft/snapshot", post(snapshot).layer(DefaultBodyLimit::disable()))
 		.route("/cluster/v1/kv/get", post(kv_get))
 		.route("/cluster/v1/kv/list", post(kv_list))
 		.route("/cluster/v1/kv/range", post(kv_range))
 		.route("/cluster/v1/kv/sync", post(kv_sync))
-		.route("/cluster/v1/kv/txn", post(kv_txn))
+		.route("/cluster/v1/kv/txns", post(kv_txns))
 		.layer(DefaultBodyLimit::max(RAFT_BODY_LIMIT))
 		.with_state(kv)
 }
@@ -101,16 +103,19 @@ async fn append(
 
 async fn vote(
 	State(kv): State<Arc<RaftKv>>,
-	Json(req): Json<VoteRequest<NodeId>>,
+	Json(req): Json<VoteRequest<TypeConfig>>,
 ) -> Json<impl Serialize> {
 	Json(kv.raft().vote(req).await)
 }
 
+/// A whole snapshot: a [`SnapshotHeader`] line, then the snapshot data.
 async fn snapshot(
 	State(kv): State<Arc<RaftKv>>,
-	Json(req): Json<InstallSnapshotRequest<TypeConfig>>,
-) -> Json<impl Serialize> {
-	Json(kv.raft().install_snapshot(req).await)
+	body: Bytes,
+) -> Result<Json<impl Serialize>, StatusCode> {
+	let (header, data) = SnapshotHeader::decode(body).ok_or(StatusCode::BAD_REQUEST)?;
+	let snapshot = Snapshot { meta: header.meta, snapshot: data.into() };
+	Ok(Json(kv.raft().install_full_snapshot(header.vote, snapshot).await))
 }
 
 async fn kv_get(
@@ -147,13 +152,13 @@ async fn kv_sync(State(kv): State<Arc<RaftKv>>, headers: HeaderMap) -> Json<Repl
 	Json(kv.leader_revision(hop == Hop::Forwarded).await.into())
 }
 
-async fn kv_txn(
+async fn kv_txns(
 	State(kv): State<Arc<RaftKv>>,
 	headers: HeaderMap,
-	Json(txn): Json<Txn>,
-) -> Json<Reply<TxnResult>> {
+	Json(txns): Json<Vec<Txn>>,
+) -> Json<Reply<Vec<TxnResult>>> {
 	let hop = Hop::from_headers(&headers);
-	Json(kv.txn(txn, hop == Hop::Forwarded).await.into())
+	Json(kv.txns(txns, hop == Hop::Forwarded).await.into())
 }
 
 /// Failure of a forwarded KV call.

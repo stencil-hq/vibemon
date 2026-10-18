@@ -6,9 +6,11 @@
 //! `QUIT`), `PING [message]`, `QUIT`, `GET key`,
 //! `SET key value [NX|XX] [EX seconds|PX milliseconds]`, `DEL key…`,
 //! `EXISTS key…`. Keys are the KV's own (UTF-8) keys. `GET`/`EXISTS` are
-//! linearizable reads ([`Kv::get_consistent`]) and `SET`/`DEL` are raft
-//! transactions, one per key. A connection runs its commands in order, so a
-//! pipeline reads its own writes.
+//! linearizable reads ([`Kv::get_consistent`]); `SET` is one transaction and
+//! `DEL` one per key. Consecutive pipelined writes are committed together by
+//! one [`Kv::txns`] call (one raft entry, in order); any other command first
+//! waits for them, so replies keep their order and a pipeline reads its own
+//! writes.
 //!
 //! Requests come in multibulk or inline form. Before `AUTH` they are capped
 //! like Redis caps unauthenticated clients (10 arguments, 16 KiB bulk
@@ -38,6 +40,10 @@ const MAX_QUERY: usize = 64 << 20;
 const READ_CHUNK: usize = 16 << 10;
 /// Reply bytes buffered before they are written mid-pipeline.
 const FLUSH_AT: usize = 64 << 10;
+/// Pipelined writes committed together are cut at this many txns or key and
+/// value bytes, which bounds the size of one raft entry.
+const GROUP_TXNS: usize = 1024;
+const GROUP_BYTES: usize = 4 << 20;
 /// Pause after a failed `accept` (e.g. out of file descriptors).
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -239,6 +245,38 @@ enum Flow {
 	Close,
 }
 
+/// Consecutive pipelined writes (`SET`, `DEL`), committed together by one
+/// [`Kv::txns`] call, and the reply each command is owed.
+#[derive(Default)]
+struct Writes {
+	txns:    Vec<Txn>,
+	replies: Vec<Owed>,
+	/// Key and value bytes of `txns`.
+	bytes:   usize,
+}
+
+impl Writes {
+	fn push(&mut self, txn: Txn) {
+		self.bytes += txn.payload_len();
+		self.txns.push(txn);
+	}
+
+	/// Whether the group reached [`GROUP_TXNS`] or [`GROUP_BYTES`].
+	const fn is_full(&self) -> bool {
+		self.txns.len() >= GROUP_TXNS || self.bytes >= GROUP_BYTES
+	}
+}
+
+/// Reply owed to a queued write command.
+enum Owed {
+	/// `SET`: `+OK` when its txn succeeded, else nil.
+	Set,
+	/// `DEL` of this many keys: how many of them existed.
+	Del(usize),
+	/// Rejected before reaching the KV.
+	Error(ErrorReply),
+}
+
 /// One client connection.
 struct Session {
 	kv:     Kv,
@@ -251,6 +289,7 @@ impl Session {
 		stream.set_nodelay(true)?;
 		let mut input = BytesMut::new();
 		let mut out = Vec::new();
+		let mut writes = Writes::default();
 		loop {
 			input.reserve(READ_CHUNK);
 			if stream.read_buf(&mut input).await? == 0 {
@@ -258,25 +297,29 @@ impl Session {
 			}
 			loop {
 				let limits = if self.authed { AUTHED } else { ANON };
-				let args = match parse(&mut input, limits) {
-					Ok(Some(args)) => args,
-					Ok(None) if input.len() > MAX_QUERY => {
-						return close(&mut stream, out, "query buffer limit exceeded").await;
+				let error = match parse(&mut input, limits) {
+					Ok(Some(args)) if args.is_empty() => continue,
+					Ok(Some(args)) => {
+						if self.execute(&args, &mut writes, &mut out).await == Flow::Close {
+							return stream.write_all(&out).await;
+						}
+						if writes.is_full() {
+							self.commit(&mut writes, &mut out).await;
+						}
+						if out.len() >= FLUSH_AT {
+							stream.write_all(&out).await?;
+							out.clear();
+						}
+						continue;
 					},
+					Ok(None) if input.len() > MAX_QUERY => "query buffer limit exceeded",
 					Ok(None) => break,
-					Err(ProtocolError(message)) => return close(&mut stream, out, message).await,
+					Err(ProtocolError(message)) => message,
 				};
-				if args.is_empty() {
-					continue;
-				}
-				if self.execute(&args, &mut out).await == Flow::Close {
-					return stream.write_all(&out).await;
-				}
-				if out.len() >= FLUSH_AT {
-					stream.write_all(&out).await?;
-					out.clear();
-				}
+				self.commit(&mut writes, &mut out).await;
+				return close(&mut stream, out, error).await;
 			}
+			self.commit(&mut writes, &mut out).await;
 			if !out.is_empty() {
 				stream.write_all(&out).await?;
 				out.clear();
@@ -284,9 +327,34 @@ impl Session {
 		}
 	}
 
-	/// Runs one command and appends its reply to `out`.
-	async fn execute(&mut self, args: &[Bytes], out: &mut Vec<u8>) -> Flow {
-		let Some((name, command)) = Command::lookup(&args[0]) else {
+	/// Runs one command and appends its reply to `out`; writes join `writes`
+	/// instead, which any other command commits first so replies stay in order
+	/// and reads see earlier writes.
+	async fn execute(&mut self, args: &[Bytes], writes: &mut Writes, out: &mut Vec<u8>) -> Flow {
+		let rest = &args[1..];
+		let command = Command::lookup(&args[0]);
+		if self.authed
+			&& let Some((_, write @ (Command::Set | Command::Del))) = command
+		{
+			let owed = if write == Command::Set {
+				set_txn(rest).map(|txn| {
+					writes.push(txn);
+					Owed::Set
+				})
+			} else {
+				del_txns(rest).map(|txns| {
+					let keys = txns.len();
+					for txn in txns {
+						writes.push(txn);
+					}
+					Owed::Del(keys)
+				})
+			};
+			writes.replies.push(owed.unwrap_or_else(Owed::Error));
+			return Flow::Continue;
+		}
+		self.commit(writes, out).await;
+		let Some((name, command)) = command else {
 			let name = args[0].escape_ascii().to_string();
 			let name: String = name.chars().take(128).collect();
 			write_error(out, &format!("ERR unknown command '{name}'"));
@@ -296,7 +364,6 @@ impl Session {
 			write_error(out, "NOAUTH Authentication required.");
 			return Flow::Continue;
 		}
-		let rest = &args[1..];
 		let result = match command {
 			Command::Auth => self.auth(rest, out),
 			Command::Ping => match rest {
@@ -315,9 +382,9 @@ impl Session {
 				return Flow::Close;
 			},
 			Command::Get => self.get(rest, out).await,
-			Command::Set => self.set(rest, out).await,
-			Command::Del => self.del(rest, out).await,
 			Command::Exists => self.exists(rest, out).await,
+			// Authenticated writes were queued above.
+			Command::Set | Command::Del => unreachable!("writes are queued"),
 		};
 		if let Err(ErrorReply(line)) = result {
 			write_error(out, &line);
@@ -353,48 +420,31 @@ impl Session {
 		Ok(())
 	}
 
-	async fn set(&self, args: &[Bytes], out: &mut Vec<u8>) -> Result<(), ErrorReply> {
-		let [key, value, options @ ..] = args else {
-			return Err(ErrorReply::arity("set"));
-		};
-		let key = utf8_key(key)?;
-		let SetOptions { condition, ttl_ms } = SetOptions::parse(options)?;
-		let compare = condition.map(|condition| match condition {
-			Condition::Missing => Compare::Missing(key.to_owned()),
-			Condition::Exists => Compare::Exists(key.to_owned()),
-		});
-		let txn = Txn {
-			compare: compare.into_iter().collect(),
-			success: vec![Op::Put { key: key.to_owned(), value: value.to_vec(), ttl_ms }],
-			failure: Vec::new(),
-		};
-		if self.kv.txn(txn).await.map_err(ErrorReply::err)?.succeeded {
-			out.extend_from_slice(b"+OK\r\n");
-		} else {
-			write_bulk(out, None);
+	/// Commits the queued writes as one [`Kv::txns`] call and appends their
+	/// replies to `out`.
+	async fn commit(&self, writes: &mut Writes, out: &mut Vec<u8>) {
+		if writes.replies.is_empty() {
+			return;
 		}
-		Ok(())
-	}
-
-	async fn del(&self, keys: &[Bytes], out: &mut Vec<u8>) -> Result<(), ErrorReply> {
-		if keys.is_empty() {
-			return Err(ErrorReply::arity("del"));
-		}
-		// Reject a malformed key before deleting any of the others.
-		let keys = utf8_keys(keys)?;
-		let mut deleted = 0;
-		for key in keys {
-			if self
-				.kv
-				.delete(key)
-				.await
-				.map_err(ErrorReply::err)?
-			{
-				deleted += 1;
+		writes.bytes = 0;
+		let outcome = self.kv.txns(std::mem::take(&mut writes.txns)).await;
+		let mut results = outcome.as_ref().map(|results| results.iter());
+		for owed in writes.replies.drain(..) {
+			match (owed, &mut results) {
+				(Owed::Error(ErrorReply(line)), _) => write_error(out, &line),
+				(_, Err(error)) => write_error(out, &format!("ERR {error}")),
+				(Owed::Set, Ok(results)) => {
+					if results.next().is_some_and(|result| result.succeeded) {
+						out.extend_from_slice(b"+OK\r\n");
+					} else {
+						write_bulk(out, None);
+					}
+				},
+				(Owed::Del(keys), Ok(results)) => {
+					write_integer(out, results.take(keys).filter(|result| result.succeeded).count());
+				},
 			}
 		}
-		write_integer(out, deleted);
-		Ok(())
 	}
 
 	async fn exists(&self, keys: &[Bytes], out: &mut Vec<u8>) -> Result<(), ErrorReply> {
@@ -402,7 +452,7 @@ impl Session {
 			return Err(ErrorReply::arity("exists"));
 		}
 		let keys = utf8_keys(keys)?;
-		let mut found = 0;
+		let mut found = 0_usize;
 		for key in keys {
 			if self
 				.kv
@@ -417,6 +467,41 @@ impl Session {
 		write_integer(out, found);
 		Ok(())
 	}
+}
+
+/// The txn of `SET key value [options]`.
+fn set_txn(args: &[Bytes]) -> Result<Txn, ErrorReply> {
+	let [key, value, options @ ..] = args else {
+		return Err(ErrorReply::arity("set"));
+	};
+	let key = utf8_key(key)?;
+	let SetOptions { condition, ttl_ms } = SetOptions::parse(options)?;
+	let compare = condition.map(|condition| match condition {
+		Condition::Missing => Compare::Missing(key.to_owned()),
+		Condition::Exists => Compare::Exists(key.to_owned()),
+	});
+	Ok(Txn {
+		compare: compare.into_iter().collect(),
+		success: vec![Op::Put { key: key.to_owned(), value: value.to_vec(), ttl_ms }],
+		failure: Vec::new(),
+	})
+}
+
+/// One txn per key of `DEL key…`, succeeding iff the key existed. A malformed
+/// key rejects the whole command before anything is deleted.
+fn del_txns(keys: &[Bytes]) -> Result<Vec<Txn>, ErrorReply> {
+	if keys.is_empty() {
+		return Err(ErrorReply::arity("del"));
+	}
+	let txns = utf8_keys(keys)?
+		.into_iter()
+		.map(|key| Txn {
+			compare: vec![Compare::Exists(key.to_owned())],
+			success: vec![Op::Delete { key: key.to_owned() }],
+			failure: Vec::new(),
+		})
+		.collect();
+	Ok(txns)
 }
 
 /// `SET` guard (`NX` / `XX`).
@@ -505,7 +590,7 @@ fn write_error(out: &mut Vec<u8>, line: &str) {
 	out.extend_from_slice(b"\r\n");
 }
 
-fn write_integer(out: &mut Vec<u8>, value: i64) {
+fn write_integer(out: &mut Vec<u8>, value: usize) {
 	out.extend_from_slice(format!(":{value}\r\n").as_bytes());
 }
 

@@ -6,6 +6,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fmt,
 	ops::Bound,
 };
 
@@ -16,7 +17,11 @@ use super::{Compare, Entry, Op, Range, Txn, TxnResult, WatchEvent, stamp};
 /// Raft log payload (openraft `D`), proposed by the leader.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
-	/// Client transaction.
+	/// Client transactions committed as one entry and applied in order, each
+	/// seeing the effects of the ones before it ([`super::Kv::txns`]).
+	Txns { now_ms: u64, txns: Vec<Txn> },
+	/// One client transaction, as logged by earlier versions (replayed, no
+	/// longer proposed).
 	Txn { now_ms: u64, txn: Txn },
 	/// Clock tick proposed by the leader so due TTL keys get removed.
 	Expire { now_ms: u64 },
@@ -24,12 +29,33 @@ pub enum Command {
 	SetClusterId { now_ms: u64, cluster_id: String },
 }
 
+/// Short form for openraft's logs.
+impl fmt::Display for Command {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Txns { now_ms, txns } => write!(f, "txns@{now_ms}({})", txns.len()),
+			Self::Txn { now_ms, txn } => write!(
+				f,
+				"txn@{now_ms}(compare: {}, success: {}, failure: {})",
+				txn.compare.len(),
+				txn.success.len(),
+				txn.failure.len()
+			),
+			Self::Expire { now_ms } => write!(f, "expire@{now_ms}"),
+			Self::SetClusterId { now_ms, cluster_id } => {
+				write!(f, "set-cluster-id@{now_ms}({cluster_id})")
+			},
+		}
+	}
+}
+
 impl Command {
 	const fn now_ms(&self) -> u64 {
 		match self {
-			Self::Txn { now_ms, .. } | Self::Expire { now_ms } | Self::SetClusterId { now_ms, .. } => {
-				*now_ms
-			},
+			Self::Txns { now_ms, .. }
+			| Self::Txn { now_ms, .. }
+			| Self::Expire { now_ms }
+			| Self::SetClusterId { now_ms, .. } => *now_ms,
 		}
 	}
 }
@@ -126,34 +152,40 @@ impl KvState {
 		}
 	}
 
-	/// Applies one command; appends resulting changes to `events`.
-	pub fn apply(&mut self, command: &Command, events: &mut Vec<WatchEvent>) -> TxnResult {
+	/// Applies one command; appends resulting changes to `events`. Returns one
+	/// result per transaction of [`Command::Txns`], else a single result.
+	pub fn apply(&mut self, command: &Command, events: &mut Vec<WatchEvent>) -> Vec<TxnResult> {
 		self.applied_ms = self.applied_ms.max(command.now_ms());
 		self.expire(events);
 		match command {
-			Command::Expire { .. } => TxnResult { succeeded: true, revision: self.revision },
+			Command::Txns { txns, .. } => txns.iter().map(|txn| self.apply_txn(txn, events)).collect(),
+			Command::Txn { txn, .. } => vec![self.apply_txn(txn, events)],
+			Command::Expire { .. } => vec![TxnResult { succeeded: true, revision: self.revision }],
 			Command::SetClusterId { cluster_id, .. } => {
 				let id = self.cluster_id.get_or_insert_with(|| cluster_id.clone());
-				TxnResult { succeeded: id == cluster_id, revision: self.revision }
-			},
-			Command::Txn { txn, .. } => {
-				let succeeded = txn.compare.iter().all(|c| self.check(c));
-				let ops = if succeeded {
-					&txn.success
-				} else {
-					&txn.failure
-				};
-				let rev = self.revision + 1;
-				let mut changed = false;
-				for op in ops {
-					changed |= self.apply_op(op, rev, events);
-				}
-				if changed {
-					self.revision = rev;
-				}
-				TxnResult { succeeded, revision: self.revision }
+				vec![TxnResult { succeeded: id == cluster_id, revision: self.revision }]
 			},
 		}
+	}
+
+	/// Evaluates `txn`'s compares and runs the chosen branch; the revision
+	/// advances only if that changed something.
+	fn apply_txn(&mut self, txn: &Txn, events: &mut Vec<WatchEvent>) -> TxnResult {
+		let succeeded = txn.compare.iter().all(|c| self.check(c));
+		let ops = if succeeded {
+			&txn.success
+		} else {
+			&txn.failure
+		};
+		let rev = self.revision + 1;
+		let mut changed = false;
+		for op in ops {
+			changed |= self.apply_op(op, rev, events);
+		}
+		if changed {
+			self.revision = rev;
+		}
+		TxnResult { succeeded, revision: self.revision }
 	}
 
 	/// Diff between `self` and `next` as watch events (used when a snapshot
@@ -305,7 +337,29 @@ mod tests {
 
 	fn txn(state: &mut KvState, now_ms: u64, compare: Vec<Compare>, success: Vec<Op>) -> TxnResult {
 		let command = Command::Txn { now_ms, txn: Txn { compare, success, failure: Vec::new() } };
-		state.apply(&command, &mut Vec::new())
+		state.apply(&command, &mut Vec::new())[0]
+	}
+
+	#[test]
+	fn batched_txns_apply_in_order_with_one_result_and_revision_each() {
+		let mut s = KvState::default();
+		let guarded = |compare: Compare, success: Op| Txn {
+			compare: vec![compare],
+			success: vec![success],
+			failure: Vec::new(),
+		};
+		let txns = vec![
+			guarded(Compare::Missing("a".into()), put("a", "1", None)),
+			// Sees the first txn's write: the key is no longer missing.
+			guarded(Compare::Missing("a".into()), put("a", "2", None)),
+			guarded(Compare::Value { key: "a".into(), value: b"1".to_vec() }, put("b", "1", None)),
+			guarded(Compare::Exists("b".into()), Op::Delete { key: "a".into() }),
+		];
+		let results = s.apply(&Command::Txns { now_ms: 1, txns }, &mut Vec::new());
+		let outcome: Vec<(bool, u64)> = results.iter().map(|r| (r.succeeded, r.revision)).collect();
+		assert_eq!(outcome, [(true, 1), (false, 1), (true, 2), (true, 3)]);
+		assert_eq!(s.get("a"), None);
+		assert_eq!(s.get("b").map(|e| e.mod_rev), Some(2));
 	}
 
 	#[test]
@@ -401,7 +455,7 @@ mod tests {
 				},
 			};
 			let mut events = Vec::new();
-			assert_eq!(s.apply(&command, &mut events).succeeded, expected, "{compare:?}");
+			assert_eq!(s.apply(&command, &mut events)[0].succeeded, expected, "{compare:?}");
 			assert_eq!(
 				events.is_empty(),
 				expected,
@@ -490,7 +544,7 @@ mod tests {
 		s.apply(&Command::SetClusterId { now_ms: 4, cluster_id: "c1".into() }, &mut Vec::new());
 		let second =
 			s.apply(&Command::SetClusterId { now_ms: 4, cluster_id: "c2".into() }, &mut Vec::new());
-		assert!(!second.succeeded);
+		assert!(!second[0].succeeded);
 		let restored = KvState::from_snapshot(&s.to_snapshot()).unwrap();
 		assert_eq!(restored, s);
 		assert_eq!(restored.cluster_id(), Some("c1"));

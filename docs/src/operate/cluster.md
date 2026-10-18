@@ -47,6 +47,9 @@ Drivers are the raft voters. Raft state lives in `<data-dir>/raft/`: every drive
 - **Removal:** a voter that has been `Dead` or `Left` in gossip for longer than `--raft-reap-after` seconds (default 600) is removed. The voter set never drops below 1.
 - **Node-only processes** run no raft. Their KV calls go to a live driver over cluster HTTP, and they retry the next driver when a connection fails. Followers forward writes and consistent reads to the leader.
 
+> [!IMPORTANT]
+> Drivers that use different openraft versions cannot replicate to each other. This release moved from openraft 0.9 to 0.10, which changed how snapshots are sent between drivers. To upgrade a cluster with several drivers from an earlier release, stop every driver, then start all of them on the new version. Their `raft/` directories stay valid. You don't need to restart node-only processes at the same time.
+
 > [!WARNING]
 > `--bootstrap-expect` defaults to 1. A lone driver with the default bootstraps as soon as it sees itself, so if several drivers start with the default before gossip connects them, more than one raft cluster can form. Give every initial driver the same `--bootstrap-expect`. It only matters while `raft/` is empty.
 

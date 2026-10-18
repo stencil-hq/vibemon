@@ -6,35 +6,28 @@
 //! serialized [`KvState`]) plus log replay up to the persisted committed id.
 
 use std::{
-	fs,
-	io::{self, Cursor},
+	fs, io,
 	path::{Path, PathBuf},
-	sync::{
-		Arc,
-		atomic::{AtomicU64, Ordering},
-	},
+	sync::Arc,
 	time::Duration,
 };
 
+use futures::{Stream, TryStreamExt};
 use openraft::{
-	EntryPayload, ErrorSubject, ErrorVerb, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta,
-	StorageError, StoredMembership, storage::RaftStateMachine,
+	EntryPayload, RaftSnapshotBuilder,
+	storage::{EntryResponder, RaftStateMachine},
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-	Entry, KvError, Range, TxnResult, WATCH_CAPACITY, WatchEvent,
+	Entry, KvError, Range, WATCH_CAPACITY, WatchEvent,
 	log_store::replace_file,
 	machine::KvState,
-	raft::{LogEntry, RaftPeer, TypeConfig},
+	raft::{LogId, Snapshot, SnapshotMeta as Meta, StoredMembership as Membership, TypeConfig},
 };
-use crate::meta::NodeId;
 
 const SNAPSHOT_FILE: &str = "snapshot.bin";
-
-type Membership = StoredMembership<NodeId, RaftPeer>;
-type Meta = SnapshotMeta<NodeId, RaftPeer>;
 
 /// Shared state machine handle: openraft drives it, [`super::Kv`] reads it.
 #[derive(Clone)]
@@ -43,18 +36,17 @@ pub struct StateMachineStore {
 }
 
 struct Shared {
-	dir:          PathBuf,
-	state:        RwLock<AppliedState>,
-	snapshot:     Mutex<Option<(Meta, Vec<u8>)>>,
-	watchers:     Mutex<Vec<(String, mpsc::Sender<WatchEvent>)>>,
-	snapshot_seq: AtomicU64,
+	dir:      PathBuf,
+	state:    RwLock<AppliedState>,
+	snapshot: Mutex<Option<(Meta, Vec<u8>)>>,
+	watchers: Mutex<Vec<(String, mpsc::Sender<WatchEvent>)>>,
 	/// Applied KV revision, for [`StateMachineStore::wait_revision`].
-	revision:     watch::Sender<u64>,
+	revision: watch::Sender<u64>,
 }
 
 struct AppliedState {
 	kv:           KvState,
-	last_applied: Option<LogId<NodeId>>,
+	last_applied: Option<LogId>,
 	membership:   Membership,
 }
 
@@ -79,12 +71,11 @@ impl StateMachineStore {
 			Err(error) => return Err(error),
 		};
 		let shared = Shared {
-			dir:          dir.to_owned(),
-			revision:     watch::Sender::new(applied.kv.revision()),
-			state:        RwLock::new(applied),
-			snapshot:     Mutex::new(snapshot),
-			watchers:     Mutex::new(Vec::new()),
-			snapshot_seq: AtomicU64::new(0),
+			dir:      dir.to_owned(),
+			revision: watch::Sender::new(applied.kv.revision()),
+			state:    RwLock::new(applied),
+			snapshot: Mutex::new(snapshot),
+			watchers: Mutex::new(Vec::new()),
 		};
 		Ok(Self { shared: Arc::new(shared) })
 	}
@@ -186,25 +177,17 @@ fn decode_snapshot(bytes: &[u8]) -> io::Result<(Meta, Vec<u8>)> {
 	Ok((meta, bytes[split + 1..].to_vec()))
 }
 
-fn snapshot_err(error: io::Error) -> StorageError<NodeId> {
-	StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error)
-}
-
 impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
-	async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+	type SnapshotData = Vec<u8>;
+
+	async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
 		// Copy the state under the lock and serialize it outside, so applies
 		// only wait for the copy.
 		let (meta, kv) = {
 			let applied = self.shared.state.read();
-			let seq = self.shared.snapshot_seq.fetch_add(1, Ordering::Relaxed);
-			let snapshot_id = match applied.last_applied {
-				Some(id) => format!("{}-{}-{seq}", id.leader_id.term, id.index),
-				None => format!("none-{seq}"),
-			};
 			let meta = Meta {
-				last_log_id: applied.last_applied,
+				last_log_id:     applied.last_applied,
 				last_membership: applied.membership.clone(),
-				snapshot_id,
 			};
 			(meta, applied.kv.clone())
 		};
@@ -215,58 +198,58 @@ impl RaftSnapshotBuilder<TypeConfig> for StateMachineStore {
 			this.persist_snapshot(&meta2, &data).map(|()| data)
 		})
 		.await
-		.map_err(io::Error::other)
-		.and_then(|r| r)
-		.map_err(snapshot_err)?;
+		.map_err(io::Error::other)??;
 		*self.shared.snapshot.lock() = Some((meta.clone(), data.clone()));
-		Ok(Snapshot { meta, snapshot: Box::new(Cursor::new(data)) })
+		Ok(Snapshot { meta, snapshot: data })
 	}
 }
 
 impl RaftStateMachine<TypeConfig> for StateMachineStore {
 	type SnapshotBuilder = Self;
+	type SnapshotData = Vec<u8>;
 
 	#[expect(
 		clippy::unused_async_trait_impl,
 		reason = "signature fixed by openraft's RaftStateMachine"
 	)]
-	async fn applied_state(
-		&mut self,
-	) -> Result<(Option<LogId<NodeId>>, Membership), StorageError<NodeId>> {
+	async fn applied_state(&mut self) -> io::Result<(Option<LogId>, Membership)> {
 		let applied = self.shared.state.read();
 		Ok((applied.last_applied, applied.membership.clone()))
 	}
 
-	#[expect(
-		clippy::unused_async_trait_impl,
-		reason = "signature fixed by openraft's RaftStateMachine"
-	)]
-	async fn apply<I>(&mut self, entries: I) -> Result<Vec<TxnResult>, StorageError<NodeId>>
+	/// Applies the batch under one state lock, then publishes the revision and
+	/// watch events, and only then answers the proposers.
+	async fn apply<S>(&mut self, entries: S) -> io::Result<()>
 	where
-		I: IntoIterator<Item = LogEntry> + Send,
-		I::IntoIter: Send,
+		S: Stream<Item = io::Result<EntryResponder<TypeConfig>>> + Unpin + Send,
 	{
+		let entries: Vec<EntryResponder<TypeConfig>> = entries.try_collect().await?;
 		let mut events = Vec::new();
-		let mut replies = Vec::new();
+		let mut replies = Vec::with_capacity(entries.len());
 		let revision = {
 			let mut applied = self.shared.state.write();
-			for entry in entries {
+			for (entry, responder) in entries {
 				applied.last_applied = Some(entry.log_id);
 				let reply = match entry.payload {
-					EntryPayload::Blank => TxnResult { succeeded: true, revision: 0 },
+					EntryPayload::Blank => Vec::new(),
 					EntryPayload::Normal(command) => applied.kv.apply(&command, &mut events),
 					EntryPayload::Membership(membership) => {
-						applied.membership = StoredMembership::new(Some(entry.log_id), membership);
-						TxnResult { succeeded: true, revision: 0 }
+						applied.membership = Membership::new(Some(entry.log_id), membership);
+						Vec::new()
 					},
 				};
-				replies.push(reply);
+				if let Some(responder) = responder {
+					replies.push((responder, reply));
+				}
 			}
 			applied.kv.revision()
 		};
 		self.shared.revision.send_replace(revision);
 		self.notify(events);
-		Ok(replies)
+		for (responder, reply) in replies {
+			responder.send(reply);
+		}
+		Ok(())
 	}
 
 	#[expect(
@@ -277,36 +260,15 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 		self.clone()
 	}
 
-	#[expect(
-		clippy::unused_async_trait_impl,
-		reason = "signature fixed by openraft's RaftStateMachine"
-	)]
-	async fn begin_receiving_snapshot(
-		&mut self,
-	) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-		Ok(Box::new(Cursor::new(Vec::new())))
-	}
-
-	async fn install_snapshot(
-		&mut self,
-		meta: &Meta,
-		snapshot: Box<Cursor<Vec<u8>>>,
-	) -> Result<(), StorageError<NodeId>> {
-		let data = snapshot.into_inner();
-		let kv = KvState::from_snapshot(&data).map_err(|e| {
-			StorageError::from_io_error(
-				ErrorSubject::Snapshot(None),
-				ErrorVerb::Read,
-				io::Error::other(e),
-			)
-		})?;
+	async fn install_snapshot(&mut self, meta: &Meta, data: Vec<u8>) -> io::Result<()> {
+		let kv = KvState::from_snapshot(&data).map_err(io::Error::other)?;
 		let this = self.clone();
-		let (meta2, data2) = (meta.clone(), data.clone());
-		tokio::task::spawn_blocking(move || this.persist_snapshot(&meta2, &data2))
-			.await
-			.map_err(io::Error::other)
-			.and_then(|r| r)
-			.map_err(snapshot_err)?;
+		let persisted = meta.clone();
+		let data = tokio::task::spawn_blocking(move || {
+			this.persist_snapshot(&persisted, &data).map(|()| data)
+		})
+		.await
+		.map_err(io::Error::other)??;
 		let (events, revision) = {
 			let mut applied = self.shared.state.write();
 			let events = applied.kv.diff(&kv);
@@ -325,17 +287,12 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 		clippy::unused_async_trait_impl,
 		reason = "signature fixed by openraft's RaftStateMachine"
 	)]
-	async fn get_current_snapshot(
-		&mut self,
-	) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+	async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot>> {
 		Ok(self
 			.shared
 			.snapshot
 			.lock()
 			.as_ref()
-			.map(|(meta, data)| Snapshot {
-				meta:     meta.clone(),
-				snapshot: Box::new(Cursor::new(data.clone())),
-			}))
+			.map(|(meta, data)| Snapshot { meta: meta.clone(), snapshot: data.clone() }))
 	}
 }
