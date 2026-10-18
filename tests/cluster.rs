@@ -203,15 +203,15 @@ impl Cluster {
 		self.procs.iter().filter(|p| p.driver && p.child.is_some())
 	}
 
-	/// The driver whose log last announced `become leader` (and not `quit
-	/// leader` after it).
+	/// The driver whose log last announced `becomes leader` (and not `steps
+	/// down from leader` after it).
 	fn leader(&self) -> Option<String> {
 		self
 			.drivers()
 			.find(|p| {
 				let log = p.log_text();
-				let become_at = log.rfind("become leader");
-				become_at.is_some() && become_at > log.rfind("quit leader")
+				let become_at = log.rfind("becomes leader");
+				become_at.is_some() && become_at > log.rfind("steps down from leader")
 			})
 			.map(|p| p.name.clone())
 	}
