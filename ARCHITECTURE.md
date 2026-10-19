@@ -838,7 +838,11 @@ under the 104-byte macOS `sun_path` limit.
   kill) and forgets the sandbox, leaving KV records and objects alone.
 - Snapshot-as-template (E2B `POST /sandboxes/{id}/snapshots`) = pause +
   snapshot + resume of the source, then the snapshot dir and a frozen rootfs
-  overlay clone (with its base link) become `builds/<newBuildID>/`.
+  overlay clone (with its base link) become `builds/<newBuildID>/`. Its
+  `ArtifactMeta` keeps the source build's defaults, boot init, `startCmd`/
+  `readyCmd` and agent digest, so cold boots, snapshot regeneration and
+  `fromTemplate` builds start the service like the source template's (the
+  source build must be local: 404 otherwise).
 - Fork (E2B `POST /sandboxes/{id}/fork`) = snapshot-as-template into a hidden
   build, then N creates from it on the same node.
 - Kill (`DELETE /sandboxes/{id}`) = SIGKILL the VMM, drop the sandbox from

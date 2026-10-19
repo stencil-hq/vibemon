@@ -36,7 +36,7 @@ use crate::{
 		VolumeMount,
 	},
 	artifacts::{
-		self,
+		self, ArtifactMeta,
 		copy::{clone_disk, link_disk_base, move_disk, remove_disk},
 	},
 	build::{Builder, ServiceLog, start_service, steps::BuildContext},
@@ -1917,7 +1917,7 @@ impl SandboxManager {
 		store
 			.build_dir(&req.build_id)
 			.map_err(|e| ApiError::invalid(format!("{e:#}")))?;
-		let boot_init = store.boot_init(&meta.build_id).ok_or_else(|| {
+		let source = store.local_meta(&meta.build_id).ok_or_else(|| {
 			ApiError::not_found(format!("source build {} has no local artifacts", meta.build_id))
 		})?;
 		let snapshot_name = format!("build-{}", req.build_id);
@@ -1979,35 +1979,25 @@ impl SandboxManager {
 				"resume after snapshot failed"
 			);
 		}
-		let source = store.local(&meta.build_id);
-		let info = ArtifactInfo {
-			build_id:        req.build_id.clone(),
-			node_id:         store.host().node_id,
-			arch:            store.host().arch.clone(),
-			backend:         store.host().backend.clone(),
-			cpu_baseline:    store.host().cpu_baseline.clone(),
-			has_snapshot:    req.memory,
-			bytes:           0,
-			envd_version:    meta.envd_version.clone(),
-			vcpus:           meta.vcpus,
-			memory_mb:       meta.memory_mb,
-			disk_mb:         meta.disk_mb,
-			default_user:    source
-				.as_ref()
-				.map_or_else(|| "user".to_owned(), |s| s.default_user.clone()),
-			default_workdir: source.as_ref().and_then(|s| s.default_workdir.clone()),
-			env:             source.map(|s| s.env).unwrap_or_default(),
+		// The source build's defaults, boot init, start/ready commands and
+		// agent carry over: cold boots and snapshot regeneration start the
+		// snapshot's service like the source's.
+		let build = ArtifactMeta {
+			info: ArtifactInfo {
+				build_id: req.build_id.clone(),
+				bytes: 0,
+				envd_version: meta.envd_version.clone(),
+				vcpus: meta.vcpus,
+				memory_mb: meta.memory_mb,
+				disk_mb: meta.disk_mb,
+				..source.info
+			},
+			template_id: req.template_id.clone(),
+			..source
 		};
 		let snapshot = req.memory.then_some(snapshot_dir.as_path());
 		match store
-			.install_snapshot_build(
-				&req.build_id,
-				snapshot,
-				&rootfs_copy,
-				info,
-				&req.template_id,
-				&boot_init,
-			)
+			.install_snapshot_build(&req.build_id, snapshot, &rootfs_copy, build)
 			.await
 		{
 			Ok(info) => Ok(info),

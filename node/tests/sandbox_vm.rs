@@ -716,6 +716,81 @@ async fn filesystem_pauses_resume_without_the_template_build() {
 	client.kill_sandbox(&id).await.expect("kill");
 }
 
+/// Regression: a snapshot build keeps its source template's start and ready
+/// commands, so a cold boot from it (here forced by a node-local volume)
+/// starts the template's service like a cold boot of the template.
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_boots_from_a_snapshot_run_the_template_start_command() {
+	if !e2e_enabled() {
+		return;
+	}
+	let harness = harness(4, None).await;
+	let (client, manager) = (&harness.client, &harness.manager);
+	let template = harness
+		.data
+		.path()
+		.join("builds")
+		.join(&harness.build_id)
+		.join(artifacts::META);
+	let mut meta: ArtifactMeta = serde_json::from_slice(&std::fs::read(&template).unwrap()).unwrap();
+	meta.start_cmd = Some("echo started > /tmp/started".into());
+	meta.ready_cmd = Some("test -f /tmp/started".into());
+	// The test rootfs may lack /etc/passwd; numeric ids resolve without it.
+	meta.info.default_user = "0".into();
+	std::fs::write(&template, serde_json::to_vec(&meta).unwrap()).unwrap();
+	let now = vmon_node::sandbox::now_ms();
+	let create = |id: &str, build_id: &str, volume_mounts: Vec<VolumeMount>| CreateSandbox {
+		sandbox_id: id.into(),
+		team_id: "team".into(),
+		template_id: "tple2e".into(),
+		build_id: build_id.into(),
+		artifact_sources: Vec::new(),
+		vcpus: 1,
+		memory_mb: 256,
+		disk_mb: 512,
+		end_at_ms: now + 300_000,
+		init: GuestInit {
+			default_user: Some("root".into()),
+			sandbox_id: id.into(),
+			template_id: "tple2e".into(),
+			..GuestInit::default()
+		},
+		network: NetworkPolicy::default(),
+		volume_mounts,
+		s3_mounts: Vec::new(),
+		cold_boot: false,
+		gpus: 0,
+	};
+	// A fork inherits the template snapshot, captured without the service.
+	let source = "ie2esnapsource0000001";
+	client
+		.create_sandbox(&create(source, &harness.build_id, Vec::new()))
+		.await
+		.expect("create source");
+	let snapshot = uuid::Uuid::new_v4().to_string();
+	client
+		.snapshot_sandbox(source, &SnapshotSandbox {
+			build_id:    snapshot.clone(),
+			template_id: "tplsnap".into(),
+			memory:      true,
+		})
+		.await
+		.expect("snapshot");
+	let volume_id = uuid::Uuid::new_v4().to_string();
+	std::fs::create_dir_all(harness.data.path().join("volumes").join(&volume_id)).unwrap();
+	let volume =
+		VolumeMount { volume_id, name: "data".into(), path: "/mnt/data".into(), object_store: false };
+	let child = "ie2esnapchild00000001";
+	client
+		.create_sandbox(&create(child, &snapshot, vec![volume]))
+		.await
+		.expect("cold boot from the snapshot");
+	let vm = manager.live_vm(child).unwrap();
+	assert_eq!(vm.agent().fs_read("/tmp/started").await.unwrap(), b"started\n");
+	client.kill_sandbox(child).await.expect("kill child");
+	client.kill_sandbox(source).await.expect("kill source");
+}
+
 /// Guest workload that keeps block and rng interrupts in flight.
 const TEMPLATE_IO_LOAD: &str = "while :; do dd if=/dev/vda of=/dev/null bs=4k count=256 \
                                 2>/dev/null; head -c 4096 /dev/hwrng >/dev/null; done";

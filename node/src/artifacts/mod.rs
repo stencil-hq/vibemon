@@ -367,16 +367,15 @@ impl ArtifactStore {
 
 	/// Installs a snapshot-as-template build captured from a running sandbox:
 	/// moves `snapshot_dir` and `rootfs` (same filesystem) into
-	/// `builds/<build_id>/` and commits `info` (node identity fields are set
-	/// from this host; `has_snapshot` follows whether a snapshot was given).
+	/// `builds/<build_id>/` and commits `meta` (node identity fields are set
+	/// from this host, `has_snapshot` follows whether a snapshot was given,
+	/// `created_at_ms` is now).
 	pub async fn install_snapshot_build(
 		&self,
 		build_id: &str,
 		snapshot_dir: Option<&Path>,
 		rootfs: &Path,
-		info: ArtifactInfo,
-		template_id: &str,
-		boot_init: &str,
+		meta: ArtifactMeta,
 	) -> Result<ArtifactInfo> {
 		let lock = self.lock(build_id);
 		let _guard = lock.lock().await;
@@ -398,23 +397,18 @@ impl ArtifactStore {
 				.with_context(|| format!("moving {} into {build_id}", snapshot.display()))?;
 		}
 		let host = &self.inner.host;
-		let info = ArtifactInfo {
-			build_id: build_id.to_owned(),
-			node_id: host.node_id,
-			arch: host.arch.clone(),
-			backend: host.backend.clone(),
-			cpu_baseline: host.cpu_baseline.clone(),
-			has_snapshot: snapshot_dir.is_some(),
-			..info
-		};
 		let meta = ArtifactMeta {
-			info,
-			template_id: template_id.to_owned(),
-			boot_init: boot_init.to_owned(),
-			start_cmd: None,
-			ready_cmd: None,
-			agent_digest: String::new(),
+			info: ArtifactInfo {
+				build_id: build_id.to_owned(),
+				node_id: host.node_id,
+				arch: host.arch.clone(),
+				backend: host.backend.clone(),
+				cpu_baseline: host.cpu_baseline.clone(),
+				has_snapshot: snapshot_dir.is_some(),
+				..meta.info
+			},
 			created_at_ms: now_ms(),
+			..meta
 		};
 		self.commit(build_id, meta).await
 	}

@@ -68,6 +68,7 @@ Every layer has a cache key chained by SHA-256. The base key covers the image di
 - The start command runs in the background during finalize, and the snapshot captures it running.
 - The ready command is polled every 2 s until it exits 0, for at most 10 minutes. Without a ready command, a template with a start command waits `sleep 20`.
 - A `fromTemplate` build that sets neither command inherits the parent's pair.
+- A snapshot keeps the pair of the template its sandbox started from. Sandboxes that cold-boot from it, and the memory snapshot a node regenerates for it (filesystem snapshots, other CPU baselines), run the start command, and `fromTemplate` builds on it inherit the pair.
 
 ## Building with the SDK
 
