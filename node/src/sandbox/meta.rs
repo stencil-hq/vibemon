@@ -137,6 +137,12 @@ impl SandboxPaths {
 		self.paused.join("rootfs.img")
 	}
 
+	/// The build's kernel `init=` (JSON string) that every pause carries, so
+	/// a cold resume never needs the build on this node.
+	pub fn paused_boot_init(&self) -> PathBuf {
+		self.paused.join("boot-init.json")
+	}
+
 	/// Written and fsynced last, after every other file of the paused state
 	/// is durable: without it a crash may have left memory and disk out of
 	/// step, so the state must not be resumed.

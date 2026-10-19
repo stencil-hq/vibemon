@@ -325,14 +325,17 @@ fn link_snapshot(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Makes a freshly moved `paused/<id>/` durable, then publishes its commit
-/// marker: the overlay disk's data, the directory entries of the renamed-in
-/// snapshot, RAM base links and disk files (the VMM already fsynced the
-/// snapshot files and their directory), and finally the marker. Until the
-/// marker exists the state is not resumable after a host crash, so durable
-/// memory is never paired with a stale disk.
+/// marker: the overlay disk's data, the boot init, the directory entries of
+/// the renamed-in snapshot, RAM base links and disk files (the VMM already
+/// fsynced the snapshot files and their directory), and finally the marker.
+/// Until the marker exists the state is not resumable after a host crash, so
+/// durable memory is never paired with a stale disk.
 fn commit_paused(paths: &SandboxPaths) -> std::io::Result<()> {
 	let sync_dir = |dir: &Path| fs::File::open(dir)?.sync_all();
 	fs::File::open(paths.paused_rootfs())?.sync_data()?;
+	if paths.paused_boot_init().is_file() {
+		fs::File::open(paths.paused_boot_init())?.sync_data()?;
+	}
 	if paths.paused_base().is_dir() {
 		sync_dir(&paths.paused_base())?;
 	}
@@ -511,14 +514,11 @@ impl SandboxManager {
 		};
 		let (store, kv) = (Store::new(s3.clone()), kv.clone());
 		let meta = entry.state.lock().meta.clone();
-		let artifacts = self.builder.artifacts();
-		let Some(boot_init) = artifacts.boot_init(&meta.build_id) else {
-			tracing::warn!(
-				sandbox = id,
-				"build of the paused sandbox is not local; pause stays node-local"
-			);
+		let Some(boot_init) = self.boot_init(&entry.paths, &meta.build_id) else {
+			tracing::warn!(sandbox = id, "paused sandbox has no boot init; pause stays node-local");
 			return;
 		};
+		let artifacts = self.builder.artifacts();
 		let template = artifacts.snapshot_dir(&meta.build_id).ok();
 		let host = artifacts.host().clone();
 		let cancel = Cancellation::new();
@@ -1140,7 +1140,7 @@ impl SandboxManager {
 		let fork = snapshot.is_some();
 		let (boot, ram_base) = match snapshot {
 			Some(snapshot) => (Boot::Fork { snapshot: snapshot.clone() }, Some(snapshot)),
-			None => (self.cold_boot(&req.build_id)?, None),
+			None => (self.cold_boot(&paths, &req.build_id)?, None),
 		};
 		let plan = BootPlan {
 			boot,
@@ -1213,20 +1213,28 @@ impl SandboxManager {
 		Ok(info)
 	}
 
-	/// Cold boot of a build's rootfs with its recorded `init`.
-	fn cold_boot(&self, build_id: &str) -> Result<Boot, ApiError> {
-		let init = self
-			.builder
-			.artifacts()
-			.boot_init(build_id)
-			.ok_or_else(|| {
-				ApiError::not_found(format!("build {build_id} has no local artifacts to boot"))
-			})?;
+	/// Cold boot of a sandbox's rootfs with its build's `init`
+	/// ([`Self::boot_init`]).
+	fn cold_boot(&self, paths: &SandboxPaths, build_id: &str) -> Result<Boot, ApiError> {
+		let init = self.boot_init(paths, build_id).ok_or_else(|| {
+			ApiError::not_found(format!("build {build_id} has no local artifacts to boot"))
+		})?;
 		Ok(Boot::Cold {
 			kernel:  self.config.kernel.clone(),
 			initrd:  None,
 			cmdline: artifacts::kernel_cmdline(&self.config.arch, &init),
 		})
+	}
+
+	/// Kernel `init=` of a sandbox's build: the copy its pause carries
+	/// ([`SandboxPaths::paused_boot_init`]), else the local build's. A sandbox
+	/// resumed on a node without its build (from the object store, after a
+	/// handover) only has the carried copy.
+	fn boot_init(&self, paths: &SandboxPaths, build_id: &str) -> Option<String> {
+		fs::read(paths.paused_boot_init())
+			.ok()
+			.and_then(|bytes| serde_json::from_slice(&bytes).ok())
+			.or_else(|| self.builder.artifacts().boot_init(build_id))
 	}
 
 	/// `POST /sandboxes/{id}/pause`: memory snapshot (or filesystem only)
@@ -1267,6 +1275,9 @@ impl SandboxManager {
 			.ok_or_else(|| ApiError::conflict(format!("sandbox {id} is not running")))?;
 		let paths = &entry.paths;
 		let delta = memory && paths.ram_base().join(CURRENT_GENERATION).is_file();
+		let build_id = entry.state.lock().meta.build_id.clone();
+		// Read before the previous pause's dir goes: the next one carries it on.
+		let boot_init = self.boot_init(paths, &build_id);
 		let captured = async {
 			if memory {
 				vm.pause().await?;
@@ -1358,6 +1369,9 @@ impl SandboxManager {
 		let moved = (|| -> std::io::Result<()> {
 			remove_path(&paths.paused);
 			fs::create_dir_all(&paths.paused)?;
+			if let Some(init) = &boot_init {
+				fs::write(paths.paused_boot_init(), serde_json::to_vec(init)?)?;
+			}
 			if memory {
 				fs::rename(paths.snapshot_root().join(PAUSE_SNAPSHOT), paths.paused_snapshot())?;
 				if delta {
@@ -1752,11 +1766,6 @@ impl SandboxManager {
 		gpus: &[String],
 	) -> Result<Booted, ApiError> {
 		let fork = !req.cold_boot && paths.paused_snapshot().join(CURRENT_GENERATION).is_file();
-		// A fetched pause carries its build's boot init: a cold boot then needs
-		// no local template.
-		let fetched_init = fs::read(paths.paused.join("boot-init.json"))
-			.ok()
-			.and_then(|bytes| serde_json::from_slice::<String>(&bytes).ok());
 		let (disk, pages) = match lazy {
 			Some(lazy) => (PlanDisk::Remote(lazy.disk), lazy.pages),
 			None => (PlanDisk::Overlay(paths.paused_rootfs()), None),
@@ -1779,11 +1788,8 @@ impl SandboxManager {
 				paths.paused_snapshot()
 			};
 			(Boot::Fork { snapshot: paths.paused_snapshot() }, Some(ram_base))
-		} else if let Some(init) = fetched_init {
-			let cmdline = artifacts::kernel_cmdline(&self.config.arch, &init);
-			(Boot::Cold { kernel: self.config.kernel.clone(), initrd: None, cmdline }, None)
 		} else {
-			(self.cold_boot(build_id)?, None)
+			(self.cold_boot(paths, build_id)?, None)
 		};
 		let plan = BootPlan {
 			boot,

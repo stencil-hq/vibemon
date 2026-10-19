@@ -3,7 +3,8 @@
 //! Prepares a template build by hand (cold boot of a prepared ext4 rootfs
 //! with the guest agent at `/.vmon/agent`, then a memory snapshot), serves
 //! the node API over HTTP, and drives one sandbox through create (fork) →
-//! tunnel to envd `/health` → pause → resume → kill, printing latencies.
+//! tunnel to envd `/health` → pause → resume → kill, printing latencies;
+//! also cold resumes of filesystem pauses on a node that lost the build.
 //!
 //! Environment: `VMON_BIN` (signed `vmon` with the `vmm` subcommand),
 //! `VMON_KERNEL` (guest kernel), `VMON_TEST_ROOTFS` (ext4 with the agent),
@@ -635,6 +636,84 @@ async fn sandbox_fork_tunnel_pause_resume_kill() {
 		assert!(Instant::now() < deadline, "paused state of a killed sandbox was not removed");
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
+}
+
+/// Regression: a sandbox on a node without its template build (resumed off
+/// its holder from the object store, adopted in a handover) keeps pausing and
+/// cold-resuming, because every pause carries the build's boot init. Dropping
+/// the build after the first pause stands in for such a node.
+#[tokio::test(flavor = "multi_thread")]
+async fn filesystem_pauses_resume_without_the_template_build() {
+	if !e2e_enabled() {
+		return;
+	}
+	let harness = harness(4, None).await;
+	let (client, manager) = (&harness.client, &harness.manager);
+	let id = "ie2enobuildsandbox001".to_owned();
+	let now = vmon_node::sandbox::now_ms();
+	let init = GuestInit {
+		default_user: Some("root".into()),
+		sandbox_id: id.clone(),
+		template_id: "tple2e".into(),
+		..GuestInit::default()
+	};
+	client
+		.create_sandbox(&CreateSandbox {
+			sandbox_id:       id.clone(),
+			team_id:          "team".into(),
+			template_id:      "tple2e".into(),
+			build_id:         harness.build_id.clone(),
+			artifact_sources: Vec::new(),
+			vcpus:            1,
+			memory_mb:        256,
+			disk_mb:          512,
+			end_at_ms:        now + 300_000,
+			init:             init.clone(),
+			network:          NetworkPolicy::default(),
+			volume_mounts:    Vec::new(),
+			s3_mounts:        Vec::new(),
+			cold_boot:        false,
+			gpus:             0,
+		})
+		.await
+		.expect("create sandbox");
+	manager
+		.live_vm(&id)
+		.unwrap()
+		.agent()
+		.fs_write("/root/on-disk", 0o644, b"kept")
+		.await
+		.unwrap();
+	let resume = ResumeSandbox {
+		end_at_ms: now + 300_000,
+		init,
+		network: NetworkPolicy::default(),
+		volume_mounts: Vec::new(),
+		s3_mounts: Vec::new(),
+		cold_boot: false,
+		remote: None,
+		meta: None,
+		artifact_sources: Vec::new(),
+		gpus: 0,
+	};
+	for round in ["first", "second"] {
+		client
+			.pause_sandbox(&id, &PauseSandbox { memory: false, handover: false })
+			.await
+			.unwrap_or_else(|error| panic!("{round} filesystem pause: {error}"));
+		let build = harness.data.path().join("builds").join(&harness.build_id);
+		if build.exists() {
+			std::fs::remove_dir_all(build).unwrap();
+		}
+		client
+			.resume_sandbox(&id, &resume)
+			.await
+			.unwrap_or_else(|error| panic!("{round} cold resume without the build: {error}"));
+		assert_eq!(health_via_tunnel(client, &id).await, 204);
+		let vm = manager.live_vm(&id).unwrap();
+		assert_eq!(vm.agent().fs_read("/root/on-disk").await.unwrap(), b"kept");
+	}
+	client.kill_sandbox(&id).await.expect("kill");
 }
 
 /// Guest workload that keeps block and rng interrupts in flight.

@@ -654,8 +654,8 @@ cache/steps/<layerKey>/       step-cache layers (rootfs.ext4 + layer.json); .<la
 cache/context/<templateID>/<hash>/  extracted COPY file contexts
 sandboxes/<sandboxID>/        rootfs.img (block overlay) + rootfs.img.base (hard link of its raw base), console.log (serial), console.vmm.log, metrics.jsonl,
                               meta.json (SandboxMeta, 0600), snap/ (live --snapshot-root; snap/base = hard-linked RAM base), net-policy.json (user-net)
-paused/<sandboxID>/           snapshot/ (+ base/ when it is a delta) + rootfs.img + rootfs.img.base + committed (durability marker) (paused sandbox state;
-                              a pause fetched from the object store has a raw rootfs.img and boot-init.json instead of the base link)
+paused/<sandboxID>/           snapshot/ (+ base/ when it is a delta) + rootfs.img + rootfs.img.base + boot-init.json + committed (durability marker)
+                              (paused sandbox state; a pause fetched from the object store has a raw rootfs.img instead of the base link)
 paused/<sandboxID>.upload/    staging of a running object-store upload (meta.json, boot-init.json, rootfs.blk, rootfs.blk.json)
                               (a lazily resumed sandbox's dir holds instead: rootfs.img (remote sector overlay), rootfs.cache,
                               rootfs.blk.json, rootfs.remote.json, pages/ (Linux page caches))
@@ -718,15 +718,20 @@ under the 104-byte macOS `sun_path` limit.
 - Pause = `pause` → `snapshot {name: "pause", base: "base"}` (plain
   `snapshot` without a RAM base, e.g. after a cold boot) → SIGKILL; the
   snapshot moves to `paused/<id>/snapshot`, the RAM base to
-  `paused/<id>/base`, and the rootfs overlay to `paused/<id>/rootfs.img`. A
+  `paused/<id>/base`, and the rootfs overlay to `paused/<id>/rootfs.img`;
+  `paused/<id>/boot-init.json` records the build's kernel `init=` (carried
+  over from the previous pause, else from the local build), so cold resumes
+  and uploads of a sandbox running on a node without its build (off-holder
+  resume, handover) never need the build. A
   delta against the RAM base stores only pages that differ from it: the VMM
   takes candidates from `/proc/self/pagemap` (private copies of the
   `MAP_PRIVATE` base mapping; fd opened before the privilege drop) and
   verifies each against the base, so cost scales with pages written since
   the fork, not guest RAM. Reaping the VMM and egress/TAP teardown run after
   the reply. So does the commit, which holds the sandbox's operation lock
-  (a resume or kill waits for it): fdatasync the overlay disk, fsync the
-  renamed-in directory entries, then create and fsync `paused/<id>/committed`.
+  (a resume or kill waits for it): fdatasync the overlay disk and the boot
+  init, fsync the renamed-in directory entries, then create and fsync
+  `paused/<id>/committed`.
   Restart recovery keeps a paused sandbox only with that marker (memory and
   disk are then a durable pair) and drops it otherwise; a resume the node
   answers with 404 marks the sandbox killed.

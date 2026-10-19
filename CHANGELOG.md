@@ -2,6 +2,12 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- A sandbox running on a node without its template build (resumed off its holder from the object store, or adopted in a handover) no longer loses its paused state: every pause now carries the build's kernel `init=` as `paused/<id>/boot-init.json`. Before, its next filesystem-only, GPU, or `memory: false` resume answered 404 and the driver marked the sandbox killed, and its pauses stopped uploading to the object store
+
 ## 0.4.0
 
 ### Added (multi-address membership)

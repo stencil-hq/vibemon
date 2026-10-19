@@ -32,7 +32,7 @@ Flag reference: [`vmon serve` options](../reference/serve.md#object-store-and-vo
 | `builds/<buildID>/` | `rootfs.ext4` (raw ext4 base), `snapshot/` (VMM memory snapshot with `startCmd` running), `meta.json`, `manifest.json`, `build.log`, `console-*.log` | Until the template is deleted and no running or paused sandbox uses it. A failed or cancelled build, or one cut off by a node restart, keeps only its logs |
 | `cache/steps/<layerKey>/` | `rootfs.ext4` and `layer.json` of a cached build layer | At most 48 layers within `--step-cache-mb` (default 10% of the data directory's filesystem); least recently used evicted first |
 | `sandboxes/<id>/` | `rootfs.img` + `rootfs.img.base`, `console.log`, `console.vmm.log`, `metrics.jsonl`, `meta.json` (0600), `snap/`, `net-policy.json` (user-net) | `console.log` and `metrics.jsonl` stay 7 days after the sandbox ends, then the directory is deleted |
-| `paused/<id>/` | `snapshot/` (+ `base/` for a delta), `rootfs.img` + `rootfs.img.base`, `committed` | Until the next pause or kill |
+| `paused/<id>/` | `snapshot/` (+ `base/` for a delta), `rootfs.img` + `rootfs.img.base`, `boot-init.json` (the template's kernel `init=`, so a cold resume never needs the template on this node), `committed` | Until the next pause or kill |
 | `paused/<id>.upload/` | Staging of a running object-store upload | Transient |
 
 Other nodes fetch a build's artifacts from a node that holds it when they first create a sandbox from it; transfers send only data extents, so destinations stay sparse.
