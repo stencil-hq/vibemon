@@ -8,6 +8,7 @@ All notable changes to this project are recorded here.
 
 - A sandbox running on a node without its template build (resumed off its holder from the object store, or adopted in a handover) no longer loses its paused state: every pause now carries the build's kernel `init=` as `paused/<id>/boot-init.json`. Before, its next filesystem-only, GPU, or `memory: false` resume answered 404 and the driver marked the sandbox killed, and its pauses stopped uploading to the object store
 - Snapshot templates (`POST /sandboxes/{id}/snapshots`, fork) keep the source template's start and ready commands and agent digest. Before, cold boots from a snapshot and the memory snapshot regenerated for filesystem snapshots or other CPU baselines skipped the template's service, `fromTemplate` builds on a snapshot inherited no start command, and every such build refreshed the guest agent
+- envd releases a process's pid file descriptor when the process exits. Before, every command started with a timeout (the SDK sends one on every command; 60 s by default) kept its pidfd open until that timeout elapsed and through the 30 s exit retention, so a sandbox running short commands faster than about 1,000 per timeout exhausted envd's 1024-descriptor limit and every new command failed with `No file descriptors available (os error 24)`
 
 ## 0.4.0
 
