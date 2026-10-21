@@ -67,13 +67,24 @@ struct Fanout {
 	end:         Option<ev::EndEvent>,
 }
 
+/// How `Proc::signal` reaches the process.
+enum SignalTarget {
+	/// Its pidfd, so a recycled pid is never hit.
+	Pidfd(OwnedFd),
+	/// Its bare pid, where `pidfd_open` is unavailable.
+	Pid,
+	/// Reaped: nothing to signal, and the pidfd is closed (an exited process
+	/// stays in the registry for `EXIT_RETENTION`, which must not pin an fd).
+	Reaped,
+}
+
 /// A tracked process.
 pub struct Proc {
 	pub pid:    u32,
 	pub tag:    Option<String>,
 	pub config: ProcessConfig,
 	io:         Io,
-	pidfd:      Option<OwnedFd>,
+	target:     Mutex<SignalTarget>,
 	fanout:     Mutex<Fanout>,
 }
 
@@ -127,9 +138,9 @@ impl Proc {
 		if self.has_ended() {
 			return Err(io::Error::from_raw_os_error(libc::ESRCH));
 		}
-		let rc = match &self.pidfd {
+		let rc = match &*self.target.lock() {
 			// SAFETY: raw syscall with a valid pidfd and null siginfo.
-			Some(fd) => unsafe {
+			SignalTarget::Pidfd(fd) => unsafe {
 				libc::syscall(
 					libc::SYS_pidfd_send_signal,
 					fd.as_raw_fd(),
@@ -138,8 +149,11 @@ impl Proc {
 					0,
 				)
 			},
-			// SAFETY: plain kill(2).
-			None => libc::c_long::from(unsafe { libc::kill(self.pid.cast_signed(), sig) }),
+			SignalTarget::Pid => {
+				// SAFETY: plain kill(2).
+				libc::c_long::from(unsafe { libc::kill(self.pid.cast_signed(), sig) })
+			},
+			SignalTarget::Reaped => return Err(io::Error::from_raw_os_error(libc::ESRCH)),
 		};
 		if rc == 0 {
 			Ok(())
@@ -497,7 +511,7 @@ pub fn spawn(
 	drop(guard);
 	drop(cmd); // closes the parent's copies of the PTY slave
 
-	let pidfd = pidfd_open(pid);
+	let target = pidfd_open(pid).map_or(SignalTarget::Pid, SignalTarget::Pidfd);
 	let io = match &master {
 		Some(m) => Io::Pty(m.clone()),
 		None => Io::Pipes(tokio::sync::Mutex::new(child.stdin.take())),
@@ -507,7 +521,7 @@ pub fn spawn(
 		tag: req.tag,
 		config,
 		io,
-		pidfd,
+		target: Mutex::new(target),
 		fanout: Mutex::new(Fanout { subscribers: Vec::new(), end: None }),
 	});
 	let Subscription::Live(rx) = proc.subscribe() else {
@@ -530,19 +544,25 @@ pub fn spawn(
 		}
 	}
 
-	if let Some(lifetime) = ctx.lifetime {
+	// The deadline task holds an `Arc<Proc>` while it sleeps; the waiter below
+	// aborts it once the process is reaped.
+	let deadline = ctx.lifetime.map(|lifetime| {
 		let p = proc.clone();
 		tokio::spawn(async move {
 			tokio::time::sleep(lifetime).await;
 			let _ = p.signal(libc::SIGKILL);
-		});
-	}
+		})
+	});
 
 	let st = state.clone();
 	let p = proc.clone();
 	tokio::spawn(async move {
 		let status = child.wait().await;
 		crate::reaper::untrack(pid.cast_signed());
+		*p.target.lock() = SignalTarget::Reaped;
+		if let Some(deadline) = deadline {
+			deadline.abort();
+		}
 		let _ = exited_tx.send(true);
 		for pump in pumps {
 			let _ = pump.await;
@@ -913,5 +933,33 @@ mod tests {
 		assert_eq!(posix_signal(9).unwrap(), libc::SIGKILL);
 		assert_eq!(posix_signal(0).unwrap_err().code, Code::Unimplemented);
 		assert_eq!(posix_signal(2).unwrap_err().code, Code::Unimplemented);
+	}
+
+	/// An exited process stays connectable for `EXIT_RETENTION`, but its pidfd
+	/// must close when it is reaped. Kept until the start timeout instead, every
+	/// short command held one descriptor, and a burst exhausted envd's limit
+	/// ("No file descriptors available").
+	#[tokio::test(flavor = "multi_thread")]
+	async fn reaped_process_releases_its_pidfd() {
+		let state = super::super::server::build_state(&super::super::server::EnvdConfig::default());
+		// SAFETY: geteuid is always safe.
+		let me = super::super::users::NameCache::default().user(unsafe { libc::geteuid() });
+		let user = state.resolve_user(Some(&me)).unwrap();
+		let req = pb::StartRequest {
+			process: Some(ProcessConfig { cmd: "/bin/true".into(), ..Default::default() }),
+			stdin: Some(false),
+			..Default::default()
+		};
+		let ctx = SpawnContext { user: &user, lifetime: Some(Duration::from_secs(600)) };
+		let (proc, mut events) = spawn(&state, req, &ctx).unwrap();
+		assert!(matches!(*proc.target.lock(), SignalTarget::Pidfd(_)), "pidfd_open failed");
+		while let Some(event) = events.recv().await {
+			if matches!(event, Event::End(_)) {
+				break;
+			}
+		}
+		let selector = pb::ProcessSelector { selector: Some(Selector::Pid(proc.pid)) };
+		assert!(state.processes.find_connectable(Some(&selector)).is_ok(), "retained for Connect");
+		assert!(matches!(*proc.target.lock(), SignalTarget::Reaped), "pidfd still open");
 	}
 }
