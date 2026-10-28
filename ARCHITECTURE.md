@@ -13,7 +13,7 @@ One binary, `vmon`, three entry points:
 |---|---|
 | `vmon vmm …` | Per-VM monitor (the `vmm` crate). Spawned by the node role; never by users. |
 | `vmon serve --role node,driver …` | Long-running server. A process runs the **node** role (hosts microVMs), the **driver** role (E2B API, scheduling, ingress), or both. |
-| `vmon admin …` | Operator tooling (teams, users, API keys, limits, system teams) against the store of a running driver, through its cluster listener (`--cluster-url`). The admin token is `vmon serve --admin-token`. |
+| `vmon admin …` | Operator tooling (teams, users, API keys, limits, system teams) against the store of a running driver, through its cluster listener (`--cluster-url`); `delete-team` runs on that driver (`DELETE /driver/v1/teams/{team}`). The admin token is `vmon serve --admin-token`. |
 
 ```mermaid
 graph TD
@@ -75,7 +75,7 @@ The `vmm` crate stays synchronous.
 |---|---|---|---|
 | `--listen` | `0.0.0.0:3000` | public HTTP/1.1 + h2c | driver: E2B API + sandbox ingress |
 | `--tls-listen` + `--tls-cert/--tls-key` | off | public HTTPS (h2/http1.1 ALPN) | same router as `--listen` |
-| `--cluster-listen` | `0.0.0.0:7947` | internal HTTP | `/cluster/v1/*` (raft, kv), `/node/v1/*` (node API, tunnels) |
+| `--cluster-listen` | `0.0.0.0:7947` | internal HTTP | `/cluster/v1/*` (raft, kv), `/node/v1/*` (node API, tunnels), `/driver/v1/*` (driver operations for `vmon admin`) |
 | `--gossip-listen` | `0.0.0.0:7946` | UDP (probes) + TCP (push-pull) | gossip |
 | `--kv-resp-listen` | off | Redis protocol (RESP2) | cluster KV for `redis-cli`/`redis-benchmark` (§5.3) |
 
@@ -1296,6 +1296,19 @@ served at `/dashboard/` on the public listeners):
   event `seq` cursor; a store error yields `starts: 0`).
 - `GET /admin/teams`: every team (limits, `blocked`, `system`) with its
   running/paused `sandboxes` counts from the store, sorted by name.
+- `DELETE /admin/teams/{teamID}[?force=true]` (`admin::delete_team`; also
+  `DELETE /driver/v1/teams/{id|slug}` on the cluster listener, bearer =
+  cluster secret, for `vmon admin delete-team`): without `force`, 409 for a
+  system team or while the team has live sandboxes (store rows plus
+  `team/<t>/sbx/*` admissions) or unfinished builds, naming them. Then it
+  blocks the team (rechecking the blockers without `force`), kills its
+  sandboxes (503 if any kill fails), cancels its unfinished builds,
+  soft-deletes its templates (`builds::delete_template`), deletes its
+  volumes with their data, secrets, webhooks, and API keys (evicting them
+  from this driver's auth cache), and finally `Store::delete_team` removes
+  the memberships, the `db/team.slug` index, and the team. Every step is
+  idempotent, so a rerun finishes a failed delete. Answers the counts
+  removed.
 - `GET /admin/sandboxes`: every team's running/paused sandboxes, newest
   first (`state` CSV, `team`, `limit` 1..=1000 default 500, `nextToken` /
   `X-Next-Token` as `/v2/sandboxes`); `ListedSandbox` fields plus `teamID`,

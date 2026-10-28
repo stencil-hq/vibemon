@@ -1,16 +1,34 @@
 //! Operator actions behind `vmon admin …` (wired by the `vmon` binary) and
-//! shared by the API handlers that mint keys.
+//! shared by the API handlers that mint keys or delete teams.
+//!
+//! Most actions only touch the store, which `vmon admin` reaches through the
+//! cluster KV. [`delete_team`] also kills sandboxes and deletes node data, so
+//! it runs on a driver: `vmon admin delete-team` calls it through
+//! [`request_team_delete`].
+
+use std::{fmt::Write, time::Duration};
 
 use anyhow::{Context, bail};
+use axum::http::StatusCode;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+	api, builds,
 	crypto::{self, Keys},
-	state::TeamLimits,
+	error::{ApiError, ApiResult},
+	lifecycle,
+	state::{AppState, TeamLimits},
 	store::{self, ApiKeyRow, NewApiKey, Store, Team, User},
 };
 
 /// Name of the key minted together with a new team.
 const DEFAULT_KEY_NAME: &str = "Default API key";
+
+/// Most sandbox or build IDs a refused [`delete_team`] names.
+const NAMED_BLOCKERS: usize = 10;
+
+/// Build failure reason recorded when [`delete_team`] cancels a build.
+const DELETED_TEAM_REASON: &str = "The build was cancelled because its team was deleted.";
 
 /// Generates, stores, and returns a new API key `(row, plaintext)`.
 pub async fn create_api_key(
@@ -45,18 +63,43 @@ pub async fn create_team(
 	name: &str,
 	limits: TeamLimits,
 ) -> anyhow::Result<(Team, String)> {
-	let name = name.trim();
-	if name.is_empty() {
-		bail!("team name must not be empty");
-	}
 	let team = store
-		.create_team(name, limits)
+		.create_team(team_name(name)?, limits)
 		.await
 		.context("creating team")?;
 	let (_, key) = create_api_key(store, keys, &team.id, DEFAULT_KEY_NAME, None)
 		.await
 		.context("creating API key")?;
 	Ok((team, key))
+}
+
+/// [`create_team`] unless a team already holds the slug of `name`: that team
+/// is returned unchanged, without an API key (`create-team --if-missing`).
+pub async fn ensure_team(
+	store: &Store,
+	keys: &Keys,
+	name: &str,
+	limits: TeamLimits,
+) -> anyhow::Result<(Team, Option<String>)> {
+	let (team, created) = store
+		.ensure_team(team_name(name)?, limits)
+		.await
+		.context("creating team")?;
+	if !created {
+		return Ok((team, None));
+	}
+	let (_, key) = create_api_key(store, keys, &team.id, DEFAULT_KEY_NAME, None)
+		.await
+		.context("creating API key")?;
+	Ok((team, Some(key)))
+}
+
+fn team_name(name: &str) -> anyhow::Result<&str> {
+	let name = name.trim();
+	if name.is_empty() {
+		bail!("team name must not be empty");
+	}
+	Ok(name)
 }
 
 /// Creates a CLI user and, when `team` (id or slug) is given, makes it the
@@ -173,4 +216,213 @@ pub async fn set_team_system(store: &Store, team: &str, system: bool) -> anyhow:
 		.with_context(|| format!("team {team} not found"))?;
 	store.set_team_system(&found.id, system).await?;
 	store.team_by_id(&found.id).await?.context("team vanished")
+}
+
+/// What [`delete_team`] removed with a team (`DELETE /admin/teams/{teamID}`
+/// body).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedTeam {
+	#[serde(rename = "teamID")]
+	pub team_id:          String,
+	pub slug:             String,
+	pub killed_sandboxes: u64,
+	pub cancelled_builds: u64,
+	pub templates:        u64,
+	pub volumes:          u64,
+	pub secrets:          u64,
+	pub webhooks:         u64,
+	pub api_keys:         u64,
+}
+
+/// Deletes a team and everything it owns, freeing its slug.
+///
+/// Removes, in order: sandboxes, builds, templates (soft-deleted; the build
+/// GC collects their artifacts once unused), volumes with their data,
+/// secrets, webhooks, API keys, and finally memberships and the team record.
+///
+/// Without `force` the delete is refused while the team has running or paused
+/// sandboxes or unfinished builds, and for a system team (other teams resolve
+/// its public templates). The team is blocked for the teardown, so a delete
+/// that fails midway leaves a blocked team that a rerun finishes.
+///
+/// # Errors
+///
+/// 409 naming the blockers when not forced; 503 when some sandboxes could not
+/// be killed; store, KV, and node failures.
+pub async fn delete_team(state: &AppState, team: &Team, force: bool) -> ApiResult<DeletedTeam> {
+	if !force {
+		if team.system {
+			return Err(ApiError::conflict(format!(
+				"team '{}' is a system team whose public templates other teams use; force the delete \
+				 to remove it",
+				team.slug
+			)));
+		}
+		refuse_live(state, team).await?;
+	}
+	state.store.set_team_blocked(&team.id, true).await?;
+	state.auth_cache.invalidate_team(&team.id);
+	if !force && let Err(error) = refuse_live(state, team).await {
+		// Something started before the block took effect.
+		if !team.blocked {
+			state.store.set_team_blocked(&team.id, false).await?;
+		}
+		return Err(error);
+	}
+
+	let mut deleted =
+		DeletedTeam { team_id: team.id.clone(), slug: team.slug.clone(), ..DeletedTeam::default() };
+	let (killed, failed) = lifecycle::kill_team(state, &team.id).await?;
+	deleted.killed_sandboxes = killed;
+	if failed > 0 {
+		return Err(ApiError::unavailable(format!(
+			"{failed} sandboxes of team '{}' could not be killed; the team stays blocked, retry the \
+			 delete",
+			team.slug
+		)));
+	}
+	for build in state.store.team_unfinished_builds(&team.id).await? {
+		if builds::cancel_build(state, &build, DELETED_TEAM_REASON).await {
+			deleted.cancelled_builds += 1;
+		}
+	}
+	for id in state.store.team_template_ids(&team.id).await? {
+		match builds::delete_template(state, &id).await {
+			Ok(()) => deleted.templates += 1,
+			Err(error) if error.status == StatusCode::NOT_FOUND => {},
+			Err(error) => return Err(error),
+		}
+	}
+	for volume in state.store.list_volumes(&team.id).await? {
+		api::volumes::remove_volume(state, &volume).await?;
+		deleted.volumes += 1;
+	}
+	for secret in state.store.list_secrets(&team.id, None, u32::MAX).await? {
+		if state.store.delete_secret(&team.id, &secret.id).await? {
+			deleted.secrets += 1;
+		}
+	}
+	for hook in state.store.list_webhooks(&team.id).await? {
+		if state.store.delete_webhook(&team.id, &hook.id).await? {
+			deleted.webhooks += 1;
+		}
+	}
+	for key in state.store.list_api_keys(&team.id).await? {
+		if let Some(hash) = state.store.delete_api_key(&team.id, &key.id).await? {
+			state.auth_cache.invalidate_key(&hash);
+			deleted.api_keys += 1;
+		}
+	}
+	state.store.delete_team(&team.id).await?;
+	tracing::info!(team = %team.id, slug = %team.slug, ?deleted, "deleted team");
+	Ok(deleted)
+}
+
+/// 409 naming the team's live sandboxes and unfinished builds, if any.
+async fn refuse_live(state: &AppState, team: &Team) -> ApiResult<()> {
+	let sandboxes = lifecycle::team_sandbox_ids(state, &team.id).await?;
+	let builds: Vec<String> = state
+		.store
+		.team_unfinished_builds(&team.id)
+		.await?
+		.into_iter()
+		.map(|build| build.id)
+		.collect();
+	let mut blockers = Vec::new();
+	if !sandboxes.is_empty() {
+		blockers.push(format!("running or paused sandboxes {}", named(&sandboxes)));
+	}
+	if !builds.is_empty() {
+		blockers.push(format!("unfinished builds {}", named(&builds)));
+	}
+	if blockers.is_empty() {
+		return Ok(());
+	}
+	Err(ApiError::conflict(format!(
+		"team '{}' has {}; force the delete to kill and cancel them",
+		team.slug,
+		blockers.join(" and ")
+	)))
+}
+
+/// `ids` as a comma-separated list of at most [`NAMED_BLOCKERS`] entries.
+fn named(ids: &[String]) -> String {
+	let mut list = ids
+		.iter()
+		.take(NAMED_BLOCKERS)
+		.map(String::as_str)
+		.collect::<Vec<_>>()
+		.join(", ");
+	if ids.len() > NAMED_BLOCKERS {
+		let _ = write!(list, " and {} more", ids.len() - NAMED_BLOCKERS);
+	}
+	list
+}
+
+/// `vmon admin delete-team`: runs [`delete_team`] on a driver.
+///
+/// Sends `DELETE /driver/v1/teams/{team}` (team by id or slug; see
+/// [`crate::Driver::cluster_router`]) to the first reachable driver cluster
+/// listener among `cluster_urls`.
+///
+/// # Errors
+///
+/// No driver reachable; the driver's refusal or failure message.
+pub async fn request_team_delete(
+	cluster_urls: &[String],
+	secret: &str,
+	team: &str,
+	force: bool,
+) -> anyhow::Result<DeletedTeam> {
+	#[derive(Deserialize)]
+	struct ErrorBody {
+		message: String,
+	}
+
+	let http = reqwest::Client::builder()
+		.connect_timeout(Duration::from_secs(2))
+		.build()
+		.context("building http client")?;
+	let mut unreachable = Vec::new();
+	for base in cluster_urls {
+		let mut url = reqwest::Url::parse(base).with_context(|| format!("cluster URL {base}"))?;
+		url.path_segments_mut()
+			.map_err(|()| anyhow::anyhow!("cluster URL {base} cannot take a path"))?
+			.pop_if_empty()
+			.extend(["driver", "v1", "teams", team]);
+		let response = match http
+			.delete(url)
+			.query(&[("force", force)])
+			.bearer_auth(secret)
+			.send()
+			.await
+		{
+			Ok(response) => response,
+			Err(error) if error.is_connect() => {
+				unreachable.push(format!("{base}: {error}"));
+				continue;
+			},
+			Err(error) => return Err(error).with_context(|| format!("deleting team via {base}")),
+		};
+		let status = response.status();
+		if status.is_success() {
+			return response
+				.json()
+				.await
+				.with_context(|| format!("reading the reply of {base}"));
+		}
+		let message = match response.json::<ErrorBody>().await {
+			Ok(body) => body.message,
+			Err(_) if status == StatusCode::UNAUTHORIZED => {
+				format!("{base} rejected the cluster secret")
+			},
+			Err(_) if status == StatusCode::NOT_FOUND => {
+				format!("{base} serves no driver API (is it a driver's cluster listener?)")
+			},
+			Err(_) => format!("{base} answered {status}"),
+		};
+		bail!("{message}");
+	}
+	bail!("no driver reachable: {}", unreachable.join("; "))
 }

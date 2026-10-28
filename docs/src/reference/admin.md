@@ -1,6 +1,6 @@
 # vmon admin commands
 
-Complete reference for `vmon admin`, the operator tool for teams, users, API keys, limits, and system teams. It reads and writes the cluster's store through the cluster listener of a running driver, so at least one driver must be up. Task-oriented walkthroughs are in [Administration](../operate/admin.md).
+Complete reference for `vmon admin`, the operator tool for teams, users, API keys, limits, and system teams. It reads and writes the cluster's store through the cluster listener of a running driver, so at least one driver must be up; [`delete-team`](#delete-team) instead asks that driver to do the work. Task-oriented walkthroughs are in [Administration](../operate/admin.md).
 
 ```text
 Usage: vmon admin [OPTIONS] <COMMAND>
@@ -10,7 +10,7 @@ Every invocation connects to the first reachable `--cluster-url`; a write reache
 
 ## Global options
 
-Global options go between `admin` and the subcommand. Every subcommand also accepts `-h`, `--help`; `--system` and `--default` are off unless supplied.
+Global options go between `admin` and the subcommand. Every subcommand also accepts `-h`, `--help`; `--system`, `--if-missing`, `--force`, and `--default` are off unless supplied.
 
 | Option | Env | Default | Description |
 |---|---|---|---|
@@ -62,9 +62,10 @@ Usage: vmon admin create-team [OPTIONS] <NAME>
 |---|---|
 | `<NAME>` | Team name. Leading and trailing whitespace is trimmed; an empty name is an error. |
 | `--system` | Make it a system team: its public templates claim the bare aliases every team resolves (`base`, `code-interpreter-v1`, …). |
+| `--if-missing` | When a team already holds the slug of `<NAME>`, print that team and change nothing. |
 | `--max-*` | [Limit options](#limit-options); omitted ones take the defaults. |
 
-The slug is derived from the name: lowercase ASCII letters and digits, every other run of characters becomes one `-`, no leading or trailing `-`, and `team` when nothing remains. On a collision `-2`, `-3`, … is appended.
+The slug is derived from the name: lowercase ASCII letters and digits, every other run of characters becomes one `-`, no leading or trailing `-`, and `team` when nothing remains. On a collision `-2`, `-3`, … is appended. With `--if-missing` there is no suffix: if the slug is taken, its team is printed as its `team` and `slug` lines, `team <slug> already exists; left unchanged` goes to stderr, the command exits with status 0, and neither `--system` nor the limit options are applied. Reruns therefore return the same team.
 
 The command also mints the team's first API key, named `Default API key`, and prints:
 
@@ -85,6 +86,36 @@ Usage: vmon admin list-teams
 ```
 
 Prints one [team line](#team-lines) per team, oldest first.
+
+## delete-team
+
+Delete a team (id or slug) with its API keys, templates, volumes, secrets, webhooks, and memberships; frees its slug.
+
+```text
+Usage: vmon admin delete-team [OPTIONS] <TEAM>
+```
+
+| Argument / option | Description |
+|---|---|
+| `<TEAM>` | Team ID or slug. |
+| `--force` | Kill the team's running and paused sandboxes and cancel its unfinished builds instead of refusing; required for a system team. |
+
+Unlike the other commands, the deletion runs on a driver, because killing sandboxes and deleting node-local volume data need the nodes. `vmon admin` sends `DELETE /driver/v1/teams/<TEAM>?force=<bool>` with `Authorization: Bearer <cluster secret>` to the first `--cluster-url` that accepts the connection. Only a driver's cluster listener serves that route; a node-only listener fails with `<url> serves no driver API (is it a driver's cluster listener?)`.
+
+Without `--force` the command fails with status 1 and changes nothing when:
+
+- the team is a system team: `team '<slug>' is a system team whose public templates other teams use; force the delete to remove it`;
+- the team has running or paused sandboxes or unfinished builds: `team '<slug>' has running or paused sandboxes <ids> and unfinished builds <ids>; force the delete to kill and cancel them` (each list names at most 10 IDs, then `and <n> more`).
+
+Otherwise the driver blocks the team, kills its sandboxes, cancels its unfinished builds (reason `The build was cancelled because its team was deleted.`), and removes, in order, its templates, volumes, secrets, webhooks, and API keys, and then the team with its memberships and slug. Templates are deleted like `DELETE /templates/{templateID}`: their aliases and tags are freed at once, and the build GC deletes their artifacts once no sandbox uses them. Volume data is deleted from the object store or the owning node; a volume whose node is gone loses only its record. Users are kept; a user whose default team was deleted falls back to their oldest remaining membership. If a sandbox cannot be killed, the command fails with `<n> sandboxes of team '<slug>' could not be killed; the team stays blocked, retry the delete`; any failure leaves the team blocked with part of its records removed, and rerunning the command finishes the delete. Other drivers may accept the team's API keys for up to 30 seconds, until their key cache expires. On success it prints:
+
+```text
+deleted team <slug> (<id>)
+killed sandboxes=<n> cancelled builds=<n>
+removed templates=<n> volumes=<n> secrets=<n> webhooks=<n> api keys=<n>
+```
+
+The admin HTTP API offers the same operation as `DELETE /admin/teams/{teamID}` ([Administration](../operate/admin.md#teams)).
 
 ## create-api-key
 

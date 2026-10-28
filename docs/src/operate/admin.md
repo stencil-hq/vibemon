@@ -1,14 +1,14 @@
 # Administration
 
-Day-to-day operator tasks: creating teams, keys, and CLI users, setting limits, blocking teams, publishing default templates, watching the fleet in the admin dashboard, and using the admin HTTP API for keys, sandboxes, builds, and nodes. Every `vmon admin` flag is listed in [vmon admin commands](../reference/admin.md); the credentials themselves are explained in [Authentication and teams](../concepts/auth.md).
+Day-to-day operator tasks: creating and deleting teams, keys, and CLI users, setting limits, blocking teams, publishing default templates, watching the fleet in the admin dashboard, and using the admin HTTP API for teams, keys, sandboxes, builds, and nodes. Every `vmon admin` flag is listed in [vmon admin commands](../reference/admin.md); the credentials themselves are explained in [Authentication and teams](../concepts/auth.md).
 
 ## Three tools
 
 | Tool | Talks to | Use it for |
 |---|---|---|
-| `vmon admin …` | A running driver's cluster listener | Teams, users, memberships, limits, blocking, system teams, minting keys |
+| `vmon admin …` | A running driver's cluster listener | Teams (create, delete), users, memberships, limits, blocking, system teams, minting keys |
 | Admin dashboard (`/dashboard/`) | A running driver, in a browser | Fleet capacity and activity charts; every team's sandboxes with a terminal, file browser, metrics, and logs; pause, resume, kill, timeouts; node draining |
-| Admin HTTP API (`X-Admin-Token`) | A running driver | Listing, minting, and deleting keys; killing a team's sandboxes; cancelling builds; node status and draining |
+| Admin HTTP API (`X-Admin-Token`) | A running driver | Deleting teams; listing, minting, and deleting keys; killing a team's sandboxes; cancelling builds; node status and draining |
 
 ## Running vmon admin
 
@@ -38,6 +38,8 @@ api key e2b_…
 ```
 
 The printed key (named `Default API key`) is shown once. Hand it to the team as `E2B_API_KEY`; client setup is in [Connecting SDKs and the CLI](../get-started/clients.md). Pass `--max-*` flags to `create-team` to start with non-default [limits](../concepts/auth.md#limits).
+
+`create-team` always creates a new team, suffixing the slug (`acme-2`) when it is taken. Automation that reruns should pass `--if-missing`: when a team already holds the slug, the command prints its `team` and `slug` lines, changes nothing, and mints no key (`create-api-key` mints one).
 
 ## More keys and rotation
 
@@ -69,7 +71,7 @@ vmon admin add-member dev@example.com other-team --default   # and make it the d
 `add-member` on an existing membership rewrites its default flag: running it without `--default` clears that membership's default flag.
 
 > [!NOTE]
-> `vmon admin` has no commands to delete teams or users, remove members, or change passwords.
+> `vmon admin` has no commands to delete users, remove members, or change passwords.
 
 ## Limits
 
@@ -97,6 +99,24 @@ vmon admin create-team system --system      # or: vmon admin set-system <team>
 ```
 
 `set-system` also claims free bare aliases for the team's already public templates; `unset-system` releases all of them. Build and publishing details are in [Templates](../concepts/templates.md).
+
+## Deleting a team
+
+```sh
+vmon admin delete-team acme
+```
+
+```text
+deleted team acme (6f0c3c1e-…)
+killed sandboxes=0 cancelled builds=0
+removed templates=2 volumes=1 secrets=0 webhooks=1 api keys=3
+```
+
+The team goes with its API keys, templates, volumes and their data, secrets, webhooks, and memberships, and its slug becomes free for the next `create-team`. Deleted templates behave as after `DELETE /templates/{templateID}`: their aliases are free at once, and their artifacts are collected once no sandbox uses them. Users stay; a user whose default team is gone falls back to their oldest remaining membership.
+
+The command refuses, naming them, while the team has running or paused sandboxes or unfinished builds, and refuses system teams, whose public templates other teams use. `--force` kills those sandboxes and cancels those builds first, and deletes system teams. The team is blocked during the teardown: if a step fails, for example a sandbox whose node does not answer, the team stays blocked and running the command again finishes the job. Other drivers may accept the team's API keys for up to 30 seconds afterwards.
+
+Killing sandboxes and deleting volume data take the nodes, so this command runs on the driver that `--cluster-url` reaches rather than in `vmon admin` itself; the HTTP equivalent is [`DELETE /admin/teams/{teamID}`](#teams). Details and exact messages are in [delete-team](../reference/admin.md#delete-team).
 
 ## Admin dashboard
 
@@ -143,6 +163,16 @@ curl -s -X DELETE -H "$AUTH" "$API/admin/teams/$TEAM/api-keys/<keyID>"
 ```
 
 `X-Admin-Token` with `X-Team-ID` also authenticates the team routes of the E2B API (all except `POST /api-keys` and `GET /teams`, which need a user token), so an operator can act as a team, for example list its sandboxes or templates, without one of its keys.
+
+### Teams
+
+| Method | Path | Result |
+|---|---|---|
+| `DELETE` | `/admin/teams/{teamID}` | vmon extension. Deletes the team as [`vmon admin delete-team`](#deleting-a-team) does; `?force=true` kills its sandboxes and cancels its builds first and is required for a system team. 200 `{"teamID", "slug", "killedSandboxes", "cancelledBuilds", "templates", "volumes", "secrets", "webhooks", "apiKeys"}`; 404 unknown team; 409 naming the blockers without `force`; 503 when some sandboxes could not be killed (the team stays blocked; retry) |
+
+```sh
+curl -s -X DELETE -H "$AUTH" "$API/admin/teams/$TEAM?force=true"
+```
 
 ### Sandboxes and builds
 

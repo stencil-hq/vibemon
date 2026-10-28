@@ -79,6 +79,7 @@ called by the `e2b` CLI, "Admin" = operator-only (`X-Admin-Token`).
 | GET | `/nodes` | Admin | Gossip members with `roles.node` + capacity. `machineInfo`: `cpuFamily` = hypervisor backend, `cpuModel` and `cpuModelName` = host CPU model name, `cpuArchitecture` = guest arch. |
 | GET | `/nodes/{nodeID}` | Admin | Member detail + sandboxes + cached builds. |
 | POST | `/nodes/{nodeID}` | Admin | `ready` / `draining` / `unhealthy` via KV `node/<id>/status`; `draining` also evacuates the node (§5). |
+| DELETE | `/admin/teams/{teamID}` | Admin | vmon extension (`vmon admin delete-team`): deletes the team with its keys, templates, volumes, secrets, webhooks, and memberships, freeing its slug; 409 naming live sandboxes and unfinished builds, or for a system team, unless `?force=true`, which kills and cancels them first. |
 | POST | `/admin/teams/{teamID}/sandboxes/kill` | Admin | Kill every team sandbox. |
 | GET | `/admin/sandboxes/running-counts` | Admin | Counts from KV catalog. |
 | GET | `/admin/sandboxes/{id}` | Admin | Team + state. |

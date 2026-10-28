@@ -557,6 +557,15 @@ impl Store {
 		}
 	}
 
+	/// IDs of a team's live templates of every kind (team delete).
+	///
+	/// # Errors
+	///
+	/// Store failures.
+	pub async fn team_template_ids(&self, team_id: &str) -> Result<Vec<String>> {
+		self.read().await?.list(&prefix(BY_TEAM, &[team_id])).await
+	}
+
 	/// Soft-deletes a template: sets `deleted_at`, frees its aliases and tags,
 	/// fails its unfinished builds, and queues its builds for artifact GC.
 	/// Returns the builds that were `building` (the caller cancels them on

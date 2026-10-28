@@ -155,10 +155,9 @@ impl AuthCache {
 			.insert(id.to_owned(), Some(Instant::now()));
 	}
 
-	/// Drops every cached key of a team, so tests see a block at once. In
-	/// production `vmon admin` changes teams from another process and drivers
-	/// pick them up when the entries expire ([`KEY_CACHE_TTL`]).
-	#[cfg(test)]
+	/// Drops every cached key of a team, so this driver sees a block or a
+	/// team delete at once. Other drivers, and changes `vmon admin` makes
+	/// through the KV, take effect when the entries expire ([`KEY_CACHE_TTL`]).
 	pub fn invalidate_team(&self, team_id: &str) {
 		self.keys.lock().retain(|_, entry| entry.team.id != team_id);
 	}

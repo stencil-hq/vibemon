@@ -343,6 +343,9 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 	if let Some(node) = &node {
 		cluster_router = cluster_router.merge(node.router());
 	}
+	if let Some(driver) = &driver {
+		cluster_router = cluster_router.merge(driver.cluster_router());
+	}
 	let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 	let mut servers = tokio::task::JoinSet::new();
 	servers.spawn(serve_plain(args.cluster_listen, cluster_router, shutdown_rx.clone()));

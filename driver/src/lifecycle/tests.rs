@@ -887,3 +887,61 @@ async fn failed_creates_and_forks_release_capacity_and_fork_builds_are_reclaimed
 
 	h.finish().await;
 }
+
+/// `DELETE /admin/teams/{id}` refuses a system team and a team with a live
+/// sandbox, naming it, and leaves the team as it was; forced, it kills the
+/// sandbox and removes the team with its key and template, freeing the slug
+/// and the alias namespace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_team_delete_refuses_live_sandboxes_unless_forced() {
+	let h = harness().await;
+	let Harness { store, fake, state, api, team, template_id, .. } = &h;
+	let (_, key) = crate::admin::create_api_key(store, &state.keys, &team.id, "ci", None)
+		.await
+		.unwrap();
+	let (status, created) = h.create().await;
+	assert_eq!(status, StatusCode::CREATED, "{created}");
+	let id = created["sandboxID"].as_str().unwrap().to_owned();
+	let uri = format!("/admin/teams/{}", team.id);
+
+	assert!(store.set_team_system(&team.id, true).await.unwrap());
+	let (status, refused, _) = api.call("DELETE", &uri, None).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+	assert!(refused["message"].as_str().unwrap().contains("system team"), "{refused}");
+	assert!(store.set_team_system(&team.id, false).await.unwrap());
+	let (status, refused, _) = api.call("DELETE", &uri, None).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+	assert!(refused["message"].as_str().unwrap().contains(&id), "{refused}");
+	assert!(!store.team_by_id(&team.id).await.unwrap().unwrap().blocked);
+	assert_eq!(fake.lock().kills, Vec::<String>::new());
+
+	let (status, deleted, _) = api.call("DELETE", &format!("{uri}?force=true"), None).await;
+	assert_eq!(status, StatusCode::OK, "{deleted}");
+	assert_eq!(
+		(&deleted["killedSandboxes"], &deleted["templates"], &deleted["apiKeys"]),
+		(&json!(1), &json!(1), &json!(1))
+	);
+	assert_eq!(fake.lock().kills, [id]);
+	assert_eq!(store.team_by_id(&team.id).await.unwrap(), None);
+	let template = store
+		.stored_templates()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|t| t.id == *template_id)
+		.unwrap();
+	assert!(template.deleted_at.is_some());
+	let (status, ..) = api
+		.call_with_headers("GET", "/v2/sandboxes", &[("x-api-key", &key)], None)
+		.await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "the team's keys are revoked");
+	let (status, ..) = api.call("DELETE", &uri, None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+
+	let reborn = store
+		.create_team("Acme", TeamLimits::default())
+		.await
+		.unwrap();
+	assert_eq!(reborn.slug, team.slug);
+	h.finish().await;
+}

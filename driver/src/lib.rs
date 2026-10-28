@@ -54,6 +54,16 @@ impl Driver {
 		ingress::wrap(self.state.clone(), api)
 	}
 
+	/// Routes for the cluster listener (`/driver/v1`, `Authorization: Bearer
+	/// <cluster secret>`): operator actions `vmon admin` cannot do through the
+	/// KV alone, such as [`admin::delete_team`].
+	pub fn cluster_router(&self) -> axum::Router {
+		let secret: std::sync::Arc<[u8]> = self.state.config.cluster_secret.as_bytes().into();
+		api::admin::cluster_routes()
+			.layer(vmon_cluster::require_secret(secret))
+			.with_state(self.state.clone())
+	}
+
 	/// Writes state still buffered in memory (template spawn counts) before the
 	/// process exits; bounded so a stalled KV cannot hang shutdown.
 	pub async fn shutdown(&self) {

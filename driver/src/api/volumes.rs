@@ -245,26 +245,32 @@ async fn delete_volume(
 		.volume(&auth.team.id, &volume_id)
 		.await?
 		.ok_or_else(|| ApiError::not_found(format!("Volume '{volume_id}' not found")))?;
+	remove_volume(&state, &row).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a volume's data (object-store prefix or owning node) and then its
+/// record. The record of a volume whose node is gone is dropped anyway.
+pub(crate) async fn remove_volume(state: &AppState, row: &VolumeRow) -> ApiResult<()> {
 	if row.object_store {
-		let removed = volume_store(&state, &row)?
+		let removed = volume_store(state, row)?
 			.delete_prefix("")
 			.await
 			.map_err(|error| ApiError::internal(format!("deleting volume {}: {error}", row.id)))?;
 		tracing::info!(volume = %row.id, objects = removed, "deleted object-store volume");
-		state.store.delete_volume(&auth.team.id, &row.id).await?;
-		return Ok(StatusCode::NO_CONTENT);
+	} else {
+		match volume_node(state, row) {
+			Ok(node) => {
+				node_call(&node, Method::DELETE, &format!("/volumes/{}", row.id), Missing::Ok).await?;
+			},
+			// The owning node is gone: its data is unreachable, drop the record.
+			Err(error) => {
+				tracing::warn!(volume = %row.id, message = %error.message, "deleting volume of unavailable node");
+			},
+		}
 	}
-	match volume_node(&state, &row) {
-		Ok(node) => {
-			node_call(&node, Method::DELETE, &format!("/volumes/{}", row.id), Missing::Ok).await?;
-		},
-		// The owning node is gone: its data is unreachable, drop the record.
-		Err(error) => {
-			tracing::warn!(volume = %row.id, message = %error.message, "deleting volume of unavailable node");
-		},
-	}
-	state.store.delete_volume(&auth.team.id, &row.id).await?;
-	Ok(StatusCode::NO_CONTENT)
+	state.store.delete_volume(&row.team_id, &row.id).await?;
+	Ok(())
 }
 
 /// Error body of the volume-content API (`code` is a string there).

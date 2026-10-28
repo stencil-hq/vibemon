@@ -4,6 +4,11 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `vmon admin delete-team <TEAM>` and `DELETE /admin/teams/{teamID}` delete a team with its API keys, templates, volumes and their data, secrets, webhooks, and memberships, and free its slug. They refuse, naming them, while the team has running or paused sandboxes or unfinished builds, and for system teams; `--force` (`?force=true`) kills and cancels them first. `vmon admin` runs the delete on the driver it reaches, through the new cluster-listener route `DELETE /driver/v1/teams/{team}` (cluster-secret bearer)
+- `vmon admin create-team --if-missing` returns the team already holding the name's slug unchanged instead of creating `<slug>-2`, so automation can rerun it
+
 ### Fixed
 
 - With `--vmm-user`, VMMs start again. The node chowned each VM's run directory to the drop uid, but the VMM binds its control and agent sockets there as root before dropping privileges and refuses a socket directory it does not own, so every sandbox create and template build failed with `control socket parent … is owned by uid <vmm-user>, expected uid 0`. The run directory now stays root-owned. Template builds then failed with `opening disk …/rootfs.ext4: Permission denied`, because a build VM's root filesystem stayed root-owned; the node now hands it to the drop uid as well

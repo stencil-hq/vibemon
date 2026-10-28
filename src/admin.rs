@@ -40,16 +40,29 @@ pub struct AdminArgs {
 enum AdminCommand {
 	/// Create a team and print its first API key.
 	CreateTeam {
-		name:   String,
+		name:       String,
 		/// Make it a system team: its public templates claim the bare aliases
 		/// every team resolves (`base`, `code-interpreter-v1`, …).
 		#[arg(long)]
-		system: bool,
+		system:     bool,
+		/// When a team already holds the slug of NAME, print it and change
+		/// nothing (no API key is minted).
+		#[arg(long)]
+		if_missing: bool,
 		#[command(flatten)]
-		limits: LimitArgs,
+		limits:     LimitArgs,
 	},
 	/// List teams.
 	ListTeams,
+	/// Delete a team (id or slug) with its API keys, templates, volumes,
+	/// secrets, webhooks, and memberships; frees its slug.
+	DeleteTeam {
+		team:  String,
+		/// Kill the team's running and paused sandboxes and cancel its builds
+		/// instead of refusing; required for a system team.
+		#[arg(long)]
+		force: bool,
+	},
 	/// Mint another API key for a team (id or slug).
 	CreateApiKey {
 		team: String,
@@ -132,20 +145,40 @@ pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
 	let store = Store::new(kv);
 	let keys = Keys::derive(secret.as_bytes());
 	match args.command {
-		AdminCommand::CreateTeam { name, system, limits } => {
-			let (mut team, key) =
-				admin::create_team(&store, &keys, &name, limits.over(TeamLimits::default())).await?;
-			if system {
+		AdminCommand::CreateTeam { name, system, if_missing, limits } => {
+			let limits = limits.over(TeamLimits::default());
+			let (mut team, key) = if if_missing {
+				admin::ensure_team(&store, &keys, &name, limits).await?
+			} else {
+				let (team, key) = admin::create_team(&store, &keys, &name, limits).await?;
+				(team, Some(key))
+			};
+			if system && key.is_some() {
 				team = admin::set_team_system(&store, &team.id, true).await?;
 			}
 			println!("team    {} ({})", team.name, team.id);
 			println!("slug    {}", team.slug);
-			println!("api key {key}");
+			match key {
+				Some(key) => println!("api key {key}"),
+				None => eprintln!("team {} already exists; left unchanged", team.slug),
+			}
 		},
 		AdminCommand::ListTeams => {
 			for team in admin::list_teams(&store).await? {
 				print_team(&team);
 			}
+		},
+		AdminCommand::DeleteTeam { team, force } => {
+			let deleted = admin::request_team_delete(&args.cluster_url, &secret, &team, force).await?;
+			println!("deleted team {} ({})", deleted.slug, deleted.team_id);
+			println!(
+				"killed sandboxes={} cancelled builds={}",
+				deleted.killed_sandboxes, deleted.cancelled_builds
+			);
+			println!(
+				"removed templates={} volumes={} secrets={} webhooks={} api keys={}",
+				deleted.templates, deleted.volumes, deleted.secrets, deleted.webhooks, deleted.api_keys
+			);
 		},
 		AdminCommand::CreateApiKey { team, name } => {
 			println!("{}", admin::create_team_api_key(&store, &keys, &team, &name).await?);

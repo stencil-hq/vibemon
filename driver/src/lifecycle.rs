@@ -1723,9 +1723,9 @@ async fn launch_forks(
 	Ok(futures::future::join_all(children).await)
 }
 
-/// Kills every running and paused sandbox of a team (admin). Returns
-/// `(killed, failed)`.
-pub async fn kill_team(state: &AppState, team_id: &str) -> ApiResult<(u64, u64)> {
+/// IDs of a team's running and paused sandboxes: durable rows plus routes
+/// admitted but not yet recorded.
+pub async fn team_sandbox_ids(state: &AppState, team_id: &str) -> ApiResult<Vec<String>> {
 	let mut ids: Vec<String> = state
 		.store
 		.team_live_sandboxes(team_id)
@@ -1741,6 +1741,13 @@ pub async fn kill_team(state: &AppState, team_id: &str) -> ApiResult<(u64, u64)>
 			ids.push(id.to_owned());
 		}
 	}
+	Ok(ids)
+}
+
+/// Kills every running and paused sandbox of a team (admin). Returns
+/// `(killed, failed)`.
+pub async fn kill_team(state: &AppState, team_id: &str) -> ApiResult<(u64, u64)> {
+	let ids = team_sandbox_ids(state, team_id).await?;
 	// Type-erased: the kill future is deep enough to overflow `Send`
 	// inference of the admin handler.
 	let results = futures::future::join_all(ids.iter().map(|id| {

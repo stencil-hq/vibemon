@@ -4,7 +4,7 @@
 //! - `db/team/<id>` → [`Team`] (read by other store modules via [`team_key`]).
 //! - `db/team.slug/<slug>` → team id (JSON string); unique slug index.
 //!   [`Store::create_team`] guards it absent and moves on to the next suffixed
-//!   candidate when it is taken.
+//!   candidate when it is taken; [`Store::delete_team`] frees it.
 //! - `db/member/<team>/<user>` → `Member` (`is_default`, `created_at`).
 //! - `db/member.user/<user>/<team>` → empty; reverse index of the user's
 //!   memberships, written and deleted together with the member record.
@@ -62,6 +62,19 @@ fn user_member_key(user_id: &str, team_id: &str) -> String {
 	key("db/member.user", &[user_id, team_id])
 }
 
+/// A new team named `name`, without a slug yet.
+fn fresh_team(name: &str, limits: TeamLimits) -> Team {
+	Team {
+		id: uuid::Uuid::new_v4().to_string(),
+		name: name.to_owned(),
+		slug: String::new(),
+		limits,
+		blocked: false,
+		system: false,
+		created_at: super::now(),
+	}
+}
+
 /// Lower-case, `[a-z0-9-]` slug of a team name (never empty).
 pub fn slugify(name: &str) -> String {
 	let mut slug = String::with_capacity(name.len());
@@ -92,15 +105,7 @@ impl Store {
 	/// failures.
 	pub async fn create_team(&self, name: &str, limits: TeamLimits) -> Result<Team> {
 		let base = slugify(name);
-		let mut team = Team {
-			id: uuid::Uuid::new_v4().to_string(),
-			name: name.to_owned(),
-			slug: String::new(),
-			limits,
-			blocked: false,
-			system: false,
-			created_at: super::now(),
-		};
+		let mut team = fresh_team(name, limits);
 		let mut tx = self.tx().await?;
 		'commit: loop {
 			for attempt in 1..=SLUG_ATTEMPTS {
@@ -122,6 +127,54 @@ impl Store {
 				continue 'commit;
 			}
 			return Err(Error::Duplicate("team slug"));
+		}
+	}
+
+	/// The team holding the slug of `name`, or a new team with that slug and
+	/// `limits`; `true` when it was created. Never suffixes the slug, so reruns
+	/// of `vmon admin create-team --if-missing` find the same team.
+	pub async fn ensure_team(&self, name: &str, limits: TeamLimits) -> Result<(Team, bool)> {
+		let mut team = fresh_team(name, limits);
+		team.slug = slugify(name);
+		let index = slug_key(&team.slug);
+		let mut tx = self.tx().await?;
+		loop {
+			if let Some(id) = tx.get::<String>(&index).await?
+				&& let Some(existing) = tx.get::<Team>(&team_key(&id)).await?
+			{
+				return Ok((existing, false));
+			}
+			tx.put(team_key(&team.id), &team);
+			tx.put(index.as_str(), &team.id);
+			if tx.commit().await? {
+				return Ok((team, true));
+			}
+		}
+	}
+
+	/// Removes the team record, its memberships, and its slug (free for the
+	/// next [`Store::create_team`]); `false` when the team does not exist.
+	/// Records the team owns elsewhere (keys, templates, volumes, secrets,
+	/// webhooks) must be removed first: see `admin::delete_team`.
+	pub async fn delete_team(&self, id: &str) -> Result<bool> {
+		let key = team_key(id);
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(team) = tx.get::<Team>(&key).await? else {
+				return Ok(false);
+			};
+			for member in tx.keys(&prefix("db/member", &[id])).await? {
+				tx.delete(user_member_key(&last_segment(&member), id));
+				tx.delete(member);
+			}
+			let index = slug_key(&team.slug);
+			if tx.get::<String>(&index).await?.as_deref() == Some(id) {
+				tx.delete(index);
+			}
+			tx.delete(key.as_str());
+			if tx.commit().await? {
+				return Ok(true);
+			}
 		}
 	}
 
@@ -342,6 +395,45 @@ mod tests {
 			.map(|t| t.id)
 			.collect();
 		assert_eq!(ids, [first.id, second.id, third.id]);
+		t.finish().await;
+	}
+
+	#[tokio::test]
+	async fn ensure_team_reuses_its_slug_and_delete_frees_it() {
+		let t = TestStore::start().await;
+		let store = &t.store;
+		let (team, created) = store
+			.ensure_team("Acme", TeamLimits::default())
+			.await
+			.unwrap();
+		assert!(created);
+		let rerun = store
+			.ensure_team("ACME!", TeamLimits::default())
+			.await
+			.unwrap();
+		assert_eq!(rerun, (team.clone(), false));
+		let user = store.create_user("dev@example.com", "hash").await.unwrap();
+		store
+			.add_team_member(&team.id, &user.id, true)
+			.await
+			.unwrap();
+
+		assert!(store.delete_team(&team.id).await.unwrap());
+		assert!(!store.delete_team(&team.id).await.unwrap());
+		assert_eq!(store.team_by_ref("acme").await.unwrap(), None);
+		let r = store.read().await.unwrap();
+		assert_eq!(r.keys(&prefix("db/member", &[&team.id])).await.unwrap(), Vec::<String>::new());
+		assert_eq!(
+			r.keys(&prefix("db/member.user", &[&user.id]))
+				.await
+				.unwrap(),
+			Vec::<String>::new()
+		);
+		let reborn = store
+			.create_team("Acme", TeamLimits::default())
+			.await
+			.unwrap();
+		assert_eq!(reborn.slug, "acme");
 		t.finish().await;
 	}
 
