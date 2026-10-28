@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 rayon = "1"
 flume = { version = "0.11", default-features = false }
 vmon-agent = { path = "../agent" }
-zstd = "0.13"
+zstd = "0.14"
 vmon-cloud = { path = "../cloud" }
 url = "2"
 

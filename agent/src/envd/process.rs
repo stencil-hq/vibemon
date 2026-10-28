@@ -723,7 +723,10 @@ fn open_pty(cols: u32, rows: u32) -> io::Result<(Arc<AsyncFd<OwnedFd>>, OwnedFd)
 		(cols, rows)
 	};
 	set_winsize(master.as_raw_fd(), cols, rows)?;
-	Ok((Arc::new(AsyncFd::new(master)?), slave))
+	// SAFETY: the `OwnedFd` keeps its fd open and unchanged until the `AsyncFd`
+	// that owns it is dropped.
+	let master = unsafe { AsyncFd::register(master) }?;
+	Ok((Arc::new(master), slave))
 }
 
 fn set_winsize(fd: RawFd, cols: u32, rows: u32) -> io::Result<()> {

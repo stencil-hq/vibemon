@@ -106,7 +106,10 @@ impl Watcher {
 		}
 		// SAFETY: fresh fd we own.
 		let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-		let fd = AsyncFd::new(owned).map_err(|e| RpcError::internal(format!("inotify: {e}")))?;
+		// SAFETY: the `OwnedFd` keeps its fd open and unchanged until the
+		// `AsyncFd` that owns it is dropped.
+		let fd = unsafe { AsyncFd::register(owned) }
+			.map_err(|e| RpcError::internal(format!("inotify: {e}")))?;
 		let mut w = Self {
 			fd,
 			root: path.to_owned(),
