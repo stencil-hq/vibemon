@@ -111,7 +111,7 @@ impl Drop for EnvdHandle {
 	}
 }
 
-fn build_state(config: &EnvdConfig) -> Arc<EnvdState> {
+pub(super) fn build_state(config: &EnvdConfig) -> Arc<EnvdState> {
 	let path_env = config
 		.env
 		.iter()
