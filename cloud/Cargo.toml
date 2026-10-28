@@ -1,6 +1,6 @@
 [package]
 name = "vmon-cloud"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Cloud workload identity, request signing, and the S3 client for Vibemon"
 license.workspace = true
