@@ -106,7 +106,7 @@ A node restarted with SIGTERM can adopt its surviving VMMs when it comes back wi
 - **KVM:** VMM processes need read-write access to `/dev/kvm`, including the uid:gid selected by `--vmm-user`; they open it after dropping privileges.
 - **TAP networking** (`--net tap`, the Linux default via `auto`) needs root or `CAP_NET_ADMIN`. The node creates TAP devices with `ip` and installs NAT and egress rules with `iptables`, `iptables-restore`, `ip6tables`, and `ip6tables-restore`. With `--net tap` and no such privilege, startup fails. With `auto`, the node starts but rejects creates. See [Networking and egress](networking.md).
 - **Hugepages:** `--hugepage-pool-mb` writes `/proc/sys/vm/nr_hugepages`, which needs root.
-- **VMM privilege drop:** when `vmon serve` runs as root, set `--vmm-user <uid>:<gid>`. VMMs then drop to that uid and gid and run under their Landlock and seccomp filters. The node makes each VM's run directory, disk directory, and snapshot directory, as well as its TAP device, accessible to that user. Without `--vmm-user`, a root node starts VMMs with `--no-sandbox`, so they keep root and run without filters.
+- **VMM privilege drop:** when `vmon serve` runs as root, set `--vmm-user <uid>:<gid>`. VMMs then drop to that uid and gid and run under their Landlock and seccomp filters. The node gives that user each VM's writable disk (a build VM's root filesystem, or the directory of a sandbox's overlay), its snapshot directory, and its TAP device. The per-VM run directory under `--run-dir` stays root-owned: the VMM binds its control and agent sockets there before it drops privileges. Without `--vmm-user`, a root node starts VMMs with `--no-sandbox`, so they keep root and run without filters.
 
 ## Capacity
 

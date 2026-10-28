@@ -359,16 +359,21 @@ impl VmRuntime {
 		private_dir(&run_dir)?;
 		let api_sock = run_dir.join("api.sock");
 		let agent_sock = run_dir.join("agent.sock");
+		// The run dir stays root-owned: the VMM binds both sockets and pre-opens
+		// `status.json` there before it drops to the sandbox uid, and refuses a
+		// socket parent owned by anyone else.
 		#[cfg(target_os = "linux")]
 		if let VmmIsolation::DropTo { uid, gid } = self.inner.config.isolation {
-			chown_path(&run_dir, uid, gid)?;
-			let private_disk = match &spec.disk {
-				Some(Disk::Overlay { path, .. }) => Some(path),
-				Some(Disk::Remote(remote)) => Some(&remote.overlay),
-				_ => None,
-			};
-			if let Some(parent) = private_disk.and_then(|path| path.parent()) {
-				chown_path(parent, uid, gid)?;
+			match &spec.disk {
+				// The dropped VMM opens a writable disk in place (build VMs).
+				Some(Disk::Direct { path, read_only: false }) => chown_path(path, uid, gid)?,
+				// It creates the private overlay (and a remote disk's cache) beside it.
+				Some(Disk::Overlay { path, .. } | Disk::Remote(RemoteDisk { overlay: path, .. })) => {
+					if let Some(parent) = path.parent() {
+						chown_path(parent, uid, gid)?;
+					}
+				},
+				Some(Disk::Direct { read_only: true, .. }) | None => {},
 			}
 			if let Some(root) = &spec.snapshot_root {
 				chown_path(root, uid, gid)?;
