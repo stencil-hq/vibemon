@@ -118,7 +118,7 @@ calc_sha256() {
 # The initramfs bakes in the guest agent when present, so the agent content
 # participates in the cache key: rebuilding the agent regenerates the image.
 if [ -z "${INITRAMFS_VERSION:-}" ]; then
-  INITRAMFS_VERSION="2026-07-06.2-$ARCH"
+  INITRAMFS_VERSION="2026-10-29.1-$ARCH"
   if [ -f "$SMOKE_AGENT" ]; then
     INITRAMFS_VERSION="$INITRAMFS_VERSION-a$(calc_sha256 "$SMOKE_AGENT" | cut -c1-12)"
   fi
@@ -195,15 +195,23 @@ write_test_init() {  # write_test_init <path>
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export PATH
 
+# `sync` flushes filesystems, not the serial console: let the tty drain before
+# the kernel's halt message, or it can land in the middle of the last result
+# line (seen as `MAC=aa:bb:cc:de:[ 0.97] reboot: …` on a slow host).
+drain_console() {
+  sync
+  sleep 0.2 2>/dev/null || sleep 1
+}
+
 fail() {
   echo "VMON_TEST_FAIL: $*" >&2
-  sync
+  drain_console
   poweroff -f 2>/dev/null || reboot -f 2>/dev/null || exit 1
   exit 1
 }
 
 finish() {
-  sync
+  drain_console
   poweroff -f 2>/dev/null || reboot -f 2>/dev/null || exit 0
   exit 0
 }
