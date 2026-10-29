@@ -82,7 +82,7 @@ const PAUSE_WORKER_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_VCPU_STATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(target_arch = "x86_64")]
-const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1";
+const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 kvm.enable_virt_at_load=0";
 #[cfg(target_arch = "aarch64")]
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 earlycon=uart8250,mmio,0x9000000";
 

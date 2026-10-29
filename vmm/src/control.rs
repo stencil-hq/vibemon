@@ -345,6 +345,13 @@ impl ApiError {
 		Self::new("busy", message)
 	}
 
+	/// `snapshot` refused: the guest uses hardware virtualization, whose KVM
+	/// nested state a snapshot does not capture.
+	#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+	pub fn nested_virtualization_active(message: impl Into<String>) -> Self {
+		Self::new("nested_virtualization_active", message)
+	}
+
 	pub fn internal(message: impl Into<String>) -> Self {
 		Self::new("internal", message)
 	}

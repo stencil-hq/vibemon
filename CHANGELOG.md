@@ -2,6 +2,17 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Added (nested virtualization)
+
+- Sandboxes on x86_64 nodes with nested KVM get `/dev/kvm`. The guest kernel builds KVM (Intel and AMD) in explicitly, and guests boot with `kvm.enable_virt_at_load=0`, so virtualization is on only while the guest runs VMs
+- A memory pause, snapshot, fork, or migration of a sandbox that is running VMs is refused with 409 `error_code: nested_virtualization_active` instead of capturing state it cannot restore; filesystem-only pause still works
+
+### Fixed
+
+- Snapshots save and restore `IA32_FEATURE_CONTROL`, so VMs start in sandboxes forked from a template snapshot on Intel hosts. Before, the guest kernel crashed (`kvm_spurious_fault`) at the first vCPU; rebuild x86_64 templates captured by earlier releases before using `/dev/kvm` in them (on AMD such sandboxes stopped)
+
 ## 0.4.1
 
 ### Added

@@ -21,6 +21,24 @@ use tokio::{
 /// Timeout for quick control methods, and for sending any request.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Error reply of a VMM control method (`{"code","message"}`).
+#[derive(Debug, thiserror::Error)]
+#[error("vmm {method}: {code}: {message}")]
+pub struct VmmError {
+	pub method:  String,
+	/// Stable VMM code (`busy`, `not_paused`, `nested_virtualization_active`,
+	/// `internal`, …).
+	pub code:    String,
+	pub message: String,
+}
+
+impl VmmError {
+	/// Whether `error` (any context chain) is a VMM reply with `code`.
+	pub fn has_code(error: &anyhow::Error, code: &str) -> bool {
+		error.downcast_ref::<Self>().is_some_and(|e| e.code == code)
+	}
+}
+
 /// Control-socket client for one VMM.
 #[derive(Debug)]
 pub struct ControlClient {
@@ -110,7 +128,14 @@ impl ControlClient {
 			.get("message")
 			.and_then(Value::as_str)
 			.unwrap_or("vmm request failed");
-		bail!("vmm {method}: {code}: {message}")
+		Err(
+			VmmError {
+				method:  method.to_owned(),
+				code:    code.to_owned(),
+				message: message.to_owned(),
+			}
+			.into(),
+		)
 	}
 
 	/// Liveness probe.
@@ -247,6 +272,30 @@ mod tests {
 				.to_string()
 				.contains("closed the control socket during snapshot"),
 			"{error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn snapshot_refusals_keep_the_vmm_code() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("api.sock");
+		fake_vmm(
+			UnixListener::bind(&path).unwrap(),
+			Duration::ZERO,
+			Some(json!({ "ok": false, "error": {
+				"code": "nested_virtualization_active", "message": "the guest runs VMs",
+			}})),
+		);
+		let error = ControlClient::new(path)
+			.snapshot("s")
+			.await
+			.expect_err("refused")
+			.context("capturing");
+		assert!(VmmError::has_code(&error, "nested_virtualization_active"), "{error:#}");
+		assert!(!VmmError::has_code(&error, "internal"));
+		assert_eq!(
+			format!("{error:#}"),
+			"capturing: vmm snapshot: nested_virtualization_active: the guest runs VMs"
 		);
 	}
 }

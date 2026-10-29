@@ -911,6 +911,32 @@ under the 104-byte macOS `sun_path` limit.
   clears with the host reboot that actually resets the GPU (Blackwell GSP
   state survives FLR; the node never issues bus resets). `Node::shutdown`
   leaves GPU VMMs running like any other.
+- Nested virtualization (x86_64): the vmon kernel builds KVM in
+  (`kernel/config/x86_64.config`) and the VMM passes the host's VMX/SVM
+  CPUID bits through, so on hosts with nested KVM (`kvm_intel nested=1`,
+  `kvm_amd nested=1`) every sandbox has `/dev/kvm`. Every x86_64 guest boot
+  (`artifacts::base_cmdline`: template builds, the unpack initramfs, cold
+  boots; the VMM's default command line) passes `kvm.enable_virt_at_load=0`:
+  the guest's KVM turns VMX/SVM on with its first VM and off after its last,
+  so template and pause snapshots capture it off. Snapshots do not carry KVM
+  nested state (`KVM_GET/SET_NESTED_STATE`); instead `arch::state::save_vcpu`
+  refuses (`NestedVirtualizationActive`, control code
+  `nested_virtualization_active`) while a vCPU is in VMX operation, has SVM
+  enabled with a host save area (`EFER.SVME` and `VM_HSAVE_PA` ≠ 0) or `CLGI`
+  in effect, runs a nested guest, or KVM reports state past the header. The
+  VM stays paused; the node resumes it and answers 409
+  `nested_virtualization_active` to the memory pause or snapshot
+  (snapshot-as-template, fork, handover pause), which the driver returns as
+  409 with that `error_code`; a reaper `autoPause` that fails this way kills
+  the sandbox like any failed auto-pause, and a template build whose start
+  command leaves VMs running fails. In-place VMM `pause`/`resume` keep
+  working. `IA32_FEATURE_CONTROL` (Intel) is a migration MSR, so restored
+  vCPUs keep VMXON allowed. Snapshots captured by earlier vmon releases
+  (virtualization on from boot, no feature-control MSR) restore with the
+  guest's KVM believing VMX/SVM is on (Intel: its first `KVM_CREATE_VCPU`
+  oopses the guest in `kvm_spurious_fault`; AMD: the first VM run ends the
+  sandbox VMM with `shutdown`): such templates must be rebuilt
+  before their sandboxes can run VMs; their pauses are not refused.
 - The VMM hard deadline (`extend`) is kept at `endAt + 60 s` as a safety net;
   the driver is the authority for timeouts.
 - Boot concurrency is bounded (`--boot-concurrency`, default 4 × CPUs).

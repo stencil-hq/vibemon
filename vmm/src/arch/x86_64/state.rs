@@ -13,11 +13,13 @@ use std::{
 };
 
 use kvm_bindings::{
-	CpuId, KVM_MAX_CPUID_ENTRIES, Msrs, Xsave, kvm_clock_data, kvm_debugregs, kvm_irqchip,
-	kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs,
-	kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
+	CpuId, KVM_MAX_CPUID_ENTRIES, KVM_STATE_NESTED_FORMAT_SVM, KVM_STATE_NESTED_FORMAT_VMX,
+	KVM_STATE_NESTED_GIF_SET, KVM_STATE_NESTED_GUEST_MODE, KVM_STATE_NESTED_RUN_PENDING, Msrs,
+	Xsave, kvm_clock_data, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state, kvm_msr_entry,
+	kvm_nested_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
+	kvm_xsave2,
 };
-use kvm_ioctls::{Kvm, VmFd};
+use kvm_ioctls::{Kvm, KvmNestedStateBuffer, VcpuFd, VmFd};
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::fam::FamStruct;
 
@@ -136,7 +138,99 @@ pub struct MachineState {
 	pub clock:      kvm_clock_data,
 }
 
+/// [`save_vcpu`] refusal: the guest uses hardware virtualization (it runs VMs
+/// of its own), so KVM holds nested state for this vCPU (VMX operation, SVM
+/// with a host save area, a running nested guest) that [`VcpuState`] does not
+/// carry. A restore without it would corrupt the guest hypervisor, so the
+/// snapshot is refused; the control API answers `nested_virtualization_active`.
+/// The vmon guest kernel boots with `kvm.enable_virt_at_load=0`, so this
+/// clears once the guest's last VM exits.
+#[derive(Debug)]
+pub struct NestedVirtualizationActive {
+	/// What KVM reported.
+	pub detail: &'static str,
+}
+
+impl std::fmt::Display for NestedVirtualizationActive {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"the guest is using hardware virtualization ({}); snapshots cannot capture nested \
+			 virtualization state, stop the guest's virtual machines and retry",
+			self.detail
+		)
+	}
+}
+
+impl std::error::Error for NestedVirtualizationActive {}
+
+/// `EFER.SVME`: SVM enabled.
+const EFER_SVME: u64 = 1 << 12;
+/// `VM_HSAVE_PA`: the SVM host save area, written by a guest hypervisor when
+/// it enables SVM and zeroed when it disables it.
+const MSR_VM_HSAVE_PA: u32 = 0xc001_0117;
+
+/// Why KVM's nested state for this vCPU cannot be dropped, or `None` when a
+/// snapshot without it is exact.
+fn nested_virtualization(vcpu: &VcpuFd, sregs: &kvm_sregs) -> Result<Option<&'static str>> {
+	let mut state = KvmNestedStateBuffer::empty();
+	match vcpu.nested_state(&mut state) {
+		Ok(_) => {},
+		// No KVM_CAP_NESTED_STATE: the host offers no nested virtualization.
+		Err(e) if e.errno() == libc::EINVAL => return Ok(None),
+		Err(e) => return Err(e.into()),
+	}
+	let hsave_pa = if u32::from(state.format) == KVM_STATE_NESTED_FORMAT_SVM {
+		let mut msrs =
+			Msrs::from_entries(&[kvm_msr_entry { index: MSR_VM_HSAVE_PA, ..Default::default() }])?;
+		(vcpu.get_msrs(&mut msrs)? == 1).then(|| msrs.as_slice()[0].data)
+	} else {
+		None
+	};
+	Ok(nested_state_in_use(&state, sregs.efer, hsave_pa))
+}
+
+/// [`nested_virtualization`] on the raw KVM report. VMX: the vCPU is in VMX
+/// operation (`VMXON`). SVM: `EFER.SVME` with a host save area (a guest
+/// hypervisor enabled SVM since this VMM started), or `CLGI` in effect; an
+/// unreadable `hsave_pa` counts as in use. SVME with a zero save area is what
+/// a snapshot taken before `kvm.enable_virt_at_load=0` restores to: nothing
+/// is lost by snapshotting it again. Both: a nested guest is running or
+/// about to run, or KVM returned state beyond the header.
+fn nested_state_in_use(
+	state: &KvmNestedStateBuffer,
+	efer: u64,
+	hsave_pa: Option<u64>,
+) -> Option<&'static str> {
+	let flags = u32::from(state.flags);
+	if flags & (KVM_STATE_NESTED_GUEST_MODE | KVM_STATE_NESTED_RUN_PENDING) != 0 {
+		return Some("a nested guest is running");
+	}
+	if state.size as usize > size_of::<kvm_nested_state>() {
+		return Some("KVM holds nested guest state");
+	}
+	match u32::from(state.format) {
+		KVM_STATE_NESTED_FORMAT_VMX => {
+			// SAFETY: the VMX format selects the `vmx` header; every bit
+			// pattern of it is valid.
+			let hdr = unsafe { state.hdr.vmx };
+			(hdr.vmxon_pa != u64::MAX || hdr.smm.flags != 0).then_some("VMX operation is on")
+		},
+		KVM_STATE_NESTED_FORMAT_SVM => {
+			if flags & KVM_STATE_NESTED_GIF_SET == 0 {
+				Some("the SVM global interrupt flag is clear")
+			} else {
+				(efer & EFER_SVME != 0 && hsave_pa != Some(0)).then_some("SVM is enabled")
+			}
+		},
+		_ => Some("unknown nested state format"),
+	}
+}
+
 /// Read the complete migratable state of a (paused) vCPU.
+///
+/// Fails with [`NestedVirtualizationActive`] while the guest uses hardware
+/// virtualization.
 pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 	let vcpu = vcpu.fd();
 	// KVM_GET_MP_STATE calls into the in-kernel APIC event acceptance path and
@@ -145,6 +239,9 @@ pub fn save_vcpu(vcpu: &Vcpu, xsave_size: usize) -> Result<VcpuState> {
 	let mp_state = vcpu.get_mp_state()?;
 	let regs = vcpu.get_regs()?;
 	let sregs = vcpu.get_sregs()?;
+	if let Some(detail) = nested_virtualization(vcpu, &sregs)? {
+		return Err(Box::new(NestedVirtualizationActive { detail }));
+	}
 
 	// Capture the full extended state. Hosts advertising KVM_CAP_XSAVE2 can have
 	// an xstate larger than the legacy 4096-byte area (AVX-512/AMX/PKRU) — use
@@ -270,4 +367,54 @@ pub fn restore_machine(vm: &VmFd, st: &MachineState) -> Result<()> {
 	vm.set_pit2(&st.pit)?;
 	vm.set_clock(&st.clock)?;
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use kvm_bindings::kvm_vmx_nested_state_hdr;
+
+	use super::*;
+
+	/// A KVM report as `KVM_GET_NESTED_STATE` writes it: header only.
+	fn report(format: u32, flags: u32) -> KvmNestedStateBuffer {
+		let mut state = KvmNestedStateBuffer::empty();
+		state.format = u16::try_from(format).unwrap();
+		state.flags = u16::try_from(flags).unwrap();
+		state.size = u32::try_from(size_of::<kvm_nested_state>()).unwrap();
+		state
+	}
+
+	fn vmx(vmxon_pa: u64, flags: u32) -> KvmNestedStateBuffer {
+		let mut state = report(KVM_STATE_NESTED_FORMAT_VMX, flags);
+		state.hdr.vmx =
+			kvm_vmx_nested_state_hdr { vmxon_pa, vmcs12_pa: u64::MAX, ..Default::default() };
+		state
+	}
+
+	#[test]
+	fn vmx_is_in_use_from_vmxon_until_vmxoff() {
+		assert_eq!(nested_state_in_use(&vmx(u64::MAX, 0), 0, None), None);
+		assert!(nested_state_in_use(&vmx(0x1000, 0), 0, None).is_some());
+		assert!(nested_state_in_use(&vmx(0x1000, KVM_STATE_NESTED_GUEST_MODE), 0, None).is_some());
+		let mut with_vmcs12 = vmx(0x1000, 0);
+		with_vmcs12.size += 4096;
+		assert!(nested_state_in_use(&with_vmcs12, 0, None).is_some());
+	}
+
+	#[test]
+	fn svm_is_in_use_while_a_guest_hypervisor_enabled_it() {
+		let idle = report(KVM_STATE_NESTED_FORMAT_SVM, KVM_STATE_NESTED_GIF_SET);
+		assert_eq!(nested_state_in_use(&idle, 0, Some(0)), None);
+		// SVME restored from an older snapshot without a host save area.
+		assert_eq!(nested_state_in_use(&idle, EFER_SVME, Some(0)), None);
+		assert!(nested_state_in_use(&idle, EFER_SVME, Some(0x7000)).is_some());
+		assert!(nested_state_in_use(&idle, EFER_SVME, None).is_some());
+		let clgi = report(KVM_STATE_NESTED_FORMAT_SVM, 0);
+		assert!(nested_state_in_use(&clgi, 0, Some(0)).is_some());
+		let running = report(
+			KVM_STATE_NESTED_FORMAT_SVM,
+			KVM_STATE_NESTED_GIF_SET | KVM_STATE_NESTED_GUEST_MODE,
+		);
+		assert!(nested_state_in_use(&running, EFER_SVME, Some(0x7000)).is_some());
+	}
 }

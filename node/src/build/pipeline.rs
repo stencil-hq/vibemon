@@ -35,7 +35,8 @@ use super::{
 use crate::{
 	api::{ArtifactInfo, BuildBase, GuestInit, StartBuild, TemplateVersion},
 	artifacts::{
-		ArtifactMeta, ArtifactStore, ROOTFS, SNAPSHOT, copy::materialize_disk, kernel_cmdline, now_ms,
+		ArtifactMeta, ArtifactStore, ROOTFS, SNAPSHOT, base_cmdline, copy::materialize_disk,
+		kernel_cmdline, now_ms,
 	},
 	client::NodeClient,
 	envd::EnvdClient,
@@ -1331,12 +1332,7 @@ fn vm_name(build_id: &str, phase: &str) -> String {
 
 /// Kernel command line booting the generated initramfs (agent as `/init`).
 fn initramfs_cmdline(arch: &str) -> String {
-	let earlycon = if arch == "aarch64" {
-		" earlycon=uart8250,mmio,0x9000000"
-	} else {
-		""
-	};
-	format!("console=ttyS0 reboot=t panic=-1{earlycon} rdinit=/init")
+	format!("{} rdinit=/init", base_cmdline(arch))
 }
 
 /// Upstream-style duration (`1m2.5s`, `850ms`).

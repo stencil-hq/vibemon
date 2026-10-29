@@ -21,11 +21,27 @@ Everything is built in: guests never need `/lib/modules` or `modprobe`. Module s
 | Security | Landlock and BPF LSMs (`lsm=landlock,bpf`) |
 | Filesystems | NFS v3/v4.x client (+ `rpc_pipefs`, RPCSEC_GSS), CIFS, FUSE/virtiofs, squashfs (all compressors), EROFS, XFS, Btrfs, ISO 9660, quota, fanotify permission events, loop, NBD, device-mapper (thin, snapshot, crypt) |
 | Introspection | `/proc/config.gz` |
+| Virtualization | KVM for Intel VT-x and AMD-V on x86_64: `/dev/kvm` in sandboxes on hosts with nested virtualization (see [Nested virtualization](#nested-virtualization-devkvm)) |
 | GPU passthrough | What NVIDIA's open kernel modules need: PCI MSI/MSI-X, firmware loading, MMU notifiers, dma-buf; DMI and PAT on x86_64 |
 
 Removed from `ch_defconfig`: the ktimer PPS test client and `PPS_DEBUG` (a wakeup and two dmesg lines every second in every sandbox), and the RAID6 boot benchmark pulled in by Btrfs (~1.1 s of a ~2 s boot under HVF).
 
 The boot path is unchanged from the cloud-hypervisor kernel: virtio-mmio and virtio-pci; virtio blk/net/console/fs/rng/vsock/balloon; 8250 and PL011 consoles; GICv3 + PSCI on arm64; kvm-clock/PVH on x86_64. Source: [`cloud-hypervisor/linux`](https://github.com/cloud-hypervisor/linux) tag `ch-release-v6.16.9-20260508`.
+
+## Nested virtualization (`/dev/kvm`)
+
+On x86_64 the vmon kernel has KVM built in, and the VMM passes the host's VT-x/AMD-V CPU feature through to every guest. On a node whose host has nested virtualization enabled, every sandbox therefore has `/dev/kvm` and can run VMs of its own: QEMU with KVM, Firecracker, Android emulators, or vmon. CI runners use this for tests that boot VMs. There is no switch per sandbox or team: every sandbox on such a node gets it. Nodes without nested virtualization, aarch64 nodes, and macOS (HVF) give sandboxes no `/dev/kvm`.
+
+**Host setup.** Check `cat /sys/module/kvm_intel/parameters/nested` (Intel, `Y`) or `cat /sys/module/kvm_amd/parameters/nested` (AMD, `1`). To enable it, put `options kvm_intel nested=1` (or `options kvm_amd nested=1`) in `/etc/modprobe.d/kvm.conf` and reload the module while no VMs run, or reboot. Template snapshots record the CPU features of the host that captured them, so build templates on nodes with nesting enabled.
+
+**Access in the guest.** The kernel creates `/dev/kvm` as `root:root` mode 0600, and images built `fromImage` on a plain distro image (such as `ubuntu:24.04`) run no udev, so only root can open it: run VM tools with `sudo`, or install `udev` and ship a rule such as `KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"`, as the `ci` template does.
+
+**Resources.** VMs inside a sandbox use the sandbox's own vCPUs and memory, which come from the template build. Size the template for both.
+
+**Pause and snapshots.** Snapshots do not capture the hypervisor state that KVM keeps for a guest that runs VMs. So that template snapshots are taken without it, every x86_64 guest boots with `kvm.enable_virt_at_load=0`: the guest's KVM turns VT-x/AMD-V on when the guest creates its first VM and off when its last VM exits. While any VM runs in the sandbox, a memory pause, a snapshot, a fork, or a migration is refused with 409 `nested_virtualization_active` and the sandbox keeps running. Stop the VMs and retry. A filesystem-only pause works at any time. See [Pause](../concepts/sandboxes.md#pause). A template build whose start command leaves VMs running fails when it captures the snapshot.
+
+> [!IMPORTANT]
+> Rebuild templates captured by earlier vmon releases before their sandboxes run VMs. Those snapshots were taken with virtualization turned on at boot, which a snapshot does not carry, so their guests' KVM believes it is still on after a restore; on Intel they also lack the feature-control setting that allows it. When a VM starts in a sandbox created from such a template, the guest kernel crashes on Intel hosts (`kernel BUG at kvm_spurious_fault`) and the whole sandbox stops on AMD hosts. Pausing those sandboxes is not refused.
 
 ## Building
 
@@ -114,7 +130,7 @@ no vmon guest kernel (vmon-kernel-<arch> next to vmon, or target/kernel/ from `j
 ```
 
 > [!WARNING]
-> Template snapshots capture the running kernel, so templates built under one kernel keep booting it. Rebuild templates after switching kernels.
+> Template snapshots capture the running kernel, so templates built under one kernel keep booting it. Rebuild templates after switching kernels. Templates also keep the kernel command line they booted with.
 
 See [Running `vmon serve`](serve.md#guest-kernel-and-agent) for how the node finds the guest agent binary.
 

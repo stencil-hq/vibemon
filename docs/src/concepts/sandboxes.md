@@ -83,6 +83,7 @@ sbx.pause()                      # memory + filesystem
 
 - **Memory pause** (`memory` true, the default): the VMM snapshots the guest. When a fork base is available, RAM is written as a delta against it, so the RAM capture scales with pages written since the fork; otherwise it is a full snapshot. Resume restores guest processes and memory, but GC4 tunnel connections are reset.
 - **Filesystem pause** (`memory: false`, SDK `mode="filesystem"`): the guest agent requests a guest page-cache flush, the VM stops, and only the disk is kept. Resume cold-boots from the disk: processes and in-memory state are lost.
+- **Sandboxes running VMs** (x86_64 nodes with nested virtualization give every sandbox `/dev/kvm`; see [Nested virtualization](../operate/kernel.md#nested-virtualization-devkvm)): while any VM runs inside the sandbox, a memory pause answers 409 with `error_code` `nested_virtualization_active` and the sandbox keeps running. Memory snapshots and forks answer the same. Stop the VMs and retry, or pause filesystem-only. A timeout with `autoPause` kills such a sandbox, because a failed auto-pause kills.
 
 The paused state stays on the node that ran the sandbox. With `--object-store`, it is also uploaded in the background so another node can resume it. See [Pause artifacts](../operate/storage.md#pause-artifacts) and [Portable paused sandboxes](../operate/storage.md#portable-paused-sandboxes).
 

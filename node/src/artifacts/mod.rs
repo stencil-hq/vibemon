@@ -80,12 +80,22 @@ impl HostIdentity {
 /// Kernel command line for booting a template rootfs with `init`
 /// (shared by builds and sandbox cold boots).
 pub fn kernel_cmdline(arch: &str, init: &str) -> String {
-	let earlycon = if arch == "aarch64" {
+	format!("{} init={init}", base_cmdline(arch))
+}
+
+/// Arguments of every guest boot.
+///
+/// `aarch64`: the early console. `x86_64`: the vmon kernel's built-in KVM
+/// (nested virtualization, `/dev/kvm`) enables VMX/SVM only while the guest
+/// runs VMs instead of at boot, so template and pause snapshots capture it
+/// off; the VMM refuses snapshots while it is on.
+pub fn base_cmdline(arch: &str) -> String {
+	let arch_args = if arch == "aarch64" {
 		" earlycon=uart8250,mmio,0x9000000"
 	} else {
-		""
+		" kvm.enable_virt_at_load=0"
 	};
-	format!("console=ttyS0 reboot=t panic=-1{earlycon} init={init}")
+	format!("console=ttyS0 reboot=t panic=-1{arch_args}")
 }
 
 /// Local artifact store under `<data>/builds`.
@@ -989,14 +999,14 @@ mod tests {
 	}
 
 	#[test]
-	fn cmdline_adds_earlycon_only_on_aarch64() {
+	fn cmdline_adds_the_arch_arguments() {
 		assert_eq!(
 			kernel_cmdline("x86_64", "/usr/bin/envd"),
-			"console=ttyS0 reboot=t panic=-1 init=/usr/bin/envd"
+			"console=ttyS0 reboot=t panic=-1 kvm.enable_virt_at_load=0 init=/usr/bin/envd"
 		);
-		assert!(
-			kernel_cmdline("aarch64", "/usr/sbin/init")
-				.contains("earlycon=uart8250,mmio,0x9000000 init=/usr/sbin/init")
+		assert_eq!(
+			kernel_cmdline("aarch64", "/usr/sbin/init"),
+			"console=ttyS0 reboot=t panic=-1 earlycon=uart8250,mmio,0x9000000 init=/usr/sbin/init"
 		);
 	}
 }

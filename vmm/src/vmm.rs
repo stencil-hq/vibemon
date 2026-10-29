@@ -100,8 +100,11 @@ type PreopenedGpuResources = Option<PreopenedVfio>;
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 type PreopenedGpuResources = ();
 
+/// `x86_64`: the guest kernel's built-in KVM enables VMX/SVM only while the
+/// guest runs VMs, so snapshots normally capture it off
+/// ([`arch::state::NestedVirtualizationActive`]).
 #[cfg(target_arch = "x86_64")]
-const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1";
+const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 kvm.enable_virt_at_load=0";
 #[cfg(target_arch = "aarch64")]
 const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=t panic=-1 earlycon=uart8250,mmio,0x9000000";
 
@@ -3170,7 +3173,13 @@ impl Vmm {
 				self
 					.snapshot(&dir, &name, base.as_deref(), track)
 					.map(|()| json!({}))
-					.map_err(|e| control::ApiError::internal(e.to_string()))
+					.map_err(|e| {
+						#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+						if e.is::<arch::state::NestedVirtualizationActive>() {
+							return control::ApiError::nested_virtualization_active(e.to_string());
+						}
+						control::ApiError::internal(e.to_string())
+					})
 			},
 			ControlKind::DiskSnapshot { name } => {
 				let dir = snapshot_name_to_path(snapshot_root, &name)?;
@@ -3463,6 +3472,10 @@ impl Vmm {
 			match rx.recv_timeout(wait) {
 				Ok(Ok(state)) => return Ok(state),
 				Ok(Err(e)) => {
+					#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+					if e.is::<arch::state::NestedVirtualizationActive>() {
+						return Err(e);
+					}
 					return Err(err(format!("snapshot vcpu save failed for vCPU {vcpu_id}: {e}")));
 				},
 				Err(RecvTimeoutError::Timeout) => {},

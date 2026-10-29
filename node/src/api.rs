@@ -29,6 +29,13 @@ pub struct ErrorBody {
 /// their filesystem.
 pub const GPU_MEMORY_SNAPSHOT: &str = "gpu_memory_snapshot";
 
+/// [`ErrorBody::code`] of a memory pause or snapshot of a sandbox whose guest
+/// runs VMs (409).
+///
+/// KVM's nested state is not part of a snapshot. The sandbox keeps running;
+/// it can be paused once its last VM exits. Also the VMM control code.
+pub const NESTED_VIRTUALIZATION_ACTIVE: &str = "nested_virtualization_active";
+
 /// `POST /sandboxes`: start a sandbox from a build's template snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

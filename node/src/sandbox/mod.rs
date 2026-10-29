@@ -50,7 +50,7 @@ use crate::{
 	paused_store::{self, Cancellation, Remote, Store, UploadInput},
 	s3fs::{self, S3Fs, S3FsConfig},
 	server::ApiError,
-	vm::{Boot, Disk, FsShare, RemoteDisk, Vm, VmGpu, VmRuntime, VmSpec, private_dir},
+	vm::{Boot, Disk, FsShare, RemoteDisk, Vm, VmGpu, VmRuntime, VmSpec, VmmError, private_dir},
 	volumes::VolumeStore,
 };
 
@@ -384,6 +384,17 @@ async fn owns_remote(kv: &Kv, id: &str, node: NodeId) -> anyhow::Result<bool> {
 	};
 	let route: crate::api::SandboxRoute = serde_json::from_slice(&route.value)?;
 	Ok(route.node_id == node)
+}
+
+/// API error of a failed memory pause or snapshot (`what`: `pausing`,
+/// `capturing`): the VMM's nested-virtualization refusal keeps its stable
+/// code, anything else is internal.
+fn capture_error(id: &str, what: &str, error: &anyhow::Error) -> ApiError {
+	if VmmError::has_code(error, crate::api::NESTED_VIRTUALIZATION_ACTIVE) {
+		ApiError::nested_virtualization_active(id)
+	} else {
+		ApiError::internal(format!("{what} sandbox {id}: {error:#}"))
+	}
 }
 
 fn remove_path(path: &Path) {
@@ -1351,7 +1362,7 @@ impl SandboxManager {
 			if vm.exited().is_none() {
 				let _ = vm.resume().await;
 			}
-			return Err(ApiError::internal(format!("pausing sandbox {id}: {error:#}")));
+			return Err(capture_error(id, "pausing", &error));
 		}
 		let live = entry.state.lock().live.take();
 		if let Some(live) = live {
@@ -1970,7 +1981,7 @@ impl SandboxManager {
 		};
 		if let Err(error) = captured {
 			cleanup();
-			return Err(ApiError::internal(format!("capturing sandbox {id}: {error:#}")));
+			return Err(capture_error(id, "capturing", &error));
 		}
 		if let Err(error) = resumed {
 			tracing::error!(

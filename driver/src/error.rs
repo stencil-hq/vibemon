@@ -137,6 +137,11 @@ impl From<NodeError> for ApiError {
 	fn from(error: NodeError) -> Self {
 		match &error {
 			NodeError::Api { status: 404, .. } => Self::not_found(error.to_string()),
+			NodeError::Api { code, message, .. }
+				if code == vmon_node::api::NESTED_VIRTUALIZATION_ACTIVE =>
+			{
+				Self::conflict(message.clone()).with_code(vmon_node::api::NESTED_VIRTUALIZATION_ACTIVE)
+			},
 			NodeError::Api { status: 409, message, .. } => Self::conflict(message.clone()),
 			NodeError::Api { status: 400, message, .. } => Self::bad_request(message.clone()),
 			NodeError::Api { code, .. } if code == "busy" => {
@@ -152,3 +157,20 @@ impl From<NodeError> for ApiError {
 
 /// Handler result alias.
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn nested_virtualization_refusals_keep_their_code() {
+		let error = ApiError::from(NodeError::Api {
+			status:  409,
+			code:    vmon_node::api::NESTED_VIRTUALIZATION_ACTIVE.to_owned(),
+			message: "sandbox x is running virtual machines".to_owned(),
+		});
+		assert_eq!(error.status, StatusCode::CONFLICT);
+		assert_eq!(error.error_code, Some("nested_virtualization_active"));
+		assert_eq!(error.message, "sandbox x is running virtual machines");
+	}
+}

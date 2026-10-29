@@ -67,6 +67,19 @@ impl ApiError {
 		)
 	}
 
+	/// 409 [`crate::api::NESTED_VIRTUALIZATION_ACTIVE`]: memory capture of a
+	/// sandbox whose guest runs VMs.
+	pub fn nested_virtualization_active(id: &str) -> Self {
+		Self::new(
+			StatusCode::CONFLICT,
+			crate::api::NESTED_VIRTUALIZATION_ACTIVE,
+			format!(
+				"sandbox {id} is running virtual machines (hardware virtualization is in use); its \
+				 memory cannot be paused or snapshotted until they exit"
+			),
+		)
+	}
+
 	/// 503 `busy` (no capacity; the driver retries another node).
 	pub fn busy(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message)

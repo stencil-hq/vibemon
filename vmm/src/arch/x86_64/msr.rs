@@ -47,6 +47,12 @@ const MSR_IA32_PL2_SSP: u32 = 0x6a6;
 const MSR_IA32_PL3_SSP: u32 = 0x6a7;
 const MSR_IA32_INT_SSP_TAB: u32 = 0x6a8;
 const MSR_IA32_XSS: u32 = 0xda0;
+// The guest kernel locks IA32_FEATURE_CONTROL with VMX enabled at boot. A
+// restore without it leaves the vCPU at KVM's reset value 0, and a guest
+// hypervisor's VMXON then faults (no /dev/kvm VMs in forks of a template).
+// Intel only: AMD hosts do not report it, so `state::save_vcpu`'s supported-MSR
+// filter drops it there.
+const MSR_IA32_FEAT_CTL: u32 = 0x3a;
 
 /// MSR indices captured for snapshot/restore (and zeroed/seeded at boot).
 /// Superset; at save time this is filtered through `KVM_GET_MSR_INDEX_LIST` and
@@ -81,6 +87,7 @@ pub const MIGRATION_MSRS: &[u32] = &[
 	MSR_IA32_PL3_SSP,
 	MSR_IA32_INT_SSP_TAB,
 	MSR_IA32_XSS,
+	MSR_IA32_FEAT_CTL,
 ];
 
 #[cfg(target_os = "linux")]

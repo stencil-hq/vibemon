@@ -27,7 +27,7 @@ use tokio::{
 };
 
 use self::argv::{VmSockets, vmm_argv};
-pub use self::control::ControlClient;
+pub use self::control::{ControlClient, VmmError};
 use crate::{
 	gc4::{AgentClient, AgentStream, ConnectError},
 	net::{NetLease, NetManager},
