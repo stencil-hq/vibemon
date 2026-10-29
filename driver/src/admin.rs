@@ -375,6 +375,69 @@ pub async fn request_team_delete(
 	team: &str,
 	force: bool,
 ) -> anyhow::Result<DeletedTeam> {
+	let query = [("force", force.to_string())];
+	let request = ClusterRequest {
+		method: reqwest::Method::DELETE,
+		path:   &["teams", team],
+		query:  &query,
+		body:   None,
+	};
+	cluster_json(cluster_urls, secret, &request).await
+}
+
+/// [`cluster_call`] decoding a JSON reply.
+///
+/// # Errors
+///
+/// As [`cluster_call`]; a reply that is not `T`.
+pub async fn cluster_json<T: serde::de::DeserializeOwned>(
+	cluster_urls: &[String],
+	secret: &str,
+	request: &ClusterRequest<'_>,
+) -> anyhow::Result<T> {
+	cluster_call(cluster_urls, secret, request)
+		.await?
+		.json()
+		.await
+		.context("reading the driver's reply")
+}
+
+/// [`cluster_call`] returning the reply body as text (empty for 204).
+///
+/// # Errors
+///
+/// As [`cluster_call`].
+pub async fn cluster_text(
+	cluster_urls: &[String],
+	secret: &str,
+	request: &ClusterRequest<'_>,
+) -> anyhow::Result<String> {
+	cluster_call(cluster_urls, secret, request)
+		.await?
+		.text()
+		.await
+		.context("reading the driver's reply")
+}
+
+pub use reqwest::Method;
+
+/// One `/driver/v1/…` request of `vmon admin` ([`cluster_call`]).
+pub struct ClusterRequest<'a> {
+	pub method: reqwest::Method,
+	/// Path segments below `/driver/v1` (each escaped).
+	pub path:   &'a [&'a str],
+	pub query:  &'a [(&'a str, String)],
+	pub body:   Option<&'a serde_json::Value>,
+}
+
+/// Sends `request` to the first reachable driver cluster listener among
+/// `cluster_urls` (cluster-secret bearer) and returns its 2xx response; else
+/// fails with no driver reachable or the driver's refusal or failure message.
+async fn cluster_call(
+	cluster_urls: &[String],
+	secret: &str,
+	request: &ClusterRequest<'_>,
+) -> anyhow::Result<reqwest::Response> {
 	#[derive(Deserialize)]
 	struct ErrorBody {
 		message: String,
@@ -390,27 +453,26 @@ pub async fn request_team_delete(
 		url.path_segments_mut()
 			.map_err(|()| anyhow::anyhow!("cluster URL {base} cannot take a path"))?
 			.pop_if_empty()
-			.extend(["driver", "v1", "teams", team]);
-		let response = match http
-			.delete(url)
-			.query(&[("force", force)])
-			.bearer_auth(secret)
-			.send()
-			.await
-		{
+			.extend(["driver", "v1"])
+			.extend(request.path);
+		let mut call = http
+			.request(request.method.clone(), url)
+			.query(request.query)
+			.bearer_auth(secret);
+		if let Some(body) = request.body {
+			call = call.json(body);
+		}
+		let response = match call.send().await {
 			Ok(response) => response,
 			Err(error) if error.is_connect() => {
 				unreachable.push(format!("{base}: {error}"));
 				continue;
 			},
-			Err(error) => return Err(error).with_context(|| format!("deleting team via {base}")),
+			Err(error) => return Err(error).with_context(|| format!("calling {base}")),
 		};
 		let status = response.status();
 		if status.is_success() {
-			return response
-				.json()
-				.await
-				.with_context(|| format!("reading the reply of {base}"));
+			return Ok(response);
 		}
 		let message = match response.json::<ErrorBody>().await {
 			Ok(body) => body.message,

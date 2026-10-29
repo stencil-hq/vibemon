@@ -24,6 +24,7 @@
 - [Storage, object store, and volumes](operate/storage.md)
 - [Guest kernel](operate/kernel.md)
 - [GPUs](operate/gpus.md)
+- [CI runners (GitHub Actions)](operate/ci.md)
 - [Administration](operate/admin.md)
 
 # Reference

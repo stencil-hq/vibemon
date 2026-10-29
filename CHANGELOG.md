@@ -4,6 +4,19 @@ All notable changes to this project are recorded here.
 
 ## Unreleased
 
+### Added (vmon CI)
+
+- GitHub Actions jobs with `runs-on: vmon-small|vmon|vmon-large|vmon-xlarge` (2/4, 4/8, 8/16, 16/32 vCPU/GiB), optionally `/from=<template>` and `/debug`, run on a fresh sandbox each: the raft leader's CI controller creates the sandbox in the team linked to the GitHub account, starts an ephemeral just-in-time runner in it as `user`, and kills it when the job ends. A failed `debug` job keeps its sandbox for 30 minutes. Unknown labels, unlinked accounts, and disallowed public-repository runs are refused with a reason. Capacity and GitHub rate limits are retried every 15 s. Lost webhooks are redelivered and orphaned runners and sandboxes are reaped every minute. Jobs are capped at 6 hours (docs: Operate → CI runners)
+- GitHub webhooks arrive at `POST /ci/github/webhook` on the driver's public listener, directly or through a relay, verified with whichever secret signs what vmon receives (the app's, or that of a relay that verifies and re-signs). The app may be shared with other services: other events are answered 200 and ignored, and missing app or installation permissions are listed as setup problems
+- Failed webhook deliveries are redelivered from GitHub's paginated failure list (up to 10 pages within 24 h, at most 3 times each), skipping deliveries vmon already answered
+- Public repositories are off by default per GitHub account. `vmon admin ci public <account> on --users …` allows runs whose actor and triggering actor are both listed. A job-started hook in the runner enforces the same policy before the first step and ends the sandbox's VM when it refuses, so a disallowed job that GitHub hands to a vmon runner never runs a step (not even `if: always()` ones); the job the runner was meant for gets a new one
+- CI admin API under `/admin/ci` (admin token) and `/driver/v1/ci` (cluster secret), and `vmon admin ci` (overview, `jobs`, `job`, `logs`, `repos`, `app show|set|delete|secret`, `connect`, `link`, `unlink`, `public`, `sync`, `--json`)
+- Dashboard: CI section with GitHub App setup (manifest flow or an existing app), installation-to-team linking, public-repository policies, 7-day statistics, a filterable job list, job pages with history, the GitHub log, and the job's sandbox terminal, and repository eligibility
+- `ci` default template (`templates/ci/`): Ubuntu 24.04 with systemd, actions/runner 2.338.2 (sha256-pinned), Docker CE with buildx and compose, gh, and a build toolchain; `user` is in the `docker` and `kvm` groups. It builds at 4 vCPU / 8 GiB with a 64 GiB disk (`vmon admin set-limits system --max-disk-mb 65536` first)
+- `vmon serve --ci-template` (`VMON_CI_TEMPLATE`, default `ci`)
+- Node API: `POST /node/v1/sandboxes/{id}/processes` starts a detached guest process through envd
+- Driver-internal sandbox creates can override the build's vCPUs and memory: a different size cold-boots the template disk, and pauses and resumes keep the size
+
 ### Added (nested virtualization)
 
 - Sandboxes on x86_64 nodes with nested KVM get `/dev/kvm`. The guest kernel builds KVM (Intel and AMD) in explicitly, and guests boot with `kvm.enable_virt_at_load=0`, so virtualization is on only while the guest runs VMs
@@ -13,6 +26,7 @@ All notable changes to this project are recorded here.
 
 - Template build steps run at the build's `cpuCount` and `memoryMB` (at least 2 vCPUs and 1 GiB). Before, every step ran in a 2 vCPU / 1 GiB VM whatever the build asked for, so memory-heavy steps such as `cargo install` were killed by the guest's OOM killer
 - Snapshots save and restore `IA32_FEATURE_CONTROL`, so VMs start in sandboxes forked from a template snapshot on Intel hosts. Before, the guest kernel crashed (`kvm_spurious_fault`) at the first vCPU; rebuild x86_64 templates captured by earlier releases before using `/dev/kvm` in them (on AMD such sandboxes stopped)
+- Dashboard: empty states in flush cards keep their bottom padding
 
 ## 0.4.1
 

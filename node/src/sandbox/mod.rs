@@ -33,7 +33,7 @@ use crate::{
 	api::{
 		ArtifactInfo, CreateSandbox, GuestInit, LogEntry, LogQuery, MetricSample, NetworkPolicy,
 		PauseSandbox, ResumeSandbox, S3Mount, SandboxInfo, SandboxState, SnapshotSandbox,
-		VolumeMount,
+		StartProcess, VolumeMount,
 	},
 	artifacts::{
 		self, ArtifactMeta,
@@ -662,6 +662,20 @@ impl SandboxManager {
 			.as_ref()
 			.map(|live| live.vm.clone())
 			.ok_or_else(|| ApiError::conflict(format!("sandbox {id} is not running")))
+	}
+
+	/// `POST /sandboxes/{id}/processes`: starts a detached guest process
+	/// through envd and returns its pid. Paused sandboxes are a 409.
+	pub async fn start_process(&self, id: &str, req: &StartProcess) -> Result<u32, ApiError> {
+		if req.cmd.trim().is_empty() {
+			return Err(ApiError::invalid("process cmd is required"));
+		}
+		let vm = self.live_vm(id)?;
+		let token = self.entry(id)?.state.lock().meta.envd_access_token.clone();
+		EnvdClient::with_token(vm, &token)
+			.start_process(req)
+			.await
+			.map_err(|error| ApiError::unreachable(format!("{error:#}")))
 	}
 
 	/// Boots a VM for a sandbox: networking, volumes, launch, guest network

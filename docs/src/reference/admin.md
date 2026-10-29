@@ -222,3 +222,32 @@ Usage: vmon admin unset-system <TEAM>
 ```
 
 Clears the system flag and, in the same transaction, deletes every bare alias held by the team's templates. The team's namespaced aliases (`<slug>/<alias>`) are unaffected. Prints the updated [team line](#team-lines).
+
+## ci
+
+[vmon CI](../operate/ci.md): GitHub Actions jobs with `runs-on: vmon…` on fresh sandboxes.
+
+```text
+Usage: vmon admin ci [OPTIONS] [COMMAND]
+```
+
+Every `ci` command calls the CI admin API of a driver (`/driver/v1/ci…` with `Authorization: Bearer <cluster secret>`, the first `--cluster-url` that accepts the connection), the same API the dashboard uses under `/admin/ci`. `--json` (any position after `ci`) prints the driver's JSON reply instead of text. `<ACCOUNT>` is a GitHub account login (case-insensitive) or installation ID of the app.
+
+| Command | Description |
+|---|---|
+| (none) | The app, the dashboard URL, setup problems (no app, an app or installation lacking Administration: write or Actions: read, uninstalled or unlinked accounts, team limits below a size, a team cap under 6 h 10 min, an unresolvable `--ci-template`), accounts, last-7-day statistics (jobs, succeeded, failed, cancelled, refused, wait p50/p95, runner minutes), and the newest 20 jobs. |
+| `jobs [--account <ACCOUNT>] [--repo <REPO>] [--state all\|active\|failed\|refused] [--limit <N>]` | Jobs, newest first (default 20): ID, state (the conclusion once completed), size, repository, job name, wait, run time, reason. `--repo` matches `owner/name` or `name`. |
+| `job <JOB_ID>` | One job: labels, size, template, state, sandbox and node, times, and its history (each state change with its reason or conclusion). |
+| `logs <JOB_ID>` | The job's GitHub log; fails with `the job log is available once the job completes` while it runs. |
+| `repos [--account <ACCOUNT>]` | Repositories the app can see: visibility, `allowed`/`refused`, and why. |
+| `app show` | The configured app (name, slug, ID, owner, page, install URL, webhook URL). |
+| `app set --app-id <ID> --private-key-file <PEM> --webhook-secret-file <FILE>` | Configure an existing app. `<FILE>` holds the secret that signs the webhooks vmon receives: the app's webhook secret, or a re-signing relay's own secret. The driver checks the key against GitHub (`GET /app`, which must report the same ID; missing permissions are reported as setup problems, not refused) and stores the key and secret encrypted. |
+| `app delete` | Remove the app; webhooks then answer 503 and no runner starts. |
+| `app secret` | Print the webhook secret vmon verifies with (the one `app set` stored; for a relay that passes GitHub's signature through). Only on the cluster listener. |
+| `connect` | Print the dashboard URL and the steps of the app-creation flow. |
+| `link <ACCOUNT> --team <TEAM>` | Run the account's jobs as sandboxes of `<TEAM>` (ID or slug). An installation not yet known is fetched from GitHub. |
+| `unlink <ACCOUNT>` | Unlink the account: its jobs are refused. |
+| `public <ACCOUNT> [on\|off] [--users "<a>, @<b>"] [--anyone[=<BOOL>]]` | Show or change the public-repository policy: off by default; with `on`, runs are allowed when `--anyone` is set or both the run's actor and its triggering actor are listed in `--users` (comma- or space-separated, `@` optional, checked against GitHub; unknown users fail with `unknown GitHub users: …`). Omitted parts keep their current values. |
+| `sync` | Re-read the app's installations from GitHub (removes uninstalled accounts, keeps links and policies). |
+
+Account lines read `<login> <type> id <installation> team <slug>|(not linked) <public policy>[ SUSPENDED]`.

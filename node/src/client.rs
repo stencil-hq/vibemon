@@ -15,7 +15,8 @@ use url::Url;
 use crate::api::{
 	AdoptSandbox, ArtifactInfo, ArtifactManifest, BuildStatus, CreateSandbox, Deadline, ErrorBody,
 	HandoverManifest, LogEntry, LogQuery, MetricSample, NetworkPolicy, PREFIX, PauseSandbox,
-	ResumeSandbox, SandboxInfo, SnapshotSandbox, StartBuild, TUNNEL_UPGRADE,
+	ProcessStarted, ResumeSandbox, SandboxInfo, SnapshotSandbox, StartBuild, StartProcess,
+	TUNNEL_UPGRADE,
 };
 
 /// Default timeout for control calls; long operations (create, pause,
@@ -169,6 +170,15 @@ impl NodeClient {
 		self
 			.empty(Method::POST, &format!("/sandboxes/{id}/deadline"), Some(&body), CONTROL_TIMEOUT)
 			.await
+	}
+
+	/// Starts a detached guest process (envd `process.Process/Start`) that
+	/// keeps running after this call; returns its pid.
+	pub async fn start_process(&self, id: &str, req: &StartProcess) -> Result<u32, NodeError> {
+		let started: ProcessStarted = self
+			.json(Method::POST, &format!("/sandboxes/{id}/processes"), Some(req), CONTROL_TIMEOUT)
+			.await?;
+		Ok(started.pid)
 	}
 
 	pub async fn update_network(&self, id: &str, policy: &NetworkPolicy) -> Result<(), NodeError> {

@@ -17,7 +17,7 @@ pub mod network;
 pub mod routes;
 pub mod s3mounts;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{
 	collections::BTreeMap,
@@ -39,6 +39,7 @@ use vmon_node::{
 	sandbox::SandboxMeta,
 };
 
+pub(crate) use self::background::LeaderTicks;
 pub use self::{
 	background::spawn_background,
 	migrate::{Migrated, migrate},
@@ -115,6 +116,16 @@ pub struct CreateSpec {
 	pub volume_mounts:         Vec<MountRequest>,
 	/// `vmonS3Mounts` (validated syntax; credentials resolved at launch).
 	pub s3_mounts:             Vec<s3mounts::S3MountRequest>,
+	/// Size override (driver-internal, e.g. CI runners; not on the E2B API).
+	/// A size other than the build's cold-boots the template disk at it.
+	pub resources:             Option<Resources>,
+}
+
+/// vCPUs and memory of a sandbox other than its template build's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resources {
+	pub vcpus:     u32,
+	pub memory_mb: u64,
 }
 
 /// Result of `connect`.
@@ -149,6 +160,8 @@ struct Plan {
 	s3:                    s3mounts::ResolvedS3Mounts,
 	/// GPUs to pass through ([`limits::requested_gpus`]).
 	gpus:                  u32,
+	/// Boot the template disk fresh: `artifact` carries a size override.
+	cold_boot:             bool,
 }
 
 /// Current unix time in ms.
@@ -172,7 +185,8 @@ pub fn unix_ms(at: DateTime<Utc>) -> u64 {
 /// /v2/sandboxes`).
 pub async fn create(state: &AppState, team: &Team, spec: CreateSpec) -> ApiResult<SandboxRef> {
 	let resolved = builds::resolve_template(state, team, &spec.template_ref).await?;
-	let artifact = resolved.artifact;
+	let mut artifact = resolved.artifact;
+	let cold_boot = resize(&mut artifact, spec.resources)?;
 	check_resources(team, &artifact)?;
 	let gpus = limits::requested_gpus(&spec.metadata, &artifact.env)?;
 	let policy = egress_policy(&spec.network.egress(spec.allow_internet_access))?;
@@ -202,8 +216,29 @@ pub async fn create(state: &AppState, team: &Team, spec: CreateSpec) -> ApiResul
 		volume_mounts,
 		s3,
 		gpus,
+		cold_boot,
 	};
 	launch(state, plan).await
+}
+
+/// Applies a size override to `artifact` (so placement, admission, the route,
+/// and the record use it); `true` when it differs from the build's size and
+/// the sandbox must cold-boot. vCPUs follow the build rules (1 or even, ≤ 32),
+/// memory is ≥ 128 MiB.
+fn resize(artifact: &mut ArtifactInfo, resources: Option<Resources>) -> ApiResult<bool> {
+	let Some(Resources { vcpus, memory_mb }) = resources else {
+		return Ok(false);
+	};
+	if (vcpus, memory_mb) == (artifact.vcpus, artifact.memory_mb) {
+		return Ok(false);
+	}
+	builds::names::validate_vcpus(Some(i64::from(vcpus)), u32::MAX)
+		.map_err(ApiError::bad_request)?;
+	builds::names::validate_memory(Some(i64::try_from(memory_mb).unwrap_or(i64::MAX)), u64::MAX)
+		.map_err(ApiError::bad_request)?;
+	artifact.vcpus = vcpus;
+	artifact.memory_mb = memory_mb;
+	Ok(true)
 }
 
 fn check_resources(team: &Team, artifact: &ArtifactInfo) -> ApiResult<()> {
@@ -391,8 +426,9 @@ async fn launch_locked(state: &AppState, plan: &Plan) -> ApiResult<SandboxRef> {
 		network:          plan.policy.clone(),
 		volume_mounts:    plan.volume_mounts.clone(),
 		s3_mounts:        plan.s3.mounts.clone(),
-		// Passed-through GPUs cannot fork a memory snapshot.
-		cold_boot:        plan.gpus > 0,
+		// Passed-through GPUs cannot fork a memory snapshot, nor can a
+		// sandbox sized differently from its build.
+		cold_boot:        plan.cold_boot || plan.gpus > 0,
 		gpus:             plan.gpus,
 	};
 
@@ -1713,6 +1749,8 @@ async fn launch_forks(
 			volume_mounts: row.volume_mounts.clone(),
 			s3: s3.clone(),
 			gpus: row.gpus,
+			// The fork snapshot carries the source's size.
+			cold_boot: false,
 		};
 		// Type-erased: keeps the fork handler's future type shallow enough
 		// for axum's `Handler: Send` check.

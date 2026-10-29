@@ -93,20 +93,20 @@ pub fn spawn_background(state: AppState) {
 
 /// Ticks every `period` while the cluster runs; `true` when this driver is
 /// the raft leader at that tick, `None` once the cluster shut down.
-struct LeaderTicks {
+pub struct LeaderTicks {
 	leader:   tokio::sync::watch::Receiver<Option<NodeId>>,
 	local:    NodeId,
 	interval: tokio::time::Interval,
 }
 
 impl LeaderTicks {
-	fn new(state: &AppState, period: Duration) -> Self {
+	pub fn new(state: &AppState, period: Duration) -> Self {
 		let mut interval = tokio::time::interval(period);
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 		Self { leader: state.cluster.leader(), local: state.cluster.local_id(), interval }
 	}
 
-	async fn tick(&mut self) -> Option<bool> {
+	pub async fn tick(&mut self) -> Option<bool> {
 		loop {
 			tokio::select! {
 				changed = self.leader.changed() => changed.ok()?,

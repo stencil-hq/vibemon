@@ -7,8 +7,8 @@ use vmon_cluster::{Cluster, MemberMeta, NodeId, gossip::MemberState};
 use vmon_node::client::NodeClient;
 
 use crate::{
-	auth::AuthCache, builds::SpawnCounter, crypto::Keys, error::ApiError, scheduler::Scheduler,
-	stats::FleetStats, store::Store,
+	auth::AuthCache, builds::SpawnCounter, ci::Ci, crypto::Keys, error::ApiError,
+	scheduler::Scheduler, stats::FleetStats, store::Store,
 };
 
 /// Driver configuration resolved by the `vmon serve` front end.
@@ -33,6 +33,10 @@ pub struct DriverConfig {
 	/// Operator object store (`--object-store`): removes portable paused
 	/// state on kill.
 	pub object_store:   Option<vmon_cloud::s3::S3Client>,
+	/// Default template of CI runner sandboxes (`--ci-template`).
+	pub ci_template:    String,
+	/// GitHub REST API base URL of CI (`--ci-github-api`).
+	pub ci_github_api:  String,
 }
 
 /// Per-team resource limits (E2B tier limits), stored in the team record.
@@ -85,6 +89,8 @@ pub struct Inner {
 	pub stats:      FleetStats,
 	/// Template spawn counts awaiting their background write.
 	pub spawns:     SpawnCounter,
+	/// CI runtime state (GitHub token cache, controller wake-ups).
+	pub ci:         Ci,
 }
 
 impl Deref for AppState {
@@ -113,6 +119,7 @@ impl AppState {
 			scheduler: Scheduler::default(),
 			stats: FleetStats::default(),
 			spawns: SpawnCounter::default(),
+			ci: Ci::default(),
 		}))
 	}
 

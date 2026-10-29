@@ -42,6 +42,8 @@ impl TestApp {
 			default_limits: TeamLimits::default(),
 			shared_volumes: false,
 			object_store:   None,
+			ci_template:    "ci".into(),
+			ci_github_api:  "https://api.github.com".into(),
 		};
 		let keys = crypto::Keys::derive(config.cluster_secret.as_bytes());
 		let state = AppState::new(config, db.store.clone(), db.cluster.clone(), keys);

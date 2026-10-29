@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
 		.merge(webhooks::routes())
 		.merge(admin::routes())
 		.merge(nodes::routes())
+		.merge(crate::ci::routes(&state))
 		.with_state(state)
 }
 

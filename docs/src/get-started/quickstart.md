@@ -70,7 +70,7 @@ curl -i http://127.0.0.1:3000/health
 just templates base
 ```
 
-`templates/build.py` creates (or reuses) the system team `system` through `vmon admin`, mints a key for it, builds `base` with the E2B `Template` builder, and publishes it. A system team's public templates claim bare aliases, so `base` then resolves for every team. Run `just templates` without arguments to build all defaults (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`, `ubuntu-systemd`).
+`templates/build.py` creates (or reuses) the system team `system` through `vmon admin`, mints a key for it, builds `base` with the E2B `Template` builder, and publishes it. A system team's public templates claim bare aliases, so `base` then resolves for every team. Run `just templates` without arguments to build all defaults (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`, `ubuntu-systemd`, `ci`); `ci` first needs a 64 GiB disk limit (see [The `ci` runner template](../concepts/templates.md#the-ci-runner-template)).
 
 > [!IMPORTANT]
 > `build.py` uses `E2B_API_KEY` if it is set. Run it in a shell without your own team's key, or the templates land in that team's namespace and the bare alias stays unclaimed.

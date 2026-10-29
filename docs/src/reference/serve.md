@@ -164,3 +164,12 @@ These flags apply to the node role.
 | `--hugepage-pool-mb <HUGEPAGE_POOL_MB>` | `VMON_HUGEPAGE_POOL_MB` | `0` | Linux, node role: at startup, write `<value> / 2` to `/proc/sys/vm/nr_hugepages`, which reserves that many MiB of 2 MiB hugetlb pages for sandbox RAM restored from snapshots (create, resume, fork). `0` leaves the host setting alone. |
 
 The hugepage write sets the absolute size of the host pool; it does not add to the current size. It needs root. The kernel can grant fewer pages than requested when contiguous memory is short. vmon logs the result either way. On other platforms a non-zero value logs a warning and is otherwise ignored. For the trade-offs, see [Hugepages](../operate/serve.md#hugepages).
+
+## CI
+
+Driver role, [vmon CI](../operate/ci.md). The GitHub App's credentials are not flags: they live encrypted in the store (`vmon admin ci app set` or the dashboard).
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--ci-template <CI_TEMPLATE>` | `VMON_CI_TEMPLATE` | `ci` | Template of CI runner sandboxes whose `runs-on` label has no `from=` option, resolved in the linked team like any template reference. |
+| `--ci-github-api <CI_GITHUB_API>` | `VMON_CI_GITHUB_API` | `https://api.github.com` | Hidden. GitHub REST API base URL; tests point it at a fake GitHub. The dashboard's manifest flow derives the web URL from it (`https://github.com` for the default). |

@@ -20,8 +20,8 @@ use vmon_cluster::{Cluster, NodeId};
 use crate::{
 	api::{
 		AdoptSandbox, ArtifactInfo, CreateSandbox, Deadline, ErrorBody, HandoverManifest, LogEntry,
-		LogQuery, MetricSample, NetworkPolicy, PauseSandbox, ResumeSandbox, SandboxInfo,
-		SnapshotSandbox, TUNNEL_UPGRADE,
+		LogQuery, MetricSample, NetworkPolicy, PauseSandbox, ProcessStarted, ResumeSandbox,
+		SandboxInfo, SnapshotSandbox, StartProcess, TUNNEL_UPGRADE,
 	},
 	artifacts::sparse,
 	gc4::{ConnectError, DATA_CHUNK},
@@ -188,6 +188,7 @@ pub fn sandbox_routes(manager: Arc<SandboxManager>, peers: Peers) -> Router {
 		.route("/sandboxes/{id}/snapshot", post(snapshot))
 		.route("/sandboxes/{id}/metrics", get(metrics))
 		.route("/sandboxes/{id}/logs", get(logs))
+		.route("/sandboxes/{id}/processes", post(start_process))
 		.route("/sandboxes/{id}/tunnel/{port}", get(tunnel))
 		.with_state(SandboxApi { manager, peers })
 }
@@ -339,6 +340,16 @@ async fn logs(
 	Query(query): Query<LogQuery>,
 ) -> Result<Json<Vec<LogEntry>>, ApiError> {
 	Ok(Json(manager.logs(&id, query).await?))
+}
+
+/// Starts a detached guest process; it outlives this request.
+async fn start_process(
+	State(manager): Manager,
+	Path(id): Path<String>,
+	Json(req): Json<StartProcess>,
+) -> Result<(StatusCode, Json<ProcessStarted>), ApiError> {
+	let pid = manager.start_process(&id, &req).await?;
+	Ok((StatusCode::CREATED, Json(ProcessStarted { pid })))
 }
 
 /// `GET /sandboxes/{id}/tunnel/{port}` with `Upgrade: vmon-tunnel`: opens

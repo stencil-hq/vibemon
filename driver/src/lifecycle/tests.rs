@@ -19,8 +19,8 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use vmon_cluster::{Cluster, ClusterConfig, MemberMeta, NodeCapacity, NodeId, Roles};
 use vmon_node::api::{
-	ArtifactInfo, CreateSandbox, Deadline, ErrorBody, PauseSandbox, ResumeSandbox, RouteState,
-	SandboxInfo, SandboxState as NodeState, SnapshotSandbox,
+	ArtifactInfo, CreateSandbox, Deadline, ErrorBody, PauseSandbox, ProcessStarted, ResumeSandbox,
+	RouteState, SandboxInfo, SandboxState as NodeState, SnapshotSandbox, StartProcess,
 };
 
 mod gpus;
@@ -49,12 +49,14 @@ const WAIT: Duration = Duration::from_secs(30);
 /// Calls the fake node received, plus its live sandbox table and injected
 /// failures.
 #[derive(Default)]
-struct FakeNode {
-	sandboxes:         BTreeMap<String, SandboxInfo>,
-	creates:           Vec<CreateSandbox>,
+pub struct FakeNode {
+	pub sandboxes:     BTreeMap<String, SandboxInfo>,
+	pub creates:       Vec<CreateSandbox>,
 	pauses:            Vec<(String, bool)>,
 	resumes:           Vec<(String, ResumeSandbox)>,
-	kills:             Vec<String>,
+	pub kills:         Vec<String>,
+	/// Processes started (`POST /sandboxes/{id}/processes`).
+	pub processes:     Vec<(String, StartProcess)>,
 	deadlines:         Vec<(String, u64)>,
 	/// Build IDs captured by `POST /sandboxes/{id}/snapshot`.
 	snapshots:         Vec<String>,
@@ -83,7 +85,7 @@ fn disk_full(what: &str) -> Response {
 	(StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
 }
 
-type Shared = Arc<Mutex<FakeNode>>;
+pub type Shared = Arc<Mutex<FakeNode>>;
 
 fn info(req: &CreateSandbox) -> SandboxInfo {
 	SandboxInfo {
@@ -198,6 +200,20 @@ async fn fake_resume(
 	Ok(Json(info))
 }
 
+async fn fake_process(
+	State(node): State<Shared>,
+	UrlPath(id): UrlPath<String>,
+	Json(req): Json<StartProcess>,
+) -> Result<(StatusCode, Json<ProcessStarted>), StatusCode> {
+	let mut node = node.lock();
+	if !node.sandboxes.contains_key(&id) {
+		return Err(StatusCode::NOT_FOUND);
+	}
+	node.processes.push((id, req));
+	let pid = u32::try_from(node.processes.len()).unwrap_or(u32::MAX) + 100;
+	Ok((StatusCode::CREATED, Json(ProcessStarted { pid })))
+}
+
 async fn fake_get(
 	State(node): State<Shared>,
 	UrlPath(id): UrlPath<String>,
@@ -232,6 +248,7 @@ fn fake_routes(node: Shared) -> Router {
 		.route("/node/v1/sandboxes/{id}/resume", post(fake_resume))
 		.route("/node/v1/sandboxes/{id}/deadline", post(fake_deadline))
 		.route("/node/v1/sandboxes/{id}/snapshot", post(fake_snapshot))
+		.route("/node/v1/sandboxes/{id}/processes", post(fake_process))
 		.route("/node/v1/sandboxes/{id}/adopt", post(migrate::fake_adopt))
 		.route("/node/v1/sandboxes/{id}/paused", axum::routing::delete(migrate::fake_drop_paused))
 		.route("/node/v1/artifacts/{id}", axum::routing::delete(fake_delete_artifact))
@@ -260,7 +277,7 @@ fn artifact(build_id: &str) -> ArtifactInfo {
 	}
 }
 
-async fn eventually<F, Fut>(what: &str, mut check: F)
+pub async fn eventually<F, Fut>(what: &str, mut check: F)
 where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = bool>,
@@ -272,13 +289,13 @@ where
 	}
 }
 
-struct Api {
+pub struct Api {
 	router:  Router,
 	team_id: String,
 }
 
 impl Api {
-	async fn call(
+	pub async fn call(
 		&self,
 		method: &str,
 		uri: &str,
@@ -289,7 +306,7 @@ impl Api {
 	}
 
 	/// [`Self::call`] with exactly `headers` as credentials.
-	async fn call_with_headers(
+	pub async fn call_with_headers(
 		&self,
 		method: &str,
 		uri: &str,
@@ -321,19 +338,24 @@ impl Api {
 
 /// A driver whose cluster URL also serves the fake node, a team limited to
 /// two concurrent sandboxes, and its ready template `my-tpl`.
-struct Harness {
-	store:       Store,
+pub struct Harness {
+	pub store:   Store,
 	_dir:        tempfile::TempDir,
-	cluster:     Cluster,
-	fake:        Shared,
-	state:       AppState,
-	api:         Api,
-	team:        Team,
+	pub cluster: Cluster,
+	pub fake:    Shared,
+	pub state:   AppState,
+	pub api:     Api,
+	pub team:    Team,
 	build_id:    String,
 	template_id: String,
 }
 
 async fn harness() -> Harness {
+	harness_with(|_| {}).await
+}
+
+/// [`harness`] with `configure` applied to the driver configuration.
+pub async fn harness_with(configure: impl FnOnce(&mut DriverConfig)) -> Harness {
 	let dir = tempfile::tempdir().unwrap();
 
 	// One process serving both roles; its cluster listener also hosts the fake
@@ -374,7 +396,7 @@ async fn harness() -> Harness {
 	let served = cluster.router().merge(fake_routes(Arc::clone(&fake)));
 	tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
 
-	let config = DriverConfig {
+	let mut config = DriverConfig {
 		domain:         "e2b.test".into(),
 		public_url:     "http://127.0.0.1:9".into(),
 		admin_token:    Some(ADMIN.into()),
@@ -383,7 +405,10 @@ async fn harness() -> Harness {
 		default_limits: TeamLimits::default(),
 		shared_volumes: false,
 		object_store:   None,
+		ci_template:    "ci".into(),
+		ci_github_api:  "https://api.github.com".into(),
 	};
+	configure(&mut config);
 	let state =
 		AppState::new(config, store.clone(), cluster.clone(), Keys::derive(SECRET.as_bytes()));
 	eventually("raft leadership", || async { cluster.is_leader() }).await;
@@ -433,7 +458,7 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
-	async fn finish(self) {
+	pub async fn finish(self) {
 		self.cluster.shutdown().await;
 	}
 
@@ -943,5 +968,66 @@ async fn admin_team_delete_refuses_live_sandboxes_unless_forced() {
 		.await
 		.unwrap();
 	assert_eq!(reborn.slug, team.slug);
+	h.finish().await;
+}
+
+/// A driver-internal create sized differently from its build (CI runners).
+fn sized(vcpus: u32, memory_mb: u64) -> super::CreateSpec {
+	super::CreateSpec {
+		template_ref:          "my-tpl".into(),
+		timeout_ms:            600_000,
+		flags:                 super::limits::lifecycle_flags(None, None, None).unwrap(),
+		allow_internet_access: None,
+		network:               super::network::NetworkConfig::default(),
+		metadata:              BTreeMap::new(),
+		env_vars:              BTreeMap::new(),
+		volume_mounts:         Vec::new(),
+		s3_mounts:             Vec::new(),
+		resources:             Some(super::Resources { vcpus, memory_mb }),
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resized_sandboxes_cold_boot_and_keep_their_size_across_pauses() {
+	let h = harness().await;
+	let Harness { store, cluster, fake, state, api, team, .. } = &h;
+
+	let created = super::create(state, team, sized(4, 2048)).await.unwrap();
+	let id = created.sandbox_id;
+	{
+		let req = fake.lock().creates.last().unwrap().clone();
+		assert_eq!((req.vcpus, req.memory_mb, req.cold_boot), (4, 2048, true));
+	}
+	let route = get_route(&cluster.kv, &id).await.unwrap().unwrap();
+	assert_eq!((route.vcpus, route.memory_mb), (4, 2048));
+	let row = store.sandbox(&id).await.unwrap().unwrap();
+	assert_eq!((row.vcpus, row.memory_mb), (4, 2048));
+
+	let (status, ..) = api
+		.call("POST", &format!("/sandboxes/{id}/pause"), Some(json!({})))
+		.await;
+	assert_eq!(status, StatusCode::NO_CONTENT);
+	let (status, resumed, _) = api
+		.call("POST", &format!("/v2/sandboxes/{id}/connect"), Some(json!({"timeout": 600})))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{resumed}");
+	let route = get_route(&cluster.kv, &id).await.unwrap().unwrap();
+	assert_eq!((route.vcpus, route.memory_mb), (4, 2048), "the resume keeps the size");
+	h.kill(&id).await;
+
+	// The build's own size forks the snapshot.
+	let same = super::create(state, team, sized(2, 512)).await.unwrap();
+	assert!(!fake.lock().creates.last().unwrap().cold_boot);
+	h.kill(&same.sandbox_id).await;
+
+	// Team limits and the build rules apply to the override.
+	let over = super::create(state, team, sized(16, 2048))
+		.await
+		.unwrap_err();
+	assert_eq!(over.status, StatusCode::BAD_REQUEST, "{}", over.message);
+	let odd = super::create(state, team, sized(3, 2048))
+		.await
+		.unwrap_err();
+	assert!(odd.message.contains("even"), "{}", odd.message);
 	h.finish().await;
 }

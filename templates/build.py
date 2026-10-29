@@ -10,7 +10,9 @@ bare alias, which every team resolves after its own namespace
 (ARCHITECTURE.md §7), so these builds make the defaults work for all teams.
 `ubuntu-systemd` (stock Ubuntu 24.04 with systemd as PID 1) is vibemon's own
 reference template for `fromImage` builds on a plain distro image; `cuda`
-(NVIDIA CUDA runtime, one GPU by default) is its template for GPU sandboxes.
+(NVIDIA CUDA runtime, one GPU by default) is its template for GPU sandboxes;
+`ci` (GitHub Actions runner image) backs `runs-on: vmon…` CI jobs and needs
+the team's `max_disk_mb` raised to 65536 first.
 
     uv run templates/build.py [NAME ...] [--jobs N] [--skip-cache]
 
@@ -46,6 +48,7 @@ TEMPLATES = {
     "mcp-gateway": "mcp-gateway",
     "ubuntu-systemd": "ubuntu-systemd",
     "cuda": "cuda",
+    "ci": "ci",
 }
 DEFAULT_API_URL = "http://127.0.0.1:3000"
 

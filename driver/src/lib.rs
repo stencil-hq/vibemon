@@ -8,6 +8,7 @@ pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod builds;
+pub mod ci;
 pub mod crypto;
 pub mod dashboard;
 pub mod error;
@@ -44,6 +45,7 @@ impl Driver {
 		builds::spawn_spawn_writer(state.clone());
 		webhooks::spawn_delivery(state.clone());
 		stats::spawn_sampler(state.clone());
+		ci::spawn_controller(state.clone());
 		Self { state }
 	}
 
@@ -56,10 +58,11 @@ impl Driver {
 
 	/// Routes for the cluster listener (`/driver/v1`, `Authorization: Bearer
 	/// <cluster secret>`): operator actions `vmon admin` cannot do through the
-	/// KV alone, such as [`admin::delete_team`].
+	/// KV alone, such as [`admin::delete_team`] and the CI admin API.
 	pub fn cluster_router(&self) -> axum::Router {
 		let secret: std::sync::Arc<[u8]> = self.state.config.cluster_secret.as_bytes().into();
 		api::admin::cluster_routes()
+			.merge(ci::cluster_routes())
 			.layer(vmon_cluster::require_secret(secret))
 			.with_state(self.state.clone())
 	}

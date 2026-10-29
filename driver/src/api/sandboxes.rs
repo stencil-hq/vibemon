@@ -258,6 +258,7 @@ fn create_spec(team: &Team, body: NewSandboxBody, default_timeout_s: i64) -> Api
 			.map(Into::into)
 			.collect(),
 		s3_mounts,
+		resources: None,
 	})
 }
 

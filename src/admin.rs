@@ -3,6 +3,8 @@
 //! the cluster secret to authenticate to the cluster listener and to encrypt
 //! stored API keys, so it must match the secret of the running drivers.
 
+mod ci;
+
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
@@ -103,6 +105,9 @@ enum AdminCommand {
 	SetSystem { team: String },
 	/// Make a system team an ordinary team (releases its bare aliases).
 	UnsetSystem { team: String },
+	/// vmon CI (GitHub Actions `runs-on: vmon` runners): status, jobs, the
+	/// GitHub App, and linked accounts.
+	Ci(ci::CiArgs),
 }
 
 /// Team limits (`--max-*` flags); unset flags keep the base value.
@@ -209,6 +214,7 @@ pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
 		AdminCommand::UnsetSystem { team } => {
 			print_team(&admin::set_team_system(&store, &team, false).await?);
 		},
+		AdminCommand::Ci(ci_args) => ci::run(ci_args, &args.cluster_url, &secret).await?,
 	}
 	Ok(())
 }

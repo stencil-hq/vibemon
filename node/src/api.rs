@@ -342,6 +342,31 @@ pub struct Deadline {
 	pub end_at_ms: u64,
 }
 
+/// `POST /sandboxes/{id}/processes`: start a detached guest process through
+/// envd (`process.Process/Start`). It keeps running after the request ends,
+/// with no lifetime; stdin is `/dev/null`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartProcess {
+	pub cmd:  String,
+	#[serde(default)]
+	pub args: Vec<String>,
+	#[serde(default)]
+	pub envs: BTreeMap<String, String>,
+	/// Working directory (default: the user's default workdir or home).
+	#[serde(default)]
+	pub cwd:  Option<String>,
+	/// User to run as (default: the sandbox's default user).
+	#[serde(default)]
+	pub user: Option<String>,
+}
+
+/// Reply of [`StartProcess`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessStarted {
+	pub pid: u32,
+}
+
 /// `POST /sandboxes/{id}/snapshot`: capture a running sandbox as a new build.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

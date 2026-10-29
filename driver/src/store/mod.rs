@@ -24,6 +24,7 @@
 //! ```
 
 pub mod builds;
+pub mod ci;
 pub mod events;
 pub mod keys;
 pub mod sandboxes;

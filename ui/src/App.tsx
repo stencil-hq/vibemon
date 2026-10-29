@@ -4,6 +4,9 @@ import { Button, DialogHost, StatusDot, Toaster } from "./components.tsx";
 import { memberName, shortId } from "./format.ts";
 import { type Poll, usePoll } from "./hooks.ts";
 import { Icon, type IconName } from "./icons.tsx";
+import { CiPage } from "./pages/Ci.tsx";
+import { CiJobPage } from "./pages/CiJob.tsx";
+import { CiConnectPage, CiInstallPage } from "./pages/CiSetup.tsx";
 import { NodeDetailPage } from "./pages/NodeDetail.tsx";
 import { NodesPage } from "./pages/Nodes.tsx";
 import { OverviewPage } from "./pages/Overview.tsx";
@@ -171,7 +174,7 @@ interface NavItem {
 function Console() {
   const cluster = usePoll("cluster", api.cluster, 5000);
   const route = useRoute();
-  const [section = "", id] = route.segments;
+  const [section = "", id, sub] = route.segments;
   const members = cluster.data?.members ?? [];
   const nodes = members.filter((m) => m.node);
   const latest = cluster.data?.history.at(-1);
@@ -194,6 +197,7 @@ function Console() {
       count: nodes.length || undefined,
     },
     { to: "/teams", label: "Teams", icon: "team", section: "teams" },
+    { to: "/ci", label: "CI", icon: "ci", section: "ci" },
   ];
 
   let page: React.ReactNode;
@@ -203,6 +207,10 @@ function Console() {
   else if (section === "nodes" && id) page = <NodeDetailPage id={id} />;
   else if (section === "nodes") page = <NodesPage />;
   else if (section === "teams") page = <TeamsPage />;
+  else if (section === "ci" && id === "jobs" && sub) page = <CiJobPage id={sub} />;
+  else if (section === "ci" && id === "connect") page = <CiConnectPage />;
+  else if (section === "ci" && id === "install") page = <CiInstallPage />;
+  else if (section === "ci" && !id) page = <CiPage />;
   else
     page = (
       <div className="page">
@@ -265,7 +273,7 @@ function Console() {
           Charts keep this driver's last hour.
         </div>
       </nav>
-      <main id="main" className="panel" key={`${section}/${id ?? ""}`}>
+      <main id="main" className="panel" key={route.segments.join("/")}>
         {page}
       </main>
     </ClusterContext.Provider>

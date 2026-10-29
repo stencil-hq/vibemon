@@ -263,6 +263,8 @@ async fn harness() -> Harness {
 		default_limits: TeamLimits::default(),
 		shared_volumes: false,
 		object_store:   None,
+		ci_template:    "ci".into(),
+		ci_github_api:  "https://api.github.com".into(),
 	};
 	let state = AppState::new(config, store, driver.clone(), Keys::derive(SECRET.as_bytes()));
 

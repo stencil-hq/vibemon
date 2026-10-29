@@ -282,6 +282,142 @@ export interface NewSandbox {
   metadata?: Record<string, string>;
 }
 
+// --------------------------------------------------------------------- CI
+
+/** GitHub App behind vmon CI (`runs-on: vmon…`). */
+export interface CiApp {
+  appId: number;
+  slug: string;
+  name: string;
+  owner: string;
+  htmlUrl: string;
+  installUrl: string;
+  webhookUrl: string | null;
+  createdAt: string;
+}
+
+export interface CiPublicPolicy {
+  enabled: boolean;
+  anyone: boolean;
+  users: string[];
+}
+
+/** A GitHub installation (user or organization) and the vmon team its jobs run in. */
+export interface CiAccount {
+  installationId: number;
+  login: string;
+  type: "User" | "Organization";
+  team: { id: string; slug: string; name: string } | null;
+  suspended: boolean;
+  public: CiPublicPolicy;
+  createdAt: string;
+}
+
+export interface CiRepo {
+  account: string;
+  /** `owner/name`. */
+  repo: string;
+  private: boolean;
+  allowed: boolean;
+  reason: string | null;
+}
+
+export type CiJobState =
+  | "queued"
+  | "waiting"
+  | "starting"
+  | "running"
+  | "held"
+  | "completed"
+  | "refused"
+  | "failed";
+
+export type CiSize = "vmon-small" | "vmon" | "vmon-large" | "vmon-xlarge";
+
+export interface CiJob {
+  jobId: number;
+  runId: number;
+  runAttempt: number;
+  account: string;
+  repo: string;
+  private: boolean;
+  workflow: string;
+  job: string;
+  branch: string | null;
+  sha: string;
+  htmlUrl: string;
+  labels: string[];
+  size: CiSize | null;
+  from: string | null;
+  debug: boolean;
+  state: CiJobState;
+  conclusion: string | null;
+  reason: string | null;
+  sandboxId: string | null;
+  nodeId: string | null;
+  runnerName: string | null;
+  queuedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  heldUntil: string | null;
+  waitMs: number | null;
+  runMs: number | null;
+}
+
+/** One state change of a job (oldest first in `CiJobDetail.events`). */
+export interface CiJobEvent {
+  at: string;
+  state: CiJobState;
+  message: string | null;
+  runner: string | null;
+  sandboxId: string | null;
+}
+
+/** `GET /admin/ci/jobs/{id}`: the job plus its history. */
+export interface CiJobDetail extends CiJob {
+  events: CiJobEvent[];
+}
+
+export interface CiStats {
+  since: string;
+  jobs: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  refused: number;
+  waitP50Ms: number | null;
+  waitP95Ms: number | null;
+  runSeconds: number;
+}
+
+export interface CiOverview {
+  app: CiApp | null;
+  /** The app's manifest dashboard URL, else `<public URL>/dashboard`. */
+  dashboardUrl: string;
+  accounts: CiAccount[];
+  /** Human-readable setup problems ("no GitHub App configured", …). */
+  problems: string[];
+  /** Last 7 days. */
+  stats: CiStats;
+  /** Newest 20. */
+  jobs: CiJob[];
+}
+
+export type CiJobFilter = "all" | "active" | "failed" | "refused";
+
+export interface CiJobPage {
+  jobs: CiJob[];
+  next: string | null;
+}
+
+export interface CiManifestRequest {
+  dashboardUrl: string;
+  webhookUrl: string;
+  org?: string;
+  public: boolean;
+  name?: string;
+}
+
 // ------------------------------------------------------------------ calls
 
 const enc = encodeURIComponent;
@@ -340,5 +476,56 @@ export const api = {
   killTeamSandboxes: (team: string) =>
     json<{ killedCount: number; failedCount: number }>(`/admin/teams/${enc(team)}/sandboxes/kill`, {
       method: "POST",
+    }),
+};
+
+export const ci = {
+  overview: (signal?: AbortSignal) => json<CiOverview>("/admin/ci", { signal }),
+
+  async jobs(
+    query: { account?: string; repo?: string; state?: CiJobFilter; next?: string | null },
+    signal?: AbortSignal,
+  ): Promise<CiJobPage> {
+    const params = new URLSearchParams({ limit: "50" });
+    if (query.account) params.set("account", query.account);
+    if (query.repo) params.set("repo", query.repo);
+    if (query.state && query.state !== "all") params.set("state", query.state);
+    if (query.next) params.set("nextToken", query.next);
+    const res = await call(`/admin/ci/jobs?${params}`, { signal });
+    const body = (await res.json()) as { jobs: CiJob[]; nextToken?: string | null };
+    return { jobs: body.jobs, next: res.headers.get("x-next-token") ?? body.nextToken ?? null };
+  },
+  job: (id: string, signal?: AbortSignal) =>
+    json<CiJobDetail>(`/admin/ci/jobs/${enc(id)}`, { signal }),
+  /** GitHub's job log (plain text); 409 `not_available` while the job runs. */
+  jobLogs: async (id: string, signal?: AbortSignal) =>
+    (await call(`/admin/ci/jobs/${enc(id)}/logs`, { signal })).text(),
+  repos: (account: string, signal?: AbortSignal) =>
+    json<{ repos: CiRepo[] }>(
+      account ? `/admin/ci/repos?account=${enc(account)}` : "/admin/ci/repos",
+      { signal },
+    ),
+
+  setApp: (body: { appId: number; privateKey: string; webhookSecret: string }) =>
+    json<CiApp>("/admin/ci/app", { method: "PUT", body }),
+  deleteApp: () => empty("/admin/ci/app", { method: "DELETE" }),
+  manifest: (body: CiManifestRequest) =>
+    json<{ action: string; manifest: string }>("/admin/ci/app/manifest", { method: "POST", body }),
+  convert: (code: string, state: string) =>
+    json<CiApp>("/admin/ci/app/conversions", { method: "POST", body: { code, state } }),
+
+  syncAccounts: () =>
+    json<{ accounts: CiAccount[] }>("/admin/ci/accounts/sync", { method: "POST" }),
+  link: (installationId: number, team: string) =>
+    json<CiAccount>(`/admin/ci/accounts/${installationId}/link`, {
+      method: "POST",
+      body: { team },
+    }),
+  unlink: (installationId: number) =>
+    json<CiAccount>(`/admin/ci/accounts/${installationId}/link`, { method: "DELETE" }),
+  setPublic: (installationId: number, policy: CiPublicPolicy) =>
+    json<CiAccount>(`/admin/ci/accounts/${installationId}/public`, {
+      method: "PUT",
+      body: policy,
     }),
 };

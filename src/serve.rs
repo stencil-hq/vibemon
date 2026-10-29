@@ -194,6 +194,14 @@ pub struct ServeArgs {
 	/// (create, resume, fork). 0 leaves the host setting alone.
 	#[arg(long, env = "VMON_HUGEPAGE_POOL_MB", default_value_t = 0)]
 	hugepage_pool_mb:        u64,
+	/// Driver role: default template of vmon CI runner sandboxes (`runs-on:
+	/// vmon…` jobs without `from=`).
+	#[arg(long, env = "VMON_CI_TEMPLATE", default_value = "ci")]
+	ci_template:             String,
+	/// Driver role: GitHub REST API base URL of vmon CI (tests point it at a
+	/// fake).
+	#[arg(long, env = "VMON_CI_GITHUB_API", default_value = "https://api.github.com", hide = true)]
+	ci_github_api:           String,
 }
 
 fn parse_uid_gid(raw: &str) -> Result<(u32, u32), String> {
@@ -333,6 +341,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			default_limits: TeamLimits::default(),
 			shared_volumes: args.shared_volumes,
 			object_store,
+			ci_template: args.ci_template.clone(),
+			ci_github_api: args.ci_github_api.clone(),
 		};
 		Some(Driver::start(config, cluster.clone()))
 	} else {

@@ -7,15 +7,20 @@
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use bytes::Bytes;
+use base64::Engine as _;
+use bytes::{Buf, Bytes, BytesMut};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use crate::{api::GuestInit, gc4::ConnectError, vm::Vm};
+use crate::{
+	api::{GuestInit, StartProcess},
+	gc4::ConnectError,
+	vm::Vm,
+};
 
 /// envd's guest port.
 pub const ENVD_PORT: u16 = 49983;
@@ -25,6 +30,10 @@ const INIT_TRY: Duration = Duration::from_millis(50);
 const INIT_BUDGET: Duration = Duration::from_secs(10);
 /// Timeout of plain requests (health, metrics).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connect envelope flag of the end-of-stream message.
+const END_STREAM: u8 = 0x02;
+/// Largest Connect message accepted before envd's `start` event.
+const MAX_START_MESSAGE: usize = 1 << 20;
 
 /// envd `/metrics` body (subset the node records).
 #[derive(Debug, Deserialize)]
@@ -199,6 +208,82 @@ impl EnvdClient {
 		bail!("envd /init did not succeed within {INIT_BUDGET:?}: {last_error}")
 	}
 
+	/// Starts a detached process with envd's `process.Process/Start`
+	/// (Connect streaming, JSON) and returns its pid. Reads the stream only
+	/// up to envd's `start` event, then closes the connection: envd keeps the
+	/// process running (and drains its output) after its client leaves, and
+	/// without `Connect-Timeout-Ms` it has no lifetime. `req.user` selects
+	/// the user through Basic auth, as the E2B SDKs do.
+	pub async fn start_process(&self, req: &StartProcess) -> anyhow::Result<u32> {
+		let mut process = json!({ "cmd": req.cmd, "args": req.args, "envs": req.envs });
+		if let Some(cwd) = &req.cwd {
+			process["cwd"] = json!(cwd);
+		}
+		let message = json!({ "process": process, "stdin": false }).to_string();
+		let mut body = Vec::with_capacity(5 + message.len());
+		body.push(0);
+		body.extend_from_slice(&u32::try_from(message.len())?.to_be_bytes());
+		body.extend_from_slice(message.as_bytes());
+		let mut builder = self
+			.builder(Method::POST, "/process.Process/Start")
+			.header(header::CONTENT_TYPE, "application/connect+json");
+		if let Some(user) = &req.user {
+			let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{user}:"));
+			builder = builder.header(header::AUTHORIZATION, format!("Basic {credentials}"));
+		}
+		let request = builder.body(Full::new(Bytes::from(body)))?;
+		let start = async {
+			let stream = self
+				.vm
+				.tcp_connect(ENVD_PORT)
+				.await
+				.map_err(|error| match error {
+					ConnectError::Refused => anyhow!("envd port is not open"),
+					ConnectError::Failed(message) => anyhow!("envd unreachable: {message}"),
+				})?;
+			let (mut sender, connection) =
+				hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+			let connection = tokio::spawn(async move {
+				if let Err(error) = connection.await {
+					tracing::trace!(%error, "envd connection ended");
+				}
+			});
+			let result = async {
+				let response = sender.send_request(request).await?;
+				let (parts, mut body) = response.into_parts();
+				if parts.status != StatusCode::OK {
+					let body = body.collect().await?.to_bytes();
+					bail!(
+						"envd process.Process/Start returned {}: {}",
+						parts.status,
+						String::from_utf8_lossy(&body)
+					);
+				}
+				let mut buffer = BytesMut::new();
+				loop {
+					if let Some(pid) = start_pid(&mut buffer)? {
+						return Ok(pid);
+					}
+					match body.frame().await.transpose()? {
+						Some(frame) => {
+							if let Ok(data) = frame.into_data() {
+								buffer.extend_from_slice(&data);
+							}
+						},
+						None => bail!("envd closed the process stream before the start event"),
+					}
+				}
+			}
+			.await;
+			// Closing the connection detaches the process from this client.
+			connection.abort();
+			result
+		};
+		tokio::time::timeout(REQUEST_TIMEOUT, start)
+			.await
+			.map_err(|_| anyhow!("envd did not start the process within {REQUEST_TIMEOUT:?}"))?
+	}
+
 	/// `GET /health` must answer `204`.
 	pub async fn health(&self) -> anyhow::Result<()> {
 		let response = self
@@ -226,6 +311,38 @@ impl EnvdClient {
 	}
 }
 
+/// Pid of envd's `start` event once `buffer` holds the stream's first
+/// Connect message; `Ok(None)` while it is incomplete. An end-of-stream
+/// message first is the RPC's error.
+fn start_pid(buffer: &mut BytesMut) -> anyhow::Result<Option<u32>> {
+	let [flags, a, b, c, d, ..] = buffer[..] else {
+		return Ok(None);
+	};
+	let len = usize::try_from(u32::from_be_bytes([a, b, c, d]))?;
+	if len > MAX_START_MESSAGE {
+		bail!("envd sent an oversized {len}-byte message");
+	}
+	if buffer.len() < 5 + len {
+		return Ok(None);
+	}
+	buffer.advance(5);
+	let message: Value =
+		serde_json::from_slice(&buffer.split_to(len)).context("malformed envd process event")?;
+	if flags & END_STREAM != 0 {
+		let error = &message["error"];
+		bail!(
+			"envd refused the process: {} {}",
+			error["code"].as_str().unwrap_or("unknown"),
+			error["message"].as_str().unwrap_or_default()
+		);
+	}
+	message["event"]["start"]["pid"]
+		.as_u64()
+		.and_then(|pid| u32::try_from(pid).ok())
+		.map(Some)
+		.ok_or_else(|| anyhow!("envd's first process event is not a start event: {message}"))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -249,5 +366,36 @@ mod tests {
 		assert!(body.get("caBundle").is_none());
 		let stamp = body["timestamp"].as_str().unwrap();
 		assert!(chrono::DateTime::parse_from_rfc3339(stamp).is_ok(), "{stamp}");
+	}
+
+	fn envelope(flags: u8, message: &str) -> Vec<u8> {
+		let mut out = vec![flags];
+		out.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+		out.extend_from_slice(message.as_bytes());
+		out
+	}
+
+	#[test]
+	fn start_pid_waits_for_a_whole_message_then_reads_the_pid() {
+		let wire = envelope(0, r#"{"event":{"start":{"pid":42}}}"#);
+		let mut buffer = BytesMut::new();
+		for byte in &wire[..wire.len() - 1] {
+			buffer.extend_from_slice(&[*byte]);
+			assert_eq!(start_pid(&mut buffer).unwrap(), None);
+		}
+		buffer.extend_from_slice(&wire[wire.len() - 1..]);
+		assert_eq!(start_pid(&mut buffer).unwrap(), Some(42));
+	}
+
+	#[test]
+	fn start_pid_reports_a_stream_error() {
+		let mut buffer = BytesMut::from(
+			&envelope(
+				END_STREAM,
+				r#"{"error":{"code":"not_found","message":"error starting process 'x'"}}"#,
+			)[..],
+		);
+		let error = start_pid(&mut buffer).unwrap_err().to_string();
+		assert!(error.contains("not_found") && error.contains("error starting process"), "{error}");
 	}
 }

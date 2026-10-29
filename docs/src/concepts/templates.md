@@ -172,15 +172,16 @@ The SDKs default to bare aliases: `Sandbox` uses `base`, the code-interpreter SD
 | `desktop` | `desktop/` | Upstream e2b-dev/desktop template on `ubuntu:22.04` | 8 / 8192 |
 | `mcp-gateway` | `mcp-gateway/` | `e2bdev/base` + Docker engine + docker/mcp-gateway + vibemon's gateway (`MIN_FREE_DISK_MB` 8192) | 2 / 2048 |
 | `ubuntu-systemd` | `ubuntu-systemd/` | `ubuntu:24.04` with systemd as PID 1, a probe unit, and a heartbeat start command; vibemon's reference `fromImage` template | 2 / 1024 |
+| `ci` | `ci/` | `ubuntu:24.04` + GitHub Actions runner + Docker engine; the runner image of [vmon CI](../operate/ci.md) (`MIN_FREE_DISK_MB` 65536) | 4 / 8192 |
 
-The definitions pick architecture-specific packages at build time, so they build on aarch64 and x86_64 guests. JDK 11 is OpenJDK on x64 and Temurin on aarch64. Desktop uses Google Chrome on amd64 and Chromium as `google-chrome-stable` on arm64. `mcp-gateway` runs Docker in the guest and needs the [vmon guest kernel](../operate/kernel.md). Provenance and licenses: [`templates/SOURCES.md`](https://github.com/stencil-hq/vibemon/blob/main/templates/SOURCES.md).
+The definitions pick architecture-specific packages at build time, so they build on aarch64 and x86_64 guests. JDK 11 is OpenJDK on x64 and Temurin on aarch64. Desktop uses Google Chrome on amd64 and Chromium as `google-chrome-stable` on arm64. `mcp-gateway` and `ci` run Docker in the guest and need the [vmon guest kernel](../operate/kernel.md). Provenance and licenses: [`templates/SOURCES.md`](https://github.com/stencil-hq/vibemon/blob/main/templates/SOURCES.md).
 
 Sandboxes take the template's resources, so a team needs limits of at least 8 vCPUs and 8192 MiB to start `desktop`. Those are the default team limits.
 
 Build and publish them against a running server:
 
 ```sh
-just templates                       # all five, as the system team
+just templates                       # every template, as the system team
 just templates -j 2 base desktop     # selected aliases, 2 concurrent builds
 uv run templates/build.py --skip-cache code-interpreter-v1
 ```
@@ -195,6 +196,26 @@ uv run templates/build.py --skip-cache code-interpreter-v1
 | `--skip-cache` | off | Rebuild every layer |
 
 It uses `E2B_API_KEY` if set; that key must belong to a system team. Otherwise it runs `vmon admin` (`$VMON_BIN`, else `vmon` on `PATH`, against a running driver's cluster listener, `VMON_CLUSTER_URL` defaulting to `http://127.0.0.1:7947`) to find or create the system team, mark it system, and mint a key. `E2B_API_URL` defaults to `http://127.0.0.1:3000`. After each build it publishes the template with `PATCH /v2/templates/{id}`, which claims the bare alias.
+
+### The `ci` runner template
+
+`ci` is the image every [vmon CI](../operate/ci.md) job (`runs-on: vmon…`) boots, and the parent of the templates its `from=` label option selects (`Template().from_template("ci")`). Workflows can rely on this layout:
+
+- Ubuntu 24.04 with systemd. The default user `user` has uid and gid 1000, passwordless sudo, and the groups `docker` and `kvm`.
+- The [GitHub Actions runner](https://github.com/actions/runner) (version and sha256 pinned in `templates/ci/template.py`) is unpacked, never configured, at `/home/user/actions-runner` with its dependencies. The controller starts `run.sh --jitconfig …` there as `user`, and jobs run in `_work/`.
+- The runner's `.env` sets `VMON_CI=1` (test it to detect a vmon runner), `ImageOS=ubuntu24`, `AGENT_TOOLSDIRECTORY` and `RUNNER_TOOL_CACHE` to `/opt/hostedtoolcache` (owned by `user`, for `actions/setup-*`), and `LANG=C.UTF-8`.
+- Docker CE with the buildx and compose plugins. The start command starts dockerd, so forks of the snapshot have it running.
+- build-essential, pkg-config, git, git-lfs, gh, curl, wget, jq, unzip, zip, xz-utils, zstd, python3 (venv, pip), rsync, openssh-client, gnupg, lsb-release, file, iproute2, iptables.
+- `/dev/kvm` is mode 0666 when the guest kernel and the host support nested KVM, so jobs can run VMs.
+
+GitHub-hosted runners preinstall language toolchains; `ci` does not. Workflows install their own (rustup, `actions/setup-node`, `actions/setup-go`, and so on), or a team derives a template with them and selects it with `from=`.
+
+`ci` is built at 4 vCPUs / 8192 MiB, the `vmon` label's size, so `runs-on: vmon` jobs fork its snapshot and other sizes cold-boot its disk. Its build disk is the system team's `max_disk_mb`, and `MIN_FREE_DISK_MB` (65536) makes the build fail with `Minimum free disk exceeds team limits` until that limit is at least 64 GiB (a raised limit reaches already-cached API keys within 30 s):
+
+```sh
+vmon admin set-limits system --max-disk-mb 65536
+just templates ci
+```
 
 ## Deletion and artifact GC
 

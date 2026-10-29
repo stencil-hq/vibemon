@@ -629,6 +629,10 @@ p {
   padding-bottom: 0;
 }
 
+.card--flush > .empty:last-child {
+  padding-bottom: 48px;
+}
+
 .card__head {
   display: flex;
   align-items: center;
@@ -797,6 +801,21 @@ p {
   font-size: 13px;
 }
 
+.warn-note {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border-radius: var(--r-control);
+  background: color-mix(in oklab, var(--warn) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--warn) 24%, transparent);
+  color: #f8cb85;
+  font-size: 13px;
+}
+
+.warn-note ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
 /* ----------------------------------------------------------------- tables */
 
 .table-wrap {
@@ -914,6 +933,14 @@ p {
   box-shadow: inset 0 0 0 1px var(--border);
   font-size: 13.5px;
   transition: box-shadow 160ms var(--ease);
+}
+
+.textarea {
+  height: auto;
+  min-height: 120px;
+  padding: 8px 10px;
+  resize: vertical;
+  font: 12px / 1.5 var(--font-mono);
 }
 
 .input::placeholder {
@@ -1581,6 +1608,55 @@ p {
 
 .log-row__fields {
   color: var(--text-3);
+}
+
+.ci-log {
+  max-height: calc(100dvh - var(--topbar-h) - 240px);
+  min-height: 240px;
+  overflow: auto;
+  padding: 6px 0;
+  background: #050505;
+  font: 12.5px / 1.55 var(--font-mono);
+}
+
+.ci-log__line {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 12px;
+  padding: 0 18px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ci-log__line:hover {
+  background: var(--fill-1);
+}
+
+.ci-log__no {
+  color: var(--text-3);
+  text-align: right;
+  user-select: none;
+}
+
+.ci-log__time {
+  color: var(--text-3);
+}
+
+.ci-log__line--error {
+  color: var(--error);
+}
+
+.ci-log__line--warning {
+  color: var(--warn);
+}
+
+.ci-log__line--group {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+.ci-log__line--command {
+  color: var(--info);
 }
 
 /* ------------------------------------------------------------------ login */

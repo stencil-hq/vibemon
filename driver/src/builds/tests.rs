@@ -237,6 +237,8 @@ async fn fixture() -> Fixture {
 		default_limits: TeamLimits::default(),
 		shared_volumes: false,
 		object_store:   None,
+		ci_template:    "ci".into(),
+		ci_github_api:  "https://api.github.com".into(),
 	};
 	let state =
 		AppState::new(config, store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));
@@ -576,6 +578,8 @@ async fn a_node_that_fetched_a_build_is_recorded_as_its_holder() {
 		default_limits: TeamLimits::default(),
 		shared_volumes: false,
 		object_store:   None,
+		ci_template:    "ci".into(),
+		ci_github_api:  "https://api.github.com".into(),
 	};
 	let state =
 		AppState::new(config, store.clone(), driver.clone(), Keys::derive(SECRET.as_bytes()));

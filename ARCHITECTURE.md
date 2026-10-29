@@ -61,7 +61,7 @@ processes discover each other through gossip seeds (`--join`).
 | `driver/` | `vmon-driver` | E2B API (`driver::api`), KV-backed store (`driver::store`), auth, scheduler, lifecycle, builds, ingress proxy, admin commands. Depends on `vmon-node` for `node::api` DTOs and `node::client`. |
 | `src/` | `vmon` (bin) | Argument parsing, config, role wiring, `vmon admin`. |
 | `e2e/` | — | Real-SDK end-to-end suites (Python `e2b`, JS `e2b`) driven against a live `vmon serve`. |
-| `templates/` | — | Template definitions we ship (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`, and the `ubuntu-systemd` reference template) as E2B v2 build scripts. |
+| `templates/` | — | Template definitions we ship (`base`, `code-interpreter-v1`, `desktop`, `mcp-gateway`, the vmon CI runner image `ci`, and the `ubuntu-systemd` reference template) as E2B v2 build scripts. |
 | `kernel/` | — | vmon guest kernel: cloud-hypervisor `ch_defconfig` + fragments (netfilter/nft, IPv6, bridge, cgroup v2, BPF/BTF, NFS, …) and the reproducible `build.sh` behind `just kernel` and the release `kernel` job. |
 | `spec/e2b/` | — | Vendored upstream specs (OpenAPI, envd protos). |
 
@@ -478,7 +478,7 @@ addresses) or revives, not when a route switches.
 | `file/<templateID>/<hash>` | `{node: NodeId, size}` | driver | Where a build file-context archive is stored. |
 | `node/<nodeID>/status` | `"draining"|"unhealthy"` | driver (admin API) | Admin node status override; absent = ready (`POST /nodes/{id}` with `ready` deletes it). |
 | `db/…` | JSON records | driver (`driver::store`) | Durable system of record, §7. |
-| journal streams (`ev…`, `blog/…`, `wh/…`) | JSON records | driver (`driver::store`, `Op::Append`) | History on the on-disk journal (§5.3), not in the map; 30-day retention, §7. |
+| journal streams (`ev…`, `blog/…`, `wh/…`, `ci/…`) | JSON records | driver (`driver::store`, `Op::Append`) | History on the on-disk journal (§5.3), not in the map; 30-day retention, §7. |
 | `idem/<teamID>/<key>` | `{hash, createdMs, response?}` | driver | `Idempotency-Key` of `POST /v2/sandboxes` (24 h TTL): same body replays the 201, other body → 409 `idempotency_request_mismatch`, pending → 409 `idempotency_in_progress` (422 `idempotency_outcome_unknown` after 10 min). |
 
 ```rust
@@ -577,6 +577,14 @@ Keys (each store module's `//!` docs also list the guards of its writes):
 | `db/secret.version/<team>/<id>/<seq>` | encrypted value | Secret versions. |
 | `db/volume/<team>/<id>` | `VolumeRow` | Volumes (node or object store). |
 | `db/volume.name/<team>/<lower-cased name>` | volume id | Unique name per team. |
+| `db/ci_app/github` | `CiAppRow` (private key, webhook and client secrets encrypted) | The CI GitHub App (§9.7). |
+| `db/ci_manifest/<state>` | `CiManifestRow` | Pending app-manifest flow; TTL 1 h. |
+| `db/ci_account/<installation>` | `CiAccountRow` | App installation: login, linked team, public-repository policy. |
+| `db/ci_job/<job>` | `CiJobRow` | Workflow job by GitHub job id (20 digits; the webhook dedupe key); finished jobs TTL 8 d. |
+| `db/ci_job.active/<job>` | empty | Unfinished jobs (controller work list). |
+| `db/ci_runner/<name>` | `CiRunnerRow` | JIT runner + its sandbox (`vmon-<job>-<n>`), claim `attempt`; deleted at teardown. |
+| `db/ci_redelivery/<delivery guid>` | `{attempts}` | Webhook redeliveries requested per delivery (≤ 3); TTL 1 d. |
+| `db/ci_delivery/<delivery guid>` | `true` | Webhook vmon answered 2xx (never redelivered); TTL 25 h. |
 
 Journal streams (`HISTORY_RETENTION`; segments escaped like keys):
 
@@ -589,6 +597,8 @@ Journal streams (`HISTORY_RETENTION`; segments escaped like keys):
 | `wh/<webhook>` | `DeliveryRow` (`ts` = commit time) | Every delivery attempt of a webhook (stats). |
 | `wh/<webhook>/event/<event>` | (same record) | One event's attempts. |
 | `wh/<webhook>/groups` | (same record, first attempts only) | Delivery groups in order of first attempt; the deliveries cursor is a group record's seq. A first attempt repeated after a leader change counts only if it is the event's earliest record. |
+| `ci/job/<job>` | `CiEvent` | A CI job's state/reason changes (`GET /admin/ci/jobs/{id}` `events`). |
+| `ci/deliveries` | `CiDelivery` | Every CI webhook received, with its outcome. |
 
 `fork` templates are the hidden templates behind `POST /sandboxes/{id}/fork`:
 soft-deleted as soon as the fork's children are started or the fork failed,
@@ -1093,6 +1103,7 @@ DTOs in `node::api` (serde, camelCase). Client: `node::client::NodeClient`.
 | POST | `/sandboxes/{id}/snapshot` | `SnapshotSandbox{buildId}` → `ArtifactInfo` |
 | GET | `/sandboxes/{id}/metrics?start&end` | → `Vec<MetricSample>` |
 | GET | `/sandboxes/{id}/logs?cursor&limit&direction&level&search` | → `Vec<LogEntry>` |
+| POST | `/sandboxes/{id}/processes` | `StartProcess{cmd, args, envs, cwd?, user?}` → `ProcessStarted{pid}` (201): envd `process.Process/Start` (Connect JSON stream read up to the `start` event; user via Basic auth, stdin `/dev/null`, no `Connect-Timeout-Ms`), then the connection closes and the process keeps running; 409 paused, 502 `unreachable` (envd refused or failed) |
 | GET (Upgrade) | `/sandboxes/{id}/tunnel/{port}` | `Upgrade: vmon-tunnel` → 101, raw bytes ↔ guest `127.0.0.1:port`; 502 `{code:"port_closed"}` (guest refused) / 502 `unreachable` (agent failure) / 409 `conflict` (paused) / 404 |
 | POST | `/builds` | `StartBuild` → 202 |
 | GET | `/builds/{id}?logsOffset` | → `BuildStatus{status, logs, reason, artifact}` |
@@ -1575,6 +1586,120 @@ Otherwise a volume lives on one node (`volumes.node_id`) unless `--shared-volume
 the owning node and get `--volume <tag>:<dir>`; the agent mounts virtio-fs
 at the requested path. The volume-content API is proxied by the driver to
 `/node/v1/volumes/{id}/content/...`.
+
+### 9.7 CI runners (`driver::ci`)
+
+GitHub Actions jobs with `runs-on: vmon…` run on one fresh sandbox each
+(docs/src/operate/ci.md). A GitHub App (`db/ci_app`; created by the
+dashboard's manifest flow or `PUT /admin/ci/app`) sends `workflow_job`,
+`installation`, and `installation_repositories` webhooks to
+`POST /ci/github/webhook` on the public listener, usually through a relay.
+The app may be shared with other services: a relay forwards the CI events
+either with GitHub's signature (vmon holds the app's webhook secret) or
+re-signed with its own secret (vmon holds that); the stored "webhook
+secret" is whichever signs what vmon receives.
+
+- **Intake** (`ci::webhook`): HMAC-SHA256 of the raw body with the stored
+  webhook secret (`X-Hub-Signature-256`, constant-time); missing/bad → 401,
+  no app → 503, ping/foreign job/other events → 200, recorded → 202 (and
+  the local controller is woken). Every 2xx-answered delivery GUID
+  (`X-GitHub-Delivery`) is marked in `db/ci_delivery` for 25 h. App and
+  installation permissions (`GET /app`, installations, installation
+  webhooks) are stored; lacking Administration: write or Actions: read is a
+  setup problem, never a refusal of `PUT /admin/ci/app`. Labels
+  (`ci::labels`): exactly one `vmon[-size][/opt…]`
+  label plus at most `self-hosted`/`linux`/`x64`; sizes `vmon-small` 2/4096,
+  `vmon` 4/8192, `vmon-large` 8/16384, `vmon-xlarge` 16/32768 (vCPU/MiB);
+  options `from=<template ref>` (default `--ci-template`, `ci`), `debug`.
+  Other vmon labels refuse the job at intake. `Store::record_ci_job` applies
+  the GitHub status (`queued` < `in_progress` < `completed`) only when it
+  moves forward, so duplicates, redeliveries, and polls are no-ops.
+- **Controller** (`ci::controller`, raft leader, 1 s tick + wake-ups): a
+  queued job without a runner is decided — refused with a reason (unlinked
+  or suspended account, missing/blocked team, size over the team's
+  `max_vcpus`/`max_memory_mb`, public repository not allowed: policy
+  `enabled && (anyone || actor ∈ users && triggering_actor ∈ users)`, actors
+  from `GET /repos/{r}/actions/runs/{id}`) or given a runner record
+  `vmon-<job>-<n>`. Provisioning runs under a claim (`claim_ci_runner`
+  bumps `attempt`; every step commits only under it; claims older than
+  16 min are taken over): `lifecycle::create` with `CreateSpec.resources`
+  = the label's size (no env vars, internet on, timeout 6 h 10 min capped by
+  the team's `max_length_hours`, metadata `vmon.ci.job`/`vmon.ci.repo`/
+  `vmon.ci.runner`; a claim first adopts a running sandbox whose
+  `vmon.ci.runner` names the runner) → repository JIT config (name, labels =
+  the job's vmon label, group 1, work folder `_work`; a 409 name conflict
+  deletes the stale registration and retries) → node
+  `POST /sandboxes/{id}/processes`: `/bin/sh -c` exec of `./run.sh
+  --jitconfig "$c"` as `user` in `/home/user/actions-runner`, the JIT config
+  passed in an unset-before-exec env var (never persisted, never in argv of
+  the logged command). The same command first writes the job gate
+  (`ci::gate`) read-only to `/home/user/actions-runner/.vmon/job-started.sh`
+  and exports `ACTIONS_RUNNER_HOOK_JOB_STARTED` to it. The worker runs it
+  before the first step and waits for it; unless `GITHUB_REPOSITORY` is the
+  runner's repository and, for a public repository, the account's policy at
+  start time allows `GITHUB_ACTOR` and `GITHUB_TRIGGERING_ACTOR` (fail
+  closed: unknown job → public, unknown account → public repositories off),
+  it prints an `::error::` line and ends the VM synchronously (`sudo -n
+  reboot -ff`, then sysrq `b`; a guest reboot is a VM exit), else SIGKILLs
+  `Runner.Worker`/`Runner.Listener`/`run.sh`/`run-helper.sh` and sleeps
+  forever (a hook that merely fails lets `always()` steps and action
+  pre-scripts run). The VM exit reaches the driver as a lost sandbox
+  (reconciler), whose runner then stops as `gone`. Team
+  capacity (429), no node capacity (503), and
+  GitHub rate limits/5xx retry every 15 s with the reason shown (job
+  `waiting`); template/limit errors (400/403/404) refuse the job; other
+  failures retry up to 3 times, then fail it.
+- **Job ↔ runner**: GitHub hands a runner any queued job with its labels.
+  `in_progress` binds the job to the runner it names; when that runner was
+  provisioned for another job, that job inherits the started job's own
+  runner (or gets a new one), so each waiting job keeps exactly one runner.
+  A refused job that starts on a vmon runner is a steal: the job stays
+  refused, the runner is stopped (`stolen`), and the job it was provisioned
+  for is queued for a fresh runner. A job not decided yet (its `queued`
+  webhook lost) is recorded from the `in_progress` report and adopted like a
+  provisioned one (the gate already checked it).
+  `completed` stops the runner; `debug` + `failure` holds it 30 min (job
+  `held`, sandbox timeout extended), a job cancelled before it started
+  releases its runner. Idle runners stop after 10 min, every runner at 6 h
+  (a busy job is marked `failed`). Teardown: terminal stops (completed,
+  hold over, 6 h, sandbox gone, stolen, provisioning failed) kill the
+  sandbox first, then remove the GitHub registration (by id, or by name when
+  the registration reply was lost; retried while GitHub fails, the app
+  fails to load, or GitHub still reports the runner busy), then drop the
+  record; a sandbox already gone counts as killed. Surplus and idle stops
+  ask GitHub first and keep a runner GitHub reports busy (422; the revive
+  commits only while the stop is still surplus/idle), and turn into
+  `expired` at the 6 h cap; a stopping runner's stop only ever moves from
+  surplus/idle to a terminal one.
+- **Reconcile** (60 s): redeliver failed `workflow_job`/`installation*`
+  deliveries of the last 24 h (`GET /app/hook/deliveries?per_page=100&
+  status=failure`, following `Link: rel="next"` cursors until a page
+  reaches past 24 h, ≤ 10 pages; newest failed attempt per GUID; GUIDs in
+  `db/ci_delivery` skipped; ≤ 3 requests per GUID), poll unfinished jobs
+  queued over 2 min ago (`GET …/actions/jobs/{id}`, 30 per pass, rotating
+  through them; applied like a webhook), stop runners whose sandbox ended,
+  kill sandboxes with `vmon.ci.runner` metadata no runner record owns (after
+  2 min; also how a sandbox created by a claim that lost its claim ends,
+  unless a newer claim adopted it), and delete offline `vmon-` GitHub
+  runners without a record (10 repositories per pass, rotating; the record
+  is re-read right before each delete).
+- **GitHub client** (`ci::github`, `--ci-github-api`): app JWTs (RS256,
+  9 min) for `/app…`, installation tokens cached per driver until 5 min
+  before expiry.
+- **Admin API** (`ci::api`): `/admin/ci…` (`X-Admin-Token`) and
+  `/driver/v1/ci…` (cluster secret, plus `GET /app/webhook-secret` for the
+  relay), same handlers: overview (app, accounts, setup problems, 7-day
+  stats, newest 20 jobs), jobs (filters, `nextToken`/`X-Next-Token` = last
+  job id), job (+ `events` from `ci/job/<id>`), job logs (409
+  `not_available` until completed or held), repos, app (get/put/delete,
+  manifest, conversions), account sync/link/unlink/public. `vmon admin ci`
+  is its CLI.
+- **Sizes**: `CreateSpec.resources` (driver-internal, not on the E2B API)
+  overrides the build's vCPUs/memory (build rules: 1 or even ≤ 32 vCPUs,
+  ≥ 128 MiB; team limits). A size other than the build's sets
+  `CreateSandbox.cold_boot` (the template disk boots fresh and runs its start
+  command); placement, admission, route, and record use the override, so
+  pauses and resumes keep it.
 
 ## 10. Guest agent (`vmon-agent`)
 
