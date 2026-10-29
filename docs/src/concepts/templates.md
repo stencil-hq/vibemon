@@ -203,18 +203,49 @@ It uses `E2B_API_KEY` if set; that key must belong to a system team. Otherwise i
 
 - Ubuntu 24.04 with systemd. The default user `user` has uid and gid 1000, passwordless sudo, and the groups `docker` and `kvm`.
 - The [GitHub Actions runner](https://github.com/actions/runner) (version and sha256 pinned in `templates/ci/template.py`) is unpacked, never configured, at `/home/user/actions-runner` with its dependencies. The controller starts `run.sh --jitconfig …` there as `user`, and jobs run in `_work/`.
-- The runner's `.env` sets `VMON_CI=1` (test it to detect a vmon runner), `ImageOS=ubuntu24`, `AGENT_TOOLSDIRECTORY` and `RUNNER_TOOL_CACHE` to `/opt/hostedtoolcache` (owned by `user`, for `actions/setup-*`), and `LANG=C.UTF-8`.
+- The runner's `.env` sets `VMON_CI=1` (test it to detect a vmon runner), `ImageOS=ubuntu24`, `AGENT_TOOLSDIRECTORY` and `RUNNER_TOOL_CACHE` to `/opt/hostedtoolcache` (owned by `user`, for `actions/setup-*`), `LANG=C.UTF-8`, and `PATH`, `RUSTUP_HOME`, `CARGO_HOME` for the toolchains below. The template environment has the same `PATH`, `RUSTUP_HOME` and `CARGO_HOME`, so sandbox commands find the tools too.
 - Docker CE with the buildx and compose plugins. The start command starts dockerd, so forks of the snapshot have it running.
 - build-essential, pkg-config, git, git-lfs, gh, curl, wget, jq, unzip, zip, xz-utils, zstd, python3 (venv, pip), rsync, openssh-client, gnupg, lsb-release, file, iproute2, iptables.
 - `/dev/kvm` is mode 0666 when the guest kernel and the host support nested KVM, so jobs can run VMs.
 
-GitHub-hosted runners preinstall language toolchains; `ci` does not. Workflows install their own (rustup, `actions/setup-node`, `actions/setup-go`, and so on), or a team derives a template with them and selects it with `from=`.
+Like GitHub's `ubuntu-24.04` image, `ci` has the common toolchains, so jobs don't install them per run. Prebuilt downloads are pinned by version and sha256 in `templates/ci/template.py`. Everything outside APT is owned by `user`, so jobs can update it or add versions without sudo:
+
+| Tool | Where |
+|---|---|
+| clang, lld, cmake, ninja, musl-tools, protobuf-compiler, libssl-dev, the cross gcc and libc for the other architecture (`gcc-aarch64-linux-gnu`, `libc6-dev-arm64-cross` on x86_64) | APT |
+| rustup with stable as the default (minimal profile plus clippy, rustfmt and rust-src; targets `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`) | `~/.rustup`, `~/.cargo` |
+| cargo-binstall, cargo-nextest, cargo-zigbuild, cargo-audit, cargo-deny, just, mdbook | `~/.cargo/bin` |
+| Node.js LTS with npm, Go, Zig | `/opt/hostedtoolcache/{node,go,zig}/<version>/<arch>`, linked into `/usr/local/bin` |
+| Python 3.12, 3.13 and 3.14 (the `actions/setup-python` builds; `python3` is Ubuntu's 3.12) | `/opt/hostedtoolcache/Python/<version>/<arch>` |
+| bun, uv | `~/.bun/bin`, `~/.local/bin`, linked into `/usr/local/bin` |
+
+A repository's `rust-toolchain.toml` still picks its own toolchain, which rustup installs on first use. `actions/setup-node`, `actions/setup-python`, `actions/setup-go` and `goto-bus-stop/setup-zig` take a matching version from the tool cache instead of downloading it. `npm install -g` installs into `~/.local`. For anything else, derive a template from `ci` and select it with `from=`.
 
 `ci` is built at 4 vCPUs / 8192 MiB, the `vmon` label's size, so `runs-on: vmon` jobs fork its snapshot and other sizes cold-boot its disk. Its build disk is the system team's `max_disk_mb`, and `MIN_FREE_DISK_MB` (65536) makes the build fail with `Minimum free disk exceeds team limits` until that limit is at least 64 GiB (a raised limit reaches already-cached API keys within 30 s):
 
 ```sh
 vmon admin set-limits system --max-disk-mb 65536
 just templates ci
+```
+
+### The `vibemon-ci` template
+
+Vibemon's own Linux CI jobs run on `vibemon-ci` (`runs-on: vmon-large/from=vibemon-ci`), defined by [`.github/vmon/vibemon_ci_template.py`](https://github.com/stencil-hq/vibemon/blob/main/.github/vmon/vibemon_ci_template.py). It derives from `ci` and adds the following:
+
+- the nightly toolchain that `rust-toolchain.toml` pins, with its components and targets;
+- the packages the KVM integration suite, the guest kernel build and the release smoke need;
+- a checkout of the pinned commit where `actions/checkout` puts it (`/home/user/actions-runner/_work/vibemon/vibemon`), with:
+  - the Cargo registry warmed,
+  - the test assets (`just agent-musl fetch-assets`),
+  - a `target/` already built by the commands CI runs.
+
+The workflows check out with `clean: false` and build with `CARGO_INCREMENTAL=0`, as the template does, so a job only recompiles the workspace crates its commit changed. The template builds at 8 vCPUs / 16384 MiB, so `vmon-large` jobs fork its snapshot. Each build is tagged `default` and `vibemon-<sha12>`. To roll back, select `from=vibemon-ci:vibemon-<sha12>` or point `default` at an older build.
+
+Rebuild it with the `github-ci` team's API key after bumping `rust-toolchain.toml` or `Cargo.lock`, or when main has moved far from the pinned commit. Until then the caches only go stale, which makes jobs slower but not wrong:
+
+```sh
+E2B_API_URL=<vmon API URL> E2B_API_KEY=<github-ci team API key> \
+    uv run .github/vmon/vibemon_ci_template.py [--ref main|<sha>]
 ```
 
 ## Deletion and artifact GC
