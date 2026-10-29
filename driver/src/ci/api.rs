@@ -870,6 +870,17 @@ fn seen(installation: github::Installation) -> InstallationSeen {
 
 async fn sync_accounts(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
 	let github = require_github(&state).await?;
+	// An owner can grant a permission after the app was configured: refresh
+	// the app's own permissions, which the setup problems read, as well.
+	let info = github.app().await?;
+	if let Some(mut app) = state.store.ci_app().await?
+		&& app.app_id == info.id
+		&& app.permissions.as_ref() != Some(&info.permissions)
+	{
+		app.permissions = Some(info.permissions);
+		app.updated_at = store::now();
+		state.store.put_ci_app(&app).await?;
+	}
 	let installations: Vec<InstallationSeen> = github
 		.installations()
 		.await?
