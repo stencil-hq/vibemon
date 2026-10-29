@@ -28,7 +28,7 @@ use chrono::Utc;
 use vmon_node::api::StartProcess;
 
 use super::{
-	gate,
+	cache, gate,
 	github::{Delivery, Github, GithubError},
 };
 use crate::{
@@ -58,7 +58,7 @@ pub(super) const IDLE_LIMIT: Duration = Duration::from_mins(10);
 /// Runtime cap of a runner.
 pub(super) const RUNTIME_LIMIT: Duration = Duration::from_hours(6);
 /// Sandbox timeout: the runtime cap plus teardown slack.
-const SANDBOX_TIMEOUT: Duration = Duration::from_mins(6 * 60 + 10);
+pub(super) const SANDBOX_TIMEOUT: Duration = Duration::from_mins(6 * 60 + 10);
 /// A provisioning claim older than this is taken over (a sandbox create
 /// tries up to three nodes at 5 minutes each).
 const CLAIM_STALE: Duration = Duration::from_mins(16);
@@ -92,8 +92,10 @@ const JIT_ENV: &str = "VMON_CI_JITCONFIG";
 /// Environment variable carrying the job gate script into the start wrapper.
 const GATE_ENV: &str = "VMON_CI_GATE";
 
-/// Starts the controller loop (every driver; only the leader works).
+/// Starts the controller loop and the CI cache sweep (every driver; only the
+/// leader works).
 pub fn spawn_controller(state: AppState) {
+	tokio::spawn(cache::run_sweeper(state.clone()));
 	tokio::spawn(run(state));
 }
 
@@ -128,7 +130,11 @@ async fn run(state: AppState) {
 }
 
 /// Runs `task` unless a task with `key` is in flight on this driver.
-fn spawn_once(state: &AppState, key: String, task: impl Future<Output = ()> + Send + 'static) {
+pub(super) fn spawn_once(
+	state: &AppState,
+	key: String,
+	task: impl Future<Output = ()> + Send + 'static,
+) {
 	if !state.ci.inflight.lock().insert(key.clone()) {
 		return;
 	}
@@ -158,14 +164,15 @@ pub(super) async fn pass(state: &AppState) -> Result<(), ApiError> {
 			Err(error.message)
 		},
 	};
+	let jobs = state.store.ci_active_jobs().await?;
 	if let Ok(Some(github)) = &github {
-		for job in state.store.ci_active_jobs().await? {
+		for job in &jobs {
 			let waits = job.state == JobState::Queued
 				&& job.github == GithubStatus::Queued
 				&& job.runner.is_none()
 				&& job.spec.is_some();
 			if waits {
-				let (task_state, github) = (state.clone(), github.clone());
+				let (task_state, github, job) = (state.clone(), github.clone(), job.clone());
 				spawn_once(state, format!("job:{}", job.job_id), async move {
 					decide(&task_state, &github, &job).await;
 				});
@@ -173,7 +180,10 @@ pub(super) async fn pass(state: &AppState) -> Result<(), ApiError> {
 		}
 	}
 	let now = Utc::now();
-	for runner in state.store.ci_runners().await? {
+	let runners = state.store.ci_runners().await?;
+	let cache_github = github.as_ref().ok().and_then(Option::as_ref);
+	cache::sync_grants(state, cache_github, &runners, &jobs).await;
+	for runner in &runners {
 		let name = runner.name.clone();
 		let expired = runner.created_at + chrono(RUNTIME_LIMIT) <= now;
 		let stop = match runner.state {

@@ -68,6 +68,12 @@ pub struct NodeConfig {
 	/// Let bring-your-own-bucket S3 mounts use loopback/private endpoints
 	/// (`--s3-mounts-allow-private`; development and private clouds).
 	pub s3_mounts_allow_private: bool,
+	/// Disk the CI cache's archive copies may occupy, in MiB; 0 = 10% of the
+	/// filesystem holding `data_dir` ([`crate::ci_cache`]).
+	pub ci_cache_mb:             u64,
+	/// GitHub results service CI sandboxes' other Twirp calls are forwarded
+	/// to; `None` = [`crate::ci_cache::DEFAULT_UPSTREAM`].
+	pub ci_results_upstream:     Option<String>,
 }
 
 /// Default `--data-dir` (also used by `vmon admin`): `/var/lib/vmon` for root

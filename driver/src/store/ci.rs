@@ -34,6 +34,7 @@ use std::{collections::BTreeMap, time::Duration};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use vmon_cluster::kv::{Range, Scan};
+use vmon_node::ci_cache::records::CacheScope;
 
 use super::{Logged, Result, Store, Tx, key, now, prefix, seq};
 use crate::ci::labels::RunnerSpec;
@@ -221,6 +222,17 @@ pub struct CiJobRow {
 	/// `owner/name`.
 	pub repo:            String,
 	pub private:         bool,
+	/// GitHub's repository id (webhook payload; `None` on records older than
+	/// the CI cache).
+	#[serde(default)]
+	pub repo_id:         Option<u64>,
+	/// The repository's default branch when the job was queued.
+	#[serde(default)]
+	pub default_branch:  Option<String>,
+	/// The job's CI cache scope, resolved by the controller from the job's
+	/// workflow run ([`crate::ci::cache`]).
+	#[serde(default)]
+	pub cache_scope:     Option<CacheScope>,
 	pub workflow:        String,
 	pub job:             String,
 	#[serde(default)]
@@ -1085,6 +1097,26 @@ impl Store {
 			stage_job(&mut tx, Some(&before), &job);
 			if tx.commit().await? {
 				return Ok(Some(job));
+			}
+		}
+	}
+
+	/// Records the cache scope the controller resolved for a job. `false`:
+	/// the job is gone.
+	pub async fn set_ci_job_cache_scope(&self, job_id: u64, scope: &CacheScope) -> Result<bool> {
+		let mut tx = self.tx().await?;
+		loop {
+			let Some(before) = tx.get::<CiJobRow>(&job_key(job_id)).await? else {
+				return Ok(false);
+			};
+			if before.cache_scope.as_ref() == Some(scope) {
+				return Ok(true);
+			}
+			let mut job = before.clone();
+			job.cache_scope = Some(scope.clone());
+			stage_job(&mut tx, Some(&before), &job);
+			if tx.commit().await? {
+				return Ok(true);
 			}
 		}
 	}

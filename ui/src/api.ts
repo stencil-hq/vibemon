@@ -322,6 +322,35 @@ export interface CiRepo {
   reason: string | null;
 }
 
+/** One repository's CI cache (`GET /admin/ci/caches`). */
+export interface CiCacheRepo {
+  repoId: number;
+  /** `owner/name` of the newest entry. */
+  repo: string;
+  entries: number;
+  sizeBytes: number;
+  /** Size the sweep evicts down to, least recently used first. */
+  budgetBytes: number;
+  lastUsedAt: string | null;
+}
+
+/** One CI cache entry (`GET /admin/ci/caches/{owner}/{name}`). */
+export interface CiCacheEntry {
+  id: number;
+  key: string;
+  version: string;
+  /** Ref the entry belongs to (`refs/heads/main`, `refs/pull/5/merge`, …). */
+  scope: string;
+  state: "uploading" | "ready";
+  sizeBytes: number;
+  digest: string | null;
+  /** Node IDs holding the archive. */
+  holders: string[];
+  jobId: number;
+  createdAt: string;
+  lastUsedAt: string;
+}
+
 export type CiJobState =
   | "queued"
   | "waiting"
@@ -528,4 +557,18 @@ export const ci = {
       method: "PUT",
       body: policy,
     }),
+
+  caches: (signal?: AbortSignal) => json<{ repos: CiCacheRepo[] }>("/admin/ci/caches", { signal }),
+  /** One repository's cache (`owner/name`, case-insensitive); entries newest used first. */
+  cache: (repo: string, signal?: AbortSignal) =>
+    json<{ repo: CiCacheRepo; entries: CiCacheEntry[] }>(
+      `/admin/ci/caches/${repo.split("/").map(enc).join("/")}`,
+      { signal },
+    ),
+  /** Deletes a repository's entries whose key starts with `keyPrefix` (all without). */
+  deleteCaches: (repo: string, keyPrefix = "") =>
+    json<{ deleted: number; freedBytes: number }>(
+      `/admin/ci/caches/${repo.split("/").map(enc).join("/")}${keyPrefix ? `?keyPrefix=${enc(keyPrefix)}` : ""}`,
+      { method: "DELETE" },
+    ),
 };

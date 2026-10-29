@@ -7,10 +7,12 @@
 //! job (labels, linked team, public-repository policy), provisions a runner
 //! (sandbox → repository JIT config → `run.sh --jitconfig` through the node's
 //! process route), and tears it down when the job completes, after a debug
-//! hold, when idle, or at the runtime cap. [`api`] serves the admin JSON API
-//! for the dashboard and `vmon admin ci`.
+//! hold, when idle, or at the runtime cap. [`cache`] grants each runner
+//! sandbox its job's CI cache scope and sweeps the cache index. [`api`]
+//! serves the admin JSON API for the dashboard and `vmon admin ci`.
 
 pub mod api;
+pub mod cache;
 mod controller;
 pub mod gate;
 pub mod github;
@@ -20,7 +22,10 @@ pub mod webhook;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+	collections::{HashMap, HashSet},
+	time::Instant,
+};
 
 use axum::{Router, middleware::from_extractor_with_state, routing::post};
 use chrono::{DateTime, Utc};
@@ -45,6 +50,8 @@ pub struct Ci {
 	poll_cursor: Mutex<Option<u64>>,
 	/// Last repository whose GitHub runners the reconcile checked.
 	repo_cursor: Mutex<Option<(u64, String)>>,
+	/// Jobs whose cache scope failed to resolve, and when to try again.
+	scope_retry: Mutex<HashMap<u64, Instant>>,
 }
 
 impl Ci {

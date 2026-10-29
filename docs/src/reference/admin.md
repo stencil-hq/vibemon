@@ -249,5 +249,7 @@ Every `ci` command calls the CI admin API of a driver (`/driver/v1/ci…` with `
 | `unlink <ACCOUNT>` | Unlink the account: its jobs are refused. |
 | `public <ACCOUNT> [on\|off] [--users "<a>, @<b>"] [--anyone[=<BOOL>]]` | Show or change the public-repository policy: off by default; with `on`, runs are allowed when `--anyone` is set or both the run's actor and its triggering actor are listed in `--users` (comma- or space-separated, `@` optional, checked against GitHub; unknown users fail with `unknown GitHub users: …`). Omitted parts keep their current values. |
 | `sync` | Re-read the app's installations from GitHub (removes uninstalled accounts, keeps links and policies). |
+| `caches [--repo <OWNER/NAME>]` | [Actions cache](../operate/ci.md#actions-cache) usage: per repository (entries, size, budget, last use), or with `--repo` that repository's entries (key, version, scope ref, state, size, last use, nodes holding a copy), most recently used first. |
+| `caches delete <OWNER/NAME> [--key-prefix <PREFIX>]` | Delete a repository's cache entries, all or those whose key starts with `<PREFIX>`; prints how many and the bytes freed. Archives no entry uses any more are dropped by their nodes within 10 minutes. |
 
 Account lines read `<login> <type> id <installation> team <slug>|(not linked) <public policy>[ SUSPENDED]`.

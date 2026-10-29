@@ -149,6 +149,19 @@ pub struct ServeArgs {
 	/// layers are evicted beyond it (0 = 10% of the data dir's filesystem).
 	#[arg(long, env = "VMON_STEP_CACHE_MB", default_value_t = 0)]
 	step_cache_mb:           u64,
+	/// Disk the CI cache's local archive copies may occupy in MiB; least
+	/// recently used copies are evicted beyond it (0 = 10% of the data dir's
+	/// filesystem).
+	#[arg(long, env = "VMON_CI_CACHE_MB", default_value_t = 0)]
+	ci_cache_mb:             u64,
+	/// GitHub results service that CI sandboxes' non-cache Twirp calls
+	/// (artifacts, …) are forwarded to.
+	#[arg(
+		long,
+		env = "VMON_CI_RESULTS_UPSTREAM",
+		default_value = vmon_node::ci_cache::DEFAULT_UPSTREAM
+	)]
+	ci_results_upstream:     String,
 	/// Linux root only: uid:gid that VMM processes drop to (unset = no privilege
 	/// drop).
 	#[arg(long, env = "VMON_VMM_USER", value_parser = parse_uid_gid)]
@@ -306,6 +319,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			boot_concurrency:        args.boot_concurrency,
 			max_parallel_builds:     args.max_builds,
 			step_cache_mb:           args.step_cache_mb,
+			ci_cache_mb:             args.ci_cache_mb,
+			ci_results_upstream:     Some(args.ci_results_upstream.clone()),
 			net_mode:                args.net.into(),
 			net_pool:                args.net_pool.clone(),
 			volumes_dir:             args.volumes_dir.clone(),

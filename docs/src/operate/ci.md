@@ -91,12 +91,46 @@ Every minute the leader also asks GitHub to redeliver `workflow_job`, `installat
 
 Job states: `queued` (recorded), `waiting` (retrying; see the reason), `starting` (sandbox up, runner registering), `running`, `held`, `completed` (with GitHub's conclusion), `refused` (never ran; see the reason), `failed` (vmon-side failure).
 
+## Actions cache
+
+Jobs on vmon runners use the GitHub Actions cache unchanged (`actions/cache`, `Swatinem/rust-cache`, the `cache:` options of `setup-node`/`setup-python`/`setup-go`, docker buildx `type=gha`, anything built on `@actions/cache` v4 or later), but the archives stay on your nodes' disks. Nothing is stored at GitHub, and GitHub's 10 GB repository quota does not apply.
+
+How it works:
+
+- The `ci` template's runner is patched (one string in `Runner.Worker.dll`, pinned by sha256) so the cache client talks to the `ACTIONS_RESULTS_URL` the runner was started with instead of GitHub's. vmon starts the runner with `ACTIONS_RESULTS_URL=http://<sandbox gateway>:7948/`, a service of the node the sandbox runs on. Templates built `from=` `ci` inherit this.
+- The node attributes each request to the sandbox by its network attachment, never by anything the job sends, and serves only CI runner sandboxes; other sandboxes get 403.
+- Scopes follow GitHub's rules, taken from GitHub's record of the workflow run: a job saves to its own ref (`refs/heads/<branch>`, `refs/pull/<n>/merge`, `refs/tags/<tag>`) and restores from its own ref, then (pull requests) the base branch, then the default branch. A pull request never writes to its base or default branch, and a branch never reads another branch except the default. `pull_request_target` runs save to the base branch, as on GitHub.
+- Lookup: exact key, then each `restore-keys` prefix (newest match first), per ref in that order; the cache version (paths and compression) must match. Entries are immutable: saving an existing key logs GitHub's "another job may be creating this cache" message.
+- A restore on a node without the archive copies it from a node that has it while streaming it to the job.
+- Other calls to GitHub's results service (`upload-artifact`/`download-artifact` v4) are forwarded to GitHub unchanged, so artifacts keep working.
+
+Storage and eviction:
+
+| Limit | Default | Behaviour |
+|---|---|---|
+| Unused entries | 7 days | Removed (GitHub's rule). |
+| Per repository | 50 GiB | Least recently used entries are removed beyond it. |
+| Per node (`--ci-cache-mb`) | 10% of the data filesystem | Least recently used local copies are removed beyond it; an archive whose last copy goes takes its entries with it. |
+| Unfinished uploads | 1 hour | The reservation is released. |
+
+Archives live in `<data-dir>/ci-cache/`, the index in the cluster store.
+
+```sh
+vmon admin ci caches                              # usage per repository
+vmon admin ci caches --repo acme/app              # entries of one repository
+vmon admin ci caches delete acme/app --key-prefix cargo-   # drop entries
+```
+
+The cache needs Linux nodes with TAP networking. Elsewhere the runner falls back to GitHub's results service (GitHub's own cache).
+
+Container actions (`uses: docker://…` or a Dockerfile action) and steps of `container:` jobs receive only the variables the runner hands them: they see GitHub's results URL as `ACTIONS_RESULTS_ORL` and no `ACTIONS_RESULTS_URL`, so caching and artifact uploads from inside a container need `ACTIONS_RESULTS_URL: ${{ env.ACTIONS_RESULTS_URL }}` passed explicitly (or the step moved out of the container). Script and JavaScript steps on the runner itself are unaffected.
+
 ## Observing
 
 - `vmon admin ci`: setup problems, 7-day statistics, latest jobs. `vmon admin ci jobs --state failed`, `vmon admin ci job <id>` (with its history), `vmon admin ci logs <id>`. See the [command reference](../reference/admin.md#ci).
-- The dashboard's CI page shows the same, plus repositories and account settings.
+- The dashboard's CI page shows the same, plus repositories, Actions caches (usage per repository, entries, deletion by key prefix), and account settings.
 - A job's sandbox is an ordinary sandbox of the linked team while it runs (`GET /v2/sandboxes?metadata=vmon.ci.job%3D<id>`).
 
 ## Admin API
 
-The dashboard and `vmon admin ci` use the JSON API under `/admin/ci` (`X-Admin-Token`) on the public listener and `/driver/v1/ci` (cluster secret) on the cluster listener: `GET /` (overview), `GET /jobs?account=&repo=&state=all|active|failed|refused&limit=&nextToken=` (`X-Next-Token`), `GET /jobs/{id}`, `GET /jobs/{id}/logs` (409 `not_available` while running), `GET /repos?account=`, `GET|PUT|DELETE /app`, `POST /app/manifest`, `POST /app/conversions`, `POST /accounts/sync`, `POST|DELETE /accounts/{installationId}/link`, `PUT /accounts/{installationId}/public`, and on the cluster listener only `GET /app/webhook-secret`. Errors use the API's `{code, message, error_code}` shape.
+The dashboard and `vmon admin ci` use the JSON API under `/admin/ci` (`X-Admin-Token`) on the public listener and `/driver/v1/ci` (cluster secret) on the cluster listener: `GET /` (overview), `GET /jobs?account=&repo=&state=all|active|failed|refused&limit=&nextToken=` (`X-Next-Token`), `GET /jobs/{id}`, `GET /jobs/{id}/logs` (409 `not_available` while running), `GET /repos?account=`, `GET|PUT|DELETE /app`, `POST /app/manifest`, `POST /app/conversions`, `POST /accounts/sync`, `POST|DELETE /accounts/{installationId}/link`, `PUT /accounts/{installationId}/public`, `GET /caches` (`{repos}` with usage per repository), `GET /caches/{owner}/{name}` (`{repo, entries}`), `DELETE /caches/{owner}/{name}?keyPrefix=` (`{deleted, freedBytes}`), and on the cluster listener only `GET /app/webhook-secret`. Errors use the API's `{code, message, error_code}` shape.

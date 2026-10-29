@@ -4,6 +4,7 @@ import { fmt } from "../format.ts";
 import { usePoll } from "../hooks.ts";
 import { useRoute } from "../router.tsx";
 import { AccountsPanel } from "./ci/Accounts.tsx";
+import { CachesPanel } from "./ci/Caches.tsx";
 import { JobsPanel } from "./ci/Jobs.tsx";
 import { ReposPanel } from "./ci/Repos.tsx";
 import { AppCard, CreateAppCard, ManualAppCard } from "./ci/Setup.tsx";
@@ -12,6 +13,7 @@ const TABS = [
   { id: "jobs", label: "Jobs", icon: "ci" },
   { id: "accounts", label: "Accounts", icon: "team" },
   { id: "repos", label: "Repositories", icon: "folder" },
+  { id: "caches", label: "Caches", icon: "download" },
   { id: "app", label: "GitHub App", icon: "link" },
 ] as const;
 
@@ -75,6 +77,8 @@ export function CiPage() {
         />
       ) : tab === "repos" ? (
         <ReposPanel accounts={data.accounts} />
+      ) : tab === "caches" ? (
+        <CachesPanel />
       ) : data.app ? (
         <AppCard app={data.app} dashboardUrl={data.dashboardUrl} onChanged={overview.refresh} />
       ) : (

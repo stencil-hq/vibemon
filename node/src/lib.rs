@@ -9,6 +9,7 @@ pub mod artifacts;
 pub mod assets;
 pub mod block_image;
 pub mod build;
+pub mod ci_cache;
 pub mod client;
 pub mod config;
 pub mod egress;
@@ -170,8 +171,35 @@ impl Node {
 		// previous process are removed, then one ready TAP per boot slot.
 		net.prewarm(boot_concurrency).await;
 
+		let ci_cache = ci_cache::start(
+			ci_cache::CacheConfig {
+				dir:      config.data_dir.join("ci-cache"),
+				budget:   if config.ci_cache_mb == 0 {
+					host::disk_size_mb(&config.data_dir) / 10
+				} else {
+					config.ci_cache_mb
+				}
+				.saturating_mul(1 << 20),
+				upstream: url::Url::parse(
+					config
+						.ci_results_upstream
+						.as_deref()
+						.unwrap_or(ci_cache::DEFAULT_UPSTREAM),
+				)
+				.context("parsing --ci-results-upstream")?,
+				secret:   config.cluster_secret.clone(),
+				http:     reqwest::Client::builder()
+					.connect_timeout(Duration::from_secs(5))
+					.build()
+					.context("building HTTP client")?,
+			},
+			cluster.clone(),
+		)?;
+		egress.set_local_service(ci_cache::PORT, Arc::new(ci_cache::Listener(Arc::clone(&ci_cache))));
+
 		let peers = server::Peers::new(cluster.clone());
 		let api = server::sandbox_routes(Arc::clone(&sandboxes), peers.clone())
+			.merge(ci_cache::routes(ci_cache))
 			.merge(build::routes(builder.clone(), peers))
 			.merge(files::routes(FileStore::new(config.data_dir.join("files"))))
 			.merge(volumes::routes(volumes));

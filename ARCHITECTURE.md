@@ -585,6 +585,9 @@ Keys (each store module's `//!` docs also list the guards of its writes):
 | `db/ci_runner/<name>` | `CiRunnerRow` | JIT runner + its sandbox (`vmon-<job>-<n>`), claim `attempt`; deleted at teardown. |
 | `db/ci_redelivery/<delivery guid>` | `{attempts}` | Webhook redeliveries requested per delivery (≤ 3); TTL 1 d. |
 | `db/ci_delivery/<delivery guid>` | `true` | Webhook vmon answered 2xx (never redelivered); TTL 25 h. |
+| `db/ci_cache/<repo id>/<scope ref>/<key>/<version>` | `CacheEntryRow` (`node::ci_cache::records`) | Actions cache entry (§9.7): state `uploading` (TTL 1 h) or `ready`, archive sha256, size, created/last used. Written by nodes through the KV forwarder; immutable once ready. |
+| `db/ci_cache_blob/<sha256>` | `CacheBlobRow` | Archive: size, holder nodes, the entry keys using it; deleted with its last entry or last holder. |
+| `db/ci_cache_grant/<sandbox>` | `CacheGrant` | A CI runner sandbox's cache permission: runner, job, and the job's `CacheScope` once resolved; TTL 6 h 20 min, synced by the controller. |
 
 Journal streams (`HISTORY_RETENTION`; segments escaped like keys):
 
@@ -1702,6 +1705,57 @@ secret" is whichever signs what vmon receives.
   `not_available` until completed or held), repos, app (get/put/delete,
   manifest, conversions), account sync/link/unlink/public. `vmon admin ci`
   is its CLI.
+- **Actions cache** (`node::ci_cache`; GitHub cache service v2 on the
+  operator's disks, nothing stored at GitHub). The `ci` template renames
+  `Runner.Worker.dll`'s one UTF-16 `ACTIONS_RESULTS_URL` literal to
+  `ACTIONS_RESULTS_ORL` (sha256-pinned), so node/container actions get
+  GitHub's results URL under that name and inherit the runner process's
+  `ACTIONS_RESULTS_URL`; the start command sets it to
+  `http://<guest default gateway>:7948/` after probing `GET /_vmon/ping`
+  (else GitHub's `https://results-receiver.actions.githubusercontent.com/`).
+  The node's egress proxy hands guest connections to `<lease host ip>:7948`
+  to the cache service with the lease's sandbox id (no iptables change: TAP
+  TCP is already redirected; nothing the guest sends identifies it). A
+  sandbox without `db/ci_cache_grant/<id>` gets Twirp 403
+  `permission_denied`. The controller writes each runner sandbox's grant
+  every pass (the scope of the job GitHub reported on the runner, never of
+  the job it was provisioned for) and resolves each runner's job's
+  `CacheScope` into `CiJobRow.cache_scope` (`GET …/actions/runs/{id}`:
+  event, head branch, pull
+  requests; fork PRs through `GET …/pulls?head=`; repository id/default
+  branch from the webhook or `GET /repos/{r}`): `pull_request*` writes
+  `refs/pull/<n>/merge` and reads it, the base branch, then the default
+  branch; `pull_request_target` writes the base branch; `release` writes
+  `refs/tags/<tag>`; other events write `refs/heads/<head_branch>` and read
+  it, then the default branch; an unknown ref writes an isolated
+  `refs/vmon/runs/<run>`. Cache calls wait ≤ 20 s for the scope (then 503,
+  which the toolkit retries). `CreateCacheEntry` reserves
+  `(repo id, write ref, key, version)` (`Compare::Missing`; taken → 409
+  `already_exists` like GitHub) and returns
+  `http://<host ip>:7948/vmon/cache/<id>?sig=<token>`; the Azure SDK's Put
+  Blob or Put Block/Put Block List land in `<data-dir>/ci-cache/` (blocks
+  staged under `uploads/`, assembled in list order, hashed, fsync'd,
+  renamed to `blobs/<sha256>`). `FinalizeCacheEntryUpload` checks the size
+  and marks the entry ready (`entry_id` as a JSON string).
+  `GetCacheEntryDownloadURL` searches the read refs in order: exact key,
+  then each restore key as a prefix (newest entry first), version equal;
+  hits update `last_used_at` (≤ once a minute). Signed tokens are random,
+  per entry, held in node memory (upload 1 h, download 1 h) and bound to the
+  sandbox. Downloads serve `Range`/`x-ms-range`; a node without the archive
+  fetches it from a holder (`GET /node/v1/ci-cache/blobs/{sha256}`, cluster
+  secret), streaming it to the guest while writing its own verified copy
+  (ranged requests wait for the copy), then registers as a holder. Every
+  other Twirp call (artifacts, …) is forwarded unchanged (headers incl.
+  `Authorization`, body) to `--ci-results-upstream`, for granted sandboxes
+  only. Eviction: the driver leader sweeps every 10 min (entries unused
+  7 days, then each repository's least recently used entries beyond
+  50 GiB); each node keeps its copies within `--ci-cache-mb` (default 10%
+  of the data filesystem; LRU by file mtime, pinned while read or written)
+  and drops copies no entry uses every 10 min; evicting a blob's last copy
+  deletes its entries. Admin: `GET /admin/ci/caches`,
+  `GET|DELETE /admin/ci/caches/{owner}/{name}[?keyPrefix=]`,
+  `vmon admin ci caches`. Linux TAP nodes only: without the service the
+  probe fails and jobs use GitHub's results service (GitHub's own cache).
 - **Sizes**: `CreateSpec.resources` (driver-internal, not on the E2B API)
   overrides the build's vCPUs/memory (build rules: 1 or even ≤ 32 vCPUs,
   ≥ 128 MiB; team limits). A size other than the build's sets

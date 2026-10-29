@@ -13,6 +13,10 @@ use axum::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use vmon_node::ci_cache::{
+	index::{self, Reserved},
+	records::CacheScope,
+};
 
 use super::webhook::sign;
 use crate::{
@@ -73,7 +77,14 @@ async fn delete_runner(
 
 async fn run(State(github): State<Shared>) -> Json<Value> {
 	let actor = github.lock().actor.clone();
-	Json(json!({ "actor": { "login": actor }, "triggering_actor": { "login": actor } }))
+	Json(json!({
+		"actor": { "login": actor },
+		"triggering_actor": { "login": actor },
+		"event": "push",
+		"head_branch": "main",
+		"head_sha": "abc123",
+		"pull_requests": [],
+	}))
 }
 
 async fn fake_github() -> (String, Shared) {
@@ -122,7 +133,12 @@ fn payload(
 			"conclusion": conclusion,
 			"runner_name": runner,
 		},
-		"repository": { "full_name": "acme/app", "private": private },
+		"repository": {
+			"id": 77,
+			"full_name": "acme/app",
+			"private": private,
+			"default_branch": "main",
+		},
 		"installation": { "id": 1 },
 	})
 }
@@ -507,11 +523,26 @@ async fn webhooks_drive_runners_from_queued_to_teardown() {
 	assert_eq!(row.metadata["vmon.ci.runner"], "vmon-1-1");
 	assert_eq!(row.metadata["vmon.ci.repo"], "acme/app");
 
-	// in_progress → running; completed → the sandbox is killed.
+	// in_progress → running, and the sandbox may use the job's cache scope.
 	let running =
 		payload("in_progress", 1, &["self-hosted", TEMPLATE_LABEL], Some("vmon-1-1"), true);
 	deliver(&h, "workflow_job", &running).await;
 	assert_eq!(job_state(&h, 1).await, JobState::Running);
+	let kv = &h.state.cluster.kv;
+	eventually("the sandbox's cache grant", || async {
+		index::grant(kv, &sandbox)
+			.await
+			.unwrap()
+			.is_some_and(|grant| grant.job_id == Some(1) && grant.scope.is_some())
+	})
+	.await;
+	let grant = index::grant(kv, &sandbox).await.unwrap().unwrap();
+	assert_eq!(grant.runner, "vmon-1-1");
+	let scope = grant.scope.unwrap();
+	assert_eq!((scope.repo_id, scope.repo.as_str()), (77, "acme/app"));
+	assert_eq!(scope.write, "refs/heads/main");
+	assert_eq!(scope.read, ["refs/heads/main"]);
+	// completed → the sandbox is killed and its grant goes.
 	let done = payload("completed", 1, &["self-hosted", TEMPLATE_LABEL], Some("vmon-1-1"), true);
 	deliver(&h, "workflow_job", &done).await;
 	eventually("the sandbox killed", || async { h.fake.lock().kills.contains(&sandbox) }).await;
@@ -521,6 +552,10 @@ async fn webhooks_drive_runners_from_queued_to_teardown() {
 	.await;
 	assert_eq!(job_state(&h, 1).await, JobState::Completed);
 	assert!(github.lock().deleted.contains(&1001), "the GitHub runner is removed");
+	eventually("the grant removed", || async {
+		index::grant(kv, &sandbox).await.unwrap().is_none()
+	})
+	.await;
 
 	// Refusals: unknown size, public repository without a policy.
 	deliver(&h, "workflow_job", &payload("queued", 2, &["vmon-huge"], None, true)).await;
@@ -620,5 +655,79 @@ async fn webhooks_drive_runners_from_queued_to_teardown() {
 	assert_ne!(status, StatusCode::CONFLICT, "a held job's log is available");
 	let (status, ..) = h.api.call_with_headers("GET", "/admin/ci", &[], None).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	h.finish().await;
+}
+
+/// The cache admin API: per-repository totals, one repository's entries
+/// (case-insensitive name, newest used first, holders), prefix deletes, and
+/// 404 for repositories without entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_admin_api_lists_and_deletes_entries() {
+	let h = harness_with(|_| {}).await;
+	let kv = &h.state.cluster.kv;
+	let node = vmon_cluster::NodeId(3);
+	let scope = CacheScope {
+		repo_id: 77,
+		repo:    "acme/app".into(),
+		write:   "refs/heads/main".into(),
+		read:    vec!["refs/heads/main".into()],
+	};
+	for (n, key) in ["cargo-linux-a", "cargo-linux-b", "npm-a"]
+		.into_iter()
+		.enumerate()
+	{
+		let Reserved::New(row) = index::reserve(kv, &scope, key, "v1", 1, node, store::now())
+			.await
+			.unwrap()
+		else {
+			panic!("{key} exists");
+		};
+		let entry = vmon_node::ci_cache::records::entry_key(77, &scope.write, key, "v1");
+		let digest = format!("{:064x}", n + 1);
+		let size = 100 * (n as u64 + 1);
+		let at = store::now() + chrono::Duration::seconds(n as i64);
+		index::finalize(kv, &entry, &digest, size, node, at)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(row.key, key);
+	}
+	let headers = [("x-admin-token", ADMIN)];
+	let (status, list, _) = h
+		.api
+		.call_with_headers("GET", "/admin/ci/caches", &headers, None)
+		.await;
+	assert_eq!(status, StatusCode::OK, "{list}");
+	assert_eq!(list["repos"][0]["repoId"], 77);
+	assert_eq!(list["repos"][0]["entries"], 3);
+	assert_eq!(list["repos"][0]["sizeBytes"], 600);
+	assert_eq!(list["repos"][0]["budgetBytes"], index::REPO_BUDGET);
+
+	let (status, detail, _) = h
+		.api
+		.call_with_headers("GET", "/admin/ci/caches/ACME/App", &headers, None)
+		.await;
+	assert_eq!(status, StatusCode::OK, "{detail}");
+	assert_eq!(detail["repo"]["repo"], "acme/app");
+	assert_eq!(detail["entries"][0]["key"], "npm-a", "newest used first");
+	assert_eq!(detail["entries"][0]["state"], "ready");
+	assert_eq!(detail["entries"][0]["holders"], json!([node.to_string()]));
+	assert_eq!(detail["entries"][0]["scope"], "refs/heads/main");
+
+	let (status, deleted, _) = h
+		.api
+		.call_with_headers("DELETE", "/admin/ci/caches/acme/app?keyPrefix=cargo-", &headers, None)
+		.await;
+	assert_eq!(status, StatusCode::OK, "{deleted}");
+	assert_eq!(deleted, json!({ "deleted": 2, "freedBytes": 300 }));
+	let left = index::entries(kv, Some(77)).await.unwrap();
+	assert_eq!(left.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(), ["npm-a"]);
+
+	let (status, missing, _) = h
+		.api
+		.call_with_headers("GET", "/admin/ci/caches/acme/other", &headers, None)
+		.await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+	assert_eq!(missing["error_code"], "not_found");
 	h.finish().await;
 }

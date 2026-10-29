@@ -20,6 +20,9 @@ fn job(id: u64, debug: bool) -> CiJobRow {
 		account:         "acme".into(),
 		repo:            "acme/app".into(),
 		private:         true,
+		repo_id:         Some(77),
+		default_branch:  Some("main".into()),
+		cache_scope:     None,
 		workflow:        "CI".into(),
 		job:             format!("job {id}"),
 		branch:          Some("main".into()),
@@ -126,6 +129,32 @@ async fn statuses_only_move_forward_and_decisions_provision_once() {
 		.collect();
 	assert_eq!(history.first(), Some(&JobState::Queued));
 	assert_eq!(history.last(), Some(&JobState::Completed));
+	db.finish().await;
+}
+
+/// A resolved cache scope sticks to the job across later transitions and
+/// adds no history record.
+#[tokio::test]
+async fn cache_scopes_are_recorded_quietly_and_kept() {
+	let db = TestStore::start().await;
+	let store = &db.store;
+	let runner = queue(store, 12, false).await;
+	let scope = CacheScope {
+		repo_id: 77,
+		repo:    "acme/app".into(),
+		write:   "refs/heads/main".into(),
+		read:    vec!["refs/heads/main".into()],
+	};
+	assert!(!store.set_ci_job_cache_scope(99, &scope).await.unwrap(), "unknown job");
+	let events = store.ci_job_events(12).await.unwrap().len();
+	assert!(store.set_ci_job_cache_scope(12, &scope).await.unwrap());
+	assert!(store.set_ci_job_cache_scope(12, &scope).await.unwrap(), "unchanged");
+	assert_eq!(store.ci_job_events(12).await.unwrap().len(), events);
+	let busy = update(GithubStatus::InProgress, job(12, false), Some(&runner));
+	assert_eq!(store.record_ci_job(&busy).await.unwrap(), Recorded::Updated);
+	let row = store.ci_job(12).await.unwrap().unwrap();
+	assert_eq!(row.cache_scope.as_ref(), Some(&scope));
+	assert_eq!((row.repo_id, row.default_branch.as_deref()), (Some(77), Some("main")));
 	db.finish().await;
 }
 

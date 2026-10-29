@@ -149,6 +149,17 @@ impl Egress {
 		}
 	}
 
+	/// Hands TAP guests' connections to `<their host ip>:port` to `service`
+	/// instead of proxying them (the CI cache, [`crate::ci_cache`]); whatever
+	/// the sandbox's policy, the service decides whom it serves. Set once;
+	/// a no-op without TAP networking.
+	pub fn set_local_service(&self, port: u16, service: Arc<dyn crate::ci_cache::LocalService>) {
+		#[cfg(target_os = "linux")]
+		self.inner.proxy.set_local(port, service);
+		#[cfg(not(target_os = "linux"))]
+		let _ = (port, service);
+	}
+
 	/// CA PEM the guest must trust for HTTPS `rules` (envd `/init` `caBundle`).
 	pub fn ca_bundle(&self) -> Option<String> {
 		self.inner.ca_pem.clone()
@@ -243,8 +254,12 @@ impl Egress {
 				}
 			},
 			#[cfg(target_os = "linux")]
-			EgressNet::Tap { tap, guest_ip, .. } => {
-				self.inner.proxy.set(*guest_ip, Arc::new(compiled.clone()));
+			EgressNet::Tap { tap, guest_ip, host_ip } => {
+				self.inner.proxy.set(*guest_ip, linux::Guest {
+					policy:  Arc::new(compiled.clone()),
+					sandbox: sandbox_id.into(),
+					host_ip: *host_ip,
+				});
 				let chains = self.inner.hooked.lock().get(tap).copied();
 				let installed = match chains {
 					Some(Chains::Closed) => linux::open_filter(tap, &compiled).await,
@@ -286,9 +301,13 @@ impl Egress {
 			#[cfg(not(unix))]
 			EgressNet::User { .. } => bail!("live user-net policy updates require a Unix control socket"),
 			#[cfg(target_os = "linux")]
-			EgressNet::Tap { tap, guest_ip, .. } => {
+			EgressNet::Tap { tap, guest_ip, host_ip } => {
 				linux::apply_filter(tap, &compiled).await?;
-				self.inner.proxy.set(*guest_ip, Arc::new(compiled));
+				self.inner.proxy.set(*guest_ip, linux::Guest {
+					policy:  Arc::new(compiled),
+					sandbox: sandbox_id.into(),
+					host_ip: *host_ip,
+				});
 				Ok(())
 			},
 			#[cfg(not(target_os = "linux"))]

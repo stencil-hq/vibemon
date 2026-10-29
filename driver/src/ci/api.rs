@@ -2,6 +2,8 @@
 //! (`X-Admin-Token`) and `/driver/v1/ci` (cluster secret) with identical
 //! handlers. The dashboard and `vmon admin ci` are its clients.
 
+use std::collections::BTreeMap;
+
 use axum::{
 	Json, Router,
 	extract::{Path, Query, State},
@@ -12,6 +14,10 @@ use axum::{
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use vmon_node::ci_cache::{
+	index,
+	records::{self, CacheBlobRow, CacheEntryRow, EntryState},
+};
 
 use super::{
 	controller::RUNTIME_LIMIT,
@@ -43,6 +49,8 @@ pub fn routes() -> Router<AppState> {
 		.route("/accounts/sync", post(sync_accounts))
 		.route("/accounts/{installation_id}/link", post(link).delete(unlink))
 		.route("/accounts/{installation_id}/public", put(set_public))
+		.route("/caches", get(caches))
+		.route("/caches/{owner}/{name}", get(cache_repo).delete(delete_caches))
 }
 
 /// Cluster-listener-only routes (the relay reads the webhook secret).
@@ -245,6 +253,147 @@ pub struct Overview {
 pub struct JobPage {
 	pub jobs:       Vec<Job>,
 	pub next_token: Option<String>,
+}
+
+/// One repository's CI cache.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheRepo {
+	pub repo_id:      u64,
+	/// `owner/name` of the newest entry.
+	pub repo:         String,
+	/// Ready and uploading entries.
+	pub entries:      usize,
+	pub size_bytes:   u64,
+	/// Size the sweep evicts down to (least recently used first).
+	pub budget_bytes: u64,
+	/// Last restore or upload of a ready entry.
+	pub last_used_at: Option<String>,
+}
+
+/// One cache entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEntry {
+	pub id:           u64,
+	pub key:          String,
+	pub version:      String,
+	/// Ref the entry belongs to (`refs/heads/main`, `refs/pull/5/merge`, …).
+	pub scope:        String,
+	/// `uploading` or `ready`.
+	pub state:        String,
+	pub size_bytes:   u64,
+	pub digest:       Option<String>,
+	/// Nodes holding the archive.
+	pub holders:      Vec<String>,
+	/// Job that created the entry.
+	pub job_id:       u64,
+	pub created_at:   String,
+	pub last_used_at: String,
+}
+
+/// `GET /caches`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheRepos {
+	pub repos: Vec<CacheRepo>,
+}
+
+/// `GET /caches/{owner}/{name}`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CacheRepoEntries {
+	pub repo:    CacheRepo,
+	/// Most recently used first.
+	pub entries: Vec<CacheEntry>,
+}
+
+/// `DELETE /caches/{owner}/{name}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachesDeleted {
+	pub deleted:     usize,
+	pub freed_bytes: u64,
+}
+
+/// Per-repository totals of cache `entries`, by repository name.
+pub fn cache_repos(entries: &[CacheEntryRow], budget: u64) -> Vec<CacheRepo> {
+	struct Totals<'a> {
+		name:      &'a str,
+		named_at:  DateTime<Utc>,
+		entries:   usize,
+		size:      u64,
+		last_used: Option<DateTime<Utc>>,
+	}
+	let mut repos: BTreeMap<u64, Totals<'_>> = BTreeMap::new();
+	for row in entries {
+		let totals = repos.entry(row.repo_id).or_insert(Totals {
+			name:      &row.repo,
+			named_at:  row.created_at,
+			entries:   0,
+			size:      0,
+			last_used: None,
+		});
+		// A renamed repository shows its newest name.
+		if row.created_at > totals.named_at {
+			totals.name = &row.repo;
+			totals.named_at = row.created_at;
+		}
+		totals.entries += 1;
+		totals.size += row.size;
+		if row.state == EntryState::Ready {
+			totals.last_used = totals.last_used.max(Some(row.last_used_at));
+		}
+	}
+	let mut repos: Vec<CacheRepo> = repos
+		.into_iter()
+		.map(|(repo_id, totals)| CacheRepo {
+			repo_id,
+			repo: totals.name.to_owned(),
+			entries: totals.entries,
+			size_bytes: totals.size,
+			budget_bytes: budget,
+			last_used_at: totals.last_used.map(rfc3339),
+		})
+		.collect();
+	repos.sort_by_cached_key(|repo| (repo.repo.to_lowercase(), repo.repo_id));
+	repos
+}
+
+/// `row` with the nodes holding its archive (`blobs` by digest).
+pub fn cache_entry(row: &CacheEntryRow, blobs: &BTreeMap<String, CacheBlobRow>) -> CacheEntry {
+	let holders: Vec<String> = row
+		.digest
+		.as_ref()
+		.and_then(|digest| blobs.get(digest))
+		.map(|blob| blob.holders.iter().map(ToString::to_string).collect())
+		.unwrap_or_default();
+	CacheEntry {
+		id: row.id,
+		key: row.key.clone(),
+		version: row.version.clone(),
+		scope: row.scope.clone(),
+		state: match row.state {
+			EntryState::Uploading => "uploading",
+			EntryState::Ready => "ready",
+		}
+		.to_owned(),
+		size_bytes: row.size,
+		digest: row.digest.clone(),
+		holders,
+		job_id: row.job_id,
+		created_at: rfc3339(row.created_at),
+		last_used_at: rfc3339(row.last_used_at),
+	}
+}
+
+/// Id of repository `name` (`owner/name`, case-insensitive) among the
+/// entries' repositories; the most recently used one when a deleted and
+/// recreated repository left entries under two ids.
+pub fn cache_repo_id(entries: &[CacheEntryRow], name: &str) -> Option<u64> {
+	entries
+		.iter()
+		.filter(|row| row.repo.eq_ignore_ascii_case(name))
+		.max_by_key(|row| row.last_used_at)
+		.map(|row| row.repo_id)
 }
 
 // --------------------------------------------------------------- helpers
@@ -660,6 +809,89 @@ async fn repos(
 	Ok(Json(json!({ "repos": repos })))
 }
 
+// ---------------------------------------------------------------- caches
+
+fn cache_error(error: &anyhow::Error) -> ApiError {
+	ApiError::unavailable(format!("CI cache index unavailable: {error:#}"))
+}
+
+async fn caches(State(state): State<AppState>) -> ApiResult<Json<CacheRepos>> {
+	let entries = index::entries(&state.cluster.kv, None)
+		.await
+		.map_err(|error| cache_error(&error))?;
+	Ok(Json(CacheRepos { repos: cache_repos(&entries, index::REPO_BUDGET) }))
+}
+
+/// The cache of repository `owner/name` and its entries (404 without
+/// entries).
+async fn repo_cache(
+	state: &AppState,
+	owner: &str,
+	name: &str,
+) -> ApiResult<(CacheRepo, Vec<CacheEntryRow>)> {
+	let full = format!("{owner}/{name}");
+	let not_found =
+		|| ApiError::not_found(format!("no CI cache entries for {full}")).with_code("not_found");
+	let entries = index::entries(&state.cluster.kv, None)
+		.await
+		.map_err(|error| cache_error(&error))?;
+	let repo_id = cache_repo_id(&entries, &full).ok_or_else(not_found)?;
+	let entries: Vec<CacheEntryRow> = entries
+		.into_iter()
+		.filter(|row| row.repo_id == repo_id)
+		.collect();
+	let repo = cache_repos(&entries, index::REPO_BUDGET)
+		.into_iter()
+		.next()
+		.ok_or_else(not_found)?;
+	Ok((repo, entries))
+}
+
+async fn cache_repo(
+	State(state): State<AppState>,
+	Path((owner, name)): Path<(String, String)>,
+) -> ApiResult<Json<CacheRepoEntries>> {
+	let (repo, mut rows) = repo_cache(&state, &owner, &name).await?;
+	let blobs = index::blobs(&state.cluster.kv)
+		.await
+		.map_err(|error| cache_error(&error))?;
+	rows.sort_by_key(|row| std::cmp::Reverse(row.last_used_at));
+	let entries = rows.iter().map(|row| cache_entry(row, &blobs)).collect();
+	Ok(Json(CacheRepoEntries { repo, entries }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteCachesQuery {
+	#[serde(default)]
+	key_prefix: String,
+}
+
+/// `DELETE /caches/{owner}/{name}?keyPrefix=`: the repository's entries
+/// (ready and uploading) whose key starts with the prefix.
+async fn delete_caches(
+	State(state): State<AppState>,
+	Path((owner, name)): Path<(String, String)>,
+	Query(query): Query<DeleteCachesQuery>,
+) -> ApiResult<Json<CachesDeleted>> {
+	let (_, rows) = repo_cache(&state, &owner, &name).await?;
+	let mut deleted = CachesDeleted::default();
+	for row in rows
+		.iter()
+		.filter(|row| row.key.starts_with(&query.key_prefix))
+	{
+		let key = records::entry_key(row.repo_id, &row.scope, &row.key, &row.version);
+		if let Some(gone) = index::delete_entry(&state.cluster.kv, &key, Some(row.id))
+			.await
+			.map_err(|error| cache_error(&error))?
+		{
+			deleted.deleted += 1;
+			deleted.freed_bytes += gone.size;
+		}
+	}
+	Ok(Json(deleted))
+}
+
 // ------------------------------------------------------------------- app
 
 async fn app(State(state): State<AppState>) -> ApiResult<Json<App>> {
@@ -1014,6 +1246,76 @@ mod tests {
 		assert_eq!(normalize_users(&["a, @b".into(), " A ".into(), "@c\nd".into()]), [
 			"a", "b", "c", "d"
 		]);
+	}
+
+	fn entry(repo_id: u64, repo: &str, key: &str, size: u64, age_h: i64) -> CacheEntryRow {
+		let at = store::now() - Duration::hours(age_h);
+		CacheEntryRow {
+			id: repo_id * 100 + size,
+			repo_id,
+			repo: repo.into(),
+			scope: "refs/heads/main".into(),
+			key: key.into(),
+			version: "v1".into(),
+			state: EntryState::Ready,
+			digest: Some(format!("{size:064x}")),
+			size,
+			node: vmon_cluster::NodeId(7),
+			job_id: 9,
+			created_at: at,
+			last_used_at: at,
+		}
+	}
+
+	#[test]
+	fn cache_repos_total_their_entries() {
+		let mut uploading = entry(2, "acme/lib", "npm-", 0, 0);
+		uploading.state = EntryState::Uploading;
+		uploading.digest = None;
+		let entries = [
+			entry(1, "acme/old-name", "cargo-a", 10, 5),
+			entry(1, "acme/app", "cargo-b", 20, 1),
+			entry(2, "Acme/lib", "npm-a", 5, 3),
+			uploading,
+		];
+		let repos = cache_repos(&entries, 1000);
+		assert_eq!(repos.len(), 2);
+		assert_eq!(repos[0], CacheRepo {
+			repo_id:      1,
+			repo:         "acme/app".into(),
+			entries:      2,
+			size_bytes:   30,
+			budget_bytes: 1000,
+			last_used_at: Some(rfc3339(entries[1].last_used_at)),
+		});
+		assert_eq!((repos[1].repo.as_str(), repos[1].entries), ("acme/lib", 2));
+		assert_eq!(repos[1].last_used_at, Some(rfc3339(entries[2].last_used_at)), "ready only");
+		assert_eq!(cache_repo_id(&entries, "ACME/APP"), Some(1));
+		assert_eq!(cache_repo_id(&entries, "acme/old-name"), Some(1));
+		assert_eq!(cache_repo_id(&entries, "acme/none"), None);
+	}
+
+	#[test]
+	fn cache_entries_name_their_holders() {
+		let row = entry(1, "acme/app", "cargo-a", 10, 1);
+		let blobs = BTreeMap::from([(row.digest.clone().unwrap(), CacheBlobRow {
+			size:       10,
+			holders:    vec![vmon_cluster::NodeId(7), vmon_cluster::NodeId(0xab)],
+			entries:    Vec::new(),
+			created_at: row.created_at,
+		})]);
+		let dto = cache_entry(&row, &blobs);
+		assert_eq!(dto.state, "ready");
+		assert_eq!(dto.holders, ["0000000000000007", "00000000000000ab"]);
+		assert_eq!((dto.size_bytes, dto.job_id, dto.id), (10, 9, 110));
+		let json = serde_json::to_value(&dto).unwrap();
+		assert_eq!(json["sizeBytes"], 10);
+		assert_eq!(json["lastUsedAt"], dto.last_used_at.as_str());
+		let mut uploading = row;
+		uploading.state = EntryState::Uploading;
+		uploading.digest = None;
+		let dto = cache_entry(&uploading, &blobs);
+		assert_eq!((dto.state.as_str(), dto.holders.len()), ("uploading", 0));
 	}
 
 	#[test]

@@ -8,7 +8,10 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use vmon_driver::{
 	admin::{ClusterRequest, Method, cluster_json, cluster_text},
-	ci::api::{Account, App, Job, JobPage, Overview, Repo},
+	ci::api::{
+		Account, App, CacheEntry, CacheRepo, CacheRepoEntries, CacheRepos, CachesDeleted, Job,
+		JobPage, Overview, Repo,
+	},
 };
 
 /// `vmon admin ci [COMMAND]`.
@@ -79,6 +82,26 @@ enum CiCommand {
 	},
 	/// Re-read the app's installations from GitHub.
 	Sync,
+	/// CI cache usage per repository, or one repository's entries.
+	Caches {
+		/// List the entries of this repository (`owner/name`).
+		#[arg(long)]
+		repo:    Option<String>,
+		#[command(subcommand)]
+		command: Option<CachesCommand>,
+	},
+}
+
+#[derive(Subcommand, Debug)]
+enum CachesCommand {
+	/// Delete a repository's cache entries (all, or those whose key starts
+	/// with `--key-prefix`).
+	Delete {
+		/// Repository (`owner/name`).
+		repo:       String,
+		#[arg(long)]
+		key_prefix: Option<String>,
+	},
 }
 
 #[derive(Subcommand, Debug)]
@@ -217,6 +240,73 @@ fn print_jobs(jobs: &[Job]) {
 			duration(job.wait_ms),
 			duration(job.run_ms),
 			or_dash(job.reason.as_deref()),
+		);
+	}
+}
+
+/// `bytes` in binary units (`1.5 GiB`).
+fn human_size(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let mut value = bytes as f64;
+	let mut unit = 0;
+	while value >= 1024.0 && unit + 1 < UNITS.len() {
+		value /= 1024.0;
+		unit += 1;
+	}
+	if unit == 0 {
+		format!("{bytes} B")
+	} else {
+		format!("{value:.1} {}", UNITS[unit])
+	}
+}
+
+/// `owner` and `name` of `owner/name`.
+fn split_repo(repo: &str) -> anyhow::Result<(&str, &str)> {
+	match repo.split_once('/') {
+		Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+			Ok((owner, name))
+		},
+		_ => bail!("expected a repository as owner/name, got {repo}"),
+	}
+}
+
+fn print_cache_repos(repos: &[CacheRepo]) {
+	if repos.is_empty() {
+		println!("no CI cache entries");
+		return;
+	}
+	println!("{:<40} {:>8} {:>10} {:>10}  LAST USED", "REPO", "ENTRIES", "SIZE", "BUDGET");
+	for repo in repos {
+		println!(
+			"{:<40} {:>8} {:>10} {:>10}  {}",
+			repo.repo,
+			repo.entries,
+			human_size(repo.size_bytes),
+			human_size(repo.budget_bytes),
+			or_dash(repo.last_used_at.as_deref())
+		);
+	}
+}
+
+fn print_cache_entries(entries: &[CacheEntry]) {
+	println!(
+		"{:<48} {:<12} {:<28} {:<9} {:>10}  {:<24}  HOLDERS",
+		"KEY", "VERSION", "SCOPE", "STATE", "SIZE", "LAST USED"
+	);
+	for entry in entries {
+		println!(
+			"{:<48} {:<12} {:<28} {:<9} {:>10}  {:<24}  {}",
+			entry.key,
+			entry.version.chars().take(12).collect::<String>(),
+			entry.scope,
+			entry.state,
+			human_size(entry.size_bytes),
+			entry.last_used_at,
+			if entry.holders.is_empty() {
+				"-".to_owned()
+			} else {
+				entry.holders.join(",")
+			}
 		);
 	}
 }
@@ -509,6 +599,41 @@ pub async fn run(args: CiArgs, urls: &[String], secret: &str) -> anyhow::Result<
 			for account in &accounts {
 				print_account(account);
 			}
+		},
+		CiCommand::Caches { command: Some(CachesCommand::Delete { repo, key_prefix }), .. } => {
+			let (owner, name) = split_repo(&repo)?;
+			let query: Vec<(&str, String)> = key_prefix
+				.map(|prefix| ("keyPrefix", prefix))
+				.into_iter()
+				.collect();
+			let deleted: CachesDeleted = driver
+				.json(Method::DELETE, &["caches", owner, name], &query, None)
+				.await?;
+			if as_json {
+				return print_json(&deleted);
+			}
+			println!(
+				"deleted {} entries of {repo} ({})",
+				deleted.deleted,
+				human_size(deleted.freed_bytes)
+			);
+		},
+		CiCommand::Caches { repo: Some(repo), command: None } => {
+			let (owner, name) = split_repo(&repo)?;
+			let reply: CacheRepoEntries = driver.get(&["caches", owner, name]).await?;
+			if as_json {
+				return print_json(&reply);
+			}
+			print_cache_repos(std::slice::from_ref(&reply.repo));
+			println!();
+			print_cache_entries(&reply.entries);
+		},
+		CiCommand::Caches { repo: None, command: None } => {
+			let reply: CacheRepos = driver.get(&["caches"]).await?;
+			if as_json {
+				return print_json(&reply);
+			}
+			print_cache_repos(&reply.repos);
 		},
 	}
 	Ok(())

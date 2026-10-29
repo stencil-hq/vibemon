@@ -38,10 +38,22 @@ use super::{
 
 const COMMENT: &str = "vmon-egress";
 
+/// One attached guest: its policy and identity.
+#[derive(Clone)]
+pub struct Guest {
+	pub policy:  Arc<Compiled>,
+	pub sandbox: Arc<str>,
+	/// Host side of the guest's TAP.
+	pub host_ip: Ipv4Addr,
+}
+
 /// The node's transparent proxy listener and its guest-IP → policy table.
 pub struct Proxy {
 	port:   u16,
-	guests: RwLock<HashMap<Ipv4Addr, Arc<Compiled>>>,
+	guests: RwLock<HashMap<Ipv4Addr, Guest>>,
+	/// Node service on `<the guest's host_ip>:<port>` (the CI cache): its
+	/// connections are handed over instead of proxied.
+	local:  std::sync::OnceLock<(u16, Arc<dyn crate::ci_cache::LocalService>)>,
 }
 
 impl Proxy {
@@ -51,7 +63,11 @@ impl Proxy {
 			.await
 			.with_context(|| format!("binding egress proxy on port {port}"))?;
 		let local = listener.local_addr()?;
-		let proxy = Arc::new(Self { port: local.port(), guests: RwLock::new(HashMap::new()) });
+		let proxy = Arc::new(Self {
+			port:   local.port(),
+			guests: RwLock::new(HashMap::new()),
+			local:  std::sync::OnceLock::new(),
+		});
 		let shared = Arc::new(shared);
 		let weak = Arc::downgrade(&proxy);
 		tokio::spawn(async move {
@@ -68,7 +84,7 @@ impl Proxy {
 				let IpAddr::V4(guest) = peer.ip().to_canonical() else {
 					continue;
 				};
-				let Some(policy) = proxy.guests.read().get(&guest).cloned() else {
+				let Some(attached) = proxy.guests.read().get(&guest).cloned() else {
 					tracing::debug!(%peer, "egress connection from unknown guest");
 					continue;
 				};
@@ -81,7 +97,13 @@ impl Proxy {
 					},
 				};
 				let _ = stream.set_nodelay(true);
-				let shared = shared.clone();
+				if let Some((port, service)) = proxy.local.get()
+					&& orig == SocketAddr::V4(SocketAddrV4::new(attached.host_ip, *port))
+				{
+					service.serve(stream, attached.sandbox.to_string(), orig);
+					continue;
+				}
+				let (shared, policy) = (shared.clone(), attached.policy);
 				tokio::spawn(async move {
 					if let Err(e) = proxy::handle(stream, orig, policy, &shared).await {
 						tracing::debug!(%peer, %orig, "egress flow ended: {e}");
@@ -97,9 +119,15 @@ impl Proxy {
 		self.port
 	}
 
-	/// Install or replace the policy for flows from `guest`.
-	pub fn set(&self, guest: Ipv4Addr, policy: Arc<Compiled>) {
-		self.guests.write().insert(guest, policy);
+	/// Install or replace the attachment of `guest`.
+	pub fn set(&self, guest: Ipv4Addr, attached: Guest) {
+		self.guests.write().insert(guest, attached);
+	}
+
+	/// Serves guest connections to `<host_ip>:port` with `service` (set
+	/// once).
+	pub fn set_local(&self, port: u16, service: Arc<dyn crate::ci_cache::LocalService>) {
+		let _ = self.local.set((port, service));
 	}
 
 	/// Stop serving flows from `guest`.
@@ -673,9 +701,23 @@ mod tests {
 		assert_eq!(rules[0].1[..3], ["-t", "nat", "PREROUTING"]);
 	}
 
+	/// A node-local service that reports what the proxy handed it.
+	struct Local;
+
+	impl crate::ci_cache::LocalService for Local {
+		fn serve(&self, mut stream: tokio::net::TcpStream, sandbox_id: String, local: SocketAddr) {
+			tokio::spawn(async move {
+				let _ = stream
+					.write_all(format!("local-ok {sandbox_id} {local}\n").as_bytes())
+					.await;
+			});
+		}
+	}
+
 	/// Privileged end-to-end check (run as root on Linux with
 	/// `VMON_EGRESS_NETNS_TEST=1`): a veth "tap" into a guest netns, real
-	/// REDIRECT + `SO_ORIGINAL_DST`, CIDR allow/deny and live update.
+	/// REDIRECT + `SO_ORIGINAL_DST`, CIDR allow/deny, live update, and the
+	/// node-local service hand-over.
 	#[tokio::test]
 	async fn netns_redirect_end_to_end() {
 		if std::env::var_os("VMON_EGRESS_NETNS_TEST").is_none() {
@@ -763,8 +805,16 @@ mod tests {
 			.await
 			.expect("proxy");
 		let guest: Ipv4Addr = "172.31.250.2".parse().expect("ip");
+		let attached = |policy: &Compiled| Guest {
+			policy:  Arc::new(policy.clone()),
+			sandbox: "sbx-test".into(),
+			host_ip: "172.31.250.1".parse().expect("ip"),
+		};
+		// The node-local service on the TAP address gets the guest's
+		// connections with the sandbox they belong to.
+		proxy.set_local(7948, Arc::new(Local));
 		let deny = compiled(&[], &["198.51.100.0/24"], &[]);
-		proxy.set(guest, Arc::new(deny.clone()));
+		proxy.set(guest, attached(&deny));
 		// Pooled path: hooks with closed chains first, then the add-only open.
 		install_hooks(tap, proxy.port())
 			.await
@@ -799,9 +849,19 @@ mod tests {
 		);
 		let (_, out) = fetch("198.51.100.1").await;
 		assert!(!out.contains("origin-ok"), "denied origin must be unreachable: {out}");
+		let (_, out) = sh(format!(
+			"ip netns exec {guest_ns} sh -c 'exec 3<>/dev/tcp/172.31.250.1/7948 2>/dev/null && \
+			 timeout 3 cat <&3' 2>&1 || ip netns exec {guest_ns} timeout 3 nc -w 2 172.31.250.1 7948 \
+			 </dev/null"
+		))
+		.await;
+		assert!(
+			out.contains("local-ok sbx-test 172.31.250.1:7948"),
+			"the TAP address's service port reaches the node service: {out}"
+		);
 		// Live update flips the decision.
 		let flipped = compiled(&[], &["203.0.113.0/24"], &[]);
-		proxy.set(guest, Arc::new(flipped.clone()));
+		proxy.set(guest, attached(&flipped));
 		apply_filter(tap, &flipped).await.expect("update");
 		let (_, out) = fetch("198.51.100.1").await;
 		assert!(out.contains("origin-ok"), "after update: {out}");
@@ -824,7 +884,7 @@ mod tests {
 		// re-dialed by name on the host, so it must still work.
 		if let Ok(domain) = std::env::var("VMON_EGRESS_DOMAIN") {
 			let domains = compiled(&[domain.as_str()], &["0.0.0.0/0"], &[]);
-			proxy.set(guest, Arc::new(domains.clone()));
+			proxy.set(guest, attached(&domains));
 			apply_filter(tap, &domains).await.expect("update");
 			let curl = |scheme: &str, host: &str| {
 				let port = if scheme == "https" { 443 } else { 80 };

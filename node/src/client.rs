@@ -339,6 +339,20 @@ impl NodeClient {
 		ensure_ok(response).await
 	}
 
+	/// Streams a peer's local copy of a CI cache archive
+	/// (`crate::ci_cache`); the caller verifies its sha256.
+	pub async fn ci_cache_blob(&self, digest: &str) -> Result<reqwest::Response, NodeError> {
+		let url = self.url(&format!("/ci-cache/blobs/{digest}"))?;
+		let response = self
+			.http
+			.get(url)
+			.bearer_auth(&self.secret)
+			.send()
+			.await
+			.map_err(transport)?;
+		ensure_ok(response).await
+	}
+
 	/// Forwards an arbitrary request below `/node/v1` (volume content API).
 	/// `path_and_query` starts with `/`.
 	pub async fn forward(

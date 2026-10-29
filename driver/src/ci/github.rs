@@ -102,11 +102,17 @@ pub struct Installation {
 	pub permissions:  BTreeMap<String, String>,
 }
 
+/// A repository (webhook payloads, installation lists, `GET /repos/{repo}`).
 #[derive(Clone, Debug, Deserialize)]
 pub struct Repository {
-	pub full_name: String,
+	pub full_name:      String,
 	#[serde(default)]
-	pub private:   bool,
+	pub private:        bool,
+	/// GitHub's repository id (stable across renames).
+	#[serde(default)]
+	pub id:             Option<u64>,
+	#[serde(default)]
+	pub default_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +125,45 @@ pub struct Login {
 pub struct Run {
 	pub actor:            Login,
 	pub triggering_actor: Option<Login>,
+	/// Triggering event (`push`, `pull_request`, …).
+	#[serde(default)]
+	pub event:            String,
+	/// Branch (or, for `release`, tag) the run is for.
+	#[serde(default)]
+	pub head_branch:      Option<String>,
+	#[serde(default)]
+	pub head_sha:         String,
+	/// Pull requests of the run's head branch in this repository (empty for
+	/// pull requests from forks).
+	#[serde(default)]
+	pub pull_requests:    Vec<PullRequest>,
+	/// Repository the head commit is in (a fork's, for fork pull requests).
+	#[serde(default)]
+	pub head_repository:  Option<HeadRepository>,
+}
+
+/// A pull request as runs and `GET /repos/{repo}/pulls` carry it (the fields
+/// CI reads).
+#[derive(Clone, Debug, Deserialize)]
+pub struct PullRequest {
+	pub number: u64,
+	pub base:   PullRef,
+	pub head:   PullRef,
+}
+
+/// One side of a pull request.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PullRef {
+	/// Branch name.
+	#[serde(rename = "ref")]
+	pub branch: String,
+	#[serde(default)]
+	pub sha:    String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HeadRepository {
+	pub owner: Login,
 }
 
 /// A workflow job as the webhooks and the jobs API carry it.
@@ -481,6 +526,36 @@ impl Github {
 			)
 			.await
 			.map(drop)
+	}
+
+	// ------------------------------------------------------- repositories
+
+	/// `GET /repos/{repo}`.
+	pub async fn repository(&self, installation_id: u64, repo: &str) -> Result<Repository> {
+		self
+			.json(Auth::Installation(installation_id), Method::GET, &format!("/repos/{repo}"), None)
+			.await
+	}
+
+	/// Pull requests of `repo` (open or closed) whose head is `owner:branch`
+	/// (one page: a head branch has few pull requests).
+	pub async fn pulls_by_head(
+		&self,
+		installation_id: u64,
+		repo: &str,
+		owner: &str,
+		branch: &str,
+	) -> Result<Vec<PullRequest>> {
+		let head: String =
+			url::form_urlencoded::byte_serialize(format!("{owner}:{branch}").as_bytes()).collect();
+		self
+			.json(
+				Auth::Installation(installation_id),
+				Method::GET,
+				&format!("/repos/{repo}/pulls?head={head}&state=all&per_page=100"),
+				None,
+			)
+			.await
 	}
 
 	// ----------------------------------------------------------- actions
