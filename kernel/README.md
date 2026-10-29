@@ -12,7 +12,7 @@ units in the default templates fail under it.
 |---|---|
 | `build.sh` | Reproducible build (pinned source tarball + sha256, fixed build metadata). |
 | `config/common.config` | Fragment for both arches (see the groups in the file). |
-| `config/aarch64.config`, `config/x86_64.config` | Arch fragments (boot path pins, IA32 emulation, x86 GPU options, x86 KVM for nested virtualization). |
+| `config/aarch64.config`, `config/x86_64.config` | Arch fragments (boot path pins, IA32 emulation with its 32-bit time syscalls, x86 GPU options, x86 KVM for nested virtualization). |
 | `Dockerfile` | Ubuntu 24.04 toolchain image `just kernel` uses on macOS. |
 | `nvidia.sh` | NVIDIA GPU driver bundle for a built kernel (`build.sh --nvidia`, `just gpu-driver`). |
 
