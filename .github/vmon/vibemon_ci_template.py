@@ -94,6 +94,15 @@ git remote add origin {REPO_URL}
 git fetch -q --depth 1 origin {sha}
 git checkout -q --detach FETCH_HEAD
 test "$(git rev-parse HEAD)" = {sha}
+# actions/checkout ends in `git checkout --force`, which rewrites every file
+# whose index stat data looks stale, and the entries written in the same
+# second as the index are (racily clean); a rewrite bumps every mtime and
+# makes the pre-built target/ rebuild all workspace crates. Refresh the index
+# once the clock has moved past the files, and compare only mtime and size.
+git config core.checkStat minimal
+git config core.trustctime false
+sleep 1
+git update-index -q --refresh
 """
 
 
