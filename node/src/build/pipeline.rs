@@ -68,8 +68,9 @@ elif command -v rc-status >/dev/null 2>&1; then
 	while pgrep -f '[o]penrc default' >/dev/null 2>&1 && [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done
 fi
 ";
-/// Minimum resources for helper VMs (unpack/steps); the template VM uses the
-/// request.
+/// Resources of the unpack VM, and the floor of the steps VM, which otherwise
+/// runs at the build's requested size (as the template VM does) so heavy steps
+/// such as compilers get the memory the template asked for.
 const HELPER_MEMORY_MB: u64 = 1024;
 const HELPER_VCPUS: u32 = 2;
 /// virtio-fs tags.
@@ -392,9 +393,11 @@ impl Job {
 			} else {
 				to_run.first().map_or(BASE, |l| l.label.as_str())
 			};
-			let guard = boot_helper(&builder, &req.build_id, "steps", &rootfs, &build_dir, shares)
-				.await
-				.map_err(fail(label_on_boot))?;
+			let size = (req.vcpus.max(HELPER_VCPUS), req.memory_mb.max(HELPER_MEMORY_MB));
+			let guard =
+				boot_helper(&builder, &req.build_id, "steps", size, &rootfs, &build_dir, shares)
+					.await
+					.map_err(fail(label_on_boot))?;
 			let vm = guard.vm().clone();
 			let agent = vm.agent();
 			if !copy_hashes.is_empty() {
@@ -679,11 +682,13 @@ async fn unpack(
 	guard.wait_poweroff(POWEROFF_GRACE).await
 }
 
-/// Boots the rootfs with the agent as PID 1 and network (steps VM).
+/// Boots the rootfs with the agent as PID 1 and network (steps VM) at
+/// `(vcpus, memory_mb)`.
 async fn boot_helper(
 	builder: &Builder,
 	build_id: &str,
 	phase: &str,
+	(vcpus, memory_mb): (u32, u64),
 	rootfs: &Path,
 	build_dir: &Path,
 	shares: Vec<FsShare>,
@@ -698,8 +703,8 @@ async fn boot_helper(
 			initrd:  None,
 			cmdline: kernel_cmdline(&inner.config.arch, provision::ENVD_PATH),
 		},
-		vcpus: HELPER_VCPUS,
-		memory_mb: HELPER_MEMORY_MB,
+		vcpus,
+		memory_mb,
 		disk: Some(Disk::Direct { path: rootfs.to_owned(), read_only: false }),
 		shares,
 		net: net.net.clone(),

@@ -1179,7 +1179,9 @@ to its gossip are skipped.
    Template and sandbox boots use `init=/usr/sbin/init` (or
    `init=/usr/bin/envd`), recorded as `ArtifactMeta.boot_init`.
 4. **Steps** (same VM as step 3: agent as PID 1, network, guest clock set
-   via GC4 `set_time`): the file-context share (archives fetched from
+   via GC4 `set_time`; sized like the template VM, at least 2 vCPUs and
+   1 GiB, while the unpack VM always runs at that minimum): the
+   file-context share (archives fetched from
    `file_sources` and extracted on the host into
    `cache/context/<templateID>/<hash>/`) is mounted read-only; steps run
    through GC4 `exec` (`RUN` via `/bin/bash -l -c` or `sh` as the step user,

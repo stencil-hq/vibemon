@@ -11,6 +11,7 @@ All notable changes to this project are recorded here.
 
 ### Fixed
 
+- Template build steps run at the build's `cpuCount` and `memoryMB` (at least 2 vCPUs and 1 GiB). Before, every step ran in a 2 vCPU / 1 GiB VM whatever the build asked for, so memory-heavy steps such as `cargo install` were killed by the guest's OOM killer
 - Snapshots save and restore `IA32_FEATURE_CONTROL`, so VMs start in sandboxes forked from a template snapshot on Intel hosts. Before, the guest kernel crashed (`kvm_spurious_fault`) at the first vCPU; rebuild x86_64 templates captured by earlier releases before using `/dev/kvm` in them (on AMD such sandboxes stopped)
 
 ## 0.4.1
