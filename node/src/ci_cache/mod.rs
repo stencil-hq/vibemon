@@ -17,6 +17,7 @@
 //! listener (`GET /node/v1/ci-cache/blobs/{digest}`) while streaming it to the
 //! guest.
 
+pub mod bazel;
 pub mod blobs;
 mod http;
 pub mod index;
@@ -47,19 +48,27 @@ const GC_INTERVAL: Duration = Duration::from_mins(10);
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
 	/// `<data-dir>/ci-cache`.
-	pub dir:      PathBuf,
+	pub dir:          PathBuf,
 	/// Disk the local archives may occupy, in bytes (`--ci-cache-mb`).
-	pub budget:   u64,
+	pub budget:       u64,
+	/// Disk the Bazel cache entries may occupy, in bytes
+	/// (`--ci-bazel-cache-mb`).
+	pub bazel_budget: u64,
 	/// GitHub's results service for pass-through calls
 	/// (`--ci-results-upstream`).
-	pub upstream: Url,
+	pub upstream:     Url,
 	/// Cluster secret (peer archive fetches).
-	pub secret:   String,
-	pub http:     reqwest::Client,
+	pub secret:       String,
+	pub http:         reqwest::Client,
 }
 
 /// Starts the service and its periodic cleanup.
 pub fn start(config: CacheConfig, cluster: Cluster) -> anyhow::Result<Arc<Service>> {
+	tracing::info!(
+		actions_mb = config.budget >> 20,
+		bazel_mb = config.bazel_budget >> 20,
+		"CI cache budgets"
+	);
 	let service = Service::new(config, cluster)?;
 	let weak = Arc::downgrade(&service);
 	tokio::spawn(async move {

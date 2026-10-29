@@ -43,6 +43,49 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 /// Type-erased [`Io`] (plain TCP, TLS to a proxy, replayed prefix, …).
 pub type BoxedIo = Box<dyn Io>;
 
+/// Where a node-local service (the CI cache) listens for TAP guests.
+///
+/// `port` on the host side of every lease of the TAP pool (`--net-pool`; /30
+/// leases, host = block + 1), not only the guest's current gateway, so a
+/// sandbox migrated from another node keeps reaching it at the address it
+/// was told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalTarget {
+	pub port: u16,
+	base:     u32,
+	mask:     u32,
+}
+
+impl LocalTarget {
+	/// `port` on the lease host addresses of `pool` (`a.b.c.d/len`, `len`
+	/// 8–30, no host bits set).
+	pub fn new(port: u16, pool: &str) -> anyhow::Result<Self> {
+		let (addr, len) = pool
+			.split_once('/')
+			.with_context(|| format!("net pool {pool:?} must be a CIDR"))?;
+		let addr: Ipv4Addr = addr
+			.parse()
+			.with_context(|| format!("net pool {pool:?}: bad address"))?;
+		let len: u32 = len
+			.parse()
+			.with_context(|| format!("net pool {pool:?}: bad prefix length"))?;
+		anyhow::ensure!((8..=30).contains(&len), "net pool {pool:?}: prefix must be /8 to /30");
+		let mask = u32::MAX << (32 - len);
+		let base = u32::from(addr);
+		anyhow::ensure!(base & !mask == 0, "net pool {pool:?} has host bits set");
+		Ok(Self { port, base, mask })
+	}
+
+	/// Whether a guest connection to `orig` is for the service.
+	pub fn matches(&self, orig: std::net::SocketAddr) -> bool {
+		let std::net::SocketAddr::V4(orig) = orig else {
+			return false;
+		};
+		let ip = u32::from(*orig.ip());
+		orig.port() == self.port && ip & self.mask == self.base && (ip - self.base) % 4 == 1
+	}
+}
+
 /// Node egress settings (from `vmon serve` flags).
 #[derive(Clone, Debug)]
 pub struct EgressConfig {
@@ -149,15 +192,20 @@ impl Egress {
 		}
 	}
 
-	/// Hands TAP guests' connections to `<their host ip>:port` to `service`
-	/// instead of proxying them (the CI cache, [`crate::ci_cache`]); whatever
-	/// the sandbox's policy, the service decides whom it serves. Set once;
-	/// a no-op without TAP networking.
-	pub fn set_local_service(&self, port: u16, service: Arc<dyn crate::ci_cache::LocalService>) {
+	/// Hands TAP guests' connections to `target` (a port on any lease host
+	/// address) to `service` instead of proxying them (the CI cache,
+	/// [`crate::ci_cache`]), with the sandbox of the TAP they arrived on;
+	/// whatever the sandbox's policy, the service decides whom it serves. Set
+	/// once; a no-op without TAP networking.
+	pub fn set_local_service(
+		&self,
+		target: LocalTarget,
+		service: Arc<dyn crate::ci_cache::LocalService>,
+	) {
 		#[cfg(target_os = "linux")]
-		self.inner.proxy.set_local(port, service);
+		self.inner.proxy.set_local(target, service);
 		#[cfg(not(target_os = "linux"))]
-		let _ = (port, service);
+		let _ = (target, service);
 	}
 
 	/// CA PEM the guest must trust for HTTPS `rules` (envd `/init` `caBundle`).
@@ -254,11 +302,10 @@ impl Egress {
 				}
 			},
 			#[cfg(target_os = "linux")]
-			EgressNet::Tap { tap, guest_ip, host_ip } => {
+			EgressNet::Tap { tap, guest_ip, .. } => {
 				self.inner.proxy.set(*guest_ip, linux::Guest {
 					policy:  Arc::new(compiled.clone()),
 					sandbox: sandbox_id.into(),
-					host_ip: *host_ip,
 				});
 				let chains = self.inner.hooked.lock().get(tap).copied();
 				let installed = match chains {
@@ -301,12 +348,11 @@ impl Egress {
 			#[cfg(not(unix))]
 			EgressNet::User { .. } => bail!("live user-net policy updates require a Unix control socket"),
 			#[cfg(target_os = "linux")]
-			EgressNet::Tap { tap, guest_ip, host_ip } => {
+			EgressNet::Tap { tap, guest_ip, .. } => {
 				linux::apply_filter(tap, &compiled).await?;
 				self.inner.proxy.set(*guest_ip, linux::Guest {
 					policy:  Arc::new(compiled),
 					sandbox: sandbox_id.into(),
-					host_ip: *host_ip,
 				});
 				Ok(())
 			},
@@ -373,5 +419,24 @@ impl Egress {
 			#[cfg(not(target_os = "linux"))]
 			EgressNet::Tap { .. } => {},
 		}
+	}
+}
+
+#[cfg(test)]
+mod local_target_tests {
+	use super::LocalTarget;
+
+	#[test]
+	fn lease_host_addresses_of_the_pool_match() {
+		let target = LocalTarget::new(7948, "172.20.0.0/16").unwrap();
+		let at = |addr: &str| target.matches(addr.parse().unwrap());
+		// Host side (+1) of any /30 lease: the current or a previous gateway.
+		assert!(at("172.20.0.1:7948") && at("172.20.0.125:7948") && at("172.20.255.253:7948"));
+		// Network, guest, broadcast addresses; other ports; outside the pool.
+		assert!(!at("172.20.0.124:7948") && !at("172.20.0.126:7948") && !at("172.20.0.127:7948"));
+		assert!(!at("172.20.0.125:7949") && !at("172.21.0.1:7948") && !at("[::1]:7948"));
+		assert!(LocalTarget::new(7948, "172.20.0.1/16").is_err(), "host bits");
+		assert!(LocalTarget::new(7948, "172.20.0.0/31").is_err());
+		assert!(LocalTarget::new(7948, "nope").is_err());
 	}
 }

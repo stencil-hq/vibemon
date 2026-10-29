@@ -105,7 +105,9 @@ exit 0
 
 /// `sh` commands exporting `ACTIONS_RESULTS_URL` (POSIX `sh` and `awk`;
 /// `set -e` safe): the node's CI cache at the default gateway read from
-/// `route_file` when its ping answers, else GitHub's results service. The
+/// `route_file` when its ping answers, else GitHub's results service; with
+/// the cache also `VMON_CACHE_URL=http://<gateway>:<port>` (the Bazel remote
+/// cache is `$VMON_CACHE_URL/bazel`), unset without it. The
 /// gateway is the little-endian hex third field of the route whose
 /// destination and mask are `00000000`.
 fn results_url(route_file: &str) -> String {
@@ -115,7 +117,8 @@ fn results_url(route_file: &str) -> String {
 		 print \"0x\" substr($3, 7, 2), \"0x\" substr($3, 5, 2), \"0x\" substr($3, 3, 2), \"0x\" \
 		 substr($3, 1, 2); exit }}' {route} 2>/dev/null) || g=; if [ -n \"$g\" ]; then g=$(printf \
 		 '%d.%d.%d.%d' $g 2>/dev/null) || g=; fi; if [ -n \"$g\" ] && curl -fsS -m 3 -o /dev/null \
-		 \"http://$g:{port}{ping}\"; then u=\"http://$g:{port}/\"; else echo \"vmon: no CI cache \
+		 \"http://$g:{port}{ping}\"; then u=\"http://$g:{port}/\"; export \
+		 VMON_CACHE_URL=\"http://$g:{port}\"; else unset VMON_CACHE_URL; echo \"vmon: no CI cache \
 		 at the default gateway; using GitHub's results service\" >&2; fi; export \
 		 ACTIONS_RESULTS_URL=\"$u\"",
 		upstream = quote(ci_cache::DEFAULT_UPSTREAM),
@@ -260,7 +263,7 @@ mod tests {
 		.unwrap();
 		std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
 		let script = format!(
-			"set -e; {}; printf '%s' \"$ACTIONS_RESULTS_URL\"",
+			"set -e; {}; printf '%s %s' \"$ACTIONS_RESULTS_URL\" \"${{VMON_CACHE_URL-unset}}\"",
 			results_url(route.to_str().unwrap())
 		);
 		let output = Command::new("sh")
@@ -268,6 +271,7 @@ mod tests {
 			.arg(&script)
 			.env_clear()
 			.env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+			.env("VMON_CACHE_URL", "stale")
 			.output()
 			.unwrap();
 		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -286,21 +290,22 @@ mod tests {
 	#[test]
 	fn the_runner_uses_the_cache_at_the_default_gateway() {
 		let (url, curl) = results_with(Some(ROUTES), 0);
-		assert_eq!(url, "http://192.168.2.1:7948/");
+		assert_eq!(url, "http://192.168.2.1:7948/ http://192.168.2.1:7948");
 		let ping = "http://192.168.2.1:7948/_vmon/ping";
 		assert!(curl.contains("-m 3") && curl.contains(ping), "{curl}");
 	}
 
 	#[test]
 	fn the_runner_falls_back_to_github_without_the_cache() {
+		let fallback = format!("{} unset", ci_cache::DEFAULT_UPSTREAM);
 		let (url, curl) = results_with(Some(ROUTES), 7);
-		assert_eq!(url, ci_cache::DEFAULT_UPSTREAM, "the ping failed");
+		assert_eq!(url, fallback, "the ping failed: no VMON_CACHE_URL either");
 		assert!(curl.contains("192.168.2.1"), "{curl}");
 		let (url, curl) = results_with(None, 0);
-		assert_eq!(url, ci_cache::DEFAULT_UPSTREAM, "no route table");
+		assert_eq!(url, fallback, "no route table");
 		assert!(curl.is_empty(), "no probe without a gateway: {curl}");
 		let no_default = ROUTES.lines().take(2).collect::<Vec<_>>().join("\n");
-		assert_eq!(results_with(Some(&no_default), 0).0, ci_cache::DEFAULT_UPSTREAM);
+		assert_eq!(results_with(Some(&no_default), 0).0, fallback);
 	}
 
 	#[test]

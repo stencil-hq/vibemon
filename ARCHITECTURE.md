@@ -1712,10 +1712,15 @@ secret" is whichever signs what vmon receives.
   GitHub's results URL under that name and inherit the runner process's
   `ACTIONS_RESULTS_URL`; the start command sets it to
   `http://<guest default gateway>:7948/` after probing `GET /_vmon/ping`
-  (else GitHub's `https://results-receiver.actions.githubusercontent.com/`).
-  The node's egress proxy hands guest connections to `<lease host ip>:7948`
-  to the cache service with the lease's sandbox id (no iptables change: TAP
-  TCP is already redirected; nothing the guest sends identifies it). A
+  (else GitHub's `https://results-receiver.actions.githubusercontent.com/`),
+  and exports `VMON_CACHE_URL=http://<gateway>:7948` (unset when the probe
+  fails). The node's egress proxy hands guest connections to port 7948 of
+  the host address (`+1`) of any lease in `--net-pool` — not only the TAP's
+  own, so a sandbox migrated from another node (drain, evacuation) keeps
+  reaching the cache at the gateway URL its runner exported — to the cache
+  service with the sandbox id of the TAP the connection arrived on (no
+  iptables change: TAP TCP is already redirected; nothing the guest sends
+  identifies it). A
   sandbox without `db/ci_cache_grant/<id>` gets Twirp 403
   `permission_denied`. The controller writes each runner sandbox's grant
   every pass (the scope of the job GitHub reported on the runner, never of
@@ -1750,12 +1755,29 @@ secret" is whichever signs what vmon receives.
   only. Eviction: the driver leader sweeps every 10 min (entries unused
   7 days, then each repository's least recently used entries beyond
   50 GiB); each node keeps its copies within `--ci-cache-mb` (default 10%
-  of the data filesystem; LRU by file mtime, pinned while read or written)
+  of the data filesystem, at most a fifth of its free space plus the copies
+  held at start; LRU by file mtime, pinned while read or written)
   and drops copies no entry uses every 10 min; evicting a blob's last copy
   deletes its entries. Admin: `GET /admin/ci/caches`,
   `GET|DELETE /admin/ci/caches/{owner}/{name}[?keyPrefix=]`,
   `vmon admin ci caches`. Linux TAP nodes only: without the service the
   probe fails and jobs use GitHub's results service (GitHub's own cache).
+- **Bazel remote cache** (`node::ci_cache::bazel`): the same node service
+  speaks Bazel's HTTP cache protocol, `GET|HEAD|PUT /bazel/{ac,cas}/<sha256>`
+  (`--remote_cache=$VMON_CACHE_URL/bazel`), attributed and granted like the
+  Actions cache (no grant → 403; the scope wait applies). Entries are
+  namespaced by the grant's repository id and stored only on the node, with
+  no KV index: `<data-dir>/ci-cache/bazel/<repo id>/{ac,cas}/<aa>/<sha256>`
+  (temp file under `tmp/`, fsync, rename; served with `Content-Length`). CAS
+  bodies must hash to their key (400). Writes (AC and CAS) need a grant
+  scope `refs/heads/*` or `refs/tags/*`; pull request (and isolated) scopes
+  read only, PUT → 403. A local `GET` miss asks every other alive node
+  (`GET /node/v1/ci-cache/bazel/{repo}/{kind}/{sha256}`, cluster secret,
+  2 s for the first 200) and stores the copy (CAS verified). LRU within
+  `--ci-bazel-cache-mb` (default 5% of the data filesystem, at most a fifth
+  of its free space plus the entries held at start), recency in memory,
+  seeded from file mtimes at start; an entry over half the budget is refused
+  (413). Readers keep their file open across an eviction.
 - **Sizes**: `CreateSpec.resources` (driver-internal, not on the E2B API)
   overrides the build's vCPUs/memory (build rules: 1 or even ≤ 32 vCPUs,
   ≥ 128 MiB; team limits). A size other than the build's sets

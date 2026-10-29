@@ -15,6 +15,7 @@ use vmon_cluster::{Cluster, ClusterConfig, MemberMeta, NodeId, Roles};
 
 use super::{
 	CacheConfig, PING_PATH, Service,
+	bazel::BazelStore,
 	blobs::BlobStore,
 	index,
 	records::{CacheEntryRow, CacheGrant, CacheScope, EntryState},
@@ -74,15 +75,19 @@ impl Harness {
 		let dir = tempfile::tempdir().expect("temp dir");
 		let cluster = start_cluster(&dir).await;
 		let store = BlobStore::open(&dir.path().join("ci-cache"), budget).expect("blob store");
+		let bazel =
+			BazelStore::open(&dir.path().join("ci-cache/bazel"), 1 << 20).expect("bazel store");
 		let service = Service::with(
 			CacheConfig {
 				dir: dir.path().join("ci-cache"),
 				budget,
+				bazel_budget: 1 << 20,
 				upstream: upstream.parse().expect("upstream"),
 				secret: "test-secret".into(),
 				http: reqwest::Client::new(),
 			},
 			store,
+			bazel,
 			cluster.kv.clone(),
 			cluster.local_id(),
 			None,
@@ -571,5 +576,63 @@ async fn evicting_the_last_copy_drops_its_entries() {
 	let keys: Vec<_> = h.entries().await.into_iter().map(|row| row.key).collect();
 	assert_eq!(keys, vec!["b"]);
 	assert!(h.restore("main", "a", &[], "v1").await.is_none());
+	h.cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bazel_cache_reads_for_every_ci_job_and_writes_for_branches_only() {
+	let h = Harness::start("http://127.0.0.1:9/", 1 << 30).await;
+	let blob = b"bazel output".to_vec();
+	let cas = format!("/bazel/cas/{}", hex::encode(Sha256::digest(&blob)));
+	let ac = format!("/bazel/ac/{}", hex::encode(Sha256::digest(b"action key")));
+	let put = |path: &str, body: Vec<u8>| Request::put(path).body(Body::from(body)).unwrap();
+	let get = |path: &str| Request::get(path).body(Body::empty()).unwrap();
+	let head = |path: &str| Request::head(path).body(Body::empty()).unwrap();
+
+	assert_eq!(h.send("main", get(&cas)).await.0, StatusCode::NOT_FOUND);
+	// A branch job writes; the CAS body must match its digest.
+	assert_eq!(h.send("main", put(&cas, blob.clone())).await.0, StatusCode::OK);
+	let (status, _, body) = h
+		.send("main", put(&cas.replace("/cas/", "/cas/0"), blob.clone()))
+		.await;
+	assert_eq!(status, StatusCode::NOT_FOUND, "not a sha256: {}", String::from_utf8_lossy(&body));
+	let wrong = format!("/bazel/cas/{}", hex::encode(Sha256::digest(b"other")));
+	let (status, _, body) = h.send("main", put(&wrong, blob.clone())).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
+	assert_eq!(h.send("main", get(&wrong)).await.0, StatusCode::NOT_FOUND, "nothing stored");
+	assert_eq!(h.send("main", put(&ac, b"action result".to_vec())).await.0, StatusCode::OK);
+
+	// Every CI job of the repository reads, with a Content-Length.
+	for sandbox in ["main", "feat", "pr"] {
+		let (status, headers, body) = h.send(sandbox, get(&cas)).await;
+		assert_eq!((status, body.as_slice()), (StatusCode::OK, blob.as_slice()), "{sandbox}");
+		assert_eq!(headers["content-length"], blob.len().to_string().as_str());
+	}
+	let (status, headers, body) = h.send("pr", head(&ac)).await;
+	assert_eq!((status, body.len()), (StatusCode::OK, 0));
+	assert_eq!(headers["content-length"], "13");
+	assert_eq!(h.send("pr", get(&ac)).await.2, b"action result");
+
+	// A pull request job may not write (Bazel only warns).
+	let pr_blob = b"pr output".to_vec();
+	let pr_cas = format!("/bazel/cas/{}", hex::encode(Sha256::digest(&pr_blob)));
+	assert_eq!(h.send("pr", put(&pr_cas, pr_blob)).await.0, StatusCode::FORBIDDEN);
+	assert_eq!(h.send("pr", put(&ac, b"poisoned".to_vec())).await.0, StatusCode::FORBIDDEN);
+	assert_eq!(h.send("main", get(&ac)).await.2, b"action result");
+	assert_eq!(h.send("main", get(&pr_cas)).await.0, StatusCode::NOT_FOUND);
+
+	// Entries are per repository; non-CI sandboxes get nothing.
+	let mut other = scope(MAIN, &[MAIN]);
+	other.repo_id = REPO + 1;
+	h.grant("elsewhere", Some(other)).await;
+	assert_eq!(h.send("elsewhere", get(&cas)).await.0, StatusCode::NOT_FOUND);
+	assert_eq!(h.send("web", get(&cas)).await.0, StatusCode::FORBIDDEN);
+	assert_eq!(h.send("web", put(&cas, blob.clone())).await.0, StatusCode::FORBIDDEN);
+	// Tag jobs write too.
+	h.grant("tag", Some(scope("refs/tags/v1", &["refs/tags/v1", MAIN])))
+		.await;
+	let tag_blob = b"release".to_vec();
+	let tag_cas = format!("/bazel/cas/{}", hex::encode(Sha256::digest(&tag_blob)));
+	assert_eq!(h.send("tag", put(&tag_cas, tag_blob)).await.0, StatusCode::OK);
 	h.cluster.shutdown().await;
 }

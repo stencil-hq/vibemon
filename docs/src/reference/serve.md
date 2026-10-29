@@ -167,11 +167,12 @@ The hugepage write sets the absolute size of the host pool; it does not add to t
 
 ## CI
 
-Driver role, [vmon CI](../operate/ci.md). The GitHub App's credentials are not flags: they live encrypted in the store (`vmon admin ci app set` or the dashboard). The `--ci-cache-mb` and `--ci-results-upstream` flags belong to the node role ([Actions cache](../operate/ci.md#actions-cache)).
+Driver role, [vmon CI](../operate/ci.md). The GitHub App's credentials are not flags: they live encrypted in the store (`vmon admin ci app set` or the dashboard). The `--ci-cache-mb`, `--ci-bazel-cache-mb`, and `--ci-results-upstream` flags belong to the node role ([Actions cache](../operate/ci.md#actions-cache)).
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
 | `--ci-template <CI_TEMPLATE>` | `VMON_CI_TEMPLATE` | `ci` | Template of CI runner sandboxes whose `runs-on` label has no `from=` option, resolved in the linked team like any template reference. |
 | `--ci-github-api <CI_GITHUB_API>` | `VMON_CI_GITHUB_API` | `https://api.github.com` | Hidden. GitHub REST API base URL; tests point it at a fake GitHub. The dashboard's manifest flow derives the web URL from it (`https://github.com` for the default). |
-| `--ci-cache-mb <CI_CACHE_MB>` | `VMON_CI_CACHE_MB` | `0` | Disk this node's copies of CI cache archives (`ci-cache/blobs/`) may occupy, in MiB. Least recently used copies are evicted beyond it; an archive whose last copy goes takes its cache entries with it. `0` means 10% of the filesystem holding the data directory. |
+| `--ci-cache-mb <CI_CACHE_MB>` | `VMON_CI_CACHE_MB` | `0` | Disk this node's copies of CI cache archives (`ci-cache/blobs/`) may occupy, in MiB. Least recently used copies are evicted beyond it; an archive whose last copy goes takes its cache entries with it. `0` means 10% of the filesystem holding the data directory, at most a fifth of its free space (plus the copies already held) at start. |
+| `--ci-bazel-cache-mb <CI_BAZEL_CACHE_MB>` | `VMON_CI_BAZEL_CACHE_MB` | `0` | Disk the node-local [Bazel remote cache](../operate/ci.md#bazel-remote-cache) (`ci-cache/bazel/`) may occupy, in MiB. Least recently used entries are evicted beyond it. `0` means 5% of the filesystem holding the data directory, at most a fifth of its free space (plus the entries already held) at start. |
 | `--ci-results-upstream <CI_RESULTS_UPSTREAM>` | `VMON_CI_RESULTS_UPSTREAM` | `https://results-receiver.actions.githubusercontent.com/` | GitHub results service that CI sandboxes' other Twirp calls (artifacts and anything but the cache) are forwarded to, unchanged. |

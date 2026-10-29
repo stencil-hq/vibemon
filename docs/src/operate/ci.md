@@ -98,7 +98,7 @@ Jobs on vmon runners use the GitHub Actions cache unchanged (`actions/cache`, `S
 How it works:
 
 - The `ci` template's runner is patched (one string in `Runner.Worker.dll`, pinned by sha256) so the cache client talks to the `ACTIONS_RESULTS_URL` the runner was started with instead of GitHub's. vmon starts the runner with `ACTIONS_RESULTS_URL=http://<sandbox gateway>:7948/`, a service of the node the sandbox runs on. Templates built `from=` `ci` inherit this.
-- The node attributes each request to the sandbox by its network attachment, never by anything the job sends, and serves only CI runner sandboxes; other sandboxes get 403.
+- The node attributes each request to the sandbox by its network attachment, never by anything the job sends, and serves only CI runner sandboxes; other sandboxes get 403. A runner moved to another node (node drain) keeps using the URL it started with: every node answers on the gateway address of any lease in its `--net-pool` (use the same pool on all nodes).
 - Scopes follow GitHub's rules, taken from GitHub's record of the workflow run: a job saves to its own ref (`refs/heads/<branch>`, `refs/pull/<n>/merge`, `refs/tags/<tag>`) and restores from its own ref, then (pull requests) the base branch, then the default branch. A pull request never writes to its base or default branch, and a branch never reads another branch except the default. `pull_request_target` runs save to the base branch, as on GitHub.
 - Lookup: exact key, then each `restore-keys` prefix (newest match first), per ref in that order; the cache version (paths and compression) must match. Entries are immutable: saving an existing key logs GitHub's "another job may be creating this cache" message.
 - A restore on a node without the archive copies it from a node that has it while streaming it to the job.
@@ -110,7 +110,7 @@ Storage and eviction:
 |---|---|---|
 | Unused entries | 7 days | Removed (GitHub's rule). |
 | Per repository | 50 GiB | Least recently used entries are removed beyond it. |
-| Per node (`--ci-cache-mb`) | 10% of the data filesystem | Least recently used local copies are removed beyond it; an archive whose last copy goes takes its entries with it. |
+| Per node (`--ci-cache-mb`) | 10% of the data filesystem, at most a fifth of its free space at start | Least recently used local copies are removed beyond it; an archive whose last copy goes takes its entries with it. |
 | Unfinished uploads | 1 hour | The reservation is released. |
 
 Archives live in `<data-dir>/ci-cache/`, the index in the cluster store.
@@ -122,6 +122,22 @@ vmon admin ci caches delete acme/app --key-prefix cargo-   # drop entries
 ```
 
 The cache needs Linux nodes with TAP networking. Elsewhere the runner falls back to GitHub's results service (GitHub's own cache).
+
+### Bazel remote cache
+
+The same node service is a [Bazel HTTP remote cache](https://bazel.build/remote/caching#http-caching). When the node serves it, the runner exports `VMON_CACHE_URL=http://<sandbox gateway>:7948` to every step (unset otherwise):
+
+```sh
+# push, tag, workflow_dispatch, schedule, … jobs: read and write
+bazel build --remote_cache="$VMON_CACHE_URL/bazel" --remote_local_fallback //...
+# pull request jobs: read only
+bazel build --remote_cache="$VMON_CACHE_URL/bazel" --remote_upload_local_results=false --remote_local_fallback //...
+```
+
+- Entries (`/bazel/ac/<sha256>`, `/bazel/cas/<sha256>`) belong to the job's repository; other repositories never see them. CAS uploads must hash to their key.
+- Only jobs saving to a branch or tag (`refs/heads/*`, `refs/tags/*`) may write. Pull request jobs read the repository's entries, but their uploads get 403 (Bazel prints a warning per upload), so pass `--remote_upload_local_results=false` on pull requests. `pull_request_target` jobs save to the base branch and may write; workflows that build pull request code in `pull_request_target` should also disable uploads.
+- Entries stay on the node that stored them; a miss asks the other nodes (2 s) and keeps a copy. Least recently used entries are evicted beyond `--ci-bazel-cache-mb` (default 5% of the data filesystem, at most a fifth of its free space at start). Unlike the Actions cache there is no cluster index and no admin listing; `<data-dir>/ci-cache/bazel/<repo id>/` can be deleted while the node is stopped.
+- Use `--remote_local_fallback` so a cache outage never fails a build, and prefer downloading all outputs (no `--remote_download_toplevel`/`minimal`): an evicted entry cannot be refetched.
 
 Container actions (`uses: docker://…` or a Dockerfile action) and steps of `container:` jobs receive only the variables the runner hands them: they see GitHub's results URL as `ACTIONS_RESULTS_ORL` and no `ACTIONS_RESULTS_URL`, so caching and artifact uploads from inside a container need `ACTIONS_RESULTS_URL: ${{ env.ACTIONS_RESULTS_URL }}` passed explicitly (or the step moved out of the container). Script and JavaScript steps on the runner itself are unaffected.
 

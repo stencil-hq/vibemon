@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 use tokio::net::TcpListener;
 
 use super::{
+	LocalTarget,
 	policy::{Cidr, Compiled},
 	proxy::{self, Shared},
 };
@@ -43,17 +44,15 @@ const COMMENT: &str = "vmon-egress";
 pub struct Guest {
 	pub policy:  Arc<Compiled>,
 	pub sandbox: Arc<str>,
-	/// Host side of the guest's TAP.
-	pub host_ip: Ipv4Addr,
 }
 
 /// The node's transparent proxy listener and its guest-IP → policy table.
 pub struct Proxy {
 	port:   u16,
 	guests: RwLock<HashMap<Ipv4Addr, Guest>>,
-	/// Node service on `<the guest's host_ip>:<port>` (the CI cache): its
-	/// connections are handed over instead of proxied.
-	local:  std::sync::OnceLock<(u16, Arc<dyn crate::ci_cache::LocalService>)>,
+	/// Node service on a port of every lease host address (the CI cache):
+	/// its connections are handed over instead of proxied.
+	local:  std::sync::OnceLock<(LocalTarget, Arc<dyn crate::ci_cache::LocalService>)>,
 }
 
 impl Proxy {
@@ -97,8 +96,8 @@ impl Proxy {
 					},
 				};
 				let _ = stream.set_nodelay(true);
-				if let Some((port, service)) = proxy.local.get()
-					&& orig == SocketAddr::V4(SocketAddrV4::new(attached.host_ip, *port))
+				if let Some((target, service)) = proxy.local.get()
+					&& target.matches(orig)
 				{
 					service.serve(stream, attached.sandbox.to_string(), orig);
 					continue;
@@ -124,10 +123,9 @@ impl Proxy {
 		self.guests.write().insert(guest, attached);
 	}
 
-	/// Serves guest connections to `<host_ip>:port` with `service` (set
-	/// once).
-	pub fn set_local(&self, port: u16, service: Arc<dyn crate::ci_cache::LocalService>) {
-		let _ = self.local.set((port, service));
+	/// Serves guest connections to `target` with `service` (set once).
+	pub fn set_local(&self, target: LocalTarget, service: Arc<dyn crate::ci_cache::LocalService>) {
+		let _ = self.local.set((target, service));
 	}
 
 	/// Stop serving flows from `guest`.
@@ -808,11 +806,11 @@ mod tests {
 		let attached = |policy: &Compiled| Guest {
 			policy:  Arc::new(policy.clone()),
 			sandbox: "sbx-test".into(),
-			host_ip: "172.31.250.1".parse().expect("ip"),
 		};
-		// The node-local service on the TAP address gets the guest's
-		// connections with the sandbox they belong to.
-		proxy.set_local(7948, Arc::new(Local));
+		// The node-local service on the lease host addresses of the pool gets
+		// the guest's connections with the sandbox they belong to.
+		let target = LocalTarget::new(7948, "172.31.250.0/24").expect("pool");
+		proxy.set_local(target, Arc::new(Local));
 		let deny = compiled(&[], &["198.51.100.0/24"], &[]);
 		proxy.set(guest, attached(&deny));
 		// Pooled path: hooks with closed chains first, then the add-only open.
@@ -859,6 +857,19 @@ mod tests {
 			out.contains("local-ok sbx-test 172.31.250.1:7948"),
 			"the TAP address's service port reaches the node service: {out}"
 		);
+		// Another lease's host address (a gateway the sandbox had on its
+		// previous node) reaches the same service, attributed by this TAP; a
+		// guest address of the pool does not.
+		let local = |ip: &'static str| {
+			sh(format!(
+				"ip netns exec {guest_ns} sh -c 'exec 3<>/dev/tcp/{ip}/7948 2>/dev/null && timeout 3 \
+				 cat <&3' 2>&1 || ip netns exec {guest_ns} timeout 3 nc -w 2 {ip} 7948 </dev/null"
+			))
+		};
+		let (_, out) = local("172.31.250.125").await;
+		assert!(out.contains("local-ok sbx-test 172.31.250.125:7948"), "migrated gateway: {out}");
+		let (_, out) = local("172.31.250.126").await;
+		assert!(!out.contains("local-ok"), "a guest address is not the service: {out}");
 		// Live update flips the decision.
 		let flipped = compiled(&[], &["203.0.113.0/24"], &[]);
 		proxy.set(guest, attached(&flipped));

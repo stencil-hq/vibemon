@@ -32,10 +32,11 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use url::Url;
-use vmon_cluster::{Cluster, NodeId, kv::Kv};
+use vmon_cluster::{Cluster, NodeId, gossip::MemberState, kv::Kv};
 
 use super::{
 	CacheConfig, LocalService, PING_PATH,
+	bazel::{BazelStore, Kind},
 	blobs::{BlobStore, Pin},
 	index::{self, REPO_BUDGET, Reserved},
 	records::{CacheGrant, CacheScope, entry_key, valid_digest},
@@ -47,6 +48,12 @@ use crate::{client::NodeClient, server::ApiError};
 const TWIRP: &str = "/twirp/";
 /// The cache service the toolkit talks to.
 const CACHE_SERVICE: &str = "github.actions.results.api.v1.CacheService";
+/// Path prefix of the Bazel HTTP cache (`<prefix>{ac,cas}/<sha256>`).
+const BAZEL_PATH: &str = "/bazel/";
+/// How long a Bazel cache miss waits for the other nodes' answers.
+const PEER_LOOKUP: Duration = Duration::from_secs(2);
+/// Upper bound of copying a Bazel entry from another node.
+const PEER_COPY: Duration = Duration::from_mins(5);
 /// Path prefix of the signed blob URLs (`<account>/<container>/<blob>` for
 /// the Azure SDKs' IP-style URL parsing).
 const BLOB_PATH: &str = "/vmon/cache/";
@@ -95,6 +102,7 @@ pub struct Service {
 	cluster:   Option<Cluster>,
 	node:      NodeId,
 	store:     Arc<BlobStore>,
+	bazel:     Arc<BazelStore>,
 	uploads:   Uploads,
 	downloads: Mutex<HashMap<String, Download>>,
 	fetches:   Mutex<HashMap<String, FetchHandle>>,
@@ -300,12 +308,15 @@ impl Service {
 	pub fn new(config: CacheConfig, cluster: Cluster) -> anyhow::Result<Arc<Self>> {
 		let store = BlobStore::open(&config.dir, config.budget)
 			.with_context(|| format!("opening the CI cache at {}", config.dir.display()))?;
-		Ok(Self::with(config, store, cluster.kv.clone(), cluster.local_id(), Some(cluster)))
+		let bazel = BazelStore::open(&config.dir.join("bazel"), config.bazel_budget)
+			.with_context(|| format!("opening the Bazel cache in {}", config.dir.display()))?;
+		Ok(Self::with(config, store, bazel, cluster.kv.clone(), cluster.local_id(), Some(cluster)))
 	}
 
 	pub(super) fn with(
 		config: CacheConfig,
 		store: Arc<BlobStore>,
+		bazel: Arc<BazelStore>,
 		kv: Kv,
 		node: NodeId,
 		cluster: Option<Cluster>,
@@ -315,6 +326,7 @@ impl Service {
 			cluster,
 			node,
 			store,
+			bazel,
 			uploads: Uploads::default(),
 			downloads: Mutex::default(),
 			fetches: Mutex::default(),
@@ -340,6 +352,9 @@ impl Service {
 			&& !rest.contains('/')
 		{
 			return self.blob(req, sandbox).await;
+		}
+		if let Some(rest) = path.strip_prefix(BAZEL_PATH) {
+			return self.bazel(req, sandbox, rest).await;
 		}
 		let Some(call) = path.strip_prefix(TWIRP) else {
 			return twirp_error(StatusCode::NOT_FOUND, "bad_route", format!("no route for {path}"));
@@ -936,6 +951,134 @@ impl Service {
 		self.evict(0).await;
 	}
 
+	// ------------------------------------------------------------------ bazel
+
+	/// Bazel's HTTP cache protocol: `GET|HEAD|PUT /bazel/{ac,cas}/<sha256>`
+	/// in the repository of the sandbox's grant. Reads for every CI job of
+	/// the repository; writes only for jobs not scoped to a pull request
+	/// (`refs/heads/*`, `refs/tags/*`): 403, which Bazel reports as a
+	/// warning. A local `GET` miss asks the other nodes.
+	async fn bazel(self: &Arc<Self>, req: Request<Body>, sandbox: &str, rest: &str) -> Response {
+		let text = |status: StatusCode, message: &str| (status, message.to_owned()).into_response();
+		let Some((kind, hash)) = rest
+			.split_once('/')
+			.and_then(|(kind, hash)| Some((Kind::parse(kind)?, hash)))
+			.filter(|(_, hash)| valid_digest(hash))
+		else {
+			return text(StatusCode::NOT_FOUND, "expected /bazel/{ac,cas}/<sha256>");
+		};
+		let grant = match index::grant(&self.kv, sandbox).await {
+			Ok(Some(grant)) => grant,
+			Ok(None) => {
+				return text(
+					StatusCode::FORBIDDEN,
+					"the vmon CI cache serves CI runner sandboxes only",
+				);
+			},
+			Err(error) => {
+				tracing::warn!(%sandbox, "CI cache grant lookup failed: {error:#}");
+				return text(StatusCode::SERVICE_UNAVAILABLE, "cluster store unavailable");
+			},
+		};
+		let scope = match self.scope(sandbox, grant).await {
+			Ok((_, scope)) => scope,
+			Err(fail) => return *fail.0,
+		};
+		let repo = scope.repo_id;
+		let method = req.method().clone();
+		match method {
+			Method::GET | Method::HEAD => {
+				let mut found = self.bazel.open_entry(repo, kind, hash).await;
+				if found.is_none()
+					&& method == Method::GET
+					&& self.bazel_from_peers(repo, kind, hash).await
+				{
+					found = self.bazel.open_entry(repo, kind, hash).await;
+				}
+				let Some((file, size)) = found else {
+					return text(StatusCode::NOT_FOUND, "not found");
+				};
+				let body = if method == Method::HEAD {
+					Body::empty()
+				} else {
+					Body::from_stream(ReaderStream::new(file))
+				};
+				let mut response = (StatusCode::OK, body).into_response();
+				let headers = response.headers_mut();
+				headers
+					.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+				headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+				response
+			},
+			Method::PUT => {
+				if !bazel_writable(&scope) {
+					return text(
+						StatusCode::FORBIDDEN,
+						&format!(
+							"{} jobs may read the Bazel cache but not write it (only branch and tag jobs \
+							 do)",
+							scope.write
+						),
+					);
+				}
+				match self.bazel.put(repo, kind, hash, req.into_body()).await {
+					Ok(_) => StatusCode::OK.into_response(),
+					Err(error) => {
+						tracing::debug!(%sandbox, kind = kind.as_str(), %hash, "Bazel cache write refused: {}", error.message);
+						text(error.status, &error.message)
+					},
+				}
+			},
+			_ => text(StatusCode::METHOD_NOT_ALLOWED, "GET, HEAD, or PUT"),
+		}
+	}
+
+	/// Copies a Bazel entry from the first other node that has it (CAS
+	/// entries are verified); `false` when none answers within
+	/// [`PEER_LOOKUP`].
+	async fn bazel_from_peers(&self, repo: u64, kind: Kind, hash: &str) -> bool {
+		let Some(cluster) = &self.cluster else {
+			return false;
+		};
+		let lookups: Vec<_> = cluster
+			.members()
+			.into_iter()
+			.filter(|(member, meta)| {
+				member.id != self.node && meta.roles.node && member.state == MemberState::Alive
+			})
+			.filter_map(|(member, _)| cluster.cluster_url(member.id))
+			.filter_map(|url| NodeClient::new(&url, &self.secret, self.http.clone()).ok())
+			.map(|client| {
+				Box::pin(async move {
+					match tokio::time::timeout(
+						PEER_LOOKUP,
+						client.ci_cache_bazel(repo, kind.as_str(), hash),
+					)
+					.await
+					{
+						Ok(Ok(response)) => Ok(response),
+						_ => Err(()),
+					}
+				})
+			})
+			.collect();
+		if lookups.is_empty() {
+			return false;
+		}
+		let Ok((response, _)) = futures::future::select_ok(lookups).await else {
+			return false;
+		};
+		let body = Body::from_stream(response.bytes_stream());
+		match tokio::time::timeout(PEER_COPY, self.bazel.put(repo, kind, hash, body)).await {
+			Ok(Ok(_)) => true,
+			Ok(Err(error)) => {
+				tracing::debug!(kind = kind.as_str(), %hash, "copying a Bazel entry from a peer failed: {}", error.message);
+				false
+			},
+			Err(_) => false,
+		}
+	}
+
 	// ----------------------------------------------------------- pass-through
 
 	/// Forwards a non-cache Twirp call to GitHub's results service, headers
@@ -1065,12 +1208,43 @@ impl LocalService for Listener {
 
 // ------------------------------------------------------------ peer route
 
-/// `GET /ci-cache/blobs/{digest}` (relative to `/node/v1`): a local copy for
-/// a peer's fetch.
+/// Whether a job with `scope` may write the Bazel cache: branch and tag
+/// jobs, never pull request (or unresolved, isolated) scopes.
+fn bazel_writable(scope: &CacheScope) -> bool {
+	scope.write.starts_with("refs/heads/") || scope.write.starts_with("refs/tags/")
+}
+
+/// Peer routes (relative to `/node/v1`): `GET /ci-cache/blobs/{digest}`, a
+/// local archive copy for a peer's fetch, and
+/// `GET /ci-cache/bazel/{repo}/{kind}/{hash}`, a local Bazel entry.
 pub fn routes(service: Arc<Service>) -> Router {
 	Router::new()
 		.route("/ci-cache/blobs/{digest}", get(peer_blob))
+		.route("/ci-cache/bazel/{repo}/{kind}/{hash}", get(peer_bazel))
 		.with_state(service)
+}
+
+async fn peer_bazel(
+	State(service): State<Arc<Service>>,
+	Path((repo, kind, hash)): Path<(u64, String, String)>,
+) -> Result<Response, ApiError> {
+	let kind = Kind::parse(&kind).ok_or_else(|| ApiError::invalid("kind is ac or cas"))?;
+	if !valid_digest(&hash) {
+		return Err(ApiError::invalid("invalid digest"));
+	}
+	let (file, size) = service
+		.bazel
+		.open_entry(repo, kind, &hash)
+		.await
+		.ok_or_else(|| ApiError::not_found(format!("no Bazel entry {}/{hash}", kind.as_str())))?;
+	Ok((
+		[
+			(header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+			(header::CONTENT_LENGTH, size.to_string()),
+		],
+		Body::from_stream(ReaderStream::new(file)),
+	)
+		.into_response())
 }
 
 async fn peer_blob(

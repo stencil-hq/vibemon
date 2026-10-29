@@ -171,31 +171,42 @@ impl Node {
 		// previous process are removed, then one ready TAP per boot slot.
 		net.prewarm(boot_concurrency).await;
 
+		let ci_dir = config.data_dir.join("ci-cache");
+		// Default budgets: a share of the filesystem, but at most a fifth of
+		// what is free (plus what the cache already holds), so a nearly full
+		// disk is never filled by caches.
+		let cache_budget = |flag_mb: u64, percent: u64, dir: &std::path::Path| -> u64 {
+			if flag_mb > 0 {
+				return flag_mb.saturating_mul(1 << 20);
+			}
+			let held = artifacts::disk_usage(dir).unwrap_or(0);
+			let share = host::disk_size_mb(&config.data_dir).saturating_mul(1 << 20) / 100 * percent;
+			share.min(held + host::disk_free_mb(&config.data_dir).saturating_mul(1 << 20) / 5)
+		};
 		let ci_cache = ci_cache::start(
 			ci_cache::CacheConfig {
-				dir:      config.data_dir.join("ci-cache"),
-				budget:   if config.ci_cache_mb == 0 {
-					host::disk_size_mb(&config.data_dir) / 10
-				} else {
-					config.ci_cache_mb
-				}
-				.saturating_mul(1 << 20),
-				upstream: url::Url::parse(
+				budget:       cache_budget(config.ci_cache_mb, 10, &ci_dir.join("blobs")),
+				bazel_budget: cache_budget(config.ci_bazel_cache_mb, 5, &ci_dir.join("bazel")),
+				dir:          ci_dir,
+				upstream:     url::Url::parse(
 					config
 						.ci_results_upstream
 						.as_deref()
 						.unwrap_or(ci_cache::DEFAULT_UPSTREAM),
 				)
 				.context("parsing --ci-results-upstream")?,
-				secret:   config.cluster_secret.clone(),
-				http:     reqwest::Client::builder()
+				secret:       config.cluster_secret.clone(),
+				http:         reqwest::Client::builder()
 					.connect_timeout(Duration::from_secs(5))
 					.build()
 					.context("building HTTP client")?,
 			},
 			cluster.clone(),
 		)?;
-		egress.set_local_service(ci_cache::PORT, Arc::new(ci_cache::Listener(Arc::clone(&ci_cache))));
+		egress.set_local_service(
+			egress::LocalTarget::new(ci_cache::PORT, &config.net_pool)?,
+			Arc::new(ci_cache::Listener(Arc::clone(&ci_cache))),
+		);
 
 		let peers = server::Peers::new(cluster.clone());
 		let api = server::sandbox_routes(Arc::clone(&sandboxes), peers.clone())

@@ -154,6 +154,11 @@ pub struct ServeArgs {
 	/// filesystem).
 	#[arg(long, env = "VMON_CI_CACHE_MB", default_value_t = 0)]
 	ci_cache_mb:             u64,
+	/// Disk the node-local Bazel remote cache of CI jobs may occupy in MiB;
+	/// least recently used entries are evicted beyond it (0 = 5% of the data
+	/// dir's filesystem, at most a fifth of its free space at start).
+	#[arg(long, env = "VMON_CI_BAZEL_CACHE_MB", default_value_t = 0)]
+	ci_bazel_cache_mb:       u64,
 	/// GitHub results service that CI sandboxes' non-cache Twirp calls
 	/// (artifacts, …) are forwarded to.
 	#[arg(
@@ -320,6 +325,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			max_parallel_builds:     args.max_builds,
 			step_cache_mb:           args.step_cache_mb,
 			ci_cache_mb:             args.ci_cache_mb,
+			ci_bazel_cache_mb:       args.ci_bazel_cache_mb,
 			ci_results_upstream:     Some(args.ci_results_upstream.clone()),
 			net_mode:                args.net.into(),
 			net_pool:                args.net_pool.clone(),

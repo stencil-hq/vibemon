@@ -71,6 +71,10 @@ pub struct NodeConfig {
 	/// Disk the CI cache's archive copies may occupy, in MiB; 0 = 10% of the
 	/// filesystem holding `data_dir` ([`crate::ci_cache`]).
 	pub ci_cache_mb:             u64,
+	/// Disk the node-local Bazel remote cache may occupy, in MiB; 0 = 5% of
+	/// the filesystem holding `data_dir`, at most a fifth of its free space
+	/// (plus the cache's own size) at start.
+	pub ci_bazel_cache_mb:       u64,
 	/// GitHub results service CI sandboxes' other Twirp calls are forwarded
 	/// to; `None` = [`crate::ci_cache::DEFAULT_UPSTREAM`].
 	pub ci_results_upstream:     Option<String>,
