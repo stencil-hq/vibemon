@@ -931,9 +931,15 @@ under the 104-byte macOS `sun_path` limit.
   so template and pause snapshots capture it off. Snapshots do not carry KVM
   nested state (`KVM_GET/SET_NESTED_STATE`); instead `arch::state::save_vcpu`
   refuses (`NestedVirtualizationActive`, control code
-  `nested_virtualization_active`) while a vCPU is in VMX operation, has SVM
-  enabled with a host save area (`EFER.SVME` and `VM_HSAVE_PA` ≠ 0) or `CLGI`
-  in effect, runs a nested guest, or KVM reports state past the header. The
+  `nested_virtualization_active`) while a vCPU is in VMX operation (Intel:
+  KVM keeps the VMXON region outside the architectural state), has `CLGI` in
+  effect, runs or is about to run a nested guest, or KVM reports state past
+  the header. AMD SVM enabled with no nested guest running is captured: KVM's
+  state is then `EFER.SVME` (sregs) plus `VM_HSAVE_PA`, a migration MSR
+  restored after the sregs (snapshots without it restore it as 0); without a
+  captured `VM_HSAVE_PA` it is refused. So on AMD a guest kernel that enables
+  SVM at load, or a sandbox whose VMs are halted at that instant, pauses
+  normally, while a pause during a running nested guest is refused. The
   VM stays paused; the node resumes it and answers 409
   `nested_virtualization_active` to the memory pause or snapshot
   (snapshot-as-template, fork, handover pause), which the driver returns as
@@ -941,7 +947,9 @@ under the 104-byte macOS `sun_path` limit.
   the sandbox like any failed auto-pause, and a template build whose start
   command leaves VMs running fails. In-place VMM `pause`/`resume` keep
   working. `IA32_FEATURE_CONTROL` (Intel) is a migration MSR, so restored
-  vCPUs keep VMXON allowed. Snapshots captured by earlier vmon releases
+  vCPUs keep VMXON allowed. The VMM integration tests boot their guests with
+  the same flag (`tests/common::cmdline`), so they snapshot when they run
+  nested in a sandbox. Snapshots captured by earlier vmon releases
   (virtualization on from boot, no feature-control MSR) restore with the
   guest's KVM believing VMX/SVM is on (Intel: its first `KVM_CREATE_VCPU`
   oopses the guest in `kvm_spurious_fault`; AMD: the first VM run ends the

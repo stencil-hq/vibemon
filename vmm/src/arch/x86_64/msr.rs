@@ -53,6 +53,11 @@ const MSR_IA32_XSS: u32 = 0xda0;
 // Intel only: AMD hosts do not report it, so `state::save_vcpu`'s supported-MSR
 // filter drops it there.
 const MSR_IA32_FEAT_CTL: u32 = 0x3a;
+// The SVM host save area. A guest kernel whose KVM enables SVM (EFER.SVME,
+// restored with the sregs) writes it, and its next VMRUN needs it; KVM keeps
+// no other state for an idle SVM vCPU (`state::save_vcpu`). AMD only: Intel
+// hosts do not report it.
+pub const MSR_VM_HSAVE_PA: u32 = 0xc001_0117;
 
 /// MSR indices captured for snapshot/restore (and zeroed/seeded at boot).
 /// Superset; at save time this is filtered through `KVM_GET_MSR_INDEX_LIST` and
@@ -88,6 +93,7 @@ pub const MIGRATION_MSRS: &[u32] = &[
 	MSR_IA32_INT_SSP_TAB,
 	MSR_IA32_XSS,
 	MSR_IA32_FEAT_CTL,
+	MSR_VM_HSAVE_PA,
 ];
 
 #[cfg(target_os = "linux")]

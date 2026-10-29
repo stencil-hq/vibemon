@@ -268,8 +268,16 @@ pub fn current_memory_file_len(dir: &Path) -> u64 {
 		.len()
 }
 
+/// Test guest command line; mirrors the VMM's `DEFAULT_CMDLINE` (`x86_64` guest
+/// KVM enables VMX/SVM only while the guest runs VMs, so a test VM that runs
+/// nested in a sandbox stays snapshottable on Intel).
 pub fn cmdline(mode: &str) -> String {
-	format!("console=ttyS0 reboot=t panic=-1 rdinit=/init vmon.test={mode}")
+	let arch_args = if cfg!(target_arch = "x86_64") {
+		" kvm.enable_virt_at_load=0"
+	} else {
+		""
+	};
+	format!("console=ttyS0 reboot=t panic=-1{arch_args} rdinit=/init vmon.test={mode}")
 }
 
 pub fn cmdline_with(mode: &str, extra: &[(&str, &str)]) -> String {

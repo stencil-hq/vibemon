@@ -25,6 +25,7 @@ All notable changes to this project are recorded here.
 ### Fixed
 
 - Template build steps run at the build's `cpuCount` and `memoryMB` (at least 2 vCPUs and 1 GiB). Before, every step ran in a 2 vCPU / 1 GiB VM whatever the build asked for, so memory-heavy steps such as `cargo install` were killed by the guest's OOM killer
+- On AMD, pause, snapshot, fork, and migration succeed while the guest has AMD-V enabled but no nested VM running (for example a guest kernel that enables it at boot): `VM_HSAVE_PA` is saved with the vCPU state. A running nested VM, and VMXON on Intel, are still refused. The VMM integration tests boot their guests with `kvm.enable_virt_at_load=0`, so they pass when run inside a sandbox
 - Snapshots save and restore `IA32_FEATURE_CONTROL`, so VMs start in sandboxes forked from a template snapshot on Intel hosts. Before, the guest kernel crashed (`kvm_spurious_fault`) at the first vCPU; rebuild x86_64 templates captured by earlier releases before using `/dev/kvm` in them (on AMD such sandboxes stopped)
 - Dashboard: empty states in flush cards keep their bottom padding
 
