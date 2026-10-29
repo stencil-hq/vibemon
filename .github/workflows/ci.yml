@@ -11,13 +11,15 @@ permissions:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-latest
+    # vmon CI (docs/src/operate/ci.md); pull requests from forks stay on
+    # GitHub-hosted runners.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install pinned Rust toolchain
-        run: rustup show
+        uses: ./.github/actions/rust-toolchain
 
       - name: Install pinned license tools
         uses: taiki-e/install-action@v2
@@ -48,10 +50,16 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Install musl targets and zig
-        run: |
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          pip install ziglang==0.13.0 cargo-zigbuild
+      - name: Install musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install Zig linker
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
 
       - name: Build static guest agents
         run: |

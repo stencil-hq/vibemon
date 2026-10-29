@@ -14,7 +14,9 @@ permissions:
 jobs:
   kvm-integration:
     name: KVM integration
-    runs-on: ubuntu-latest
+    # vmon-large: 8 vCPUs / 16 GiB with nested KVM (/dev/kvm) for the test
+    # VMs. Pull requests from forks stay on GitHub-hosted runners.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large' }}
     timeout-minutes: 45
     env:
       VMON_TAP: vmon0

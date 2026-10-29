@@ -1,0 +1,23 @@
+name: Rust toolchain
+description: >-
+  Install the toolchain pinned in rust-toolchain.toml. vmon runners
+  (`runs-on: vmon…`) have no rustup preinstalled, so install rustup first when
+  it is missing; GitHub-hosted runners already have it.
+
+runs:
+  using: composite
+  steps:
+    - name: Install rustup if missing
+      shell: bash
+      run: |
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: |
+        rustup toolchain install
+        rustup show

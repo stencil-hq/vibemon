@@ -1,0 +1,7 @@
+# vmon CI runner labels (docs/src/operate/ci.md).
+self-hosted-runner:
+  labels:
+    - vmon-small
+    - vmon
+    - vmon-large
+    - vmon-xlarge

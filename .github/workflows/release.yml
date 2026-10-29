@@ -12,7 +12,8 @@ permissions:
 jobs:
   binaries:
     name: Package ${{ matrix.target }} binaries and guest assets
-    runs-on: ubuntu-latest
+    # vmon CI (docs/src/operate/ci.md). Both targets cross-build on x86_64.
+    runs-on: vmon-large
     # The guest assets ship the vmon kernel built by the `kernel` job.
     needs: [kernel]
     strategy:
@@ -30,9 +31,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install pinned Rust toolchain
-        run: |
-          rustup show
-          rustup target add ${{ matrix.target }}
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Add the release target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -94,13 +96,15 @@ jobs:
     name: Build ${{ matrix.arch }} guest kernel
     # Native runners: same Ubuntu 24.04 toolchain as `just kernel` (its
     # container on macOS), so local and released kernels are bit-identical.
+    # x86_64 builds in a vmon CI sandbox (Ubuntu 24.04, the `ci` template);
+    # vmon has no aarch64 nodes, so aarch64 stays on GitHub's arm64 runner.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-24.04
+            runner: vmon-large
             files: bzImage-x86_64 vmlinux-x86_64 config-x86_64
           - arch: aarch64
             runner: ubuntu-24.04-arm
@@ -138,7 +142,8 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    runs-on: ubuntu-latest
+    # `vmon` is the `ci` template's build size: the sandbox forks its snapshot.
+    runs-on: vmon
     needs: [binaries, kernel]
     if: startsWith(github.ref, 'refs/tags/')
     steps:

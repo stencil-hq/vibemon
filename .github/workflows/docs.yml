@@ -23,7 +23,9 @@ concurrency:
 jobs:
   build:
     name: Build and check documentation
-    runs-on: ubuntu-latest
+    # vmon CI (docs/src/operate/ci.md); pull requests from forks stay on
+    # GitHub-hosted runners.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -52,6 +54,8 @@ jobs:
     name: Deploy documentation
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
+    # Only asks the Pages API to deploy the uploaded artifact (no checkout, no
+    # build), so it stays on a GitHub-hosted runner.
     runs-on: ubuntu-latest
     permissions:
       pages: write

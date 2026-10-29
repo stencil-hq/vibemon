@@ -1,8 +1,9 @@
 name: KVM host setup
 description: >-
-  Prepare a GitHub-hosted Linux runner to boot vmon microVMs under KVM: enable
-  /dev/kvm + userfaultfd, install build deps, build the vmm + guest agent (cached),
-  fetch guest assets (cached), and bring up the shared host tap.
+  Prepare a Linux runner (GitHub-hosted, or a vmon CI sandbox with nested KVM)
+  to boot vmon microVMs under KVM: enable /dev/kvm + userfaultfd, install build
+  deps and the Rust toolchain, build the vmm + guest agent (cached), fetch guest
+  assets (cached), and bring up the shared host tap.
 
 runs:
   using: composite
@@ -10,12 +11,12 @@ runs:
     - name: Enable KVM and userfaultfd
       # Grant the runner user /dev/kvm (fail loudly if absent so tests can't
       # silently skip into a false green) and allow non-root userfaultfd for the
-      # pager tests.
+      # pager tests. The vmon `ci` template already ships the udev rule.
       shell: bash
       run: |
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
           | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-        sudo udevadm control --reload-rules
+        sudo udevadm control --reload-rules || true
         sudo udevadm trigger --name-match=kvm || true
         sudo chmod 0666 /dev/kvm || true
         test -r /dev/kvm && test -w /dev/kvm || { echo "::error::/dev/kvm not accessible"; exit 1; }
@@ -30,8 +31,7 @@ runs:
         sudo apt-get install -y cpio e2fsprogs iptables
 
     - name: Install pinned Rust toolchain
-      shell: bash
-      run: rustup show
+      uses: ./.github/actions/rust-toolchain
 
     - name: Cache cargo build
       uses: Swatinem/rust-cache@v2
