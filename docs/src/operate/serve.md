@@ -99,6 +99,14 @@ Each sandbox's guest console and VMM log are kept under `sandboxes/<id>/` in the
 
 If a listener fails, for example because its port is taken, the process exits with the error without running the graceful node and cluster shutdown sequence.
 
+Under systemd, set `KillMode=process` in the unit (or a drop-in). The default `KillMode=control-group` sends the stop signal to every process in the service's cgroup, VMMs included, so `systemctl restart vmon` would end every running sandbox instead of letting the next start adopt them:
+
+```ini
+# /etc/systemd/system/vmon.service.d/killmode.conf
+[Service]
+KillMode=process
+```
+
 A node restarted with SIGTERM can adopt its surviving VMMs when it comes back within the leader's 60 s grace period for `Left` nodes. On Linux, a sandbox with lazily restored memory loses its node-local page server and fails its next remote page fault after restart. A node that dies without leaving (SIGKILL, crash, network loss) goes `Dead`, and its sandboxes are marked killed. See [Failure handling](cluster.md#failure-handling).
 
 ## Linux privileges
