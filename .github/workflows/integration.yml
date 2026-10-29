@@ -15,8 +15,10 @@ jobs:
   kvm-integration:
     name: KVM integration
     # vmon-large: 8 vCPUs / 16 GiB with nested KVM (/dev/kvm) for the test
-    # VMs. Pull requests from forks stay on GitHub-hosted runners.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large' }}
+    # VMs, on the `vibemon-ci` template (toolchain, host packages, pre-built
+    # target/ and test assets baked in). Pull requests from forks stay on
+    # GitHub-hosted runners.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large/from=vibemon-ci' }}
     timeout-minutes: 45
     env:
       VMON_TAP: vmon0
@@ -27,6 +29,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Keep vibemon-ci's pre-built target/ and test assets.
+          clean: false
 
       - name: Prepare KVM host
         uses: ./.github/actions/kvm-host

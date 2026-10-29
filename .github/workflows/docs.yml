@@ -23,8 +23,9 @@ concurrency:
 jobs:
   build:
     name: Build and check documentation
-    # vmon CI (docs/src/operate/ci.md); pull requests from forks stay on
-    # GitHub-hosted runners.
+    # vmon CI (docs/src/operate/ci.md): the `ci` template bakes mdBook 0.5.4
+    # and is built at the `vmon` size, so the job forks its snapshot. Pull
+    # requests from forks stay on GitHub-hosted runners.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon' }}
     steps:
       - name: Check out repository
@@ -32,6 +33,7 @@ jobs:
 
       # 0.5+ renders the `> [!NOTE]` admonitions the pages use.
       - name: Install mdBook
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.5.4

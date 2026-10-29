@@ -24,7 +24,9 @@ runs:
 
     - name: Install system dependencies
       # cpio builds the busybox initramfs; e2fsprogs (mkfs.ext4) builds rootfs
-      # fixtures and template disks; iptables backs TAP NAT + egress.
+      # fixtures and template disks; iptables backs TAP NAT + egress. The
+      # vmon `vibemon-ci` template has them.
+      if: runner.environment == 'github-hosted'
       shell: bash
       run: |
         sudo apt-get update
@@ -38,10 +40,13 @@ runs:
       with:
         shared-key: kvm-integration
 
+    # vmon's `ci` template (and so `vibemon-ci`) bakes just and uv.
     - name: Install just
+      if: runner.environment == 'github-hosted'
       uses: taiki-e/install-action@just
 
     - name: Install uv
+      if: runner.environment == 'github-hosted'
       uses: astral-sh/setup-uv@v5
 
     - name: Build vmon

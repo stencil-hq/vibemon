@@ -13,7 +13,9 @@ jobs:
   binaries:
     name: Package ${{ matrix.target }} binaries and guest assets
     # vmon CI (docs/src/operate/ci.md). Both targets cross-build on x86_64.
-    runs-on: vmon-large
+    # `vibemon-ci` bakes the toolchain with both musl targets, uv, zig,
+    # cargo-zigbuild and qemu-user.
+    runs-on: vmon-large/from=vibemon-ci
     # The guest assets ship the vmon kernel built by the `kernel` job.
     needs: [kernel]
     strategy:
@@ -32,24 +34,6 @@ jobs:
 
       - name: Install pinned Rust toolchain
         uses: ./.github/actions/rust-toolchain
-
-      - name: Add the release target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install Zig linker
-        uses: goto-bus-stop/setup-zig@v2
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@cargo-zigbuild
-
-      - name: Install target runtime
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes qemu-user
 
       - name: Package release binaries
         run: ./scripts/package-rust-release.sh --target ${{ matrix.target }}
@@ -96,15 +80,16 @@ jobs:
     name: Build ${{ matrix.arch }} guest kernel
     # Native runners: same Ubuntu 24.04 toolchain as `just kernel` (its
     # container on macOS), so local and released kernels are bit-identical.
-    # x86_64 builds in a vmon CI sandbox (Ubuntu 24.04, the `ci` template);
-    # vmon has no aarch64 nodes, so aarch64 stays on GitHub's arm64 runner.
+    # x86_64 builds in a vmon CI sandbox (Ubuntu 24.04, the `vibemon-ci`
+    # template, which has the build tools); vmon has no aarch64 nodes, so
+    # aarch64 stays on GitHub's arm64 runner.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: vmon-large
+            runner: vmon-large/from=vibemon-ci
             files: bzImage-x86_64 vmlinux-x86_64 config-x86_64
           - arch: aarch64
             runner: ubuntu-24.04-arm
@@ -114,6 +99,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install kernel build tools
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install --yes build-essential flex bison bc libelf-dev libssl-dev dwarves python3 cpio xz-utils

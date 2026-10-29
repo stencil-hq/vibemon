@@ -11,17 +11,27 @@ permissions:
 jobs:
   rust:
     name: Rust
-    # vmon CI (docs/src/operate/ci.md); pull requests from forks stay on
-    # GitHub-hosted runners.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large' }}
+    # vmon CI (docs/src/operate/ci.md) on the `vibemon-ci` template, which
+    # bakes the pinned toolchain, the tools below and a pre-built target/
+    # (.github/vmon/vibemon_ci_template.py). Pull requests from forks stay on
+    # GitHub-hosted runners, which install the tools per run.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'vmon-large/from=vibemon-ci' }}
+    env:
+      # As Swatinem/rust-cache sets for the integration job; vibemon-ci
+      # pre-builds with it, so the workspace crates' fingerprints match.
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Keep vibemon-ci's pre-built target/ (git clean would delete it).
+          clean: false
 
       - name: Install pinned Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
       - name: Install pinned license tools
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@v2
         with:
           tool: just@1.58.0,cargo-deny@0.20.2
@@ -33,6 +43,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Install AArch64 cross compiler
+        if: runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
 
       - name: Check
@@ -50,15 +61,15 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Install musl targets
-        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-
+      # The musl targets come with the toolchain (rust-toolchain.toml).
       - name: Install Zig linker
+        if: runner.environment == 'github-hosted'
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@cargo-zigbuild
 
       - name: Build static guest agents
@@ -67,6 +78,7 @@ jobs:
           cargo zigbuild --locked --release -p vmon-agent --target aarch64-unknown-linux-musl
 
       - name: Install cargo-audit
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies

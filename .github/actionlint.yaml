@@ -5,3 +5,4 @@ self-hosted-runner:
     - vmon
     - vmon-large
     - vmon-xlarge
+    - vmon-large/from=vibemon-ci

@@ -1,8 +1,9 @@
 name: Rust toolchain
 description: >-
-  Install the toolchain pinned in rust-toolchain.toml. vmon runners
-  (`runs-on: vmon…`) have no rustup preinstalled, so install rustup first when
-  it is missing; GitHub-hosted runners already have it.
+  Install the toolchain pinned in rust-toolchain.toml (components and targets
+  included). GitHub-hosted runners and vmon's `ci` template have rustup; the
+  `vibemon-ci` template also has the pinned toolchain, so there this only
+  checks it. rustup is installed first on runners without it.
 
 runs:
   using: composite
