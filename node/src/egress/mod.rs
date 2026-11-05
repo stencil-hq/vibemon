@@ -93,6 +93,10 @@ pub struct EgressConfig {
 	pub data_dir:       PathBuf,
 	/// Operator CIDRs exempt from the always-denied private ranges.
 	pub internal_allow: Vec<String>,
+	/// Resolvers a policy with `allowOut` domains implicitly allows: the DNS
+	/// the node hands to TAP guests ([`policy::DEFAULT_NAMESERVER`] by
+	/// default).
+	pub nameservers:    Vec<Ipv4Addr>,
 	/// Linux transparent proxy port (0 = ephemeral).
 	pub proxy_port:     u16,
 }
@@ -113,16 +117,17 @@ pub struct Egress {
 }
 
 struct Inner {
-	internal: Vec<policy::Cidr>,
-	attached: tokio::sync::Mutex<HashMap<String, EgressNet>>,
+	internal:    Vec<policy::Cidr>,
+	nameservers: Vec<Ipv4Addr>,
+	attached:    tokio::sync::Mutex<HashMap<String, EgressNet>>,
 	#[cfg(target_os = "linux")]
-	proxy:    Arc<linux::Proxy>,
+	proxy:       Arc<linux::Proxy>,
 	/// TAPs whose hooks target this process's proxy port (installed by
 	/// [`Egress::prepare_tap`] or a full [`Egress::attach`]) and the state of
 	/// their policy chains; attach and release only rewrite the chains.
 	#[cfg(target_os = "linux")]
-	hooked:   parking_lot::Mutex<HashMap<String, Chains>>,
-	ca_pem:   Option<String>,
+	hooked:      parking_lot::Mutex<HashMap<String, Chains>>,
+	ca_pem:      Option<String>,
 }
 
 /// Policy chains of a hooked TAP.
@@ -163,6 +168,7 @@ impl Egress {
 			Ok(Self {
 				inner: Arc::new(Inner {
 					internal,
+					nameservers: cfg.nameservers,
 					attached: tokio::sync::Mutex::default(),
 					proxy,
 					hooked: parking_lot::Mutex::default(),
@@ -176,6 +182,7 @@ impl Egress {
 			Ok(Self {
 				inner: Arc::new(Inner {
 					internal,
+					nameservers: cfg.nameservers,
 					attached: tokio::sync::Mutex::default(),
 					ca_pem: None,
 				}),
@@ -214,7 +221,8 @@ impl Egress {
 	}
 
 	fn compile(&self, policy: &NetworkPolicy) -> anyhow::Result<policy::Compiled> {
-		policy::Compiled::compile(policy, &self.inner.internal).map_err(anyhow::Error::msg)
+		policy::Compiled::compile(policy, &self.inner.internal, &self.inner.nameservers)
+			.map_err(anyhow::Error::msg)
 	}
 
 	/// For `--net user` launches (create, fork, resume): write the compiled

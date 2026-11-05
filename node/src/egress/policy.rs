@@ -409,9 +409,14 @@ pub struct Compiled {
 }
 
 impl Compiled {
-	/// Compile a policy; `internal` are node-exempted private ranges. Adds
-	/// [`DEFAULT_NAMESERVER`] to the allowed CIDRs when domains are present.
-	pub fn compile(policy: &NetworkPolicy, internal: &[Cidr]) -> Result<Self, String> {
+	/// Compile a policy; `internal` are node-exempted private ranges.
+	/// `nameservers` (the resolvers the node hands to guests) are added to
+	/// the allowed CIDRs when domains are present.
+	pub fn compile(
+		policy: &NetworkPolicy,
+		internal: &[Cidr],
+		nameservers: &[Ipv4Addr],
+	) -> Result<Self, String> {
 		validate(policy)?;
 		let mut domains = Vec::new();
 		let mut allow = Vec::new();
@@ -422,7 +427,7 @@ impl Compiled {
 			}
 		}
 		if !domains.is_empty() {
-			allow.push(Cidr::host(IpAddr::V4(DEFAULT_NAMESERVER)));
+			allow.extend(nameservers.iter().map(|ns| Cidr::host(IpAddr::V4(*ns))));
 		}
 		let deny = policy
 			.deny_out
@@ -575,7 +580,7 @@ mod tests {
 	}
 
 	fn compiled(allow: &[&str], deny: &[&str]) -> Compiled {
-		Compiled::compile(&policy(allow, deny), &[]).expect("valid policy")
+		Compiled::compile(&policy(allow, deny), &[], &[DEFAULT_NAMESERVER]).expect("valid policy")
 	}
 
 	fn ip(s: &str) -> IpAddr {
@@ -607,6 +612,23 @@ mod tests {
 	}
 
 	#[test]
+	fn domains_allow_the_configured_nameservers_instead_of_the_default() {
+		let lan = Ipv4Addr::new(10, 0, 20, 1);
+		let internal: Vec<Cidr> = vec!["10.0.20.1/32".parse().expect("cidr")];
+		let compile = |allow: &[&str], nameservers: &[Ipv4Addr]| {
+			Compiled::compile(&policy(allow, &["0.0.0.0/0"]), &internal, nameservers).expect("policy")
+		};
+		let p = compile(&["api.example.com"], &[lan, Ipv4Addr::new(1, 1, 1, 1)]);
+		assert_eq!(p.decide(None, IpAddr::V4(lan)), Decision::Allow);
+		assert_eq!(p.decide(None, ip("1.1.1.1")), Decision::Allow);
+		assert_eq!(p.decide(None, IpAddr::V4(DEFAULT_NAMESERVER)), Decision::Deny);
+		// Without domains nothing is implicitly allowed.
+		let p = compile(&[], &[lan]);
+		assert_eq!(p.decide(None, IpAddr::V4(lan)), Decision::Deny);
+		assert_eq!(p.allow_cidrs(), []);
+	}
+
+	#[test]
 	fn private_ranges_are_always_denied_unless_exempt() {
 		let p = compiled(&["10.0.0.0/8", "0.0.0.0/0"], &[]);
 		for target in [
@@ -626,14 +648,20 @@ mod tests {
 		for target in ["172.32.0.1", "100.128.0.1", "11.0.0.1", "2001:db8::1"] {
 			assert_eq!(p.decide(None, ip(target)), Decision::Allow, "{target}");
 		}
-		let exempt = Compiled::compile(&policy(&[], &[]), &["10.9.0.0/16".parse().expect("cidr")])
+		let exempt =
+			Compiled::compile(&policy(&[], &[]), &["10.9.0.0/16".parse().expect("cidr")], &[
+				DEFAULT_NAMESERVER,
+			])
 			.expect("policy");
 		assert_eq!(exempt.decide(None, ip("10.9.1.1")), Decision::Allow);
 		assert_eq!(exempt.decide(None, ip("10.8.1.1")), Decision::Deny);
 		// An exempted range is still subject to user deny rules.
-		let exempt =
-			Compiled::compile(&policy(&[], &["0.0.0.0/0"]), &["10.9.0.0/16".parse().expect("cidr")])
-				.expect("policy");
+		let exempt = Compiled::compile(
+			&policy(&[], &["0.0.0.0/0"]),
+			&["10.9.0.0/16".parse().expect("cidr")],
+			&[DEFAULT_NAMESERVER],
+		)
+		.expect("policy");
 		assert_eq!(exempt.decide(None, ip("10.9.1.1")), Decision::Deny);
 		// A domain flow re-dialed by name must not land on a private address.
 		assert!(!p.resolved_ip_allowed(ip("192.168.0.10")));
@@ -760,7 +788,7 @@ mod tests {
 			rule(&[("X-Scope", "first")]),
 			rule(&[("x-scope", "exact")]),
 		]);
-		let c = Compiled::compile(&p, &[]).expect("policy");
+		let c = Compiled::compile(&p, &[], &[DEFAULT_NAMESERVER]).expect("policy");
 		assert_eq!(
 			c.rules_for("v1.api.x.io"),
 			Some(&[("x-scope".to_string(), "exact".to_string())][..])

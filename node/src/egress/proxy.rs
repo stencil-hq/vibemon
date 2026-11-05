@@ -270,7 +270,10 @@ mod tests {
 
 	fn compile(policy: &NetworkPolicy, internal: &[&str]) -> Arc<Compiled> {
 		let internal: Vec<_> = internal.iter().map(|c| c.parse().expect("cidr")).collect();
-		Arc::new(Compiled::compile(policy, &internal).expect("policy"))
+		Arc::new(
+			Compiled::compile(policy, &internal, &[crate::egress::policy::DEFAULT_NAMESERVER])
+				.expect("policy"),
+		)
 	}
 
 	/// Run `handle` for one accepted connection with a forced original dst.

@@ -12,19 +12,26 @@ mod lease;
 mod tap;
 
 use std::{
-	net::Ipv4Addr,
+	net::{IpAddr, Ipv4Addr},
 	sync::{
 		Arc, OnceLock, Weak,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub use self::lease::{Block, LEASE_PREFIX, LeaseAllocator};
-use crate::{egress::Egress, gc4::NetConfig, vm::VmNet};
+use crate::{
+	egress::{
+		Egress,
+		policy::{self, Cidr},
+	},
+	gc4::NetConfig,
+	vm::VmNet,
+};
 
 /// Requested networking mode (`--net`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,8 +45,11 @@ pub enum NetMode {
 	Auto,
 }
 
-/// Public resolvers handed to TAP guests (the host IP is firewalled off).
-const TAP_DNS: [&str; 2] = ["8.8.8.8", "1.1.1.1"];
+/// Public resolvers handed to TAP guests unless `--guest-dns` is set (the host
+/// IP is firewalled off).
+const DEFAULT_TAP_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(1, 1, 1, 1)];
+/// Most resolvers a guest's `resolv.conf` honours (glibc `MAXNS`).
+const MAX_GUEST_DNS: usize = 3;
 /// Upper bound of ready TAP slots ([`NetManager::prewarm`]).
 pub const MAX_TAP_SLOTS: usize = 32;
 /// Released TAPs return to the ready pool until it holds this multiple of
@@ -107,10 +117,53 @@ enum Backend {
 	Unavailable(String),
 }
 
+/// Checks `--guest-dns` against the node's `--egress-internal-allow`.
+///
+/// At most [`MAX_GUEST_DNS`] distinct resolvers, and every resolver inside an
+/// always-denied range must be exempted there (an explicit exemption that
+/// covers all ports; nothing is exempted implicitly). Empty = defaults.
+pub fn validate_guest_dns(dns: &[Ipv4Addr], internal_allow: &[String]) -> anyhow::Result<()> {
+	if dns.is_empty() {
+		return Ok(());
+	}
+	ensure!(
+		dns.len() <= MAX_GUEST_DNS,
+		"--guest-dns lists {} resolvers; a guest's resolv.conf honours at most {MAX_GUEST_DNS}",
+		dns.len()
+	);
+	let internal = policy::parse_internal(internal_allow).map_err(anyhow::Error::msg)?;
+	let denied: Vec<Cidr> = policy::ALWAYS_DENIED
+		.iter()
+		.filter_map(|cidr| cidr.parse().ok())
+		.collect();
+	for (i, ip) in dns.iter().enumerate() {
+		ensure!(!dns[..i].contains(ip), "--guest-dns lists {ip} more than once");
+		let addr = IpAddr::V4(*ip);
+		ensure!(
+			!denied.iter().any(|cidr| cidr.contains(addr))
+				|| internal.iter().any(|cidr| cidr.contains(addr)),
+			"--guest-dns {ip} is in an always-denied range; add it to --egress-internal-allow"
+		);
+	}
+	Ok(())
+}
+
+/// Resolvers pushed to TAP guests: `configured`, or the public defaults.
+fn resolvers(configured: &[Ipv4Addr]) -> Arc<[String]> {
+	let list = if configured.is_empty() {
+		&DEFAULT_TAP_DNS[..]
+	} else {
+		configured
+	};
+	list.iter().map(ToString::to_string).collect()
+}
+
 /// Allocates per-VM network attachments.
 #[derive(Debug)]
 pub struct NetManager {
 	backend: Backend,
+	/// Resolvers pushed to TAP guests ([`resolvers`]).
+	dns:     Arc<[String]>,
 }
 
 /// Network attachment of one VM; releasing it recycles the TAP into the ready
@@ -119,6 +172,8 @@ pub struct NetManager {
 pub struct NetLease {
 	tap:        Option<TapLease>,
 	manager:    Weak<NetManager>,
+	/// Resolvers pushed to a TAP guest.
+	dns:        Arc<[String]>,
 	/// The TAP may return to the ready pool: it was set up by this process
 	/// with egress hooks (not adopted, not a build VM's).
 	recyclable: bool,
@@ -126,8 +181,14 @@ pub struct NetLease {
 
 impl NetManager {
 	/// Resolves `mode` for this host. `pool` is the TAP CIDR; `owner_uid` the
-	/// uid privilege-dropped VMMs run as (TAP ownership).
-	pub fn new(mode: NetMode, pool: &str, owner_uid: Option<u32>) -> anyhow::Result<Arc<Self>> {
+	/// uid privilege-dropped VMMs run as (TAP ownership); `dns` the resolvers
+	/// TAP guests get (empty = public defaults, see [`validate_guest_dns`]).
+	pub fn new(
+		mode: NetMode,
+		pool: &str,
+		owner_uid: Option<u32>,
+		dns: &[Ipv4Addr],
+	) -> anyhow::Result<Arc<Self>> {
 		let linux = cfg!(target_os = "linux");
 		let backend = match (mode, linux) {
 			(NetMode::User, true) => {
@@ -160,7 +221,7 @@ impl NetManager {
 				}
 			},
 		};
-		Ok(Arc::new(Self { backend }))
+		Ok(Arc::new(Self { backend, dns: resolvers(dns) }))
 	}
 
 	/// Capacity features advertised in gossip (`net-user` / `net-tap`).
@@ -225,7 +286,7 @@ impl NetManager {
 	}
 
 	fn lease(self: &Arc<Self>, tap: Option<TapLease>, recyclable: bool) -> NetLease {
-		NetLease { tap, manager: Arc::downgrade(self), recyclable }
+		NetLease { tap, manager: Arc::downgrade(self), dns: Arc::clone(&self.dns), recyclable }
 	}
 
 	/// Reserves the next free block of the TAP address pool.
@@ -465,7 +526,7 @@ impl NetLease {
 				ip:     lease.guest_ip.to_string(),
 				prefix: lease.prefix,
 				gw:     lease.host_ip.to_string(),
-				dns:    TAP_DNS.iter().map(|dns| (*dns).to_owned()).collect(),
+				dns:    self.dns.to_vec(),
 			},
 			// libslirp's fixed guest network.
 			None => NetConfig {
@@ -542,13 +603,18 @@ mod tests {
 
 	#[test]
 	fn guest_config_matches_lease_or_slirp() {
-		let manager = Arc::new(NetManager { backend: Backend::User });
+		let manager = Arc::new(NetManager { backend: Backend::User, dns: resolvers(&[]) });
 		let user = manager.lease(None, false);
 		assert_eq!(user.guest_config().ip, "10.0.2.15");
 		assert_eq!(user.vm_net(), VmNet::User);
 		let pool = LeaseAllocator::new("172.20.0.0/16").unwrap();
 		let lease = TapLease::from_block(pool.block(1).unwrap());
-		let tap = NetLease { tap: Some(lease), manager: Weak::new(), recyclable: false };
+		let tap = NetLease {
+			tap:        Some(lease),
+			manager:    Weak::new(),
+			dns:        resolvers(&[]),
+			recyclable: false,
+		};
 		let config = tap.guest_config();
 		assert_eq!(
 			(config.ip.as_str(), config.gw.as_str(), config.prefix),
@@ -561,8 +627,78 @@ mod tests {
 	#[cfg(not(target_os = "linux"))]
 	#[test]
 	fn platform_mode_resolution() {
-		assert!(NetManager::new(NetMode::Tap, "172.20.0.0/16", None).is_err());
-		let auto = NetManager::new(NetMode::Auto, "172.20.0.0/16", None).unwrap();
+		assert!(NetManager::new(NetMode::Tap, "172.20.0.0/16", None, &[]).is_err());
+		let auto = NetManager::new(NetMode::Auto, "172.20.0.0/16", None, &[]).unwrap();
 		assert_eq!(auto.features(), ["net-user"]);
+	}
+
+	fn ips(list: &[&str]) -> Vec<Ipv4Addr> {
+		list.iter().map(|ip| ip.parse().unwrap()).collect()
+	}
+
+	fn allow(list: &[&str]) -> Vec<String> {
+		list.iter().map(ToString::to_string).collect()
+	}
+
+	#[test]
+	fn guest_dns_defaults_when_unset() {
+		validate_guest_dns(&[], &[]).unwrap();
+		assert_eq!(&*resolvers(&[]), ["8.8.8.8", "1.1.1.1"]);
+		assert_eq!(&*resolvers(&ips(&["9.9.9.9"])), ["9.9.9.9"]);
+	}
+
+	#[test]
+	fn guest_dns_accepts_public_resolvers_without_exemption() {
+		validate_guest_dns(&ips(&["9.9.9.9", "149.112.112.112", "1.1.1.1"]), &[]).unwrap();
+	}
+
+	#[test]
+	fn guest_dns_allows_at_most_three_resolvers() {
+		let error = validate_guest_dns(&ips(&["9.9.9.9", "8.8.8.8", "1.1.1.1", "8.8.4.4"]), &[])
+			.unwrap_err()
+			.to_string();
+		assert!(error.contains("at most 3"), "{error}");
+	}
+
+	#[test]
+	fn guest_dns_rejects_duplicates() {
+		let error = validate_guest_dns(&ips(&["9.9.9.9", "8.8.8.8", "9.9.9.9"]), &[])
+			.unwrap_err()
+			.to_string();
+		assert!(error.contains("9.9.9.9 more than once"), "{error}");
+	}
+
+	#[test]
+	fn guest_dns_in_always_denied_range_needs_an_exemption() {
+		let lan = ips(&["10.0.20.1", "1.1.1.1"]);
+		let error = validate_guest_dns(&lan, &[]).unwrap_err().to_string();
+		assert!(
+			error.contains("--guest-dns 10.0.20.1") && error.contains("--egress-internal-allow"),
+			"{error}"
+		);
+		// An exemption for another range does not cover it.
+		assert!(validate_guest_dns(&lan, &allow(&["10.9.0.0/16"])).is_err());
+		validate_guest_dns(&lan, &allow(&["10.0.20.1/32"])).unwrap();
+		validate_guest_dns(&lan, &allow(&["192.168.5.0/24", "10.0.0.0/8"])).unwrap();
+	}
+
+	#[test]
+	fn guest_dns_rejects_invalid_internal_allow() {
+		assert!(validate_guest_dns(&ips(&["10.0.20.1"]), &allow(&["nonsense"])).is_err());
+	}
+
+	#[test]
+	fn guest_config_pushes_the_configured_resolvers() {
+		let pool = LeaseAllocator::new("172.20.0.0/16").unwrap();
+		let lease = TapLease::from_block(pool.block(1).unwrap());
+		let tap = NetLease {
+			tap:        Some(lease),
+			manager:    Weak::new(),
+			dns:        resolvers(&ips(&["10.0.20.1", "1.1.1.1"])),
+			recyclable: false,
+		};
+		assert_eq!(tap.guest_config().dns, ["10.0.20.1", "1.1.1.1"]);
+		// Avoid running teardown commands for this synthetic lease.
+		std::mem::forget(tap);
 	}
 }

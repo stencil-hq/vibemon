@@ -570,7 +570,8 @@ mod tests {
 			..NetworkPolicy::default()
 		};
 		let internal: Vec<Cidr> = internal.iter().map(|c| c.parse().expect("cidr")).collect();
-		Compiled::compile(&policy, &internal).expect("policy")
+		Compiled::compile(&policy, &internal, &[crate::egress::policy::DEFAULT_NAMESERVER])
+			.expect("policy")
 	}
 
 	#[test]

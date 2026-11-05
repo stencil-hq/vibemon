@@ -1,7 +1,7 @@
 //! Node role configuration, built by the `vmon serve` front end from flags,
 //! environment, and defaults (ARCHITECTURE.md §3, §8.1).
 
-use std::path::PathBuf;
+use std::{net::Ipv4Addr, path::PathBuf};
 
 pub use crate::net::NetMode;
 
@@ -56,6 +56,10 @@ pub struct NodeConfig {
 	pub vmm_user:                Option<(u32, u32)>,
 	/// CIDRs exempt from the always-denied private ranges in egress policy.
 	pub egress_internal_allow:   Vec<String>,
+	/// Resolvers handed to TAP guests (`--guest-dns`); empty = `8.8.8.8` and
+	/// `1.1.1.1`. Validated by [`crate::net::validate_guest_dns`]; ignored
+	/// without TAP networking.
+	pub guest_dns:               Vec<Ipv4Addr>,
 	/// Docker Hub pull-through mirror (`--registry-mirror`), tried first for
 	/// anonymous `docker.io` base images.
 	pub registry_mirror:         Option<String>,

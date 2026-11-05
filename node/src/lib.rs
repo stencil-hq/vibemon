@@ -68,6 +68,22 @@ impl Node {
 	/// the sandbox manager, adopts VMMs left by a previous process, and starts
 	/// capacity publishing into `cluster` metadata.
 	pub async fn start(config: NodeConfig, cluster: Cluster) -> anyhow::Result<Self> {
+		net::validate_guest_dns(&config.guest_dns, &config.egress_internal_allow)?;
+		// Only TAP guests are handed resolvers; slirp guests use 10.0.2.3, which
+		// forwards to the host's.
+		let guest_dns = if cfg!(target_os = "linux") {
+			config.guest_dns.clone()
+		} else {
+			if !config.guest_dns.is_empty() {
+				tracing::warn!("--guest-dns is only supported with TAP networking on Linux");
+			}
+			Vec::new()
+		};
+		let nameservers = if guest_dns.is_empty() {
+			vec![egress::policy::DEFAULT_NAMESERVER]
+		} else {
+			guest_dns.clone()
+		};
 		std::fs::create_dir_all(&config.data_dir)
 			.with_context(|| format!("creating {}", config.data_dir.display()))?;
 		let http = reqwest::Client::builder()
@@ -90,8 +106,12 @@ impl Node {
 		let cpu_model = host::cpu_model();
 		let arch = assets::host_arch().to_owned();
 
-		let net =
-			NetManager::new(config.net_mode, &config.net_pool, config.vmm_user.map(|(uid, _)| uid))?;
+		let net = NetManager::new(
+			config.net_mode,
+			&config.net_pool,
+			config.vmm_user.map(|(uid, _)| uid),
+			&guest_dns,
+		)?;
 		// SAFETY: geteuid has no preconditions.
 		let root = unsafe { libc::geteuid() } == 0;
 		let isolation = match (cfg!(target_os = "linux") && root, config.vmm_user) {
@@ -112,9 +132,10 @@ impl Node {
 			net: Arc::clone(&net),
 		})?;
 		let egress = Egress::start(EgressConfig {
-			data_dir:       config.data_dir.clone(),
+			data_dir: config.data_dir.clone(),
 			internal_allow: config.egress_internal_allow.clone(),
-			proxy_port:     0,
+			nameservers,
+			proxy_port: 0,
 		})
 		.await
 		.context("starting egress enforcement")?;

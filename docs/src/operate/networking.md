@@ -24,7 +24,7 @@ Guests run no DHCP client: after every boot, fork, and resume the node pushes th
 |---|---|---|
 | Guest address | `<lease>+2`/30 | `10.0.2.15/24` |
 | Gateway | `<lease>+1` (TAP side) | `10.0.2.2` |
-| DNS | `8.8.8.8`, `1.1.1.1` | `10.0.2.3` (slirp resolver) |
+| DNS | `8.8.8.8`, `1.1.1.1` (or `--guest-dns`) | `10.0.2.3` (slirp resolver) |
 
 ## Linux: TAP and NAT
 
@@ -94,7 +94,7 @@ The E2B API carries the policy; the driver validates and normalizes it and the n
 - **IP / CIDR**: IPv4 or IPv6; a bare address becomes `/32` or `/128`. In `denyOut`, an unspecified address (`0.0.0.0`, `::`) is only accepted as the literal `0.0.0.0/0` (the SDKs export it as `ALL_TRAFFIC`).
 - **Domains** (`allowOut` only): `example.com` (exact), `*.example.com` (strict subdomains at any depth, not the apex), or `*` (every hostname). Matching is case-insensitive. A domain is recognized from the HTTP `Host` header on port 80 and the TLS SNI on port 443; on other ports only CIDR rules apply.
 - `allowOut` with any domain requires `denyOut` to contain `0.0.0.0/0`; otherwise the request fails with 400.
-- When `allowOut` has domains, `8.8.8.8` is implicitly allowed so DNS works under deny-all.
+- When `allowOut` has domains, the guests' DNS resolvers are implicitly allowed so DNS works under deny-all: `8.8.8.8` by default, or the `--guest-dns` list (see [DNS for private resolvers](#dns-for-private-resolvers)).
 
 Precedence for a TCP flow:
 
@@ -122,6 +122,16 @@ vmon serve --role node --egress-internal-allow 10.20.0.0/16,192.168.5.10/32
 ```
 
 The exemption only lifts the always-denied block; the sandbox's own `denyOut` still applies.
+
+### DNS for private resolvers
+
+Names that only a LAN resolver knows (a split-horizon resolver, for example a gateway at `10.0.20.1`) do not resolve through the default public resolvers, which answer with no records. `vmon serve --guest-dns` (`VMON_GUEST_DNS`, comma-separated IPv4 addresses, 1 to 3) replaces the resolvers Linux TAP guests get. A resolver inside an always-denied range also needs `--egress-internal-allow`; the node refuses to start with only one of the two:
+
+```sh
+vmon serve --role node --guest-dns 10.0.20.1,1.1.1.1 --egress-internal-allow 10.0.20.1/32
+```
+
+The exemption is the explicit `--egress-internal-allow` entry and it covers all ports of that address, not only `:53`; to let sandboxes reach only `:53` there, pair it with a host firewall rule. A policy with `allowOut` domains implicitly allows the configured resolvers (instead of `8.8.8.8`) so DNS works under deny-all. On user-mode networking the flag logs a warning and is ignored: slirp guests use `10.0.2.3`, which forwards to the host's resolvers.
 
 ### HTTPS header rules
 
