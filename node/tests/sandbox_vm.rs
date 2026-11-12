@@ -126,7 +126,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 	let arch = vmon_node::assets::host_arch().to_owned();
 	let cpu_baseline = host::cpu_baseline(&vmon_bin).await.expect("cpu baseline");
 
-	let net = NetManager::new(NetMode::Auto, "172.20.0.0/16", None).expect("net manager");
+	let net = NetManager::new(NetMode::Auto, "172.20.0.0/16", None, &[]).expect("net manager");
 	let vms = VmRuntime::new(VmRuntimeConfig {
 		vmon_bin: vmon_bin.clone(),
 		run_dir: run_dir.clone(),
@@ -144,6 +144,7 @@ async fn harness(boot_concurrency: usize, template_load: Option<&str>) -> Harnes
 	let egress = Egress::start(EgressConfig {
 		data_dir:       data.path().to_owned(),
 		internal_allow: Vec::new(),
+		nameservers:    vec![vmon_node::egress::policy::DEFAULT_NAMESERVER],
 		proxy_port:     0,
 	})
 	.await

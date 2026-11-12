@@ -728,7 +728,7 @@ mod tests {
 			run_dir:          dir.path().join("run"),
 			boot_concurrency: 1,
 			isolation:        VmmIsolation::Default,
-			net:              NetManager::new(crate::net::NetMode::Auto, "172.20.0.0/16", None)
+			net:              NetManager::new(crate::net::NetMode::Auto, "172.20.0.0/16", None, &[])
 				.unwrap(),
 		})
 		.unwrap();

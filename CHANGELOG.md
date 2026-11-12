@@ -26,6 +26,10 @@ All notable changes to this project are recorded here.
 - Sandboxes on x86_64 nodes with nested KVM get `/dev/kvm`. The guest kernel builds KVM (Intel and AMD) in explicitly, and guests boot with `kvm.enable_virt_at_load=0`, so virtualization is on only while the guest runs VMs
 - A memory pause, snapshot, fork, or migration of a sandbox that is running VMs is refused with 409 `error_code: nested_virtualization_active` instead of capturing state it cannot restore; filesystem-only pause still works
 
+### Added
+
+- `vmon serve --guest-dns <IP>[,<IP>…]` (`VMON_GUEST_DNS`, node role) sets the DNS resolvers handed to Linux TAP guests, so a split-horizon LAN resolver can answer internal names (default `8.8.8.8,1.1.1.1`, unchanged). One to three distinct IPv4 addresses; a resolver in an always-denied private range must also be listed in `--egress-internal-allow`, which exempts it on every port. A policy with `allowOut` domains implicitly allows the configured resolvers instead of `8.8.8.8`. On user-mode networking (macOS) the flag logs a warning and is ignored
+
 ### Fixed
 
 - Template build steps run at the build's `cpuCount` and `memoryMB` (at least 2 vCPUs and 1 GiB). Before, every step ran in a 2 vCPU / 1 GiB VM whatever the build asked for, so memory-heavy steps such as `cargo install` were killed by the guest's OOM killer

@@ -108,6 +108,9 @@ These flags apply to the node role.
 | `--net-pool <NET_POOL>` | `VMON_NET_POOL` | `172.20.0.0/16` | Address pool for Linux TAP leases. Each sandbox gets a /30. |
 | `--vmm-user <VMM_USER>` | `VMON_VMM_USER` | none | `uid:gid` (numeric) that VMM processes drop to. Linux root only. See below. |
 | `--egress-internal-allow <EGRESS_INTERNAL_ALLOW>` | `VMON_EGRESS_INTERNAL_ALLOW` | none | CIDRs that sandboxes may reach despite the always-denied private ranges, comma separated. |
+| `--guest-dns <GUEST_DNS>` | `VMON_GUEST_DNS` | `8.8.8.8,1.1.1.1` | DNS resolvers handed to Linux TAP guests, comma separated IPv4 addresses (1 to 3, no duplicates). A resolver inside an always-denied private range, such as a LAN resolver, must also be listed in `--egress-internal-allow`. On user-mode networking the flag logs a warning and is ignored. |
+
+`--guest-dns` is written to each guest's `/etc/resolv.conf` on every boot, fork, and resume, and a policy with `allowOut` domains implicitly allows these resolvers (`8.8.8.8` when the flag is unset). Startup fails on an IPv6 or malformed address, more than three entries (the glibc resolver limit), a duplicate, or an always-denied resolver without a matching `--egress-internal-allow`. The exemption covers every port of the address, not just `:53`. See [DNS for private resolvers](../operate/networking.md#dns-for-private-resolvers).
 
 **VMM privilege drop.** The node launches each VMM as `vmon vmm`:
 

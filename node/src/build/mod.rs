@@ -472,7 +472,7 @@ mod tests {
 			run_dir:          dir.join("run"),
 			boot_concurrency: 1,
 			isolation:        VmmIsolation::Default,
-			net:              NetManager::new(NetMode::Auto, "172.20.0.0/16", None).unwrap(),
+			net:              NetManager::new(NetMode::Auto, "172.20.0.0/16", None, &[]).unwrap(),
 		})
 		.unwrap();
 		Builder::new(

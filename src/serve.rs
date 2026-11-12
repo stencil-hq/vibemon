@@ -3,7 +3,7 @@
 
 use std::{
 	fs,
-	net::{IpAddr, SocketAddr},
+	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -175,6 +175,12 @@ pub struct ServeArgs {
 	/// separated).
 	#[arg(long, env = "VMON_EGRESS_INTERNAL_ALLOW", value_delimiter = ',')]
 	egress_internal_allow:   Vec<String>,
+	/// Node role, Linux TAP guests: DNS resolvers handed to guests, comma
+	/// separated IPv4 addresses (1 to 3; default `8.8.8.8,1.1.1.1`). A resolver
+	/// in an always-denied private range, such as a LAN resolver, must also be
+	/// listed in `--egress-internal-allow`, which exempts it on every port.
+	#[arg(long, env = "VMON_GUEST_DNS", value_delimiter = ',')]
+	guest_dns:               Vec<Ipv4Addr>,
 	/// Docker Hub pull-through mirror tried first for anonymous `docker.io`
 	/// template base images, e.g. `https://mirror.gcr.io` (falls back to
 	/// Docker Hub).
@@ -338,6 +344,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 			cluster_secret:          secret.clone(),
 			vmm_user:                args.vmm_user,
 			egress_internal_allow:   args.egress_internal_allow.clone(),
+			guest_dns:               args.guest_dns.clone(),
 			registry_mirror:         args.registry_mirror.clone(),
 			object_store:            object_store.clone(),
 			lazy_resume:             args.lazy_resume,
@@ -601,4 +608,36 @@ fn now_ms() -> u64 {
 	std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+	use clap::Parser;
+
+	use super::*;
+
+	#[derive(Parser)]
+	struct Cli {
+		#[command(flatten)]
+		serve: ServeArgs,
+	}
+
+	fn parse(dns: &str) -> Result<Vec<Ipv4Addr>, clap::Error> {
+		Cli::try_parse_from(["vmon", "--guest-dns", dns]).map(|cli| cli.serve.guest_dns)
+	}
+
+	#[test]
+	fn guest_dns_parses_a_comma_separated_ipv4_list() {
+		assert_eq!(parse("10.0.20.1,1.1.1.1").unwrap(), [
+			Ipv4Addr::new(10, 0, 20, 1),
+			Ipv4Addr::new(1, 1, 1, 1)
+		]);
+	}
+
+	#[test]
+	fn guest_dns_rejects_non_ipv4_values() {
+		for bad in ["dns.example.com", "10.0.20", "10.0.20.1:53", "2001:4860:4860::8888", "::1"] {
+			assert!(parse(bad).is_err(), "{bad}");
+		}
+	}
 }
