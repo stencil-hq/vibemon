@@ -69,6 +69,13 @@ const DRAIN_CHUNK: usize = 16 * 1024;
 const SOCKET_BUFFER_MAX: usize = 2 << 20;
 /// Smallest socket buffer size tried before keeping the system default.
 const SOCKET_BUFFER_MIN: usize = 256 << 10;
+/// How long a call polls for the first reply byte before the vCPU thread
+/// sleeps in a blocking receive. Small replies usually arrive within a few
+/// microseconds, and polling saves the kernel sleep and wake-up a blocking
+/// receive pays for each. The vCPU is stalled until the reply either way, so
+/// spinning costs host CPU only while a call is in flight, at most this long
+/// per call; replies slower than this pay the sleep as before.
+const SPIN_WINDOW: Duration = Duration::from_micros(50);
 
 // Linux errno values for `status`: the guest's numbering, not the host's
 // (macOS numbers `EMSGSIZE` and `ENOTCONN` differently).
@@ -242,6 +249,22 @@ impl Failure {
 	}
 }
 
+impl Scratch {
+	/// Buffers sized for the largest call, so calls never grow them.
+	fn new() -> Self {
+		Self { segs: Vec::with_capacity(MAX_SEGS), iov: Vec::with_capacity(MAX_SEGS + 1) }
+	}
+}
+
+/// How the first bytes of a reply were received.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arrival {
+	/// While polling, within the spin window.
+	Spun,
+	/// By the blocking receive after the spin window.
+	Blocked,
+}
+
 /// Direction of a vectored socket transfer.
 #[derive(Clone, Copy)]
 enum Direction {
@@ -252,9 +275,7 @@ enum Direction {
 impl Port {
 	/// A port with no daemon connection yet.
 	fn new(index: usize, mem: GuestMemoryMmap, sock: Arc<Path>, timeout: Duration) -> Self {
-		let scratch =
-			Scratch { segs: Vec::with_capacity(MAX_SEGS), iov: Vec::with_capacity(MAX_SEGS + 1) };
-		Self { index, mem, sock, timeout, conn: None, outage_logged: false, scratch }
+		Self { index, mem, sock, timeout, conn: None, outage_logged: false, scratch: Scratch::new() }
 	}
 
 	/// Performs the call at `call_gpa` and writes `status` and `reply_len`
@@ -435,24 +456,32 @@ fn transact(
 	let (request, reply) = scratch.segs.split_at(call.request_segs);
 	let mut prefix = (call.request_len as u32).to_le_bytes();
 	let frame = fill_iov(&mut scratch.iov, &mut prefix, request);
+	let started = Instant::now();
 	transfer_all(fd, frame, Direction::Send).map_err(Failure::before_reply)?;
-	receive(mem, fd, reply, call.reply_cap, &mut scratch.iov)
+	let sent = Instant::now();
+	crate::metrics::record_ovnfs_send(sent - started);
+	receive(mem, fd, reply, call.reply_cap, &mut scratch.iov, sent)
 }
 
-/// Receives one reply frame into the call's reply segments. The length prefix
-/// and whatever body is already queued arrive with a single `readv` across
-/// `[prefix, reply segments]`; the daemon sends nothing past its reply, so
-/// that read cannot overrun the frame.
+/// Receives one reply frame into the call's reply segments; the request went
+/// out at `sent`. The length prefix and whatever body is already queued arrive
+/// with a single receive across `[prefix, reply segments]`; the daemon sends
+/// nothing past its reply, so that read cannot overrun the frame.
 fn receive(
 	mem: &GuestMemoryMmap,
 	fd: RawFd,
 	reply: &[Seg],
 	reply_cap: usize,
 	iov: &mut Vec<libc::iovec>,
+	sent: Instant,
 ) -> Result<Reply, Failure> {
 	let mut prefix = [0u8; FRAME_PREFIX_SIZE];
 	let used = fill_iov(iov, &mut prefix, reply);
-	let got = transfer(fd, used, Direction::Receive).map_err(Failure::before_reply)?;
+	let (got, arrival) = first_reply(fd, used, sent + SPIN_WINDOW).map_err(Failure::before_reply)?;
+	crate::metrics::record_ovnfs_reply_wait(sent.elapsed());
+	if arrival == Arrival::Spun {
+		crate::metrics::record_ovnfs_spin_hit();
+	}
 	if got == 0 {
 		return Err(Failure::Broken(io::ErrorKind::UnexpectedEof.into()));
 	}
@@ -575,6 +604,47 @@ fn transfer(fd: RawFd, iov: &[libc::iovec], direction: Direction) -> io::Result<
 			return Err(error);
 		}
 	}
+}
+
+/// The first receive of a reply into `iov`: polls without sleeping until
+/// `spin_until`, then blocks with the connection's timeout. Returns the bytes
+/// received (0 at end of stream) and how they arrived; a partial reply
+/// continues through the caller's blocking path.
+fn first_reply(
+	fd: RawFd,
+	iov: &[libc::iovec],
+	spin_until: Instant,
+) -> io::Result<(usize, Arrival)> {
+	loop {
+		match receive_nonblocking(fd, iov) {
+			Ok(n) => return Ok((n, Arrival::Spun)),
+			Err(error)
+				if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {},
+			Err(error) => return Err(error),
+		}
+		if Instant::now() >= spin_until {
+			break;
+		}
+		std::hint::spin_loop();
+	}
+	let n = transfer(fd, iov, Direction::Receive)?;
+	Ok((n, Arrival::Blocked))
+}
+
+/// One `recvmsg` into `iov` that fails with `WouldBlock` instead of sleeping
+/// when nothing is queued; the socket itself stays blocking.
+fn receive_nonblocking(fd: RawFd, iov: &[libc::iovec]) -> io::Result<usize> {
+	// SAFETY: an all-zero `msghdr` is valid (no address, no control data); it
+	// is plain data whose private padding fields differ between C libraries.
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = iov.as_ptr().cast_mut();
+	// At most `MAX_SEGS + 1` entries; the field type differs between libcs.
+	msg.msg_iovlen = iov.len() as _;
+	// SAFETY: `msg` names only `iov`, whose entries describe memory valid for
+	// their lengths (see `transfer`); `recvmsg` writes through them and does
+	// not keep any pointer.
+	let n = unsafe { libc::recvmsg(fd, &raw mut msg, libc::MSG_DONTWAIT) };
+	usize::try_from(n).map_err(|_| io::Error::last_os_error())
 }
 
 /// Reads and discards `len` bytes, keeping the connection framed after a reply
@@ -915,6 +985,80 @@ mod tests {
 			let size = buffer_size(conn, option);
 			assert!(size >= SOCKET_BUFFER_MIN, "socket buffer {option} is {size} bytes");
 		}
+		daemon.join().unwrap();
+	}
+
+	/// An `iovec` over `buf`.
+	fn iovec(buf: &mut [u8]) -> libc::iovec {
+		libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() }
+	}
+
+	/// The process-wide count of replies that arrived while polling.
+	fn spin_hits() -> u64 {
+		crate::metrics::snapshot_json()["ovnfs"]["spin_hits"]
+			.as_u64()
+			.unwrap()
+	}
+
+	#[test]
+	fn ovnfs_immediate_reply_is_a_spin_hit() {
+		let mem = memory();
+		simple_call(&mem);
+		let (vmm, mut daemon) = UnixStream::pair().unwrap();
+		// The reply is queued before the request goes out, so the first poll
+		// finds it.
+		write_frame(&mut daemon, b"pong");
+		let mut scratch = Scratch::new();
+		let call = parse_call(&mem, GuestAddress(RAM_BASE), &mut scratch.segs).unwrap();
+		let hits = spin_hits();
+		let reply = transact(&mem, &mut scratch, vmm.as_raw_fd(), call);
+		assert!(matches!(reply, Ok(Reply::Delivered(4))));
+		assert!(spin_hits() > hits);
+		assert_eq!(get(&mem, REPLY, 4), b"pong");
+		assert_eq!(read_frame(&mut daemon), b"ping");
+
+		write_frame(&mut daemon, b"pong");
+		let (mut prefix, mut body) = ([0u8; 4], [0u8; 16]);
+		let iov = [iovec(&mut prefix), iovec(&mut body)];
+		let spin_until = Instant::now() + SPIN_WINDOW;
+		let first = first_reply(vmm.as_raw_fd(), &iov, spin_until).unwrap();
+		assert_eq!(first, (8, Arrival::Spun));
+	}
+
+	#[test]
+	fn ovnfs_slow_reply_falls_back_to_blocking() {
+		let (vmm, mut daemon) = UnixStream::pair().unwrap();
+		let replier = thread::spawn(move || {
+			let mut request = [0u8; 4];
+			daemon.read_exact(&mut request).unwrap();
+			thread::sleep(Duration::from_micros(200));
+			write_frame(&mut daemon, b"late");
+		});
+		// The window closes 50 µs after this point; the reply comes 200 µs after
+		// the request, which is sent later still.
+		let spin_until = Instant::now() + SPIN_WINDOW;
+		(&vmm).write_all(b"ping").unwrap();
+		let (mut prefix, mut body) = ([0u8; 4], [0u8; 16]);
+		let iov = [iovec(&mut prefix), iovec(&mut body)];
+		let (got, arrival) = first_reply(vmm.as_raw_fd(), &iov, spin_until).unwrap();
+		assert_eq!(arrival, Arrival::Blocked);
+		assert!(got >= FRAME_PREFIX_SIZE, "received {got} bytes");
+		assert_eq!(u32::from_le_bytes(prefix), 4);
+		replier.join().unwrap();
+
+		let mem = memory();
+		let sock = SockPath::new();
+		let listener = UnixListener::bind(&sock.0).unwrap();
+		let daemon = thread::spawn(move || {
+			let (mut conn, _) = listener.accept().unwrap();
+			assert_eq!(read_frame(&mut conn), b"ping");
+			thread::sleep(Duration::from_micros(200));
+			write_frame(&mut conn, b"pong");
+		});
+		let bus = bus(&mem, &sock.0, 1);
+		simple_call(&mem);
+		assert_eq!(ring(&bus, &mem, 0, RAM_BASE), (0, 4));
+		assert_eq!(get(&mem, REPLY, 4), b"pong");
 		daemon.join().unwrap();
 	}
 

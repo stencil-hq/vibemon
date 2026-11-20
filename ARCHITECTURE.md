@@ -1325,7 +1325,7 @@ flag nothing is mapped there.
   `struct ovnfs_call`. The trapping vCPU thread validates it (segment count,
   every segment inside one guest RAM region, request and reply each within
   `OVNFS_MAX_FRAME`), `writev`s the request as one `__le32`-length-prefixed
-  frame straight from guest RAM, `readv`s the reply frame straight into the
+  frame straight from guest RAM, reads the reply frame straight into the
   reply segments (marking them in the host-write dirty bitmap), writes
   `status`/`reply_len` and resumes the guest. Statuses are Linux errnos:
   `EINVAL` malformed call, `EMSGSIZE` reply larger than the segments (drained,
@@ -1335,11 +1335,20 @@ flag nothing is mapped there.
   hung daemon delays a pause by at most that per transfer); a failed
   connection is closed, and a call that could not dial or found its
   connection broken before any reply byte is re-dialed once. Timeouts and
-  failures mid-reply are never resent.
+  failures mid-reply are never resent. Send and receive buffers are raised
+  to 2 MiB (halving down to 256 KiB where the host refuses), so a 1 MiB
+  payload is not handed over in 8 KiB pieces. After the request, the vCPU
+  thread polls for the first reply byte (`MSG_DONTWAIT`) for up to 50 µs
+  before it sleeps in a blocking receive: the vCPU is stalled either way, and
+  small replies arrive within that window.
 - **Snapshots**: the device has no state. Boot, restore and fork build it
   from the flag on their own command line, so a snapshot taken with it
   restores with or without it. Under `--jail` the socket is bind-mounted like
-  `--remote-fs` sockets. `metrics` reports `ovnfs.calls` and `ovnfs.call_ns`.
+  `--remote-fs` sockets.
+- **Metrics**: `ovnfs.calls`, `ovnfs.call_ns` (trap to reply in guest
+  memory), `ovnfs.send_ns` (handing requests to the socket),
+  `ovnfs.reply_wait_ns` (request sent to first reply byte) and
+  `ovnfs.spin_hits` (replies that arrived while polling).
 
 ### 8.7 Metrics and logs
 

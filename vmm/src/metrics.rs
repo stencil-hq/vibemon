@@ -73,6 +73,9 @@ struct Metrics {
 	ksm_regions_advised:        AtomicU64,
 	ovnfs_calls:                AtomicU64,
 	ovnfs_call_ns:              AtomicU64,
+	ovnfs_spin_hits:            AtomicU64,
+	ovnfs_send_ns:              AtomicU64,
+	ovnfs_reply_wait_ns:        AtomicU64,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::default);
@@ -158,13 +161,38 @@ pub fn record_snapshot(duration: Duration) {
 	saturating_add(&METRICS.snapshot_total_duration_ms, d);
 }
 
+/// Whole nanoseconds of `duration`, saturating like [`ms`].
+#[cfg(unix)]
+#[inline]
+fn ns(duration: Duration) -> u64 {
+	duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 /// Count one ovnfs call (doorbell write) and the nanoseconds the vCPU spent
 /// in it, from the trap to the reply in guest memory.
 #[cfg(unix)]
 pub fn record_ovnfs_call(duration: Duration) {
 	METRICS.ovnfs_calls.fetch_add(1, Ordering::Relaxed);
-	let ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
-	saturating_add(&METRICS.ovnfs_call_ns, ns);
+	saturating_add(&METRICS.ovnfs_call_ns, ns(duration));
+}
+
+/// Add the time one ovnfs request took to hand to the daemon socket.
+#[cfg(unix)]
+pub fn record_ovnfs_send(duration: Duration) {
+	saturating_add(&METRICS.ovnfs_send_ns, ns(duration));
+}
+
+/// Add the time from a sent ovnfs request to the first reply byte.
+#[cfg(unix)]
+pub fn record_ovnfs_reply_wait(duration: Duration) {
+	saturating_add(&METRICS.ovnfs_reply_wait_ns, ns(duration));
+}
+
+/// Count one ovnfs reply that arrived while polling, before the vCPU thread
+/// would have slept in a blocking receive.
+#[cfg(unix)]
+pub fn record_ovnfs_spin_hit() {
+	METRICS.ovnfs_spin_hits.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -269,6 +297,9 @@ pub fn snapshot_json() -> Value {
 		 "ovnfs": {
 			  "calls": load(&METRICS.ovnfs_calls),
 			  "call_ns": load(&METRICS.ovnfs_call_ns),
+			  "spin_hits": load(&METRICS.ovnfs_spin_hits),
+			  "send_ns": load(&METRICS.ovnfs_send_ns),
+			  "reply_wait_ns": load(&METRICS.ovnfs_reply_wait_ns),
 		 },
 	})
 }
