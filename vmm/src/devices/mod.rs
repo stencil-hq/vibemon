@@ -1,5 +1,7 @@
 //! Device-model plumbing: a portable port/MMIO bus.
 
+#[cfg(unix)]
+pub mod ovnfs;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
 pub mod serial;

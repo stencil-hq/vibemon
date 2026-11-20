@@ -1309,6 +1309,38 @@ protocol, inode table only in snapshots); the proxy owns all state.
   addresses are refused unless `--s3-mounts-allow-private`. Mount traffic is
   host-side and not subject to the sandbox egress policy.
 
+### 8.9 ovnfs call device (`vmm::devices::ovnfs`)
+
+`vmon vmm --ovnfs <SOCK>` (absolute path of an ovnfs daemon's kernel-share
+socket, at most once; Linux and macOS hosts) maps the call page of ovnfs's
+`kmod/ovnfs_wire.h` at `layout::OVNFS_MMIO_BASE` (arm64 `0x0910_0000`,
+x86_64 `0xefff_0000`), where the guest's `ovnfs.ko` finds it. Without the
+flag nothing is mapped there.
+
+- **Registers**: `INFO` (64-bit read: magic, version, port count) and one
+  64-bit doorbell per vCPU (capped at the page's 480). Each doorbell is its
+  own bus device with its own lock and daemon connection, so a call on one
+  port never waits for a call on another.
+- **Call**: a 64-bit doorbell write carries the guest address of a
+  `struct ovnfs_call`. The trapping vCPU thread validates it (segment count,
+  every segment inside one guest RAM region, request and reply each within
+  `OVNFS_MAX_FRAME`), `writev`s the request as one `__le32`-length-prefixed
+  frame straight from guest RAM, `readv`s the reply frame straight into the
+  reply segments (marking them in the host-write dirty bitmap), writes
+  `status`/`reply_len` and resumes the guest. Statuses are Linux errnos:
+  `EINVAL` malformed call, `EMSGSIZE` reply larger than the segments (drained,
+  connection kept), `ENOTCONN` daemon unreachable, `EIO` I/O error or timeout.
+  Other widths and offsets are ignored; reads other than `INFO` return zero.
+- **Connections**: dialed on first use with 30 s send/receive timeouts (a
+  hung daemon delays a pause by at most that per transfer); a failed
+  connection is closed, and a call that could not dial or found its
+  connection broken before any reply byte is re-dialed once. Timeouts and
+  failures mid-reply are never resent.
+- **Snapshots**: the device has no state. Boot, restore and fork build it
+  from the flag on their own command line, so a snapshot taken with it
+  restores with or without it. Under `--jail` the socket is bind-mounted like
+  `--remote-fs` sockets. `metrics` reports `ovnfs.calls` and `ovnfs.call_ns`.
+
 ### 8.7 Metrics and logs
 
 - Every 5 s per running sandbox: envd `GET /metrics` via tunnel →

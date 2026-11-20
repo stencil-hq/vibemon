@@ -52,6 +52,10 @@ mod x86_64 {
 	/// Local / IO APIC default physical bases (from `apicdef.h`).
 	pub const APIC_DEFAULT_PHYS_BASE: u32 = 0xfee0_0000;
 	pub const IO_APIC_DEFAULT_PHYS_BASE: u32 = 0xfec0_0000;
+	/// ovnfs call page (`OVNFS_MMIO_BASE_X86_64` of ovnfs `kmod/ovnfs_wire.h`):
+	/// a fixed address the guest module defaults to, below the IOAPIC.
+	#[cfg(unix)]
+	pub const OVNFS_MMIO_BASE: u64 = 0xefff_0000;
 	/// COM1 uses legacy IRQ 4; virtio devices take consecutive GSIs from 5.
 	pub const SERIAL_IRQ: u32 = 4;
 	pub const IRQ_BASE: u32 = 5;
@@ -87,6 +91,12 @@ mod aarch64 {
 	pub const SERIAL_MMIO_BASE: u64 = 0x0900_0000;
 	pub const SERIAL_MMIO_SIZE: u64 = 0x1000;
 	pub const SERIAL_IRQ: u32 = 0;
+
+	/// ovnfs call page (`OVNFS_MMIO_BASE_ARM64` in ovnfs's `kmod/ovnfs_wire.h`):
+	/// a fixed address the guest module defaults to, between the serial port
+	/// and the virtio-mmio window.
+	#[cfg(unix)]
+	pub const OVNFS_MMIO_BASE: u64 = 0x0910_0000;
 
 	/// virtio-mmio device window base and first virtio GSI.
 	pub const MMIO_MEM_START: u64 = 0x0a00_0000;

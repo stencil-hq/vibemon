@@ -9,6 +9,8 @@
 //! Durations are stored as whole milliseconds. Boot/restore/fork timers are
 //! gauges (last value wins; a process reconstructs exactly once), while the
 //! snapshot timer keeps a running count plus last and cumulative duration.
+//! ovnfs calls are microsecond-scale, so their cumulative time is kept in
+//! nanoseconds.
 
 use std::{
 	sync::{
@@ -69,6 +71,8 @@ struct Metrics {
 	pager_compressed_bytes:     AtomicU64,
 	pager_swapped_pages:        AtomicU64,
 	ksm_regions_advised:        AtomicU64,
+	ovnfs_calls:                AtomicU64,
+	ovnfs_call_ns:              AtomicU64,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(Metrics::default);
@@ -152,6 +156,15 @@ pub fn record_snapshot(duration: Duration) {
 		.snapshot_last_duration_ms
 		.store(d, Ordering::Relaxed);
 	saturating_add(&METRICS.snapshot_total_duration_ms, d);
+}
+
+/// Count one ovnfs call (doorbell write) and the nanoseconds the vCPU spent
+/// in it, from the trap to the reply in guest memory.
+#[cfg(unix)]
+pub fn record_ovnfs_call(duration: Duration) {
+	METRICS.ovnfs_calls.fetch_add(1, Ordering::Relaxed);
+	let ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+	saturating_add(&METRICS.ovnfs_call_ns, ns);
 }
 
 #[cfg(target_os = "linux")]
@@ -252,6 +265,10 @@ pub fn snapshot_json() -> Value {
 		 },
 		 "ksm": {
 			  "regions_advised": load(&METRICS.ksm_regions_advised),
+		 },
+		 "ovnfs": {
+			  "calls": load(&METRICS.ovnfs_calls),
+			  "call_ns": load(&METRICS.ovnfs_call_ns),
 		 },
 	})
 }

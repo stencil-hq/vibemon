@@ -60,10 +60,10 @@ use crate::{
 	arch,
 	config::{BootMode, Config, MAX_COUNT, Transport},
 	control::{self, ControlCmd, ControlKind, PauseGate, RunState, VcpuCmd},
-	devices::{Bus, serial::SerialDevice},
+	devices::{Bus, ovnfs, serial::SerialDevice},
 	disk_snapshot,
 	hv::{Exit, Vcpu, Vm},
-	layout::{IRQ_BASE, MMIO_DEVICE_SIZE, MMIO_MEM_START, SERIAL_IRQ},
+	layout::{IRQ_BASE, MMIO_DEVICE_SIZE, MMIO_MEM_START, OVNFS_MMIO_BASE, SERIAL_IRQ},
 	metrics::VmExit,
 	os::{EFD_NONBLOCK, EventFd},
 	result::{Result, err},
@@ -1318,8 +1318,9 @@ fn build_sandbox_paths(config: &Config) -> Result<crate::sandbox::SandboxPaths> 
 			paths.rw_dirs.push(parent.to_path_buf());
 		}
 	}
-	for m in &config.remote_fs {
-		if let Some(parent) = m.sock.parent()
+	let remote_socks = config.remote_fs.iter().map(|m| m.sock.as_path());
+	for sock in remote_socks.chain(config.ovnfs.as_deref()) {
+		if let Some(parent) = sock.parent()
 			&& !parent.as_os_str().is_empty()
 		{
 			paths.rw_dirs.push(parent.to_path_buf());
@@ -1880,6 +1881,7 @@ impl Vmm {
 		let serial = setup_serial(&vm, &mut pio_bus, None)?;
 		#[cfg(target_arch = "aarch64")]
 		let serial = setup_serial(&vm, &mut mmio_bus, None)?;
+		setup_ovnfs(&mut mmio_bus, &vm, &config, config.cpus);
 
 		#[cfg(target_arch = "x86_64")]
 		let (pci_root, mut pci_mmio) =
@@ -2545,6 +2547,7 @@ impl Vmm {
 		let serial = setup_serial(&vm, &mut pio_bus, Some(&snap.serial))?;
 		#[cfg(target_arch = "aarch64")]
 		let serial = setup_serial(&vm, &mut mmio_bus, Some(&snap.serial))?;
+		setup_ovnfs(&mut mmio_bus, &vm, config, snap.cpus);
 
 		#[cfg(target_arch = "x86_64")]
 		let needs_pci = snap
@@ -4211,6 +4214,16 @@ fn setup_serial(
 		serial.clone(),
 	);
 	Ok(serial)
+}
+
+/// Map the ovnfs call page when `--ovnfs` names a daemon socket, one port per
+/// vCPU. It has no snapshot state, so boot, restore and fork all build it from
+/// the launch flag: a restored or forked VM binds to the socket on its own
+/// command line, or runs without the device.
+fn setup_ovnfs(mmio_bus: &mut Bus, vm: &Vm, config: &Config, cpus: u8) {
+	if let Some(sock) = &config.ovnfs {
+		ovnfs::register(mmio_bus, OVNFS_MMIO_BASE, vm.memory(), sock, cpus);
+	}
 }
 
 fn build_serial_device(

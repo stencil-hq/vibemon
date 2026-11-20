@@ -228,6 +228,12 @@ pub struct Config {
 	pub volumes: Vec<FsMount>,
 	/// Read-only virtio-fs mounts backed by per-VM object proxy sockets.
 	pub remote_fs: Vec<RemoteFsMount>,
+	/// Absolute ovnfs daemon kernel-share socket; maps the ovnfs call device.
+	#[cfg_attr(
+		target_os = "windows",
+		allow(dead_code, reason = "the ovnfs call device exists only on Unix hosts")
+	)]
+	pub ovnfs: Option<PathBuf>,
 }
 
 /// Raw command-line surface parsed by clap; flag tokenization only.
@@ -386,6 +392,11 @@ struct CliArgs {
 	/// (read-only unless :rw); repeatable
 	#[arg(long = "remote-fs", value_name = "T:SOCK[:RW]", value_parser = parse_remote_fs)]
 	remote_fs: Vec<RemoteFsMount>,
+
+	/// ovnfs daemon kernel-share socket (absolute path); maps the ovnfs call
+	/// device the guest mounts with `mount -t ovnfs`
+	#[arg(long, value_name = "SOCK")]
+	ovnfs: Option<PathBuf>,
 
 	/// Unix control socket (pause/resume/snapshot/quit)
 	#[arg(long, value_name = "PATH")]
@@ -821,6 +832,15 @@ impl Config {
 				seen.push(tag.as_str());
 			}
 		}
+		#[cfg(target_os = "windows")]
+		if cli.ovnfs.is_some() {
+			bail!("--ovnfs requires a Linux or macOS host");
+		}
+		if let Some(sock) = &cli.ovnfs
+			&& !sock.is_absolute()
+		{
+			bail!("--ovnfs socket path must be absolute (got {})", sock.display());
+		}
 		if user_net && cli.tap.is_some() {
 			bail!("--net user cannot be combined with --tap");
 		}
@@ -1067,6 +1087,7 @@ impl Config {
 			owner_lease_secs: cli.owner_lease_secs,
 			volumes: cli.volumes,
 			remote_fs: cli.remote_fs,
+			ovnfs: cli.ovnfs,
 		})
 	}
 }
@@ -1467,6 +1488,22 @@ mod tests {
 	fn assert_config_err_contains(args: &[&str], expected: &str) {
 		let err = config_err(args);
 		assert!(err.contains(expected), "expected error containing {expected}, got {err}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn ovnfs_socket_is_absolute_and_single() {
+		let sock = "/run/ovnfs/kfs.sock";
+		let cfg = parse_config(&["vmon", "--kernel", "k", "--ovnfs", sock]).unwrap();
+		assert_eq!(cfg.ovnfs.as_deref(), Some(Path::new(sock)));
+		let bare = parse_config(&["vmon", "--kernel", "k"]).unwrap();
+		assert!(bare.ovnfs.is_none());
+		assert_config_err_contains(
+			&["vmon", "--kernel", "k", "--ovnfs", "kfs.sock"],
+			"--ovnfs socket path must be absolute",
+		);
+		let twice = ["vmon", "--kernel", "k", "--ovnfs", "/a.sock", "--ovnfs", "/b.sock"];
+		assert!(parse_config(&twice).is_err(), "--ovnfs is given at most once");
 	}
 	#[test]
 	fn remote_rootfs_flags_require_complete_nonempty_group() {

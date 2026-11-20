@@ -290,6 +290,9 @@ fn bind_configured_paths(config: &Config, chroot: &Path) -> Result<()> {
 	for m in &config.remote_fs {
 		bind_remote_socket(chroot, &m.sock)?;
 	}
+	if let Some(sock) = &config.ovnfs {
+		bind_remote_socket(chroot, sock)?;
+	}
 	bind_optional(chroot, config.netns.as_deref(), true)?;
 	#[cfg(target_arch = "x86_64")]
 	if !config.vfio_gpus.is_empty() {
