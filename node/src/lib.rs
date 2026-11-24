@@ -333,6 +333,9 @@ impl Node {
 		for task in self.tasks.lock().drain(..) {
 			task.abort();
 		}
+		// Before anything drops a sandbox's `NetLease`, whose `Drop` deletes the
+		// TAP and so kills the guest's network (the VMM exits on it).
+		self.sandboxes.detach_live();
 		self.net.shutdown().await;
 	}
 }

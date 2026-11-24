@@ -621,6 +621,23 @@ impl SandboxManager {
 		&self.config.gpus
 	}
 
+	/// Node shutdown: lets go of every running sandbox's TAP without tearing it
+	/// down, so the VMMs keep their network and the next node process on this
+	/// data dir adopts them with their TAPs ([`Self::recover`]).
+	pub fn detach_live(&self) {
+		for entry in self.sandboxes.lock().values() {
+			let net = entry
+				.state
+				.lock()
+				.live
+				.as_mut()
+				.and_then(|live| live.net.take());
+			if let Some(net) = net {
+				net.detach();
+			}
+		}
+	}
+
 	/// Totals over running sandboxes.
 	pub fn usage(&self) -> Usage {
 		let sandboxes = self.sandboxes.lock();
