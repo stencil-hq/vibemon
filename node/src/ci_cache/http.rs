@@ -957,7 +957,9 @@ impl Service {
 	/// in the repository of the sandbox's grant. Reads for every CI job of
 	/// the repository; writes only for jobs not scoped to a pull request
 	/// (`refs/heads/*`, `refs/tags/*`): 403, which Bazel reports as a
-	/// warning. A local `GET` miss asks the other nodes.
+	/// warning. An action result is a hit only while the outputs it references
+	/// are present ([`BazelStore::action_result`]). A local `GET` miss asks
+	/// the other nodes.
 	async fn bazel(self: &Arc<Self>, req: Request<Body>, sandbox: &str, rest: &str) -> Response {
 		let text = |status: StatusCode, message: &str| (status, message.to_owned()).into_response();
 		let Some((kind, hash)) = rest
@@ -988,20 +990,31 @@ impl Service {
 		let method = req.method().clone();
 		match method {
 			Method::GET | Method::HEAD => {
-				let mut found = self.bazel.open_entry(repo, kind, hash).await;
+				let streamed = |(file, size): (tokio::fs::File, u64)| {
+					(Body::from_stream(ReaderStream::new(file)), size)
+				};
+				let mut found = match kind {
+					Kind::Ac => self.bazel.action_result(repo, hash).await.map(|result| {
+						let size = result.len() as u64;
+						(Body::from(result), size)
+					}),
+					Kind::Cas => self.bazel.open_entry(repo, kind, hash).await.map(streamed),
+				};
+				// A peer answers only with an action result valid there; Bazel
+				// fetches its outputs from the peer through the same fallback.
 				if found.is_none()
 					&& method == Method::GET
 					&& self.bazel_from_peers(repo, kind, hash).await
 				{
-					found = self.bazel.open_entry(repo, kind, hash).await;
+					found = self.bazel.open_entry(repo, kind, hash).await.map(streamed);
 				}
-				let Some((file, size)) = found else {
+				let Some((body, size)) = found else {
 					return text(StatusCode::NOT_FOUND, "not found");
 				};
 				let body = if method == Method::HEAD {
 					Body::empty()
 				} else {
-					Body::from_stream(ReaderStream::new(file))
+					body
 				};
 				let mut response = (StatusCode::OK, body).into_response();
 				let headers = response.headers_mut();
@@ -1034,8 +1047,8 @@ impl Service {
 	}
 
 	/// Copies a Bazel entry from the first other node that has it (CAS
-	/// entries are verified); `false` when none answers within
-	/// [`PEER_LOOKUP`].
+	/// entries are verified, action results validated by the peer); `false`
+	/// when none answers within [`PEER_LOOKUP`].
 	async fn bazel_from_peers(&self, repo: u64, kind: Kind, hash: &str) -> bool {
 		let Some(cluster) = &self.cluster else {
 			return false;
@@ -1217,6 +1230,8 @@ fn bazel_writable(scope: &CacheScope) -> bool {
 /// Peer routes (relative to `/node/v1`): `GET /ci-cache/blobs/{digest}`, a
 /// local archive copy for a peer's fetch, and
 /// `GET /ci-cache/bazel/{repo}/{kind}/{hash}`, a local Bazel entry.
+///
+/// An action result is answered only while its outputs are present here.
 pub fn routes(service: Arc<Service>) -> Router {
 	Router::new()
 		.route("/ci-cache/blobs/{digest}", get(peer_blob))
@@ -1232,17 +1247,26 @@ async fn peer_bazel(
 	if !valid_digest(&hash) {
 		return Err(ApiError::invalid("invalid digest"));
 	}
-	let (file, size) = service
-		.bazel
-		.open_entry(repo, kind, &hash)
-		.await
+	let found = match kind {
+		Kind::Ac => service
+			.bazel
+			.action_result(repo, &hash)
+			.await
+			.map(|result| (result.len() as u64, Body::from(result))),
+		Kind::Cas => service
+			.bazel
+			.open_entry(repo, kind, &hash)
+			.await
+			.map(|(file, size)| (size, Body::from_stream(ReaderStream::new(file)))),
+	};
+	let (size, body) = found
 		.ok_or_else(|| ApiError::not_found(format!("no Bazel entry {}/{hash}", kind.as_str())))?;
 	Ok((
 		[
 			(header::CONTENT_TYPE, "application/octet-stream".to_owned()),
 			(header::CONTENT_LENGTH, size.to_string()),
 		],
-		Body::from_stream(ReaderStream::new(file)),
+		body,
 	)
 		.into_response())
 }

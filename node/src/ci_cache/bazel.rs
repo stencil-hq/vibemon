@@ -9,9 +9,16 @@
 //! evicted beyond the node's budget (`--ci-bazel-cache-mb`); recency is kept
 //! in memory and starts from the files' modification times after a restart.
 //! An open file survives its eviction (readers hold the descriptor).
+//!
+//! Eviction is per file, so an action result can outlive the outputs it
+//! names; Bazel building without the bytes would trust such a hit and fail
+//! later on the missing outputs. Action results are therefore served only
+//! while every CAS entry they reference is present
+//! ([`BazelStore::action_result`]).
 
 use std::{
 	collections::{BTreeMap, HashMap},
+	fmt::Write as _,
 	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -26,7 +33,10 @@ use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 
-use super::records::valid_digest;
+use super::{
+	reapi::{self, Digest},
+	records::valid_digest,
+};
 
 /// The two Bazel cache namespaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,15 +94,41 @@ struct State {
 impl State {
 	fn touch(&mut self, rel: &str) -> Option<u64> {
 		let tick = self.tick + 1;
-		let (size, old) = self.files.get_mut(rel).map(|entry| {
-			let old = entry.1;
-			entry.1 = tick;
-			(entry.0, old)
-		})?;
+		let entry = self.files.get_mut(rel)?;
+		let old = std::mem::replace(&mut entry.1, tick);
+		let size = entry.0;
 		self.tick = tick;
-		self.order.remove(&old);
-		self.order.insert(tick, rel.to_owned());
+		let rel = self.order.remove(&old).unwrap_or_else(|| rel.to_owned());
+		self.order.insert(tick, rel);
 		Some(size)
+	}
+
+	fn remove(&mut self, rel: &str) {
+		if let Some((size, tick)) = self.files.remove(rel) {
+			self.order.remove(&tick);
+			self.total -= size;
+		}
+	}
+
+	/// Whether every CAS entry of `blobs` is present with its size; if so,
+	/// marks the action result `ac` used and then them (so they outlive it).
+	fn claim(&mut self, ac: &str, repo_id: u64, blobs: &[Digest<'_>]) -> bool {
+		let mut key = String::new();
+		let present = blobs.iter().all(|digest| {
+			rel_into(&mut key, repo_id, Kind::Cas, digest.hash);
+			self
+				.files
+				.get(&key)
+				.is_some_and(|&(size, _)| size == digest.size)
+		});
+		if present {
+			self.touch(ac);
+			for digest in blobs {
+				rel_into(&mut key, repo_id, Kind::Cas, digest.hash);
+				self.touch(&key);
+			}
+		}
+		present
 	}
 
 	fn insert(&mut self, rel: String, size: u64) {
@@ -116,7 +152,15 @@ pub struct BazelStore {
 
 /// Relative path of an entry.
 fn rel(repo_id: u64, kind: Kind, hash: &str) -> String {
-	format!("{repo_id}/{}/{}/{hash}", kind.as_str(), &hash[..2])
+	let mut rel = String::new();
+	rel_into(&mut rel, repo_id, kind, hash);
+	rel
+}
+
+/// Replaces `rel` with the relative path of an entry.
+fn rel_into(rel: &mut String, repo_id: u64, kind: Kind, hash: &str) {
+	rel.clear();
+	let _ = write!(rel, "{repo_id}/{}/{}/{hash}", kind.as_str(), &hash[..2]);
 }
 
 impl BazelStore {
@@ -200,11 +244,57 @@ impl BazelStore {
 			return Some((file, size));
 		}
 		// Removed underneath the index: forget it.
-		let mut state = self.state.lock();
-		if let Some((size, tick)) = state.files.remove(&rel) {
-			state.order.remove(&tick);
-			state.total -= size;
+		self.state.lock().remove(&rel);
+		None
+	}
+
+	/// Reads an indexed entry without marking it used.
+	async fn read(&self, rel: &str) -> Option<Vec<u8>> {
+		if !self.state.lock().files.contains_key(rel) {
+			return None;
 		}
+		let read = tokio::fs::read(self.path(rel)).await;
+		if read.is_err() {
+			// Removed underneath the index.
+			self.state.lock().remove(rel);
+		}
+		read.ok()
+	}
+
+	/// Reads an action result (AC entry) whose referenced CAS entries are all
+	/// present (output files, output directories' `Tree`s and the files they
+	/// list, stdout and stderr), marking it and them used. A result with a
+	/// missing output, or that does not decode, is a miss and is dropped.
+	pub async fn action_result(&self, repo_id: u64, hash: &str) -> Option<Vec<u8>> {
+		let ac = rel(repo_id, Kind::Ac, hash);
+		let result = self.read(&ac).await?;
+		let mut trees = Vec::new();
+		let valid = 'valid: {
+			let Some((mut blobs, tree_digests)) = reapi::action_result(&result) else {
+				break 'valid false;
+			};
+			for tree in &tree_digests {
+				let Some(tree) = self.read(&rel(repo_id, Kind::Cas, tree.hash)).await else {
+					break 'valid false;
+				};
+				trees.push(tree);
+			}
+			if trees
+				.iter()
+				.try_for_each(|tree| reapi::tree_files(tree, &mut blobs))
+				.is_none()
+			{
+				break 'valid false;
+			}
+			blobs.extend(tree_digests);
+			self.state.lock().claim(&ac, repo_id, &blobs)
+		};
+		if valid {
+			return Some(result);
+		}
+		tracing::debug!(repo_id, %hash, "dropping a Bazel action result with missing outputs or that does not decode");
+		self.state.lock().remove(&ac);
+		let _ = tokio::fs::remove_file(self.path(&ac)).await;
 		None
 	}
 
@@ -316,6 +406,7 @@ mod tests {
 	use http_body_util::BodyExt as _;
 
 	use super::*;
+	use crate::ci_cache::reapi::testing;
 
 	fn sha(data: &[u8]) -> String {
 		hex::encode(Sha256::digest(data))
@@ -327,6 +418,110 @@ mod tests {
 		let bytes = body.collect().await.unwrap().to_bytes().to_vec();
 		assert_eq!(bytes.len() as u64, size);
 		Some(bytes)
+	}
+
+	async fn put(store: &Arc<BazelStore>, kind: Kind, hash: &str, data: &[u8]) {
+		store
+			.put(1, kind, hash, Body::from(data.to_vec()))
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_valid_action_result_is_served_and_keeps_its_outputs_alive() {
+		let (out, log, file, nested) = (
+			b"output".as_slice(),
+			b"stdout".as_slice(),
+			b"tree file".as_slice(),
+			b"nested file".as_slice(),
+		);
+		let tree = testing::tree(&[file], &[nested]);
+		let result = testing::action_result(&[out], &[&tree], log);
+		let outputs = [out, log, file, nested, tree.as_slice()];
+		let filler = vec![0u8; result.len()];
+		let budget = outputs.iter().map(|blob| blob.len()).sum::<usize>() + 2 * result.len();
+		let dir = tempfile::tempdir().unwrap();
+		let store = BazelStore::open(dir.path(), budget as u64).unwrap();
+		// Bazel uploads the outputs before the action result.
+		for blob in outputs {
+			put(&store, Kind::Cas, &sha(blob), blob).await;
+		}
+		put(&store, Kind::Ac, &sha(b"action"), &result).await;
+		put(&store, Kind::Cas, &sha(&filler), &filler).await;
+		assert_eq!(store.action_result(1, &sha(b"action")).await.unwrap(), result);
+		// The hit made the result and its outputs more recent than the filler:
+		// a new entry evicts the filler alone.
+		let next = vec![1u8; result.len()];
+		put(&store, Kind::Cas, &sha(&next), &next).await;
+		assert!(store.touch(1, Kind::Cas, &sha(&filler)).is_none(), "evicted");
+		for blob in outputs {
+			assert!(store.touch(1, Kind::Cas, &sha(blob)).is_some());
+		}
+		assert_eq!(store.action_result(1, &sha(b"action")).await.unwrap(), result);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_action_result_whose_output_was_evicted_is_a_miss_and_dropped() {
+		let out = b"output".as_slice();
+		let result = testing::action_result(&[out], &[], b"");
+		let filler = vec![0u8; result.len()];
+		let dir = tempfile::tempdir().unwrap();
+		let budget = out.len() + result.len() + filler.len() - 1;
+		let store = BazelStore::open(dir.path(), budget as u64).unwrap();
+		put(&store, Kind::Cas, &sha(out), out).await;
+		put(&store, Kind::Ac, &sha(b"action"), &result).await;
+		// The output is the least recently used entry.
+		put(&store, Kind::Cas, &sha(&filler), &filler).await;
+		assert!(store.touch(1, Kind::Cas, &sha(out)).is_none(), "evicted");
+		let path = dir
+			.path()
+			.join(format!("1/ac/{}/{}", &sha(b"action")[..2], sha(b"action")));
+		assert!(path.is_file());
+		assert_eq!(store.action_result(1, &sha(b"action")).await, None);
+		assert!(!path.exists(), "dropped");
+		assert_eq!(store.total(), filler.len() as u64);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn action_results_missing_tree_files_or_not_decoding_are_misses() {
+		let dir = tempfile::tempdir().unwrap();
+		let store = BazelStore::open(dir.path(), 1 << 20).unwrap();
+		let (file, nested) = (b"tree file".as_slice(), b"nested file".as_slice());
+		let tree = testing::tree(&[file], &[nested]);
+		// `nested` is not stored.
+		for blob in [file, tree.as_slice()] {
+			put(&store, Kind::Cas, &sha(blob), blob).await;
+		}
+		let mut truncated = testing::action_result(&[file], &[], b"");
+		truncated.pop();
+		for (case, result) in [
+			("missing tree file", testing::action_result(&[], &[&tree], b"")),
+			("missing tree", testing::action_result(&[], &[b"other tree".as_slice()], b"")),
+			("output file of another size", {
+				let mut result = testing::action_result(&[b"tree fil"], &[], b"");
+				let at = result
+					.windows(64)
+					.position(|w| w == sha(b"tree fil").as_bytes());
+				result[at.unwrap()..][..64].copy_from_slice(sha(file).as_bytes());
+				result
+			}),
+			("not protobuf", b"action result".to_vec()),
+			("truncated", truncated),
+		] {
+			put(&store, Kind::Ac, &sha(case.as_bytes()), &result).await;
+			assert_eq!(store.action_result(1, &sha(case.as_bytes())).await, None, "{case}");
+			assert!(
+				store
+					.open_entry(1, Kind::Ac, &sha(case.as_bytes()))
+					.await
+					.is_none(),
+				"{case}: dropped"
+			);
+		}
+		put(&store, Kind::Cas, &sha(nested), nested).await;
+		let result = testing::action_result(&[file], &[&tree], b"");
+		put(&store, Kind::Ac, &sha(b"action"), &result).await;
+		assert_eq!(store.action_result(1, &sha(b"action")).await.unwrap(), result);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

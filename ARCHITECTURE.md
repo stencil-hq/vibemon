@@ -1820,7 +1820,16 @@ secret" is whichever signs what vmon receives.
   `--ci-bazel-cache-mb` (default 5% of the data filesystem, at most a fifth
   of its free space plus the entries held at start), recency in memory,
   seeded from file mtimes at start; an entry over half the budget is refused
-  (413). Readers keep their file open across an eviction.
+  (413). Readers keep their file open across an eviction. Eviction is per
+  file, so an AC `GET`/`HEAD` (and the peer route) decodes the
+  `ActionResult` (`ci_cache::reapi`, a minimal protobuf wire reader) and
+  serves it only if every CAS entry it references is indexed with its size:
+  output files, stdout/stderr, each output directory's `Tree` and the files
+  of its root and children (empty digests count as present). A valid hit
+  marks the result and then those entries used; a stale or undecodable
+  result is deleted and answered as a miss (on `GET`, then looked up on the
+  peers). A result copied from a peer is served as copied: the peer
+  validated it, and its outputs follow through the CAS fallback.
 - **Sizes**: `CreateSpec.resources` (driver-internal, not on the E2B API)
   overrides the build's vCPUs/memory (build rules: 1 or even ≤ 32 vCPUs,
   ≥ 128 MiB; team limits). A size other than the build's sets

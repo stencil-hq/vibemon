@@ -21,6 +21,7 @@ pub mod bazel;
 pub mod blobs;
 mod http;
 pub mod index;
+mod reapi;
 pub mod records;
 #[cfg(test)]
 mod tests;

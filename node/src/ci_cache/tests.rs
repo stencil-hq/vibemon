@@ -17,7 +17,7 @@ use super::{
 	CacheConfig, PING_PATH, Service,
 	bazel::BazelStore,
 	blobs::BlobStore,
-	index,
+	index, reapi,
 	records::{CacheEntryRow, CacheGrant, CacheScope, EntryState},
 };
 
@@ -600,7 +600,8 @@ async fn bazel_cache_reads_for_every_ci_job_and_writes_for_branches_only() {
 	let (status, _, body) = h.send("main", put(&wrong, blob.clone())).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&body));
 	assert_eq!(h.send("main", get(&wrong)).await.0, StatusCode::NOT_FOUND, "nothing stored");
-	assert_eq!(h.send("main", put(&ac, b"action result".to_vec())).await.0, StatusCode::OK);
+	let result = reapi::testing::action_result(&[&blob], &[], b"");
+	assert_eq!(h.send("main", put(&ac, result.clone())).await.0, StatusCode::OK);
 
 	// Every CI job of the repository reads, with a Content-Length.
 	for sandbox in ["main", "feat", "pr"] {
@@ -610,15 +611,36 @@ async fn bazel_cache_reads_for_every_ci_job_and_writes_for_branches_only() {
 	}
 	let (status, headers, body) = h.send("pr", head(&ac)).await;
 	assert_eq!((status, body.len()), (StatusCode::OK, 0));
-	assert_eq!(headers["content-length"], "13");
-	assert_eq!(h.send("pr", get(&ac)).await.2, b"action result");
+	assert_eq!(headers["content-length"], result.len().to_string().as_str());
+	assert_eq!(h.send("pr", get(&ac)).await.2, result);
+
+	// An action result whose outputs are gone (or that does not decode) is a
+	// miss and is dropped, for jobs and for other nodes alike.
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let peer = format!("http://{}/ci-cache/bazel/{REPO}", listener.local_addr().unwrap());
+	let routes = super::routes(Arc::clone(&h.service));
+	tokio::spawn(async move { axum::serve(listener, routes).await });
+	let from_peer = |path: &str| reqwest::get(format!("{peer}{}", &path["/bazel".len()..]));
+	let stale = format!("/bazel/ac/{}", hex::encode(Sha256::digest(b"stale key")));
+	let evicted = reapi::testing::action_result(&[b"evicted output"], &[], b"");
+	for result in [evicted, b"not an action result".to_vec()] {
+		assert_eq!(h.send("main", put(&stale, result.clone())).await.0, StatusCode::OK);
+		assert_eq!(h.send("pr", head(&stale)).await.0, StatusCode::NOT_FOUND);
+		assert_eq!(h.send("main", put(&stale, result.clone())).await.0, StatusCode::OK);
+		assert_eq!(h.send("pr", get(&stale)).await.0, StatusCode::NOT_FOUND);
+		assert_eq!(h.send("main", put(&stale, result)).await.0, StatusCode::OK);
+		assert_eq!(from_peer(&stale).await.unwrap().status(), StatusCode::NOT_FOUND);
+	}
+	let response = from_peer(&ac).await.unwrap();
+	assert_eq!(response.status(), StatusCode::OK);
+	assert_eq!(response.bytes().await.unwrap(), result);
 
 	// A pull request job may not write (Bazel only warns).
 	let pr_blob = b"pr output".to_vec();
 	let pr_cas = format!("/bazel/cas/{}", hex::encode(Sha256::digest(&pr_blob)));
 	assert_eq!(h.send("pr", put(&pr_cas, pr_blob)).await.0, StatusCode::FORBIDDEN);
 	assert_eq!(h.send("pr", put(&ac, b"poisoned".to_vec())).await.0, StatusCode::FORBIDDEN);
-	assert_eq!(h.send("main", get(&ac)).await.2, b"action result");
+	assert_eq!(h.send("main", get(&ac)).await.2, result);
 	assert_eq!(h.send("main", get(&pr_cas)).await.0, StatusCode::NOT_FOUND);
 
 	// Entries are per repository; non-CI sandboxes get nothing.
