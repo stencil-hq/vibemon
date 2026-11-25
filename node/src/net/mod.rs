@@ -538,6 +538,13 @@ impl NetLease {
 		}
 	}
 
+	/// Leaves the TAP, its rules, and its address block in place for a VMM
+	/// that outlives this process: the next node process adopts the lease from
+	/// the sandbox metadata ([`NetManager::adopt`]). Node shutdown only.
+	pub fn detach(mut self) {
+		self.tap = None;
+	}
+
 	/// Returns the TAP to the ready pool (after flushing its conntrack
 	/// entries), or tears it down and frees the lease when the pool is full
 	/// or the TAP is not recyclable. Call only once the VM has exited and its
@@ -622,6 +629,60 @@ mod tests {
 		);
 		// Avoid running teardown commands for this synthetic lease.
 		std::mem::forget(tap);
+	}
+
+	/// Node shutdown detaches a running sandbox's lease: the TAP stays up for
+	/// the VMM, and the next process adopts it and tears it down on release.
+	/// Runs in a fresh network namespace, so it never touches a live node's
+	/// `vmon<N>` TAPs; needs root or `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn detached_tap_survives_and_is_adopted() {
+		// Threads, and the `ip`/iptables children they spawn, inherit the
+		// namespace of the thread that creates them: unshare one thread and run
+		// the runtime (and its blocking pool) from it.
+		std::thread::spawn(|| {
+			// SAFETY: unshare(2) on the calling thread only.
+			if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+				eprintln!(
+					"skipped: cannot create a network namespace: {}",
+					std::io::Error::last_os_error()
+				);
+				return;
+			}
+			tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap()
+				.block_on(detach_then_adopt());
+		})
+		.join()
+		.unwrap();
+	}
+
+	#[cfg(target_os = "linux")]
+	async fn detach_then_adopt() {
+		// sysfs shows the namespace it was mounted in; ask `ip` instead.
+		let exists = |tap: &str| {
+			std::process::Command::new("ip")
+				.args(["link", "show", "dev", tap])
+				.output()
+				.is_ok_and(|out| out.status.success())
+		};
+		let first = NetManager::new(NetMode::Tap, "172.20.240.0/24", None, &[]).unwrap();
+		let lease = first.acquire().await.unwrap();
+		let tap = lease.tap().cloned().unwrap();
+		assert!(exists(&tap.tap));
+		lease.detach();
+		first.shutdown().await;
+		drop(first);
+		assert!(exists(&tap.tap), "a detached TAP outlives its node process");
+
+		let second = NetManager::new(NetMode::Tap, "172.20.240.0/24", None, &[]).unwrap();
+		let adopted = second.adopt(Some(tap.clone())).unwrap();
+		assert!(exists(&tap.tap));
+		adopted.release().await;
+		assert!(!exists(&tap.tap), "releasing the adopted lease tears the TAP down");
 	}
 
 	#[cfg(not(target_os = "linux"))]
