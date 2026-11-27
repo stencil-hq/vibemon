@@ -36,6 +36,7 @@ All notable changes to this project are recorded here.
 - On AMD, pause, snapshot, fork, and migration succeed while the guest has AMD-V enabled but no nested VM running (for example a guest kernel that enables it at boot): `VM_HSAVE_PA` is saved with the vCPU state. A running nested VM, and VMXON on Intel, are still refused. The VMM integration tests boot their guests with `kvm.enable_virt_at_load=0`, so they pass when run inside a sandbox
 - Snapshots save and restore `IA32_FEATURE_CONTROL`, so VMs start in sandboxes forked from a template snapshot on Intel hosts. Before, the guest kernel crashed (`kvm_spurious_fault`) at the first vCPU; rebuild x86_64 templates captured by earlier releases before using `/dev/kvm` in them (on AMD such sandboxes stopped)
 - Dashboard: empty states in flush cards keep their bottom padding
+- On macOS, guest RAM of booted and fully restored VMs is anonymous memory instead of a shared mapping of an unlinked `$TMPDIR/vmon-ram-*` file. The kernel wrote every page a guest dirtied back to that file, which kept the SSD writing hundreds of MB/s on a host with busy guests. Forks still map the snapshot memory file privately
 
 ## 0.4.1
 
