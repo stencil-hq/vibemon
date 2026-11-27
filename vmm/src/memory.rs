@@ -1,7 +1,9 @@
 //! Guest RAM allocation.
 
 #[cfg(not(target_os = "windows"))]
-use std::{fs::File, io, os::unix::io::AsRawFd};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::{io, os::unix::io::AsRawFd};
 
 #[cfg(not(target_os = "windows"))]
 use vm_memory::FileOffset;
@@ -104,9 +106,16 @@ pub fn arrange_memory(size: usize) -> Vec<(GuestAddress, usize)> {
 	}
 }
 
-/// Allocate non-zero, page-aligned guest RAM of `size` bytes as file-backed,
-/// `MAP_SHARED` regions so snapshots can copy RAM and `CoW` forks can remap
-/// the snapshot privately.
+/// Allocate non-zero, page-aligned guest RAM of `size` bytes.
+///
+/// On Linux each region is a `MAP_SHARED` memfd mapping, which the pager
+/// needs to punch evicted pages out of. Elsewhere RAM is anonymous
+/// `MAP_PRIVATE` memory: on macOS a file-backed shared mapping makes the
+/// kernel write every page the guest dirties back to that file, so a busy
+/// guest turns into a steady stream of SSD writes. Anonymous RAM is only
+/// ever compressed or swapped under memory pressure. Snapshots read RAM
+/// through its host address and forks map the snapshot file privately, so
+/// neither needs a backing file.
 pub fn create_guest_memory(size: usize) -> Result<GuestMemoryMmap> {
 	if size == 0 {
 		return Err(err("guest memory size is zero"));
@@ -115,32 +124,28 @@ pub fn create_guest_memory(size: usize) -> Result<GuestMemoryMmap> {
 		return Err(err(format!("guest memory size {size} is not page-aligned")));
 	}
 	let regions = arrange_memory(size);
-	#[cfg(target_os = "windows")]
+	#[cfg(not(target_os = "linux"))]
 	{
 		Ok(GuestMemoryMmap::from_ranges(&regions)?)
 	}
-	#[cfg(not(target_os = "windows"))]
+	#[cfg(target_os = "linux")]
 	{
 		let mut ranges: Vec<(GuestAddress, usize, Option<FileOffset>)> =
 			Vec::with_capacity(regions.len());
 		for (addr, len) in regions {
-			let file = create_shared_memory_file(len)?;
+			let file = linux::create_memfd(len)?;
 			ranges.push((addr, len, Some(FileOffset::new(file, 0))));
 		}
 		Ok(GuestMemoryMmap::from_ranges_with_files(ranges)?)
 	}
 }
 
-/// Create the platform RAM backing file used by the shared guest mappings.
+/// Linux guest RAM backing: memfds for the shared guest mappings.
 #[cfg(target_os = "linux")]
 mod linux {
 	use std::os::unix::io::FromRawFd;
 
 	use super::*;
-
-	pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
-		create_memfd(len)
-	}
 
 	/// Create an anonymous memfd of exactly `len` bytes, returned as an owned
 	/// `File`.
@@ -148,7 +153,7 @@ mod linux {
 	/// The fd is `MFD_CLOEXEC` and sized with `ftruncate`. Mapping it with a
 	/// `FileOffset` (via `from_ranges_with_files`) yields a shared, file-backed
 	/// region, so guest and VMM writes land in the same backing object.
-	fn create_memfd(len: usize) -> Result<File> {
+	pub(super) fn create_memfd(len: usize) -> Result<File> {
 		// SAFETY: name is a valid NUL-terminated C string; flags are valid.
 		let fd = unsafe { libc::memfd_create(c"vmon-ram".as_ptr(), libc::MFD_CLOEXEC) };
 		if fd < 0 {
@@ -185,66 +190,26 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-	use std::{
-		os::unix::fs::OpenOptionsExt,
-		sync::atomic::{AtomicU64, Ordering},
-	};
-
-	use super::*;
-
-	/// Create an unlinked temporary file for macOS shared guest RAM mappings.
-	pub(super) fn create_shared_memory_file(len: usize) -> Result<File> {
-		static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
-
-		let tmpdir =
-			std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
-		for _ in 0..128 {
-			let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-			let path = tmpdir.join(format!("vmon-ram-{}-{id}", std::process::id()));
-			match std::fs::OpenOptions::new()
-				.read(true)
-				.write(true)
-				.create_new(true)
-				.mode(0o600)
-				.open(&path)
-			{
-				Ok(file) => {
-					let _ = std::fs::remove_file(&path);
-					size_file(&file, len)?;
-					return Ok(file);
-				},
-				Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {},
-				Err(e) => {
-					return Err(crate::result::err(format!(
-						"creating RAM backing {}: {e}",
-						path.display()
-					)));
-				},
-			}
-		}
-		Err(crate::result::err("creating unique RAM backing file in TMPDIR"))
-	}
-
 	pub(super) const fn private_mmap_flags() -> libc::c_int {
 		libc::MAP_PRIVATE
 	}
 
-	pub const fn advise_mergeable(_mem: &GuestMemoryMmap) {}
+	pub const fn advise_mergeable(_mem: &super::GuestMemoryMmap) {}
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::advise_mergeable;
 #[cfg(target_os = "linux")]
-use linux::{create_shared_memory_file, private_mmap_flags};
+use linux::private_mmap_flags;
 #[cfg(target_os = "macos")]
 pub use macos::advise_mergeable;
 #[cfg(target_os = "macos")]
-use macos::{create_shared_memory_file, private_mmap_flags};
+use macos::private_mmap_flags;
 #[cfg(target_os = "windows")]
 pub const fn advise_mergeable(_mem: &GuestMemoryMmap) {}
 
 /// Resize a backing file to exactly `len` bytes.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn size_file(file: &File, len: usize) -> Result<()> {
 	let len =
 		libc::off_t::try_from(len).map_err(|_| err("RAM backing file size overflows off_t"))?;
@@ -499,6 +464,15 @@ mod tests {
 	fn create_guest_memory_rejects_unaligned_size() {
 		let err = result_err(create_guest_memory(PAGE_SIZE + 1));
 		assert!(err.contains("page-aligned"), "unexpected error: {err}");
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	#[test]
+	fn create_guest_memory_is_anonymous_off_linux() {
+		use vm_memory::GuestMemoryRegion;
+
+		let mem = create_guest_memory(2 << 20).expect("guest memory");
+		assert!(mem.iter().all(|region| region.file_offset().is_none()));
 	}
 
 	#[cfg(not(target_os = "windows"))]
